@@ -32,6 +32,28 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_client_reset_closes_keepalive_without_a_server_traceback(self):
+        import http.client
+        import os
+        import socket
+        import struct
+        from urllib.parse import urlsplit
+        from remote_compute.worker import Handler
+        finished=threading.Event();original=Handler.finish
+        def finish(handler):
+            try:original(handler)
+            finally:finished.set()
+        with scratch() as root, provider(Path(root)/'worker') as (_,client):
+            endpoint=urlsplit(client.url)
+            with patch.object(Server,'handle_error') as errors,patch.object(Handler,'finish',finish):
+                connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port)
+                connection.request('GET','/health');connection.getresponse().read()
+                connection.sock.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('hh' if os.name=='nt' else 'ii',1,0))
+                connection.close()
+                self.assertTrue(finished.wait(3))
+                errors.assert_not_called()
+            self.assertEqual(client.health()['cpus'],1)
+
     def test_resize_lost_reply_recovers_the_original_grant(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):

@@ -591,6 +591,12 @@ class Server(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
+
     def setup(self):
         super().setup()
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -603,17 +609,17 @@ class Handler(BaseHTTPRequestHandler):
         compressed = not binary and len(body) >= 1024 and 'gzip' in self.headers.get('Accept-Encoding', '')
         if compressed:
             body = gzip.compress(body, compresslevel=1)
-        self.send_response(status)
-        self.send_header("Content-Type", "application/zip" if binary else "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        if compressed:
-            self.send_header('Content-Encoding', 'gzip')
-            self.send_header('Vary', 'Accept-Encoding')
-        self.end_headers()
         try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/zip" if binary else "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if compressed:
+                self.send_header('Content-Encoding', 'gzip')
+                self.send_header('Vary', 'Accept-Encoding')
+            self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def _handle(self):
         worker = self.server.worker
