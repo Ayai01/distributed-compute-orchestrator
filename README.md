@@ -57,7 +57,7 @@ quit
 
 `set 节点 limit=N memory_limit_mb=M` 控制**本调度器**向该节点分配的 CPU 和内存，0 跟随节点预算；`cpus 节点 N` 和 `memory 节点 MiB` 调整**提供者总预算**。`enabled=false` 暂停本调度器向该节点分配；`pause` 暂停提供者启动新任务。在途任务继续运行。
 
-算力提供者的终端支持 `status`、`jobs`、`cpus N`、`memory MiB`、`pause`、`resume`、`logs 任务ID`、`cancel 任务ID|all`、`delete 任务ID`、`quit`。空行保持状态；参数错误后继续接受操作；Ctrl+C 返回提示符。调度器 `quit` 取消本终端持有的单任务和批次；提供者 `quit` 停止本节点任务及其子进程。
+算力提供者的终端支持 `status`、`jobs`、`cpus N`、`memory MiB`、`pause`、`resume`、`logs 任务ID`、`cancel 任务ID|all`、`delete 任务ID`、`quit`。空行保持状态；参数错误后继续接受操作；Ctrl+C 返回提示符。通过 `--url` 连接已有中心的终端，`quit` 取消本终端提交的单任务和批次并断开连接。托管中心或提供者的入口退出时，停止相应服务及它承接的在途任务和子进程。
 
 ## 分配策略
 
@@ -153,12 +153,12 @@ result = client.run(task, files={
 
 ## 现有工程接入位置
 
-| 工程 | 建议接入粒度 |
+| 工程 | 入口与执行粒度 |
 | --- | --- |
 | AOP_v2 | `--compute-center URL` 或 `compute.center`，每角点沿用原测量器、模型与结果解析；BGR 三工况21个指标与本地完全一致 |
-| RGCN-v2 | 将生成后的 PRE/POST 网表及分析批次提交，模型用 shared/asset 引用；沿用物理测量与来源记录 |
+| RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url`，完整候选PRE/POST分析为一任务；源码和34MiB原生模型闭包按内容同步，8组149项指标、67份波形数字摘要完全一致，保留后仿恢复与原任务ID |
 | ARH-DSE-v2 | `main.py run --headless --compute-center URL --project mac --workers 1 --memory-budget-mib 1024`；按整轮运行调度，沿用原生持久进程/构建，支持原ID重连；MAC 30候选/2326原生调用完全一致 |
-| Analog-Opt-Bench-v2 | 按种子或评价批次分配，保留原算法状态与唯一设计预算 |
+| Analog-Opt-Bench-v2 | `main.py run --remote-url URL` 或配置 `remote_compute.url`，按算法/种子批次分配；Class-AB与ZDT1四任务、每任务512次评价的科学数组完全一致，持久Numba缓存将同批热运行从61秒降至7.885秒 |
 | Rocket 神经网络工程 | 按硬件配置构建后，在同一任务内执行多程序和网络批次 |
 
 现有工程默认保持独立本机计算；显式设置中心才接入。其他工程由各自正在工作的会话在运行边界适配，具体入口随验证结果更新。
