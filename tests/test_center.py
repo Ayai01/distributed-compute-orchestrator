@@ -66,6 +66,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(value['role'], 'scheduler')
                 self.assertEqual(value['memory_total_mb'], one.health()['memory_total_mb'])
                 self.assertEqual(value['memory_capacity_mb'], 256)
+                self.assertEqual({v['node'] for v in value['tools']['python']['variants']}, {'node1', 'node2'})
                 self.assertEqual(len(client.nodes()['nodes']), 2)
                 client.control(node='node1', routing={'memory_limit_mb': 64})
                 self.assertEqual(client.nodes()['nodes'][0]['memory_capacity_mb'], 64)

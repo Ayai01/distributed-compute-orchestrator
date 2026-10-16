@@ -48,8 +48,7 @@ class Coordinator:
             for name, value in node.health.get("tools", {}).items():
                 if value.get("available"):
                     info = tools.setdefault(name, {"available": True, "variants": []})
-                    if value not in info["variants"]:
-                        info["variants"].append(value)
+                    info["variants"].append({"node": node.name, **value})
         with self.condition:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": "scheduler", "tools": tools,
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),

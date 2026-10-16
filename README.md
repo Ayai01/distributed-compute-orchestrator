@@ -68,6 +68,7 @@ quit
 任务还可设置 `priority`、`node`、`requires`。较大的 `priority` 先启动；`node` 固定节点名称；`requires` 要求节点标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选节点。多个批次共享同一调度器的资源账本，节点再按自身预算统一准入。
 
 用 `label` 区分电路、保真度或相近工作量的批次，使同类耗时具有可比性。执行中的任务保留原节点；中断任务的状态和已有产物留在节点，便于查询和回收。
+中心的工具变体包含节点名和可执行文件摘要，调用工程可核对固定节点的引擎身份。
 
 ## 脚本与 Python 接口
 
@@ -156,7 +157,7 @@ result = client.run(task, files={
 | --- | --- |
 | AOP_v2 | `--compute-center URL` 或 `compute.center`，每角点沿用原测量器、模型与结果解析；BGR 三工况21个指标与本地完全一致 |
 | RGCN-v2 | 将生成后的 PRE/POST 网表及分析批次提交，模型用 shared/asset 引用；沿用物理测量与来源记录 |
-| ARH-DSE-v2 | 每个任务处理一批候选，任务内复用原生持久进程和构建结果；保持候选与故障种子身份 |
+| ARH-DSE-v2 | `main.py run --headless --compute-center URL --project mac --workers 1 --memory-budget-mib 1024`；按整轮运行调度，沿用原生持久进程/构建，支持原ID重连；MAC 30候选/2326原生调用完全一致 |
 | Analog-Opt-Bench-v2 | 按种子或评价批次分配，保留原算法状态与唯一设计预算 |
 | Rocket 神经网络工程 | 按硬件配置构建后，在同一任务内执行多程序和网络批次 |
 
