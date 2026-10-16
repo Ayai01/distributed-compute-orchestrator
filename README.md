@@ -30,6 +30,12 @@ AOP、RGCN、ARH-DSE、Analog-Opt-Bench默认优先本机8766中心；中心未�
 
 在工程目录执行，唯一入口是 `main.py`：
 
+Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执行 `./start.sh`（也可 `sh start.sh`）。两个脚本都会切换到工程目录并调用同一个 `main.py`，读取设备配置：Aya1-PC 启动 hybrid，Aya1-TX 启动 worker。参数原样传递，例如 `start.cmd --mode worker --host 0.0.0.0`。Windows 优先使用工程内的 `.tools/python`，随后尝试 `py -3`、`python`。
+
+启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:8766` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
+
+端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心，hybrid 也能复用已有本机 worker）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
+
 ```text
 python main.py
 python main.py --mode hybrid --cpus 8 --memory-mb 8192

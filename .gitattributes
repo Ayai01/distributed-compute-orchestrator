@@ -1,0 +1,2 @@
+start.cmd text eol=crlf
+start.sh text eol=lf

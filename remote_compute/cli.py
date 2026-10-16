@@ -20,6 +20,7 @@ from .coordinator import Coordinator
 from .tasks import ngspice, verilator
 from .bundle import TERMINAL, atomic_json
 from .worker import Conflict, Server, Worker
+from .startup import Cancelled, resolve
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -684,6 +685,8 @@ def main(argv=None):
     parser.add_argument("--root", help="节点任务/资产目录；默认使用现有内存盘或系统临时目录")
     parser.add_argument("--headless", action="store_true", help="启动后台服务，不打开交互终端；console=true可启用设备终端")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument('--on-port-conflict', choices=('ask', 'reuse', 'kill', 'admin-kill', 'cancel'),
+                        default='ask', help='端口冲突处理；交互终端默认询问，admin-kill请求管理员权限')
     parser.add_argument("--check", action="store_true", help="检查本机仿真工具")
     parser.add_argument("--test", action="store_true", help="运行核心回归")
     parser.add_argument("--test-native", action="store_true", help="同时验证真实ngspice和Verilator")
@@ -767,7 +770,22 @@ def main(argv=None):
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
         if args.mode == "worker" and args.action:
             raise ValueError("worker 模式使用本地操作终端；提交任务使用 scheduler/hybrid 模式")
-        if args.mode != "scheduler":
+        existing_worker = None
+        if not args.url:
+            if args.mode != 'worker':
+                center_port = args.center_port if args.center_port is not None else (0 if args.port == 0 else 8766)
+                if args.mode == 'scheduler' and args.port is not None and args.center_port is None:
+                    center_port = args.port
+                existing = resolve(args.host or '127.0.0.1', center_port, policy=args.on_port_conflict,
+                                   token=args.local_token, reuse_role='scheduler')
+                if existing:
+                    args.mode, args.url = 'scheduler', existing
+            if args.mode != 'scheduler':
+                existing_worker = resolve(args.host or config.get('host', '127.0.0.1'),
+                                          args.port if args.port is not None else config.get('port', 8765),
+                                          policy=args.on_port_conflict, token=args.local_token,
+                                          reuse_role='worker' if args.mode == 'hybrid' else None)
+        if args.mode != "scheduler" and not existing_worker:
             port = args.port if args.port is not None else config.get("port", 8765)
             from .ramdisk import scratch
             root = args.root or config.get("root") or scratch('Remote-Compute') / str(port)
@@ -816,9 +834,14 @@ def main(argv=None):
             else:
                 WorkerShell(worker).loop(worker.health, f'http://{host}:{server.server_port}', thread.is_alive)
             return 75 if restarting.is_set() else 0
-        return run_scheduler(args, f"http://127.0.0.1:{server.server_port}" if server else None)
+        return run_scheduler(args, f"http://127.0.0.1:{server.server_port}" if server else existing_worker)
+    except Cancelled as error:
+        print(error)
+        return 0
     except (ValueError, OSError, RuntimeError, StopIteration) as error:
         print("操作失败:", error, file=sys.stderr)
+        if args.url and ('10061' in str(error) or 'Connection refused' in str(error)):
+            print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py。', file=sys.stderr)
         return 2
     finally:
         if server:
