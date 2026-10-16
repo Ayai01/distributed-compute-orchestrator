@@ -59,7 +59,7 @@ AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。RGCN 中�
 ## 脚本与 Python 接口
 
 ```text
-python main.py --mode hybrid --port 26134 --cpus 2 batch examples/batch.json results/demo
+python main.py --mode hybrid --cpus 2 batch examples/batch.json results/demo
 python main.py --mode scheduler --nodes nodes.local.json run examples/spice/task.json --input examples/spice --output results/divider
 python main.py --mode scheduler --url http://192.168.1.10:26133 jobs
 python main.py --mode scheduler --url http://192.168.1.10:26133 fetch 任务ID --output results/recovered
@@ -78,7 +78,7 @@ print(result["status"], result["assigned_node"])
 print(result["files"]["ngspice.log"].decode(errors="replace"))
 ```
 
-指定 `output_dir` 时产物保存到该目录；省略时以 bytes 返回在 `result["files"]` 中。高级脚本可使用 `Pool` 直接连接 worker（Aya1-PC 为 `127.0.0.1:26134`、Aya1-TX 为 `192.168.1.10:26133`）；接入统一调度使用 `Client(中心地址)`，让中心管理多工程份额。
+指定 `output_dir` 时产物保存到该目录；省略时以 bytes 返回在 `result["files"]` 中。高级脚本可使用 `Pool` 直接连接独立 worker（例如 Aya1-TX 的 `192.168.1.10:26133`）；hybrid 本机 worker 仅供所属中心进程使用。接入统一调度使用 `Client(中心地址)`，让中心管理多工程份额。
 
 其他工程可把此工程目录加入 Python 的模块搜索路径，再导入 `remote_compute`。工程本身没有 pip 安装步骤。
 
@@ -143,6 +143,23 @@ result = client.run(task, files={
 普通计算任务继续使用独立工作目录。指定 `cwd` 的任务在目标机该目录中执行，`cwd` 接受绝对路径、`~` 或 `${shared:工程名}`；`${work}` 和 `outputs` 始终指向任务输入目录，可将需要回收的文件明确写入 `${work}`。任务 JSON 的 `stdin` 是输入包中的相对文件路径，逐步作为标准输入传入。
 
 每份结果包含任务 ID、输入摘要、命令、退出码、CPU 数、时间和工具文件摘要。接受后的任务通过原节点和 ID 查询；相同 ID 在节点保留期间重复提交只执行一次。测量解析、科学评分、唯一设计预算与研究缓存由原工程管理。
+
+## 传输与本地执行
+
+- hybrid 本机 worker 进程内调用，不经过第二层 HTTP；本机结果直接附加中心记录后打包一次。外部调用者仍统一访问中心 26133。
+- 普通固定线程任务保持原始输入包直接转发；整轮自动线程任务仅在派发时写入实际授予的线程数。输入身份与重复提交语义保持。
+- 模型和源码按内容标识同步；同一节点会话内每份资产只检查/上传一次，并发任务共用同步锁。worker 重启后重新确认资产。
+- HTTP 使用持久连接。状态轮询只返回进度字段，完成后取完整资源与来源记录；支持 gzip 的客户端接收压缩 JSON，旧客户端继续接收普通 JSON。
+- 文本包采用低开销压缩；已经压缩的 gz/npz/zip/7z 直接封装。仿真器构建和中间文件留在执行端，按任务 outputs 回收必要结果。
+
+| 工程 | 默认回传内容 |
+| --- | --- |
+| AOP | 执行端测量与解析后的 aop-result.json；按配置选择日志。 |
+| RGCN | measurement.json：指标、分析证据、波形统计及数值摘要，不传整套原始波形。 |
+| Bench | result.pkl.gz：评分、前沿、轨迹等报告需要的科学数组。 |
+| ARH-DSE | summary/report 与恢复、验证所需产物；保留报告校验，不回传整个编译环境。 |
+
+通用 SPICE/RTL 命令的 outputs 由任务声明；需要原始波形时显式保留对应输出模式。调用工程的测量定义和正式产物契约保持。
 
 ## 验证入口
 

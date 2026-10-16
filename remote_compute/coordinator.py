@@ -229,17 +229,20 @@ class Coordinator:
         node, identity, task = job["node"], job["result"]["id"], job["task"]
         result = None
         try:
-            for asset in task["assets"].values():
-                if not node.client.request("/assets/" + asset)["exists"]:
-                    node.client.request("/assets/" + asset, (self.root / "assets" / (asset + ".zip")).read_bytes())
-            with zipfile.ZipFile(job['directory'] / 'request.zip') as archive:
-                payload = {name: archive.read(name) for name in archive.namelist()}
-            payload['task.json'] = json_bytes(task)
-            node.client.submit_bundle(identity, pack(payload))
+            self._ensure_assets(node, task['assets'].values())
+            payload = (job['directory'] / 'request.zip').read_bytes()
+            if job['auto_cpus']:
+                with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                    files = {name: archive.read(name) for name in archive.namelist()}
+                files['task.json'] = json_bytes(task)
+                payload = pack(files)
+            node.client.submit_bundle(identity, payload)
             while True:
                 if job["cancel"].is_set():
                     node.client.cancel(identity)
-                remote = node.client.status(identity)
+                remote = node.client.status(identity, brief=True)
+                if remote['status'] in TERMINAL:
+                    remote = node.client.status(identity)
                 with self.condition:
                     self._update(job, remote)
                 if remote["status"] in TERMINAL:
@@ -256,9 +259,21 @@ class Coordinator:
                 self.threads.discard(threading.current_thread())
                 self.condition.notify_all()
 
+    def _ensure_assets(self, node, assets):
+        # One upload per content id and worker session, including concurrent jobs.
+        with node.asset_lock:
+            session = (node.health.get('pid'), node.health.get('root'))
+            if node.asset_session != session:
+                node.known_assets.clear()
+                node.asset_session = session
+            for asset in set(assets) - node.known_assets:
+                if not node.client.request('/assets/' + asset)['exists']:
+                    node.client.request('/assets/' + asset, (self.root/'assets'/(asset+'.zip')).read_bytes())
+                node.known_assets.add(asset)
+
     def _update(self, job, remote):
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
-        assigned = {key: job["result"][key] for key in ("assigned_node", "worker_url", "dispatched") if key in job["result"]}
+        assigned = {key: job["result"][key] for key in ("assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
         job["result"].update(remote, **assigned, center_submitted=submitted)
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
@@ -320,6 +335,9 @@ class Coordinator:
             result, client = self.get(identity), self._client(job)
         files = {}
         if client:
+            from .local import LocalClient
+            if isinstance(client, LocalClient):
+                return client.worker.artifacts(identity, result=result)
             try:
                 raw = client.request("/jobs/" + identity + "/artifacts", binary=True)
             except RemoteError as error:

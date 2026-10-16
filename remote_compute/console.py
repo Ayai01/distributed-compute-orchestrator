@@ -45,11 +45,14 @@ def _layout(status, events, output, height):
     budget = max(1, height - 2)
     sections = int(bool(events)) + int(bool(output))
     count = min(6, max(1, (budget - 3 - sections) // sections)) if sections else 0
+    if sections and isinstance(status,StatusRows):
+        resource_rows = max(3,min(22,budget-4))
+        count = min(count,max(1,(budget-resource_rows-sections)//sections))
     footer = (['最近操作（最多6条）:'] + events[-count:] if events else [])
     footer += (['终端输出（PgUp/PgDn翻页）:'] + output[-count:] if output else [])
     remaining = max(0, budget - len(footer))
-    head = status[:remaining]
-    if len(status) > remaining and head:
+    head = status.fit(remaining) if isinstance(status,StatusRows) else status[:remaining]
+    if not isinstance(status,StatusRows) and len(status) > remaining and head:
         head[-1] = '… status 查看完整资源；help 查看操作'
     return (head + footer)[-budget:]
 
@@ -119,28 +122,65 @@ class FocusRefresh:
         return refresh
 
 
+class StatusRows(list):
+    def __init__(self):
+        super().__init__()
+        self.priorities = []
+
+    def add(self, text, priority=1):
+        self.append(text)
+        self.priorities.append(priority)
+
+    def fit(self, count):
+        if count >= len(self):
+            return list(self)
+        if count <= 0:
+            return []
+        chosen = sorted(range(len(self)), key=lambda index: (self.priorities[index],index))[:max(0,count-1)]
+        return [self[index] for index in sorted(chosen)] + ['… status 查看完整资源；jobs 查看全部任务']
+
+
 def format_status(value, url=''):
     center = value.get('role') == 'scheduler'
-    rows = [f"Remote Compute | {value.get('node', '')} | {'调度中心' if center else '算力提供者'} | {url}"]
-    if center:
-        rows.append(f"策略 {value.get('policy')} | 分配 {value.get('used_cpus', 0)}/{value.get('cpus', 0)} 线程 | 排队 {value.get('queued', 0)} | 内存预留 {_gb(value.get('memory_reserved_mb'))} GiB")
-        for name, allocation in value.get('projects', {}).items():
-            rows.append(f"项目 {name} | 分配度 {allocation['resource_share']:g} | 已分配 {allocation['used']} / 当前份额 {allocation['target']} | 排队 {allocation['queued']}")
-        nodes = value.get('nodes', [])
-    else:
-        nodes = [{**value, 'name': value.get('node'), 'capacity': value.get('cpus')}]
+    rows = StatusRows()
+    rows.add(f"Remote Compute | {value.get('node', '')} | {'调度中心' if center else '算力提供者'} | {url}",0)
+    rows.add(f"总览  分配 {value.get('used_cpus',0)}/{value.get('cpus',0)} 线程 | 排队 {value.get('queued',0)} | 内存预留 {_gb(value.get('memory_reserved_mb'))} GiB" + (f" | 策略 {value.get('policy')}" if center else ''),0)
+    nodes = value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
+    rows.add('[设备资源]  设备 / 线程 / CPU / 温度',0)
+    jobs = []
     for node in nodes:
-        total, available = node.get('memory_total_mb') or 0, node.get('host_memory_available_mb') or 0
+        name = node.get('node') or node.get('name')
+        total,available = node.get('memory_total_mb') or 0,node.get('host_memory_available_mb') or 0
         temp = node.get('temperature_c')
-        state = node.get('error') or ('暂停接单' if node.get('paused') else '在线')
-        rows += [f"{node.get('node') or node.get('name')}  {node.get('url', url)}  {state}",
-                 f"  CPU {node.get('cpu_percent') or 0:.1f}% | 已分配 {node.get('used_cpus', 0)}/{node.get('capacity', 0)} | 设备 {node.get('logical_cpus', '?')} 线程 | 温度 {str(temp) + '°C' if temp is not None else '未提供'}",
-                 f"  内存 {_gb(total-available)}/{_gb(total)} GiB | 任务RSS {_gb(node.get('rss_mb'))} | 预留 {_gb(node.get('memory_reserved_mb'))} | 可分配 {_gb(node.get('memory_available_mb'))} GiB",
-                 '  能力: ' + ', '.join(node.get('tags') or []),
-                 '  访问IP: ' + (', '.join(x['ip'] for x in node.get('peers') or []) or '等待连接')]
-        for job in (node.get('active_jobs') or [])[:3]:
-            rows.append(f"  {job['status']} {job['cpus']}线程 {_gb(job.get('memory_mb'))}GiB  {job['label']} [{job['id'][:8]}]")
-    rows += ['操作: help | status | jobs | cpus ' + ('设备名 N' if center else 'N') + ' | memory | pause | resume | quit']
+        state = '离线' if node.get('error') else '暂停' if node.get('paused') or not node.get('enabled',True) else '在线'
+        allocated = max(node.get('used_cpus',0),node.get('reserved',0)+node.get('external_cpus',0))
+        rows.add(f"{name}  {state} | 已分配 {allocated}/{node.get('capacity',0)} | CPU {node.get('cpu_percent') or 0:.1f}% | 设备 {node.get('logical_cpus','?')} 线程 | 温度 {str(temp)+'°C' if temp is not None else '未提供'}",0)
+        peers = ', '.join('本机进程' if item['ip']=='local' else item['ip'] for item in node.get('peers') or []) or '等待连接'
+        rows.add(f"  内存 {_gb(total-available)}/{_gb(total)} GiB | RSS {_gb(node.get('rss_mb'))} | 预留 {_gb(node.get('memory_reserved_mb'))} | 可分配 {_gb(node.get('memory_available_mb'))} | 访问IP {peers}",1)
+        address = node.get('url',url)
+        if address.startswith('local://'):
+            address = '本机内置 worker'
+        rows.add('  '+address+' | 能力 '+', '.join(node.get('tags') or []),3)
+        if node.get('error'):
+            rows.add('  '+node['error'],1)
+        jobs.extend((name,job) for job in node.get('active_jobs') or [])
+    if center:
+        rows.add('[工程份额]  工程 / 权重 / 已分配 / 目标 / 排队',0)
+        for name,allocation in value.get('projects',{}).items():
+            rows.add(f"{name} | 权重 {allocation['resource_share']:g} | {allocation['used']}/{allocation['target']} 线程 | 排队 {allocation['queued']}",1)
+        if not value.get('projects'):
+            rows.add('  等待工程任务',2)
+    rows.add(f'[当前任务]  共 {len(jobs)} 个；jobs 查看完整列表',0)
+    # Interleave devices so a busy first device cannot hide every remote task.
+    groups = [[item for item in jobs if item[0]==(node.get('node') or node.get('name'))] for node in nodes]
+    for index in range(max((len(group) for group in groups),default=0)):
+        for group in groups:
+            if index < len(group):
+                name,job=group[index]
+                rows.add(f"{name} | {job['cpus']}线程 {_gb(job.get('memory_mb'))}GiB | {job['status']} | {job['label']} [{job['id'][:8]}]",1 if index==0 else 2)
+    if not jobs:
+        rows.add('  空闲',2)
+    rows.add('操作  help | status | jobs | cpus '+('设备名 N' if center else 'N')+' | memory | pause | resume | quit',2)
     return rows
 
 
@@ -150,12 +190,14 @@ class Dashboard:
         self.output = deque(maxlen=200)
         self.output_lock = threading.RLock()
         self.pending = ''
+        self.output_revision = 0
         self.stream = sys.stdout
         self.encoding = getattr(self.stream, 'encoding', 'utf-8')
 
     def write(self, text):
         with self.output_lock:
             self.pending += text
+            self.output_revision += 1
             while '\n' in self.pending:
                 line, self.pending = self.pending.split('\n', 1)
                 if line.strip():
@@ -177,6 +219,7 @@ class Dashboard:
         line, cursor, history, selected = '', 0, [], 0
         last, offset, last_frame = 0, 0, ''
         rows, events = [], []
+        revision, cached_key, body = 0, None, ''
         stdout, stderr, shell_stdout = sys.stdout, sys.stderr, self.shell.stdout
         try:
             sys.stdout = sys.stderr = self.shell.stdout = self
@@ -197,14 +240,21 @@ class Dashboard:
                                       for e in sorted(notices, key=lambda x: x['time'])[-6:]]
                         except (OSError, RuntimeError, ValueError) as error:
                             rows = ['连接状态: ' + str(error)]
+                        revision += 1
                         last = now
                     columns, height = shutil.get_terminal_size((110, 32))
                     with self.output_lock:
-                        output = list(self.output) + ([self.pending] if self.pending else [])
-                    offset = min(offset, max(0, len(output) - 1))
-                    if offset:
-                        output = output[:-offset]
-                    body = '\n'.join(_clip(row, columns - 1) + '\x1b[K' for row in _layout(rows, events, output, height))
+                        key = (revision,self.output_revision,offset,columns,height)
+                        if key != cached_key:
+                            output = list(self.output) + ([self.pending] if self.pending else [])
+                            offset = min(offset,max(0,len(output)-1))
+                            if offset:
+                                output = output[:-offset]
+                            visible = _layout(rows,events,output,height)
+                            visible += [''] * max(0,height-2-len(visible))
+                            body = '\n'.join(_clip(row,columns-1)+'\x1b[K' for row in visible)
+                            body += '\n'+'─'*max(1,columns-1)
+                            cached_key = (revision,self.output_revision,offset,columns,height)
                     prompt, column = _input_view(self.shell.prompt, line, cursor, max(1, columns - 1))
                     frame = '\x1b[H' + body + '\n\x1b[J' + prompt + f'\r\x1b[{column+1}G'
                     if frame != last_frame:

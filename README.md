@@ -17,7 +17,7 @@
 直接使用 Python 时：
 
 ```text
-python main.py --mode hybrid --port 26134
+python main.py --mode hybrid
 python main.py --mode scheduler
 python main.py --mode worker --host 0.0.0.0 --port 26133
 ```
@@ -28,7 +28,7 @@ python main.py --mode worker --host 0.0.0.0 --port 26133
 | scheduler | 仅运行调度中心 |
 | worker | 独立提供算力和远程操作，不依赖其他工程 |
 
-中心和独立 worker 的对外端口统一 **26133**；hybrid 的内部 worker 仅用回环 **26134**。`--url` 连接已有服务，服务尚未启动时先运行启动脚本。
+中心和独立 worker 的对外端口统一 **26133**；hybrid 的本机 worker 直接在调度器进程内调用，**不监听额外端口**。`--url` 连接已有服务，服务尚未启动时先运行启动脚本。
 
 ## 当前设备与控制
 
@@ -46,7 +46,7 @@ jobs
 restart Aya1-TX
 ```
 
-各工程 `resource_share` 默认 1.0，按相对权重分配，整数余量与空闲份额继续使用。`queue_ratio` 默认 1.0，提前准备一波已就绪任务；CPU/内存准入由中心统一控制。看板聚焦时每秒刷新，失焦时每 30 秒刷新。
+各工程 `resource_share` 默认 1.0，按相对权重分配，整数余量与空闲份额继续使用。`queue_ratio` 默认 1.0，提前准备一波已就绪任务；CPU/内存准入由中心统一控制。看板按设备资源、工程份额、当前任务和通知分区，输入区固定在底部；聚焦时每秒刷新，失焦时每 30 秒刷新。
 
 ## 文档
 

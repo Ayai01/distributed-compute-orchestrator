@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.cli import Shell
-from remote_compute.console import Dashboard, FocusRefresh, _enable_ansi, _input_view, _layout, _width
+from remote_compute.console import Dashboard, FocusRefresh, format_status, _enable_ansi, _input_view, _layout, _width
 
 
 class Keyboard:
@@ -53,6 +53,19 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_small_dashboard_keeps_both_devices_and_tasks_visible(self):
+        nodes=[]
+        for name in ('Aya1-PC','Aya1-TX'):
+            nodes.append(dict(name=name,node=name,capacity=24,used_cpus=12,
+                active_jobs=[dict(id=name+'12345678',label='task-'+name,cpus=1,status='running')]))
+        status=format_status(dict(role='scheduler',node='Aya1-PC',nodes=nodes,cpus=54,used_cpus=24,
+                                  projects={name:dict(resource_share=1,used=8,target=18,queued=2) for name in ('AOP','RGCN','ARH')}))
+        rows=_layout(status,[f'notice {i}' for i in range(6)],[f'output {i}' for i in range(10)],24)
+        text='\n'.join(rows)
+        self.assertLessEqual(len(rows),22)
+        for expected in ('task-Aya1-PC','task-Aya1-TX','notice 5','output 9','[设备资源]','[工程份额]','[当前任务]'):
+            self.assertIn(expected,text)
+
     def test_focus_refresh_uses_one_or_thirty_seconds_and_updates_on_return(self):
         refresh=FocusRefresh()
         self.assertTrue(refresh.due(0,True))

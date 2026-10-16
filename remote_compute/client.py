@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
+import gzip
 import http.client
 import io
 import json
@@ -36,10 +37,15 @@ class Client:
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
 
-    def request(self, path, data=None, *, method=None, binary=False):
-        headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json"}
+    def request(self, path, data=None, *, method=None, binary=False, brief=False):
+        if self.endpoint.scheme not in {'http', 'https'}:
+            raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
+        headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
+                   'Accept-Encoding': 'gzip'}
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
+        if brief:
+            headers['X-Remote-Compute-Brief'] = '1'
         if data is not None and not isinstance(data, bytes):
             data = json_bytes(data)
         method = method or ('POST' if data is not None else 'GET')
@@ -57,6 +63,8 @@ class Client:
                 connection.request(method, self.endpoint.path.rstrip('/') + path, body=data, headers=headers)
                 response = connection.getresponse()
                 raw = response.read()
+                if response.getheader('Content-Encoding') == 'gzip':
+                    raw = gzip.decompress(raw)
                 if response.status >= 400:
                     detail = raw.decode('utf-8', errors='replace')
                     error = RemoteError(f'{self.url}{path}: HTTP {response.status}: {detail}')
@@ -104,8 +112,8 @@ class Client:
         from .machine import Machine
         return Machine(self, node, cwd=cwd)
 
-    def status(self, identity=None):
-        return self.request("/jobs" + ("/" + identity if identity else ""))
+    def status(self, identity=None, *, brief=False):
+        return self.request("/jobs" + ("/" + identity if identity else ""), brief=brief)
 
     def cancel(self, identity):
         return self.request("/jobs/" + identity + "/cancel", {})
@@ -127,8 +135,9 @@ class Client:
     def wait(self, identity, *, poll=0.15, wait_timeout=None):
         started = time.monotonic()
         while True:
-            result = self.status(identity)
+            result = self.status(identity, brief=True)
             if result["status"] in TERMINAL:
+                result = self.status(identity)
                 result["url"] = self.url
                 return result
             if wait_timeout is not None and time.monotonic() - started >= wait_timeout:
@@ -189,6 +198,9 @@ class Node:
     durations: dict = field(default_factory=dict)
     completed: int = 0
     failed: int = 0
+    asset_lock: object = field(default_factory=threading.Lock)
+    asset_session: object = None
+    known_assets: set = field(default_factory=set)
 
     @property
     def capacity(self):
@@ -231,7 +243,7 @@ class Pool:
                 node = Node(f"node{index + 1}", entry)
             else:
                 node = Node(entry.get("name", f"node{index + 1}"),
-                            Client(entry["url"], entry.get("token", "")),
+                            entry.get('client') or Client(entry["url"], entry.get("token", "")),
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))

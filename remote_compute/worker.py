@@ -3,6 +3,7 @@
 from collections import deque
 from contextlib import nullcontext
 import hashlib
+import gzip
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -19,7 +20,7 @@ import time
 import zipfile
 from urllib.parse import unquote
 
-from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack
+from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
 from . import __version__
 from .process import Process
 from .resources import Host, process_usage
@@ -470,14 +471,14 @@ class Worker:
                 self.condition.notify_all()
             return self.get(identity)
 
-    def artifacts(self, identity):
+    def artifacts(self, identity, *, result=None):
         with self.condition:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             directory = job["directory"]
             task = job.get("task") or json.loads((directory / "task.json").read_text(encoding="utf-8"))
-            files = {"result.json": json_bytes(job["result"])}
+            files = {"result.json": json_bytes(job["result"] if result is None else result)}
             files.update({"files/" + name: path for name, path in tree(directory / "input", task["outputs"]).items()})
             for name in ("stdout.log", "stderr.log"):
                 if (directory / name).exists():
@@ -569,9 +570,15 @@ class Handler(BaseHTTPRequestHandler):
     def _reply(self, value, status=200):
         binary = isinstance(value, bytes)
         body = value if binary else json_bytes(value)
+        compressed = not binary and len(body) >= 1024 and 'gzip' in self.headers.get('Accept-Encoding', '')
+        if compressed:
+            body = gzip.compress(body, compresslevel=1)
         self.send_response(status)
         self.send_header("Content-Type", "application/zip" if binary else "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if compressed:
+            self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Vary', 'Accept-Encoding')
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -642,6 +649,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply({"error": "Unknown route"}, 404)
             else:
                 return self._reply({"error": "Unknown route"}, 404)
+            if self.command == 'GET' and parts[0] == 'jobs' and self.headers.get('X-Remote-Compute-Brief') == '1':
+                if len(parts) == 1:
+                    value = [progress(row) for row in value]
+                elif len(parts) == 2:
+                    value = progress(value)
             self._reply(value)
         except KeyError as exc:
             self._reply({"error": "Unknown job, tool or path variable: " + str(exc)}, 404)

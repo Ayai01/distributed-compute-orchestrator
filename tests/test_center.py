@@ -32,6 +32,96 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_brief_polling_omits_payload_and_wait_returns_full_provenance(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,client):
+            identity=client.submit(python("import time; print('complete'); time.sleep(.2)"))['id']
+            brief=client.status(identity,brief=True)
+            self.assertIn('status',brief)
+            self.assertNotIn('tools',brief)
+            self.assertNotIn('stdout',brief)
+            result=client.wait(identity)
+            self.assertIn('tools',result)
+            self.assertIn('complete',result['stdout'])
+            client.fetch(identity)
+
+    def test_json_compression_is_negotiated_and_client_decodes_it(self):
+        import gzip
+        import http.client
+        from urllib.parse import urlsplit
+        with scratch() as root, provider(Path(root)/'worker') as (_,client):
+            endpoint=urlsplit(client.url)
+            connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port)
+            try:
+                connection.request('GET','/health')
+                response=connection.getresponse();plain=response.read()
+                self.assertIsNone(response.getheader('Content-Encoding'))
+                connection.request('GET','/health',headers={'Accept-Encoding':'gzip'})
+                response=connection.getresponse();compressed=response.read()
+                self.assertEqual(response.getheader('Content-Encoding'),'gzip')
+                self.assertLess(len(compressed),len(plain))
+                self.assertEqual(json.loads(gzip.decompress(compressed))['node'],client.health()['node'])
+            finally:
+                connection.close()
+
+    def test_precompressed_artifacts_are_stored_without_another_deflate(self):
+        import gzip
+        import zipfile
+        from remote_compute.bundle import pack
+        data=gzip.compress(b'scientific arrays '*10000)
+        payload=pack({'result.pkl.gz':data,'metrics.json':b'{"passed":true}'})
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            self.assertEqual(archive.getinfo('result.pkl.gz').compress_type,zipfile.ZIP_STORED)
+            self.assertEqual(archive.read('result.pkl.gz'),data)
+            self.assertEqual(archive.getinfo('metrics.json').compress_type,zipfile.ZIP_DEFLATED)
+
+    def test_private_worker_runs_without_http_and_packs_result_once(self):
+        from remote_compute.local import LocalClient
+        from remote_compute.worker import Worker
+        import remote_compute.worker as module
+        with scratch() as root:
+            worker = Worker(Path(root)/'worker',cpus=2)
+            try:
+                local = LocalClient(worker)
+                with self.assertRaises(RemoteError):
+                    Client(local.url).health()
+                with Pool([local]) as pool, center(pool,Path(root)/'center') as (_,client):
+                    client.health()  # Keep the caller's one center connection open.
+                    with patch('remote_compute.client.http.client.HTTPConnection',side_effect=AssertionError('worker opened HTTP')):
+                        with patch('remote_compute.worker.pack',wraps=module.pack) as packed:
+                            result=client.run(python("from pathlib import Path; Path('value').write_text('42')",outputs=['value']))
+                        self.assertEqual(packed.call_count,1)
+                    self.assertEqual(result['files']['value'],b'42')
+                    self.assertEqual(result['worker_url'],local.url)
+                    self.assertEqual(local.status(),[])
+            finally:
+                worker.close()
+
+    def test_concurrent_jobs_check_and_upload_an_asset_once(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,node):
+            with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
+                asset=client.sync_files({'model':b'model data'})
+                client.control(paused=True)
+                identities=[client.submit(python('pass',assets={'model':asset}))['id'] for _ in range(8)]
+                original=pool.nodes[0].client.request
+                counts=[]
+                def request(path,data=None,**kwargs):
+                    if path=='/assets/'+asset:counts.append('POST' if data is not None else 'GET')
+                    return original(path,data,**kwargs)
+                with patch.object(pool.nodes[0].client,'request',side_effect=request), patch('remote_compute.coordinator.pack',side_effect=AssertionError('repacked fixed task')):
+                    client.control(paused=False)
+                    for identity in identities:client.wait(identity)
+                for identity in identities:client.fetch(identity)
+                self.assertEqual(counts,['GET','POST'])
+
+    def test_auto_cpu_result_preserves_original_submission_identity(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,node):
+            with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
+                task=python('pass',cpus=0)
+                accepted=client.submit(task);client.wait(accepted['id'])
+                repeated=client.submit(task,job_id=accepted['id'])
+                self.assertEqual(repeated['request_sha256'],accepted['request_sha256'])
+                client.fetch(accepted['id'])
+
     def test_logs_are_empty_while_worker_submission_is_in_progress(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,node):
             with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
@@ -214,7 +304,7 @@ class CenterTests(unittest.TestCase):
                 try:
                     with io.StringIO() as output, redirect_stdout(output):
                         client.control(node='node1', routing={'memory_limit_mb': 128})
-                        with patch('remote_compute.cli.ROOT', root):
+                        with patch('remote_compute.commands.ROOT', root):
                             shell.do_save('')
                         saved = json.loads((root/'nodes.local.json').read_text())
                         self.assertEqual(saved['nodes'][0]['memory_limit_mb'], 128)

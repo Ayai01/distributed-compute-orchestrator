@@ -10,7 +10,7 @@ Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执�
 
 启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:26133` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
 
-端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心，hybrid 也能复用已有本机 worker）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
+端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心，hybrid 复用中心内置的本机算力）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
 
 ```text
 python main.py
@@ -25,7 +25,7 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 | `scheduler` | 调度其他设备，本机仅负责分配和回收 |
 | `worker` | 提供算力，启动本节点的操作终端 |
 
-调度中心默认端口 `26133`，独立算力提供者默认端口 `26133`；hybrid 的本机 worker 仅在回环内部使用 `26134`，默认监听 `127.0.0.1`。`--center-port` 设置中心端口，worker / hybrid 的 `--port` 设置提供者端口；纯 scheduler 的 `--port` 也可设置中心端口。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 启动持续运行的后台服务。
+调度中心默认端口 `26133`，独立算力提供者默认端口 `26133`；hybrid 的本机 worker 使用进程内私有调用，不监听端口；`local://设备名` 只是节点标记，由当前调度器持有。`--port` 设置当前对外服务端口；hybrid / scheduler 可用 `--center-port` 显式设置中心端口，优先于 `--port`。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 启动持续运行的后台服务。
 
 调用工程连接中心的 `26133`，多个工程共享中心队列、资源预算和分配策略。中心将任务转交给配置的 worker，回收结果后同时清理两侧的任务文件；模型和源码资产按内容同步并复用。
 
@@ -33,7 +33,7 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 
 | 模式 | `--host` | `--port` | `--center-port` |
 | --- | --- | --- | --- |
-| hybrid | 中心监听地址；内部 worker 固定回环 | 内部 worker 端口，默认 26134 | 中心端口，默认 26133 |
+| hybrid | 中心监听地址；内部 worker 无监听 | 中心端口，默认 26133 | 指定时优先作为中心端口 |
 | scheduler | 中心监听地址 | 未指定 center-port 时作为中心端口 | 指定时优先作为中心端口 |
 | worker | worker 监听地址 | 对外端口，默认 26133 | 不使用 |
 
@@ -57,7 +57,7 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 | 设备 | 模式 | 地址 | 默认预算 | 硬上限 |
 | --- | --- | --- | --- | --- |
-| Aya1-PC | hybrid | 中心 `127.0.0.1:26133`；内部 worker `127.0.0.1:26134` | 24 | 24 |
+| Aya1-PC | hybrid | 中心 `127.0.0.1:26133`；本机 worker 进程内调用 | 24 | 24 |
 | Aya1-TX | worker | `192.168.1.10:26133` | 30 | 31 |
 
 新设备的通用默认预算和硬上限为 `max(1, CPU_COUNT-1)`。`cpu_limit` 在设备配置中设置硬上限，`cpus` 设置当前预算。在线 `cpus` 控制会写回当前使用的配置文件；调低预算后，在途任务自然结束，后续派发按新预算执行。改硬上限需要更新配置并重启。
@@ -79,13 +79,15 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 }
 ```
 
-`--config 路径` 选择其他配置；命令行显式选项覆盖配置。切换 mode 会保留配置中的 host/port，切为独立 worker 时同时指定 `--port 26133`，切为 hybrid 时使用内部 worker `--port 26134`。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
+`--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听回环 26133，通过命令行设置中心地址。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
 
 `memory_mb` / `--memory-mb` 单位为 MiB；0 使用物理内存减去预留量。中心同时核对任务内存预留、实际进程树 RSS 和系统可用内存。同一设备的多个 worker 共用一份物理内存统计。任务默认预留 256 MiB；大任务由调用者声明所需内存。
 
 ## 终端操作
 
-总调度器的操作不会阻塞后续输入，任务在后台执行：
+耗时计算、命令和文件传输在后台执行，输入行持续可用。help 按资源、任务、机器、终端分组显示操作；完成后的后台操作及时释放结果引用。看板按总览、设备资源、工程份额、当前任务、最近通知分区，窄窗口优先保留每台设备和任务摘要；status / jobs 查看完整明细。输入行固定在底部，状态与输出未变化时复用上一帧。
+
+常用操作：
 
 ```text
 nodes
@@ -235,7 +237,7 @@ AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB�
 | 现象 | 操作 |
 | --- | --- |
 | `--url` 连接被拒绝 | 先运行 `start.cmd` / `start.sh`；`--url` 只连接已有服务。默认中心端口为 26133。 |
-| 地址仍是 8765 / 8766 | 更新设备配置、`nodes.local.json` 和调用工程的显式 URL，再重启；统一使用 26133，本机 hybrid 内部 worker 用 26134。 |
+| 地址仍是 8765 / 8766 | 更新设备配置、`nodes.local.json` 和调用工程的显式 URL，再重启；统一使用 26133；hybrid 的本机节点改为 local://设备名，不再使用 26134。 |
 | 端口已占用 | 按提示选择 reuse / kill / admin-kill / cancel；提示会列出 PID 与命令。 |
 | 找不到旧工程共享目录 | 独立 worker 可用 `worker.example.json`；删除迁移配置中不需要的 shared 条目，计算工具按实际任务配置。 |
 | 工具路径指向另一台电脑 | 运行 setup 或修改该设备 tools/env 路径，然后重启 worker；源码仓库不包含这些运行时。 |

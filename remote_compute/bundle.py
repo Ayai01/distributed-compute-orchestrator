@@ -12,6 +12,12 @@ TERMINAL = frozenset({"succeeded", "failed", "cancelled", "timed_out", "interrup
 MAX_BODY = 512 * 1024 * 1024
 
 
+def progress(value):
+    """Small polling view; full provenance remains in the final result."""
+    return {key: value[key] for key in ('id','status','label','cpus','memory_mb','submitted','started',
+             'finished','elapsed','assigned_node','worker_url','center_submitted','dispatched') if key in value}
+
+
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
 
@@ -35,10 +41,12 @@ def pack(files):
         for name, source in sorted(files.items()):
             inside(Path.cwd(), name)
             info = zipfile.ZipInfo(str(name).replace("\\", "/"), (1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = (zipfile.ZIP_STORED if str(name).lower().endswith(('.gz','.npz','.zip','.7z'))
+                                  else zipfile.ZIP_DEFLATED)
             mode = source.stat().st_mode if isinstance(source, Path) else 0o644
             info.external_attr = (stat.S_IFREG | stat.S_IMODE(mode)) << 16
-            archive.writestr(info, source.read_bytes() if isinstance(source, Path) else source)
+            archive.writestr(info, source.read_bytes() if isinstance(source, Path) else source,
+                            compresslevel=1)
     return buffer.getvalue()
 
 
