@@ -8,8 +8,9 @@
 
 ```text
 python main.py
-python main.py --mode scheduler
-python main.py --mode worker --host 0.0.0.0 --cpus 8
+python main.py --mode hybrid --cpus 8 --memory-mb 8192
+python main.py --mode scheduler --host 0.0.0.0 --headless
+python main.py --mode worker --host 0.0.0.0 --cpus 8 --memory-mb 8192
 ```
 
 | 模式 | 用途 |
@@ -18,9 +19,13 @@ python main.py --mode worker --host 0.0.0.0 --cpus 8
 | `scheduler` | 调度其他设备，本机仅负责分配和回收 |
 | `worker` | 提供算力，启动本节点的操作终端 |
 
-默认端口 `8765`，默认监听 `127.0.0.1`。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 可用于后台算力节点；调度模式下搭配具体任务命令使用。
+调度中心默认端口 `8766`，算力提供者默认端口 `8765`，默认监听 `127.0.0.1`。`--center-port` 设置中心端口，worker 的 `--port` 设置提供者端口；纯 scheduler 的 `--port` 也可设置中心端口。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 启动持续运行的后台服务。
+
+调用工程连接中心的 `8766`，多个工程共享中心队列、资源预算和分配策略。中心将任务转交给配置的 worker，回收结果后同时清理两侧的任务文件；模型和源码资产按内容同步并复用。
 
 默认 CPU 预算为 `min(C,16)+floor(max(C-16,0)/2)`，`--cpus N` 使用显式值。每个任务声明自己的总 CPU 占用，节点将任务并发与数值内核线程共同计账。调低预算后，在途任务正常结束，后续任务按新预算启动。
+
+`--memory-mb N` 设置提供者的任务内存总预算，单位 MiB；0/未设置使用物理内存减去预留量，`memory_reserve_mb` 默认512。任务的 `memory_mb` 默认256。中心同时参考任务预留、实际进程树 RSS 和系统可用内存，CPU与内存都够才派发；同一设备的多个 worker 共享同一份物理内存统计。`nodes` 展示主机 CPU 使用率、内存容量、占用和可用量，结果记录峰值 RSS 与 CPU 秒数。
 
 本机 `worker.local.json` 已配置现有 ngspice、ARH 的 MSYS2/Verilator，以及现有工程的共享路径。它属于本机配置，Git 忽略。迁移时按 `worker.example.json` 填写目标设备的工具和路径。
 
@@ -31,7 +36,7 @@ python main.py --mode worker --host 0.0.0.0 --cpus 8
 ```text
 nodes
 add device2 http://192.168.1.20:8765
-set device2 weight=2 limit=8 enabled=true
+set device2 weight=2 limit=8 memory_limit_mb=4096 enabled=true
 policy adaptive
 spice examples/spice/divider.spice --output results/divider
 rtl examples/rtl --top tb --sources tb.sv --output results/rtl
@@ -42,6 +47,7 @@ cancel device2 任务ID
 pause device2
 resume device2
 cpus device2 4
+memory device2 4096
 save
 wait
 quit
@@ -49,13 +55,13 @@ quit
 
 `192.168.1.20` 替换为目标设备 IP。`save` 保存节点、权重、限额和策略到 `nodes.local.json`，下次自动加载。
 
-`set 节点 limit=N` 控制**本调度器**向该节点分配的 CPU 数，`limit=0` 跟随节点预算；`cpus 节点 N` 调整**提供者总预算**。`enabled=false` 暂停本调度器向该节点分配；`pause` 暂停提供者启动新任务。在途任务继续运行。
+`set 节点 limit=N memory_limit_mb=M` 控制**本调度器**向该节点分配的 CPU 和内存，0 跟随节点预算；`cpus 节点 N` 和 `memory 节点 MiB` 调整**提供者总预算**。`enabled=false` 暂停本调度器向该节点分配；`pause` 暂停提供者启动新任务。在途任务继续运行。
 
-算力提供者的终端支持 `status`、`jobs`、`cpus N`、`pause`、`resume`、`logs 任务ID`、`cancel 任务ID|all`、`delete 任务ID`、`quit`。空行保持状态；参数错误后继续接受操作；Ctrl+C 返回提示符。调度器 `quit` 取消本终端持有的任务；提供者 `quit` 停止本节点任务及其子进程。
+算力提供者的终端支持 `status`、`jobs`、`cpus N`、`memory MiB`、`pause`、`resume`、`logs 任务ID`、`cancel 任务ID|all`、`delete 任务ID`、`quit`。空行保持状态；参数错误后继续接受操作；Ctrl+C 返回提示符。调度器 `quit` 取消本终端持有的单任务和批次；提供者 `quit` 停止本节点任务及其子进程。
 
 ## 分配策略
 
-- `adaptive`：结合空闲 CPU、节点权重和同类任务实测耗时分配。首次接触节点时先取得样本，之后按耗时的指数移动平均调整选择。
+- `adaptive`：结合空闲 CPU、主机负载、可用内存、节点权重和同类任务实测耗时分配。首次接触节点时先取得样本，之后按耗时的指数移动平均调整选择。
 - `balanced`：按相对 CPU 负载和权重均衡分配。
 - `round_robin`：在满足资源条件的节点之间轮询，便于固定分配实验。
 
@@ -68,14 +74,14 @@ quit
 ```text
 python main.py --mode hybrid --cpus 2 batch examples/batch.json results/demo
 python main.py --mode scheduler --nodes nodes.local.json run examples/spice/task.json --input examples/spice --output results/divider
-python main.py --mode scheduler --url http://192.168.1.20:8765 jobs
-python main.py --mode scheduler --url http://192.168.1.20:8765 fetch 任务ID --output results/recovered
+python main.py --mode scheduler --url http://192.168.1.20:8766 jobs
+python main.py --mode scheduler --url http://192.168.1.20:8766 fetch 任务ID --output results/recovered
 python main.py --check
 python main.py --test
 python main.py --test-native
 ```
 
-全局 `--cpus` 是本机提供者预算；任务命令后面的 `--cpus` 是该任务占用的 CPU 数。单任务命令成功返回 0，执行失败返回 1，配置或通信错误返回 2。
+全局 `--cpus` / `--memory-mb` 是本机提供者预算；任务命令后面的同名选项是该任务的资源预留。单任务命令成功返回 0，执行失败返回 1，配置或通信错误返回 2。
 
 ```python
 from remote_compute import Client, Pool, command, ngspice
@@ -92,9 +98,9 @@ with Pool([
     print(result["status"], result["assigned_node"])
 
 # 不指定 output_dir 时，文件以 bytes 返回在 result["files"] 中。
-client = Client("http://127.0.0.1:8765")
+client = Client("http://127.0.0.1:8766")
 task = command(["${tool:python}", "runner.py", "--workers", "${cpus}"],
-               cpus=4, timeout=1800, outputs=["measurements.json"],
+               cpus=4, memory_mb=1024, timeout=1800, outputs=["measurements.json"],
                label="candidate-batch", priority=5)
 result = client.run(task, inputs="my-batch")
 ```
@@ -109,6 +115,7 @@ result = client.run(task, inputs="my-batch")
 {
   "label": "my-batch",
   "cpus": 2,
+  "memory_mb": 512,
   "priority": 5,
   "timeout": 300,
   "steps": [["${tool:python}", "runner.py", "--workers", "${cpus}"]],
@@ -120,7 +127,7 @@ result = client.run(task, inputs="my-batch")
 
 | 变量 | 含义 |
 | --- | --- |
-| `${tool:python}` / `${tool:ngspice}` / `${tool:verilator}` | 节点配置的工具，放在每一步的第一个参数 |
+| `${tool:python}` / `${tool:ngspice}` / `${tool:verilator}` | 节点配置的工具；多参数前缀放在每步第一个参数，单个可执行路径也可嵌入环境和输入文件 |
 | `${work}` | 当前任务的独立工作目录 |
 | `${cpus}` | 当前任务占用的 CPU 数，用于程序线程数或编译 `-j` |
 | `${exe}` | Windows 为 `.exe`，Linux 为空串 |
@@ -147,20 +154,20 @@ result = client.run(task, files={
 
 | 工程 | 建议接入粒度 |
 | --- | --- |
-| AOP_v2 | 在模拟器执行层接入客户端，沿用现有网表准备、corner 解析、缓存与付费预算；现有 AOP compute 协议由其适配器转换 |
+| AOP_v2 | `--compute-center URL` 或 `compute.center`，每角点沿用原测量器、模型与结果解析；BGR 三工况21个指标与本地完全一致 |
 | RGCN-v2 | 将生成后的 PRE/POST 网表及分析批次提交，模型用 shared/asset 引用；沿用物理测量与来源记录 |
 | ARH-DSE-v2 | 每个任务处理一批候选，任务内复用原生持久进程和构建结果；保持候选与故障种子身份 |
 | Analog-Opt-Bench-v2 | 按种子或评价批次分配，保留原算法状态与唯一设计预算 |
 | Rocket 神经网络工程 | 按硬件配置构建后，在同一任务内执行多程序和网络批次 |
 
-这些接入通过对应工程会话在运行边界完成。当前工程提供统一执行层、Python 接口和可运行示例。
+现有工程默认保持独立本机计算；显式设置中心才接入。其他工程由各自正在工作的会话在运行边界适配，具体入口随验证结果更新。
 
 ## 部署到其他设备
 
-复制工程源码，准备 Python 3.11+ 和该节点要使用的计算工具。运行 `python main.py --check` 检查，再以 worker 模式启动。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 使用 PATH 中的 Verilator 和编译器。
+复制工程源码，准备 Python 3.11+ 和该节点要使用的计算工具。运行 `python main.py --check` 检查，再以 worker 模式启动。`worker.example.json` 中各工程的 Python 别名要指向已安装相应依赖的解释器。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 使用 PATH 中的 Verilator 和编译器。
 
 按需在两端设置相同的 `REMOTE_COMPUTE_TOKEN`，启用单个共享 token。节点通信直接连接配置的地址。
 
-本机验证：Python 3.14.4、ngspice 47、Verilator 5.050；`--test-native` 的 22 项测试全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。独立 worker、纯 scheduler、hybrid 终端、优先级、实时日志、预算调整、进程树取消及自动清理均已实测。
+本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050；`--test-native` 的29项回归全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。真实工程对照数据保存在本机 `results/`。
 
 工具参数参考：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。

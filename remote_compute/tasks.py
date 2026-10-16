@@ -2,11 +2,11 @@
 
 
 def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
-            priority=0, requires=(), node=None):
+            priority=0, requires=(), node=None, memory_mb=256):
     return {"steps": [list(argv)], "cpus": cpus, "timeout": timeout,
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
             "render": list(render), "label": label, "priority": priority,
-            "requires": list(requires), "node": node}
+            "requires": list(requires), "node": node, "memory_mb": memory_mb}
 
 
 def ngspice(deck="circuit.spice", *, cpus=1, timeout=120, assets=None, render=(), env=None):

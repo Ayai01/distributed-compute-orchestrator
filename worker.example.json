@@ -2,9 +2,15 @@
   "host": "127.0.0.1",
   "port": 8765,
   "cpus": 0,
+  "memory_mb": 0,
+  "memory_reserve_mb": 512,
   "tags": ["cpu"],
   "tools": {
-    "ngspice": "ngspice"
+    "ngspice": "ngspice",
+    "aop_python": "python",
+    "rgcn_python": "python",
+    "bench_python": "python",
+    "arh_python": "python"
   },
   "shared": {},
   "env": {}

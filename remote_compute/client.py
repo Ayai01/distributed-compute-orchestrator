@@ -40,7 +40,9 @@ class Client:
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             exc.close()
-            raise RemoteError(f"{self.url}{path}: HTTP {exc.code}: {detail}") from None
+            error = RemoteError(f"{self.url}{path}: HTTP {exc.code}: {detail}")
+            error.status_code = exc.code
+            raise error from None
         except (URLError, OSError) as exc:
             raise RemoteError(f"{self.url}{path}: {exc}") from None
         return raw if binary else json.loads(raw)
@@ -57,7 +59,13 @@ class Client:
     def submit(self, task, *, inputs=None, files=None, job_id=None):
         identity = job_id or uuid.uuid4().hex
         # A stable id can be queried or resubmitted to THIS node after a lost reply.
-        return self.request("/jobs/" + identity, task_bundle(task, inputs, files))
+        return self.submit_bundle(identity, task_bundle(task, inputs, files))
+
+    def submit_bundle(self, identity, payload):
+        return self.request("/jobs/" + identity, payload)
+
+    def nodes(self):
+        return self.request("/nodes")
 
     def status(self, identity=None):
         return self.request("/jobs" + ("/" + identity if identity else ""))
@@ -109,7 +117,10 @@ class Client:
         return self.fetch(identity, output_dir, delete=not keep)
 
     def sync(self, root, patterns=("**/*",)):
-        payload = pack(tree(root, patterns))
+        return self.sync_files(tree(root, patterns))
+
+    def sync_files(self, files):
+        payload = pack(files)
         identity = hashlib.sha256(payload).hexdigest()
         if not self.request("/assets/" + identity)["exists"]:
             self.request("/assets/" + identity, payload)
@@ -127,6 +138,9 @@ class Node:
     error: str = ""
     reserved: int = 0
     external: int = 0
+    memory_limit_mb: int = 0
+    reserved_memory_mb: int = 0
+    external_memory_mb: float = 0
     durations: dict = field(default_factory=dict)
     completed: int = 0
     failed: int = 0
@@ -135,6 +149,17 @@ class Node:
     def capacity(self):
         available = self.health.get("cpus", 0)
         return min(available, self.limit) if self.limit else available
+
+    @property
+    def memory_capacity(self):
+        value = self.health.get("memory_capacity_mb", 0)
+        return min(value, self.memory_limit_mb) if self.memory_limit_mb else value
+
+    @property
+    def memory_free(self):
+        unreported = max(0, self.reserved_memory_mb - self.health.get("memory_reserved_mb", 0))
+        return min(self.memory_capacity - self.reserved_memory_mb - self.external_memory_mb,
+                   self.health.get("memory_available_mb", 0) - unreported)
 
 
 class Pool:
@@ -163,6 +188,7 @@ class Pool:
                 node = Node(entry.get("name", f"node{index + 1}"),
                             Client(entry["url"], entry.get("token", "")),
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
+                            memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
             self._validate_node(node)
             self.nodes.append(node)
@@ -177,7 +203,8 @@ class Pool:
     @staticmethod
     def _validate_node(node):
         if (not isinstance(node.weight, (int, float)) or not 0 < node.weight < float("inf")
-                or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)):
+                or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)
+                or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
             raise ValueError("Node weight must be positive; limit is 0/auto or a positive integer")
 
     def refresh(self):
@@ -189,6 +216,7 @@ class Pool:
             with self.condition:
                 node.health, node.error = value, error
                 node.external = max(0, value.get("used_cpus", 0) - node.reserved)
+                node.external_memory_mb = max(0, value.get("memory_reserved_mb", 0) - node.reserved_memory_mb)
                 self.condition.notify_all()
         with ThreadPoolExecutor(max_workers=len(self.nodes)) as executor:
             list(executor.map(probe, self.nodes))
@@ -205,10 +233,10 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled"}:
-                    raise ValueError("Node settings: weight, limit, enabled")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb")
                 proposed = Node(node.name, node.client, **{
-                    key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled")})
+                    key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled", "memory_limit_mb")})
                 self._validate_node(proposed)
                 for key, value in changes.items():
                     setattr(node, key, value)
@@ -229,12 +257,23 @@ class Pool:
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
+                 "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),
+                 "memory_capacity_mb": n.memory_capacity, "memory_available_mb": max(0, int(n.memory_free)),
+                 "memory_reserved_mb": n.health.get("memory_reserved_mb", 0),
+                 "reserved_memory_mb": n.reserved_memory_mb, "memory_limit_mb": n.memory_limit_mb,
+                 "memory_total_mb": n.health.get("memory_total_mb"),
+                 "host_memory_available_mb": n.health.get("host_memory_available_mb"),
+                 "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
-    def _acquire(self, task):
+    def _acquire(self, task, *, block=True, cancel_event=None):
+        if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
+                not isinstance(argv, list) or not argv for argv in task["steps"]):
+            raise ValueError("Task requires nonempty argv steps")
         cpus = task.get("cpus", 1)
+        memory_mb = task.get("memory_mb", 256)
         label = task.get("label", "")
         required_tools = {m[1] for argv in task.get("steps", ())
                           if (m := re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0]))}
@@ -242,14 +281,17 @@ class Pool:
             while True:
                 if self.closed:
                     raise RemoteError("Pool has closed")
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
                 matching = [n for n in self.nodes if (not task.get("node") or n.name == task["node"])
                             and set(task.get("requires", ())).issubset(n.health.get("tags", ()))
                             and all(n.health.get("tools", {}).get(tool, {}).get("available") for tool in required_tools)
-                            and n.capacity >= cpus and not n.error]
+                            and n.capacity >= cpus and n.memory_capacity >= memory_mb and not n.error]
                 if not matching:
                     raise RemoteError("No matching online node for task CPU count, tools, node name and tags")
                 ready = [n for n in matching if n.enabled and not n.health.get("paused")
                          and n.capacity - n.reserved - n.external >= cpus
+                         and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0]
                 if ready:
                     if self.policy == "round_robin":
@@ -261,11 +303,38 @@ class Pool:
                         def score(n):
                             speed = n.durations.get(label, typical * 0.8) / typical if self.policy == "adaptive" else 1.0
                             load = n.reserved + n.external
-                            return (load + cpus) * speed / (n.capacity * n.weight)
-                        node = min(ready, key=score)
+                            pressure = (n.health.get("cpu_percent") or 0) / 100
+                            return (load + cpus) * speed * (1 + pressure) / (n.capacity * n.weight)
+                        unexplored = [n for n in ready if label not in n.durations] if self.policy == "adaptive" else []
+                        node = min(unexplored or ready, key=score)
                     node.reserved += cpus
+                    node.reserved_memory_mb += memory_mb
                     return node
+                if not block:
+                    return None
                 self.condition.wait(0.2)
+
+    def _host_memory_free(self, node):
+        machine = node.health.get("machine_id", node.client.url)
+        siblings = [n for n in self.nodes if n.health.get("machine_id", n.client.url) == machine and not n.error]
+        # One physical memory pool per machine, even with several worker ports.
+        physical = min(n.health.get("host_memory_available_mb", 0) - n.health.get("memory_reserve_mb", 0) for n in siblings)
+        unallocated = sum(max(0, n.reserved_memory_mb + n.external_memory_mb - n.health.get("rss_mb", 0)) for n in siblings)
+        return physical - unallocated
+
+    def _release(self, node, task, result=None):
+        label = task.get("label", "")
+        with self.condition:
+            node.reserved -= task.get("cpus", 1)
+            node.reserved_memory_mb -= task.get("memory_mb", 256)
+            if result is not None:
+                node.completed += 1
+                if result["status"] == "succeeded":
+                    measured = result["elapsed"]
+                    node.durations[label] = 0.7 * node.durations.get(label, measured) + 0.3 * measured
+                else:
+                    node.failed += 1
+            self.condition.notify_all()
 
     def run(self, task, *, inputs=None, files=None, output_dir=None, keep=False, on_submit=None):
         node = self._acquire(task)
@@ -288,15 +357,7 @@ class Pool:
             with self.condition:
                 if identity:
                     self.active.pop((node.name, identity), None)
-                node.reserved -= cpus
-                if result is not None:
-                    node.completed += 1
-                    if result["status"] == "succeeded":
-                        measured = result["elapsed"]
-                        node.durations[label] = 0.7 * node.durations.get(label, measured) + 0.3 * measured
-                    else:
-                        node.failed += 1
-                self.condition.notify_all()
+                self._release(node, task, result)
 
     def map(self, tasks, *, inputs=None, output_root=None, keep=False):
         tasks = list(tasks)

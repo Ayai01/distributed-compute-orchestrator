@@ -19,6 +19,7 @@ import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack
 from .process import Process
+from .resources import Host, process_usage
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -28,6 +29,26 @@ _VAR = re.compile(r"\$\{(work|cpus|exe|tool:[\w-]+|asset:[\w-]+|shared:[\w-]+)\}
 
 class Conflict(ValueError):
     pass
+
+
+def lock_root(root, role):
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / (role + ".lock")).open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise Conflict("Another " + role + " is using " + str(root)) from None
+    return handle
 
 
 def cpu_budget(value=0):
@@ -43,14 +64,16 @@ def file_hash(path):
 def validate_task(task, capacity):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node"}
+    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
-            "render": [], "label": "", "priority": 0, "requires": [], "node": None, **task}
+            "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256, **task}
     cpus, timeout = task["cpus"], task["timeout"]
     if type(cpus) is not int or not 1 <= cpus <= capacity:
         raise ValueError(f"Task cpus must be in 1..{capacity}")
+    if type(task["memory_mb"]) is not int or task["memory_mb"] < 1:
+        raise ValueError("memory_mb must be a positive integer in MiB")
     if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
             or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("Task timeout must be a positive number")
@@ -84,12 +107,18 @@ def validate_task(task, capacity):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=()):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512):
         self.root = Path(root).expanduser().resolve()
         self.capacity = cpu_budget(cpus)
         self.token = token
         self.tags = list(tags)
         self.paused = False
+        self.host = Host()
+        total_mb = self.host.sample()["memory_total_mb"]
+        if type(memory_mb) is not int or memory_mb < 0 or type(memory_reserve_mb) is not int or memory_reserve_mb < 0:
+            raise ValueError("Memory budget and headroom must be nonnegative integer MiB")
+        self.memory_capacity = memory_mb or max(1, total_mb - memory_reserve_mb)
+        self.memory_reserve = memory_reserve_mb
         self.env = dict(env or {})
         self.shared = {k: Path(v).expanduser().resolve().as_posix() for k, v in (shared or {}).items()}
         for path in self.shared.values():
@@ -120,23 +149,8 @@ class Worker:
             self.tool_info["verilator"].update(available=ready, engine=engine,
                                                engine_sha256=file_hash(engine) if ready else None)
         self.tags = sorted(set(self.tags) | {sys.platform} | {k for k, v in self.tool_info.items() if v["available"]})
-        self.root.mkdir(parents=True, exist_ok=True)
         # The lock is released by the OS on exit; no stale PID files to repair.
-        self.root_lock = (self.root / "worker.lock").open("a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
-                if self.root_lock.tell() == 0:
-                    self.root_lock.write(b"0")
-                    self.root_lock.flush()
-                self.root_lock.seek(0)
-                msvcrt.locking(self.root_lock.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.root_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self.root_lock.close()
-            raise Conflict("Another worker is using " + str(self.root)) from None
+        self.root_lock = lock_root(self.root, "worker")
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
@@ -156,24 +170,41 @@ class Worker:
 
     def health(self):
         with self.condition:
+            resources = self._memory_state()
             return {"protocol": PROTOCOL, "node": socket.gethostname(), "platform": sys.platform,
+                    "role": "worker", **resources,
                     "cpus": self.capacity, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused}
 
     def control(self, value):
-        if not isinstance(value, dict) or set(value) - {"cpus", "paused"}:
-            raise ValueError("Control accepts cpus and paused")
+        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb"}:
+            raise ValueError("Control accepts cpus, memory_mb and paused")
         if "cpus" in value and (type(value["cpus"]) is not int or value["cpus"] < 1):
             raise ValueError("cpus must be a positive integer")
         if "paused" in value and not isinstance(value["paused"], bool):
             raise ValueError("paused must be true or false")
+        if "memory_mb" in value and (type(value["memory_mb"]) is not int or value["memory_mb"] < 1):
+            raise ValueError("memory_mb must be a positive integer")
         with self.condition:
             if "cpus" in value:
                 self.capacity = value["cpus"]
             if "paused" in value:
                 self.paused = value["paused"]
+            if "memory_mb" in value:
+                self.memory_capacity = value["memory_mb"]
             self.condition.notify_all()
             return self.health()
+
+    def _memory_state(self):
+        host = self.host.sample()
+        running = [j for j in self.jobs.values() if j["result"]["status"] == "running"]
+        reserved = sum(max(j["task"]["memory_mb"], j.get("rss_mb", 0)) for j in running)
+        unallocated = sum(max(0, j["task"]["memory_mb"] - j.get("rss_mb", 0)) for j in running)
+        available = max(0, min(self.memory_capacity - reserved,
+                               host["host_memory_available_mb"] - self.memory_reserve - unallocated))
+        return {**host, "memory_capacity_mb": self.memory_capacity, "memory_reserved_mb": round(reserved, 2),
+                "memory_available_mb": int(available), "memory_reserve_mb": self.memory_reserve,
+                "rss_mb": round(sum(j.get("rss_mb", 0) for j in running), 2)}
 
     def _save(self, job):
         atomic_json(job["directory"] / "result.json", job["result"])
@@ -192,7 +223,9 @@ class Worker:
                 return self.shared[name]
             if kind == "asset":
                 return (self.root / "assets" / task["assets"][name]).as_posix()
-            raise ValueError("Tool variables belong at argv[0]")
+            if len(self.tools[name]) != 1:
+                raise ValueError("Multi-argument tools belong at argv[0]")
+            return Path(self.tools[name][0]).as_posix()
         return _VAR.sub(substitute, text)
 
     def submit(self, identity, payload):
@@ -209,6 +242,8 @@ class Worker:
                 return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), self.capacity)
+                if task["memory_mb"] > self.memory_capacity:
+                    raise ValueError("Task memory_mb exceeds worker memory budget")
                 for item in archive.infolist():
                     inside(self.root, item.filename)
                     if item.filename != "task.json" and not item.filename.startswith("input/"):
@@ -233,6 +268,7 @@ class Worker:
                 for name, path in tree(work, task["render"]).items():
                     path.write_text(self._expand(path.read_text(encoding="utf-8"), task, work), encoding="utf-8")
                 result = {"id": identity, "status": "queued", "label": task["label"], "cpus": task["cpus"],
+                          "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
                           "stdout": "", "stderr": "", "tools": self.tool_info,
@@ -256,7 +292,8 @@ class Worker:
                 # FIFO prevents a continuous stream of small jobs starving a larger one.
                 if self.queue and not self.paused:
                     job = self.jobs[self.queue[0]]
-                    if self.used + job["task"]["cpus"] <= self.capacity:
+                    if (self.used + job["task"]["cpus"] <= self.capacity
+                            and job["task"]["memory_mb"] <= self._memory_state()["memory_available_mb"]):
                         self.queue.popleft()
                         self.used += job["task"]["cpus"]
                         job["result"].update(status="running", started=time.time())
@@ -265,13 +302,14 @@ class Worker:
                         self.threads.add(thread)
                         thread.start()
                         continue
-                self.condition.wait()
+                self.condition.wait(0.5)
 
     def _execute(self, job):
         task, result, directory = job["task"], job["result"], job["directory"]
         work = directory / "input"
         deadline = time.monotonic() + task["timeout"]
         state, error = "succeeded", None
+        cpu_seconds = 0.0
         try:
             environment = dict(os.environ, **self.env)
             environment.update({key: self._expand(value, task, work) for key, value in task["env"].items()})
@@ -294,12 +332,20 @@ class Worker:
                     process = Process(argv, work, environment, stdout, stderr)
                     try:
                         while process.child.poll() is None:
+                            usage = process_usage(process)
+                            with self.condition:
+                                job["rss_mb"] = usage["rss_mb"]
+                                result["peak_rss_mb"] = max(result["peak_rss_mb"], usage["rss_mb"])
+                                result["cpu_seconds"] = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
                             if job["cancel"].is_set() or time.monotonic() >= deadline:
                                 state = "cancelled" if job["cancel"].is_set() else "timed_out"
                                 process.stop()
                                 break
                             job["cancel"].wait(0.05)
                         step.update(returncode=process.child.wait(), finished=time.time())
+                        usage = process_usage(process)
+                        cpu_seconds = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
+                        result["cpu_seconds"] = cpu_seconds
                     finally:
                         process.close()
                     if state != "succeeded":
@@ -314,6 +360,7 @@ class Worker:
                 if job["cancel"].is_set() and state == "succeeded":
                     state = "cancelled"
                 result.update(status=state, finished=time.time())
+                job["rss_mb"] = 0
                 if error:
                     result["error"] = error
                 for name in ("stdout", "stderr"):
@@ -451,6 +498,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Incomplete request body")
             if parts == ["health"] and self.command == "GET":
                 value = worker.health()
+            elif parts == ["nodes"] and self.command == "GET" and hasattr(worker, "nodes"):
+                value = worker.nodes()
             elif parts == ["control"] and self.command == "POST":
                 value = worker.control(json.loads(body))
             elif parts == ["jobs"] and self.command == "GET":

@@ -14,7 +14,8 @@ import threading
 import time
 import uuid
 
-from .client import Pool, RemoteError
+from .client import Client, Pool, RemoteError
+from .coordinator import Coordinator
 from .tasks import ngspice, verilator
 from .worker import Server, Worker
 
@@ -53,6 +54,7 @@ def submission_parser(kind):
     parser.add_argument("--output", help="结果保存目录")
     parser.add_argument("--node", help="固定分配给指定节点")
     parser.add_argument("--cpus", type=int, dest="task_cpus")
+    parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
     parser.add_argument("--priority", type=int)
     parser.add_argument("--requires", help="节点标签，以逗号分隔")
     parser.add_argument("--keep", action="store_true", help="回收后保留节点任务目录")
@@ -80,11 +82,13 @@ def prepare(kind, args):
             task[key] = value
     if args.requires:
         task["requires"] = args.requires.split(",")
+    if args.memory_mb is not None:
+        task["memory_mb"] = args.memory_mb
     output = Path(args.output) if args.output else ROOT / "results" / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])
     return task, {"inputs": inputs, "output_dir": output, "keep": args.keep}
 
 
-def batch(pool, source, output):
+def batch(pool, source, output, *, on_submit=None, stop_event=None):
     source = Path(source).resolve()
     entries = read_json(source)
     if not isinstance(entries, list):
@@ -96,10 +100,13 @@ def batch(pool, source, output):
         prepared.append((task, inputs))
     results = [None] * len(prepared)
     def run(index):
+        if stop_event is not None and stop_event.is_set():
+            raise RemoteError("Console is closing")
         task, inputs = prepared[index]
-        results[index] = pool.run(task, inputs=inputs, output_dir=Path(output) / str(index))
+        results[index] = pool.run(task, inputs=inputs, output_dir=Path(output) / str(index), on_submit=on_submit)
     order = sorted(range(len(entries)), key=lambda i: -prepared[i][0].get("priority", 0))
-    with ThreadPoolExecutor(max_workers=max(1, min(len(entries), sum(n.capacity for n in pool.nodes) or 1))) as executor:
+    capacity = sum(n.capacity for n in pool.nodes) if isinstance(pool, Pool) else pool.health()["cpus"]
+    with ThreadPoolExecutor(max_workers=max(1, min(len(entries), capacity or 1))) as executor:
         list(executor.map(run, order))
     return results
 
@@ -141,9 +148,13 @@ class Shell(cmd.Cmd):
 class SchedulerShell(Shell):
     prompt = "调度> "
 
-    def __init__(self, pool):
+    def __init__(self, pool, center=None):
         super().__init__()
         self.pool = pool
+        self.center = center
+        self.dispatch = center or pool
+        self.handles = {}
+        self.closing = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="console-submit")
         self.futures = []
 
@@ -167,14 +178,21 @@ class SchedulerShell(Shell):
 
     def do_nodes(self, _line):
         """查看节点预算、占用、权重和分配状态。"""
-        self.pool.refresh()
-        value = self.pool.snapshot()
+        if self.center:
+            value = self.center.nodes()
+        else:
+            self.pool.refresh()
+            value = self.pool.snapshot()
         print("分配策略:", value["policy"])
-        table(value["nodes"], ["name", "url", "capacity", "reserved", "used_cpus", "weight", "enabled", "paused", "error"])
+        table(value["nodes"], ["name", "capacity", "used_cpus", "cpu_percent", "memory_available_mb", "memory_reserved_mb", "weight", "enabled", "paused"])
 
     def do_jobs(self, line):
         """jobs [节点]：查看任务；id 可用于 logs/cancel/fetch。"""
         rows = []
+        if self.center:
+            rows = [{**item, "node": item.get("assigned_node", "queued")} for item in self.center.status()]
+            table(rows, ["node", "id", "status", "label", "cpus", "memory_mb"])
+            return
         for node in self.pool.nodes:
             if line.strip() and node.name != line.strip():
                 continue
@@ -187,9 +205,13 @@ class SchedulerShell(Shell):
 
     def _submit(self, kind, line):
         task, options = prepare(kind, submission_parser(kind).parse_args(words(line)))
-        def accepted(client, identity):
-            print(f"\n已接单 {client.url}  {identity}")
-        self._start(self.pool.run, task, **options, on_submit=accepted)
+        self._start(self.dispatch.run, task, **options, on_submit=self._accepted)
+
+    def _accepted(self, client, identity):
+        self.handles[identity] = client
+        if self.closing.is_set():
+            client.cancel(identity)
+        print(f"\n已接单 {client.url}  {identity}")
 
     def do_run(self, line):
         """run 任务.json [--input 目录] [--output 目录] [--node 节点] [--cpus N] [--priority N]"""
@@ -206,12 +228,15 @@ class SchedulerShell(Shell):
     def do_batch(self, line):
         """batch 清单.json 结果目录：按优先级和可用算力并行分配。"""
         source, output = words(line)
-        self._start(batch, self.pool, source, output)
+        self._start(batch, self.dispatch, source, output, on_submit=self._accepted, stop_event=self.closing)
 
     def do_policy(self, line):
         """policy adaptive|balanced|round_robin：切换自适应、均衡或轮询。"""
-        self.pool.configure(policy=line.strip())
-        print("分配策略:", self.pool.policy)
+        if self.center:
+            self.center.control(policy=line.strip())
+        else:
+            self.pool.configure(policy=line.strip())
+        print("分配策略:", line.strip())
 
     def do_set(self, line):
         """set 节点 weight=2 limit=4 enabled=true：设置本调度器的权重、CPU上限和开关。"""
@@ -224,62 +249,92 @@ class SchedulerShell(Shell):
                     raise ValueError("enabled=true|false")
                 value = value.lower() == "true"
             else:
-                value = int(value) if key == "limit" else float(value)
+                value = int(value) if key in {"limit", "memory_limit_mb"} else float(value)
             changes[key] = value
-        self.pool.configure(name, **changes)
+        if self.center:
+            self.center.control(node=name, routing=changes)
+        else:
+            self.pool.configure(name, **changes)
         self.do_nodes("")
 
     def do_add(self, line):
         """add 名称 http://设备IP:8765：加入节点，token 从当前环境变量读取。"""
         name, url = words(line)
-        self.pool.add(name, url, token=os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
+        if self.center:
+            self.center.control(add={"name": name, "url": url, "token": os.environ.get("REMOTE_COMPUTE_TOKEN", "")})
+        else:
+            self.pool.add(name, url, token=os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
         self.do_nodes("")
 
     def do_save(self, _line):
         """保存当前节点和策略到 nodes.local.json，下次启动自动加载。"""
-        value = {"policy": self.pool.policy, "nodes": [
-            {"name": n.name, "url": n.client.url, "weight": n.weight, "limit": n.limit,
-             "enabled": n.enabled, **({"token": n.client.token} if n.client.token else {})} for n in self.pool.nodes]}
+        snapshot = self.center.nodes() if self.center else self.pool.snapshot()
+        tokens = {n.client.url: n.client.token for n in self.pool.nodes}
+        value = {"policy": snapshot["policy"], "nodes": []}
+        for row in snapshot["nodes"]:
+            node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
+            token = tokens.get(row["url"], self.center.token if self.center else "")
+            if token:
+                node["token"] = token
+            value["nodes"].append(node)
         path = ROOT / "nodes.local.json"
         path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print("已保存:", path)
 
     def do_pause(self, line):
         """pause 节点：暂停该提供者的新任务，已运行任务继续。"""
-        self._node(line.strip()).client.control(paused=True)
+        if self.center:
+            self.center.control(node=line.strip(), worker={"paused": True})
+        else:
+            self._node(line.strip()).client.control(paused=True)
         self.pool.refresh()
 
     def do_resume(self, line):
         """resume 节点：恢复该提供者接单。"""
-        self._node(line.strip()).client.control(paused=False)
+        if self.center:
+            self.center.control(node=line.strip(), worker={"paused": False})
+        else:
+            self._node(line.strip()).client.control(paused=False)
         self.pool.refresh()
 
     def do_cpus(self, line):
         """cpus 节点 N：调整提供者的总CPU预算，现有任务自然收尾。"""
         name, count = words(line)
-        self._node(name).client.control(cpus=int(count))
+        if self.center:
+            self.center.control(node=name, worker={"cpus": int(count)})
+        else:
+            self._node(name).client.control(cpus=int(count))
         self.pool.refresh()
+
+    def do_memory(self, line):
+        """memory 节点 MiB：调整提供者的任务内存总预算。"""
+        name, amount = words(line)
+        if self.center:
+            self.center.control(node=name, worker={"memory_mb": int(amount)})
+        else:
+            self._node(name).client.control(memory_mb=int(amount))
+        self.do_nodes("")
 
     def do_cancel(self, line):
         """cancel 节点 任务ID：取消指定任务及其子进程。"""
         name, identity = words(line)
-        display(self._node(name).client.cancel(identity))
+        display((self.center or self._node(name).client).cancel(identity))
 
     def do_logs(self, line):
         """logs 节点 任务ID：读取实时日志末尾。"""
         name, identity = words(line)
-        for key, value in self._node(name).client.logs(identity).items():
+        for key, value in (self.center or self._node(name).client).logs(identity).items():
             print(key + ":\n" + value)
 
     def do_fetch(self, line):
         """fetch 节点 任务ID 结果目录：回收结果并清理节点任务目录。"""
         name, identity, output = words(line)
-        result = self._node(name).client.fetch(identity, output)
+        result = (self.center or self._node(name).client).fetch(identity, output)
         print(result["status"], result["output_dir"])
 
     def do_sync(self, line):
         """sync 目录：将模型/只读文件同步到在线节点，返回内容ID。"""
-        print(self.pool.sync(words(line)[0]))
+        print(self.dispatch.sync(words(line)[0]))
 
     def do_wait(self, _line):
         """等待本终端已提交操作结束；Ctrl+C 返回提示符。"""
@@ -287,7 +342,14 @@ class SchedulerShell(Shell):
             future.result()
 
     def close(self):
-        self.pool.close(cancel=True)
+        self.closing.set()
+        if not self.center:
+            self.pool.close(cancel=True)
+        for identity, client in list(self.handles.items()):
+            try:
+                client.cancel(identity)
+            except RemoteError:
+                pass  # completed tasks have already been collected and removed
         self.executor.shutdown(wait=True, cancel_futures=True)
 
 
@@ -301,7 +363,13 @@ class WorkerShell(Shell):
     def do_status(self, _line):
         """查看本节点CPU预算和实时占用。"""
         value = self.worker.health()
-        display({k: value[k] for k in ("node", "platform", "cpus", "used_cpus", "queued", "paused", "tags")})
+        display({k: value[k] for k in ("node", "platform", "cpus", "logical_cpus", "used_cpus", "cpu_percent", "queued",
+                                      "memory_total_mb", "memory_available_mb", "memory_reserved_mb", "rss_mb", "paused", "tags")})
+
+    def do_memory(self, line):
+        """memory MiB：调整本机任务内存总预算。"""
+        self.worker.control({"memory_mb": int(line)})
+        self.do_status("")
 
     def do_jobs(self, _line):
         """列出本节点任务。"""
@@ -359,9 +427,33 @@ def run_scheduler(args, local_url=None):
             config["nodes"].append({"name": name, "url": local_url,
                                      "token": args.local_token})
     pool = Pool(config["nodes"], policy=args.policy or config.get("policy", "adaptive"))
+    coordinator = api = api_thread = None
+    dispatch = None
     try:
+        if args.url:
+            dispatch = Client(args.url, os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
+            if dispatch.health().get("role") != "scheduler":
+                dispatch = None  # existing direct-worker CLI calls retain their route
+        else:
+            temporary = Path("Z:/") if os.name == "nt" and Path("Z:/").is_dir() else Path(tempfile.gettempdir())
+            root = Path(args.root) / "scheduler" if args.root else temporary / "Remote-Compute/scheduler"
+            coordinator = Coordinator(pool, root, token=args.local_token)
+            port = args.center_port if args.center_port is not None else (0 if args.port == 0 else 8766)
+            if args.mode == "scheduler" and args.port is not None and args.center_port is None:
+                port = args.port
+            api = Server((args.host or "127.0.0.1", port), coordinator)
+            api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+            api_thread.start()
+            print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}", flush=True)
+            dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token)
         if args.action is None:
-            shell = SchedulerShell(pool)
+            if args.headless:
+                try:
+                    while api_thread is None or api_thread.is_alive():
+                        time.sleep(0.5)
+                except KeyboardInterrupt:
+                    return 0
+            shell = SchedulerShell(pool, dispatch)
             try:
                 shell.do_nodes("")
                 shell.loop()
@@ -370,21 +462,21 @@ def run_scheduler(args, local_url=None):
             return 0
         if args.action in {"run", "spice", "rtl"}:
             task, options = prepare(args.action, args)
-            result = pool.run(task, **options)
+            result = (dispatch or pool).run(task, **options)
             display(result)
             return 0 if result["status"] == "succeeded" else 1
         if args.action == "batch":
-            results = batch(pool, args.source, args.output)
+            results = batch(dispatch or pool, args.source, args.output)
             display([{k: x.get(k) for k in ("id", "status", "assigned_node", "elapsed", "output_dir")} for x in results])
             return 0 if all(x["status"] == "succeeded" for x in results) else 1
         if args.action == "nodes":
-            display(pool.snapshot())
+            display(dispatch.nodes() if dispatch else pool.snapshot())
         elif args.action == "jobs":
-            display({n.name: n.client.status() for n in pool.nodes if not n.error})
+            display(dispatch.status() if dispatch else {n.name: n.client.status() for n in pool.nodes if not n.error})
         elif args.action == "sync":
-            print(pool.sync(args.source))
+            print((dispatch or pool).sync(args.source))
         else:
-            client = next(n.client for n in pool.nodes if n.name == args.node)
+            client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
             method = getattr(client, args.action)
             display(method(args.identity, args.output) if args.action == "fetch" else method(args.identity))
         return 0
@@ -393,6 +485,12 @@ def run_scheduler(args, local_url=None):
         pool.close(cancel=True)
         return 130
     finally:
+        if coordinator:
+            coordinator.close()
+        if api:
+            api.shutdown()
+            api_thread.join()
+            api.server_close()
         if not pool.closed:
             pool.close()
 
@@ -420,13 +518,15 @@ def main(argv=None):
     parser.add_argument("--mode", choices=("scheduler", "hybrid", "worker"), default="hybrid")
     parser.add_argument("--config", help="本机工具链/共享目录配置 JSON")
     parser.add_argument("--nodes", help="调度器节点配置 JSON")
-    parser.add_argument("--url", help="直接连接一个算力提供者")
+    parser.add_argument("--url", help="连接现有调度中心或直接连接算力提供者")
     parser.add_argument("--policy", choices=sorted(Pool.POLICIES))
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--center-port", type=int, help="调度中心HTTP端口，默认8766")
     parser.add_argument("--cpus", type=lambda v: 0 if v == "auto" else int(v), help="本机算力预算")
+    parser.add_argument("--memory-mb", type=int, dest="worker_memory_mb", help="本机提供者的任务内存总预算，MiB")
     parser.add_argument("--root", help="节点任务/资产目录；默认使用现有内存盘或系统临时目录")
-    parser.add_argument("--headless", action="store_true", help="算力提供者不打开交互终端")
+    parser.add_argument("--headless", action="store_true", help="启动后台服务，不打开交互终端")
     parser.add_argument("--check", action="store_true", help="检查本机仿真工具")
     parser.add_argument("--test", action="store_true", help="运行核心回归")
     parser.add_argument("--test-native", action="store_true", help="同时验证真实ngspice和Verilator")
@@ -463,15 +563,16 @@ def main(argv=None):
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         if args.check:
             return check_tools(config)
-        if args.mode != "worker" and args.headless and args.action is None:
-            raise ValueError("--headless 调度模式请指定 run/batch 等命令")
+        args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
         if args.mode == "worker" and args.action:
             raise ValueError("worker 模式使用本地操作终端；提交任务使用 scheduler/hybrid 模式")
         if args.mode != "scheduler":
             port = args.port if args.port is not None else config.get("port", 8765)
             temporary = Path("Z:/") if os.name == "nt" and Path("Z:/").is_dir() else Path(tempfile.gettempdir())
             root = args.root or config.get("root") or temporary / "Remote-Compute" / str(port)
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb") if key in config}
+            if args.worker_memory_mb is not None:
+                options["memory_mb"] = args.worker_memory_mb
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
             options["token"] = args.local_token
             worker = Worker(root, args.cpus if args.cpus is not None else config.get("cpus", 0), **options)
