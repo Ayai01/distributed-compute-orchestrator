@@ -1,0 +1,7 @@
+{
+  "label": "ngspice",
+  "cpus": 1,
+  "timeout": 120,
+  "steps": [["${tool:ngspice}", "-b", "-o", "ngspice.log", "divider.spice"]],
+  "outputs": ["ngspice.log", "divider.dat"]
+}

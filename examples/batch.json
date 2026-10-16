@@ -1,0 +1,5 @@
+[
+  {"task": "spice/task.json", "input": "spice"},
+  {"task": "spice/task.json", "input": "spice"},
+  {"task": "rtl/task.json", "input": "rtl"}
+]

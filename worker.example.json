@@ -1,0 +1,11 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "cpus": 0,
+  "tags": ["cpu"],
+  "tools": {
+    "ngspice": "ngspice"
+  },
+  "shared": {},
+  "env": {}
+}

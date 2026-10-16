@@ -1,0 +1,10 @@
+{
+  "label": "verilator",
+  "cpus": 1,
+  "timeout": 600,
+  "steps": [
+    ["${tool:verilator}", "--binary", "--assert", "-j", "${cpus}", "--Mdir", "obj_dir", "--top-module", "tb", "tb.sv"],
+    ["${work}/obj_dir/Vtb${exe}"]
+  ],
+  "outputs": ["metrics.json"]
+}

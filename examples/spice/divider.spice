@@ -1,0 +1,11 @@
+* 1.8 V resistive divider; the measured output is 1.2 V.
+V1 in 0 1.8
+R1 in out 1k
+R2 out 0 2k
+.control
+tran 1n 10n
+meas tran vout_at find v(out) at=10n
+wrdata divider.dat v(out)
+quit 0
+.endc
+.end
