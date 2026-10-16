@@ -228,7 +228,11 @@ python main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source "D
 
 Windows 的 `setup` 安装固定版本的可移动Python3.12科学环境，验证Numba JIT、OpenCV与ONNX Runtime CPU推理后写入本机工具配置；首次可直接下载Python/ngspice，也可复用已有ngspice。`--rtl-source` 提取现有MSYS2中GCC/Verilator的实际依赖，排除编译链无关组件与下载缓存。
 
-AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB）；`.tools/ngspice`约38MiB，精简RTL环境约608MiB。原工程模型训练仍使用各工程环境。跨机复制运行时后，用`setup`校验版本并重定位路径，再从中心重载worker。
+AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB）；`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB。ARH的GSIM另外使用Clang/Flex/Bison及其依赖，继续装在公共MSYS中。原工程模型训练仍使用各工程环境。跨机复制运行时后，用`setup`校验版本并重定位路径，待worker自然启动或空闲重载时加载配置。
+
+Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/Remote-Compute/.projects/arh`，Python复用 `arh_python`。该目录的 `.tools` 保存Java、Scala CLI、firtool/circt-translate、模型、Coursier缓存和Rocket/GSIM必要资产；`.tools/msys64`是指向Remote-Compute公共MSYS的目录联接，GCC、Verilator与Clang共用一份。数值源码更新时只同步源码和必要数据，保留工具缓存；已有工程任务完成后再更新它使用的源码。ARH在执行前及收回结果时校验源码摘要。
+
+`worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过 `Client().machine('Aya1-TX', cwd=上述目录)` 或指定 `node='Aya1-TX'` 的普通任务按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。实际自动候选节点以中心返回的 `shared_paths` 为准。
 
 ## 部署到其他设备
 

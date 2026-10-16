@@ -68,7 +68,7 @@ worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`�
 | --- | --- | --- |
 | AOP_v2 | `--compute-center URL` 或 `compute.center`；网页选本地调度器 / 本地工程 | 每角点任务；源码、模型按内容同步，沿用原测量与解析。 |
 | RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | 每候选 PRE/POST 分析；源码和模型闭包同步，保留后仿恢复与原任务 ID。 |
-| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；执行节点需要 `shared.arh` 指向 ARH 工程及其原生计算环境。当前此节点为 Aya1-PC；Aya1-TX 独立 RTL 能力通过 Verilator 任务提供。 |
+| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；需要 `arh_python` 与 `shared.arh` 指向预部署工程及原生环境。Aya1-TX的持久目录、公共编译器复用与配置加载见[工具部署](operations.md#工程内工具安装)。自动候选节点以实际 `shared_paths` 为准。 |
 | Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码同步，需要 bench_python 科学环境。 |
 
 仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告；本次验证使用该隔离方式，正式结果与已有报告保持原样。日常正式运行仍按各工程规则更新当前成功报告。
