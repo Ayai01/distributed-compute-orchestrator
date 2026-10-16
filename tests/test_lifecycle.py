@@ -187,6 +187,48 @@ class RepositoryUpdateTests(unittest.TestCase):
 
 
 class ControlLifecycleTests(unittest.TestCase):
+    def test_hybrid_reloads_without_console_relaunch_and_preserves_unfetched_results(self):
+        with tempfile.TemporaryDirectory(prefix='compute-hybrid-reload-') as directory:
+            root=Path(directory);copied=root/'tool';copied.mkdir()
+            shutil.copyfile(ROOT/'main.py',copied/'main.py')
+            shutil.copytree(ROOT/'remote_compute',copied/'remote_compute',ignore=shutil.ignore_patterns('__pycache__'))
+            config=copied/'worker.local.json'
+            config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False)),encoding='utf8')
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
+            client=Client(f'http://127.0.0.1:{port}',timeout=1)
+            with (root/'service.log').open('wb') as log:
+                process=Process([sys.executable,'-B',str(copied/'main.py'),'--headless','--port',str(port),
+                                 '--root',str(root/'state'),'--cpus=2'],copied,dict(os.environ,PYTHONPATH='',PYTHONUTF8='1'),log,log)
+                try:
+                    def ready():
+                        try:return 'restart' in client.health().get('capabilities',[])
+                        except RemoteError:return False
+                    until(ready,seconds=15)
+                    initial=client.health()
+                    name=initial['node']
+                    client.control(node=name,worker=dict(cpus=1))
+                    pending=client.submit(python("import time;time.sleep(.6);print('retained output')"))['id']
+                    until(lambda:client.status(pending)['status']=='running')
+                    with self.assertRaises(RemoteError) as busy:client.restart()
+                    self.assertEqual(busy.exception.status_code,409)
+                    reloaded=copied/'remote_compute/__init__.py'
+                    reloaded.write_text(reloaded.read_text(encoding='utf8').replace('__version__ = ', '__version__ = "reload-" + '),encoding='utf8')
+                    self.assertTrue(client.restart(name,wait=True,wait_timeout=5)['restarting'])
+                    def fresh():
+                        try:return client.health()['pid']!=initial['pid']
+                        except RemoteError:return False
+                    until(fresh,seconds=15)
+                    health=client.health()
+                    self.assertTrue(health['version'].startswith('reload-'))
+                    self.assertEqual(health['nodes'][0]['capacity'],1)
+                    result=client.fetch(pending)
+                    self.assertEqual(result['status'],'succeeded')
+                    self.assertIn('retained output',result['stdout'])
+                    self.assertEqual(client.run(python("print('after center reload')"))['status'],'succeeded')
+                finally:
+                    process.stop();process.close()
+
     @unittest.skipUnless((os.cpu_count() or 1) >= 3, 'Requires a two-thread worker')
     def test_supervisor_reloads_latest_live_budgets_instead_of_original_cli(self):
         with tempfile.TemporaryDirectory(prefix='compute-reload-') as directory:

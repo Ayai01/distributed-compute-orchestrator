@@ -7,6 +7,7 @@ from ctypes import wintypes
 import io
 import os
 import sys
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -53,6 +54,17 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_plain_posix_console_exits_on_reload_without_waiting_for_input(self):
+        import select
+        shell=OperatorShell();alive=threading.Event();alive.set()
+        def waiting(*_args):
+            alive.clear()
+            return [],[],[]
+        shell.stdout=io.StringIO()
+        with patch.object(select,'select',side_effect=waiting),patch.object(sys.stdin,'readline') as read:
+            shell._poll_input(alive.is_set)
+        read.assert_not_called()
+
     def test_command_tables_fit_inside_the_dashboard_and_keep_complete_ids(self):
         from remote_compute.commands import table
         identity = '1234567890abcdef'*2

@@ -132,6 +132,7 @@ def validate_task(task, capacity, *, allow_auto=False):
 class Worker:
     def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None):
         self.root = Path(root).expanduser().resolve()
+        self.callback = {}
         physical_limit = max(1, (os.cpu_count() or 1) - 1)
         if cpu_limit is not None and (type(cpu_limit) is not int or not 1 <= cpu_limit <= physical_limit):
             raise ValueError(f'cpu_limit must be in 1..{physical_limit}')
@@ -209,7 +210,7 @@ class Worker:
                     "role": "worker", **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
-                    "capabilities": ["machine"] + (["restart"] if self.restart_available else []),
+                    "capabilities": ["machine", "resize"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
@@ -274,7 +275,25 @@ class Worker:
             return Path(self.tools[name][0]).as_posix()
         return _VAR.sub(substitute, text)
 
-    def submit(self, identity, payload):
+    def resize(self, identity, cpus):
+        if type(cpus) is not int or cpus<1:
+            raise ValueError('resize cpus must be a positive integer')
+        with self.condition:
+            job=self.jobs[identity];task,result=job['task'],job['result']
+            if self.stopping or job['cancel'].is_set() or result['status']!='running':
+                raise Conflict('Only a running task can change its CPU grant')
+            old=task['cpus']
+            granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
+            if granted!=old:
+                self.used+=granted-old
+                task['cpus']=result['cpus']=granted
+                result['peak_cpus']=max(result.get('peak_cpus',old),granted)
+                result['resize_count']=result.get('resize_count',0)+1
+                self._save(job)
+                self.condition.notify_all()
+            return dict(id=identity,node=socket.gethostname(),cpus=granted,requested_cpus=cpus)
+
+    def submit(self, identity, payload, *, callback=None):
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
@@ -321,12 +340,14 @@ class Worker:
                     path.write_text(self._expand(path.read_text(encoding="utf-8"), task, work), encoding="utf-8")
                 result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"],
                           "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
+                          'initial_cpus':task['cpus'],'peak_cpus':task['cpus'],'resize_count':0,
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
                           "stdout": "", "stderr": "", "tools": self.tool_info,
                           "assets": task["assets"], "cwd": cwd.as_posix()}
                 job = {"result": result, "cancel": threading.Event(), "task": task,
-                       "commands": commands, "directory": directory, "cwd": cwd}
+                       "commands": commands, "directory": directory, "cwd": cwd,
+                       'callback':dict(self.callback if callback is None else callback)}
                 self._save(job)
             except BaseException:
                 if directory.exists():
@@ -373,6 +394,11 @@ class Worker:
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
+            callback=job.get('callback',{})
+            environment.update(REMOTE_COMPUTE_URL=callback.get('url',''),
+                               REMOTE_COMPUTE_TOKEN=callback.get('token',''),
+                               REMOTE_COMPUTE_RESIZE='1' if callback.get('url') else '0',
+                               REMOTE_COMPUTE_HOME=str(Path(__file__).resolve().parent.parent))
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 for argv in job["commands"]:
                     if job["cancel"].is_set():
@@ -534,6 +560,10 @@ class Server(ThreadingHTTPServer):
         self.connections = set()
         self.connections_lock = threading.Lock()
         super().__init__(address, Handler)
+        if hasattr(worker,'restart_node'):
+            worker.callback_address=self.server_address
+        else:
+            worker.callback=dict(url=f'http://127.0.0.1:{self.server_port}',token=worker.token)
 
     def get_request(self):
         connection, address = super().get_request()
@@ -610,15 +640,16 @@ class Handler(BaseHTTPRequestHandler):
                 value = worker.control(json.loads(body))
                 worker.activity.notify('Control ' + body.decode('utf-8'), self.client_address[0])
             elif parts == ["restart"] and self.command == "POST":
-                if hasattr(worker, "restart_node"):
-                    value = worker.restart_node(json.loads(body)["node"])
-                elif self.server.restart:
+                request = json.loads(body)
+                if self.server.restart and (not hasattr(worker, 'restart_node') or request.get('node') in (None,socket.gethostname())):
                     self.server.restart(check=True)
                     self._reply({"restarting": True, "pid": os.getpid()}, 202)
                     self.server.restart()
                     return
+                elif hasattr(worker, "restart_node") and request.get('node'):
+                    value = worker.restart_node(request['node'])
                 else:
-                    raise ValueError("Remote restart requires worker --headless")
+                    raise ValueError("Restart requires a supervised service")
             elif parts == ["jobs"] and self.command == "GET":
                 with worker.condition:
                     value = [worker.get(identity) for identity in worker.jobs]
@@ -627,7 +658,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) >= 2 and parts[0] == "jobs":
                 identity = parts[1]
                 if len(parts) == 2 and self.command == "POST":
-                    value = worker.submit(identity, body)
+                    callback=self.headers.get('X-Remote-Compute-Callback')
+                    value = worker.submit(identity,body,callback=json.loads(callback)) if callback else worker.submit(identity,body)
                     worker.activity.submitted(value, worker.jobs[identity].get('task', {}), self.client_address[0])
                     return self._reply(value, 202)
                 if len(parts) == 2 and self.command == "GET":
@@ -636,6 +668,8 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.delete(identity)
                 elif parts[2:] == ["cancel"] and self.command == "POST":
                     value = worker.cancel(identity)
+                elif parts[2:] == ['resize'] and self.command == 'POST':
+                    value = worker.resize(identity,json.loads(body)['cpus'])
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
                     value = worker.artifacts(identity)
                 elif parts[2:] == ["logs"] and self.command == "GET":

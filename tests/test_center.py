@@ -32,6 +32,97 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_resize_lost_reply_recovers_the_original_grant(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                identity=client.submit(python('import time; time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                original=pool.nodes[0].client.resize
+                def lost_reply(*args):
+                    original(*args)
+                    raise RemoteError('connection closed after accepting resize')
+                with patch.object(pool.nodes[0].client,'resize',side_effect=lost_reply) as resize:
+                    self.assertEqual(client.resize(identity,4)['cpus'],4)
+                    self.assertEqual(resize.call_count,1)
+                self.assertEqual(pool.nodes[0].reserved,4)
+                self.assertEqual(worker.health()['used_cpus'],4)
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(worker.health()['used_cpus'],0)
+
+    def test_submission_window_refreshes_shares_and_honors_node(self):
+        with scratch() as root, provider(Path(root)/'big',cpus=4,cpu_limit=4) as (_,big), provider(Path(root)/'small',cpus=2,cpu_limit=2) as (_,small):
+            with Pool([dict(name='big',url=big.url),dict(name='small',url=small.url)]) as pool, center(pool,Path(root)/'center') as (_,client):
+                client.control(paused=True)
+                identities=[client.submit(python('pass',project='A'))['id'] for _ in range(6)]
+                window=client.window('B',queue_ratio=0)
+                self.assertEqual((window.maximum,window.current()),(6,3))
+                pinned=client.admission('B',queue_ratio=0,node='small')
+                self.assertEqual((pinned['target_cpus'],pinned['max_in_flight']),(2,2))
+                for identity in identities:client.cancel(identity);client.delete(identity)
+                window.updated=0
+                self.assertEqual(window.current(),6)
+                client.control(node='big',worker=dict(cpus=2))
+                window.updated=0
+                self.assertEqual(window.current(),4)
+
+    def test_task_callback_resizes_original_job_and_preserves_bundle_identity(self):
+        import hashlib
+        from remote_compute.bundle import task_bundle
+        with scratch() as root, provider(Path(root)/'worker',cpus=4,token='worker-token') as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (state,client):
+                code=("import os,sys,json,time\nfrom pathlib import Path\n"
+                      "sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\nfrom remote_compute import Client\n"
+                      "c=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'])\n"
+                      "r=c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],4)\n"
+                      "Path('grant.json').write_text(json.dumps(r))\n"
+                      "while not Path('release').exists(): time.sleep(.02)\n"
+                      "c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],1)\n")
+                task=python(code,project='callback',outputs=['grant.json'])
+                identity=client.submit(task)['id']
+                until(lambda:client.status(identity)['cpus']==4)
+                self.assertEqual(client.health()['used_cpus'],4)
+                self.assertEqual(worker.health()['used_cpus'],4)
+                with state.condition:
+                    state._update(state.jobs[identity],dict(status='running',cpus=1))
+                self.assertEqual(client.status(identity)['cpus'],4)
+                client.write_job_file(identity,'release','done')
+                client.wait(identity)
+                result=client.fetch(identity,delete=False)
+                self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                self.assertEqual(result['cpus'],1)
+                self.assertEqual((result['initial_cpus'],result['peak_cpus'],result['resize_count']),(1,4,2))
+                self.assertEqual(json.loads(result['files']['grant.json'])['id'],identity)
+                self.assertEqual(result['request_sha256'],hashlib.sha256(task_bundle(task)).hexdigest())
+                self.assertEqual(client.submit(task,job_id=identity)['id'],identity)
+                client.delete(identity)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(worker.health()['used_cpus'],0)
+
+    def test_running_grants_obey_project_shares_and_cancel_releases_latest_grant(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                client.control(paused=True)
+                task="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+                first=client.submit(python(task,project='A'))['id']
+                second=client.submit(python(task,project='B'))['id']
+                with self.assertRaises(RemoteError):client.resize(first,2)
+                client.control(paused=False)
+                until(lambda:all(client.status(i)['status']=='running' for i in (first,second)))
+                self.assertEqual(client.resize(first,4)['cpus'],3)
+                self.assertEqual(client.resize(second,4)['cpus'],1)
+                self.assertEqual(client.health()['used_cpus'],4)
+                self.assertEqual(client.resize(first,1)['cpus'],1)
+                self.assertEqual(client.resize(second,4)['cpus'],3)
+                client.cancel(first);client.wait(first);client.fetch(first)
+                until(lambda:pool.nodes[0].reserved==3)
+                self.assertEqual(client.resize(second,4)['cpus'],4)
+                client.write_job_file(second,'release','done')
+                result=client.wait(second);client.fetch(second)
+                self.assertEqual(result['cpus'],4)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(worker.health()['used_cpus'],0)
+
     def test_auto_uses_idle_smaller_node_while_larger_node_is_busy(self):
         with scratch() as root, provider(Path(root)/'big',cpus=3) as (_,big), provider(Path(root)/'small',cpus=2) as (_,small):
             with Pool([dict(name='big',url=big.url),dict(name='small',url=small.url)]) as pool, center(pool,Path(root)/'center') as (_,client):
@@ -165,10 +256,10 @@ class CenterTests(unittest.TestCase):
             with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
                 entered, release = threading.Event(), threading.Event()
                 original = pool.nodes[0].client.submit_bundle
-                def delayed(*args):
+                def delayed(*args,**kwargs):
                     entered.set()
                     release.wait(5)
-                    return original(*args)
+                    return original(*args,**kwargs)
                 with patch.object(pool.nodes[0].client,'submit_bundle',side_effect=delayed):
                     identity = client.submit(python("print('ready')"))['id']
                     try:

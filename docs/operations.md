@@ -79,7 +79,7 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 }
 ```
 
-`--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听回环 26133，通过命令行设置中心地址。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
+`--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听 `0.0.0.0:26133`，以便远端任务回调中心申请/归还线程，CLI 仍用本机127.0.0.1地址。`--host 127.0.0.1` 可限定回环；此时远端任务保持静态授予。本机 worker 始终为进程内私有调用。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
 
 `memory_mb` / `--memory-mb` 单位为 MiB；0 使用物理内存减去预留量。中心同时核对任务内存预留、实际进程树 RSS 和系统可用内存。同一设备的多个 worker 共用一份物理内存统计。任务默认预留 256 MiB；大任务由调用者声明所需内存。
 
@@ -188,7 +188,7 @@ machine.download("./results", "./results/Aya1-TX")
 
 `execute` 和 `python` 接受 `job_id`，在结果保留期间用相同 ID 和相同请求重提交只执行一次。操作固定到显式选择的节点；源码更新、工程环境安装、Git 操作和检查可沿用同一接口。
 
-以 `worker` 或 `worker --headless` 启动时，入口保留一个轻量 Python 启动进程，支持远程重新加载自身。通过 `machine.upload()` / `write_text()` 更新本工具源码或该节点配置后，调用 `machine.restart()`，或在中心终端执行 `restart Aya1-TX` / `python main.py --url 中心地址 restart --node Aya1-TX`。节点空闲时重启并重新读取磁盘上的代码和配置，地址保持原配置；在途任务存在时返回409，待任务结束后再操作。`health` 返回 `pid`、`tool_root` 和 `restart` 能力，便于核对更新已生效。启动终端保持运行，之后的文件修改和重启均可远程完成。
+所有服务模式均保留一个轻量 Python 启动进程，支持在原终端重新加载代码和设备配置。源码写完后，`Client().restart(wait=True)` 重载中心，`Client().restart('Aya1-TX', wait=True)` 重载远端；中心终端使用 `restart --wait` / `restart Aya1-TX --wait`，CLI 使用 `python main.py --url 中心地址 restart --node Aya1-TX --wait`。`machine.restart(wait=True)` 同样可用。省略 wait 时，忙碌服务返回409；wait 模式等待在途任务结束再重载，已完成未领取结果保留。`health` 返回 `pid`、`version`、`tool_root` 和 `restart` 能力，可核对生效版本。运行时保存的CPU/内存配置在重载后继续使用。
 
 ## 同一仓库、设备独立配置
 
@@ -212,7 +212,7 @@ if result["status"] == "succeeded":
     print(machine.restart())
 ```
 
-`update` 仅允许 main 快进更新；本地源码改动先提交再更新。更新后检查两端 `git rev-parse HEAD` 一致，`nodes` 中设备重新在线。`restart` 在节点仍有任务时返回 409，空闲后重试。hybrid 的本机服务由启动终端托管，更新本机后退出该终端并重新运行启动脚本。
+`update` 仅允许 main 快进更新；本地源码改动先提交再更新。更新后检查两端 `git rev-parse HEAD` 一致，`nodes` 中设备重新在线。先重载独立 worker，再 `Client().restart(wait=True)` 重载本机中心；两边均保持原终端，无需手动关闭再启动。
 
 ## 每台设备唯一8 GiB共享内存盘
 

@@ -16,6 +16,9 @@ from .telemetry import Activity
 from .allocation import weighted_threads
 import socket
 import math
+import os
+from urllib.parse import urlsplit
+from . import __version__
 
 
 class Coordinator:
@@ -29,6 +32,8 @@ class Coordinator:
         self.condition = threading.Condition(threading.RLock())
         self.jobs, self.queue, self.threads = {}, [], set()
         self.stopping = self.paused = False
+        self.restart_available = False
+        self.callback_address = None
         for path in (self.root / "jobs").glob("*/result.json"):
             value = json.loads(path.read_text(encoding="utf-8"))
             if value["status"] not in TERMINAL:
@@ -48,11 +53,12 @@ class Coordinator:
         ratio = request.get('queue_ratio', 1.0)
         cpus = request.get('cpus', 1)
         requires = request.get('requires', [])
+        node_name=request.get('node')
         if (not isinstance(project, str) or isinstance(share, bool) or not isinstance(share, (int,float))
                 or not math.isfinite(share) or share <= 0 or isinstance(ratio, bool)
                 or not isinstance(ratio, (int,float)) or not math.isfinite(ratio) or ratio < 0
                 or type(cpus) is not int or cpus < 0 or not isinstance(requires,list)
-                or any(not isinstance(tag,str) for tag in requires)):
+                or any(not isinstance(tag,str) for tag in requires) or (node_name is not None and not isinstance(node_name,str))):
             raise ValueError('project, positive resource_share, nonnegative queue_ratio and cpus required')
         resources = self.project_resources()
         capacity = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled)
@@ -60,13 +66,16 @@ class Coordinator:
         demands = {name: row['demand'] for name,row in resources.items()}
         shares[project], demands[project] = share, capacity
         target = weighted_threads(capacity, shares, demands)[project]
-        capable = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled
-                      and set(requires).issubset(n.health.get('tags',())))
+        eligible=[n for n in self.pool.nodes if not n.error and n.enabled
+                  and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))]
+        capable=sum(n.capacity for n in eligible)
+        maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
         target = min(target, capable)
         ready = max(1, math.ceil(target / max(1, cpus))) if cpus else 1
+        ceiling=max(1,math.ceil(maximum/max(1,cpus))) if cpus else max(1,len(eligible))
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,
                     running_tasks=ready,queued_tasks=math.ceil(ready*ratio),
-                    in_flight=ready+math.ceil(ready*ratio))
+                    in_flight=ready+math.ceil(ready*ratio),max_in_flight=ceiling+math.ceil(ceiling*ratio))
 
     def restart_node(self, name):
         node = next((n for n in self.pool.nodes if n.name == name), None)
@@ -110,6 +119,9 @@ class Coordinator:
                         remaining -= item['cpus']
                 node['active_jobs'] = active.get(node['name'],[]) + external
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
+                    'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
+                    'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
+                    'capabilities':['resize']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -133,7 +145,7 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                demands[name] = demands.get(name, 0) + (largest if job.get('auto_cpus') else task.get('cpus', 1))
+                demands[name] = demands.get(name, 0) + job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
         quotas = weighted_threads(capacity, shares, demands)
@@ -254,7 +266,8 @@ class Coordinator:
                     files = {name: archive.read(name) for name in archive.namelist()}
                 files['task.json'] = json_bytes(task)
                 payload = pack(files)
-            node.client.submit_bundle(identity, payload)
+            callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
+            node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
             while True:
                 if job["cancel"].is_set():
                     node.client.cancel(identity)
@@ -292,10 +305,63 @@ class Coordinator:
     def _update(self, job, remote):
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ("assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
+        if job.get('task'):
+            assigned['cpus']=job['task']['cpus']
         job["result"].update(remote, **assigned, center_submitted=submitted)
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
             self._save(job)
+
+    def _callback(self, node):
+        if not self.callback_address:
+            return None
+        host,port=self.callback_address[:2]
+        endpoint=urlsplit(node.client.url)
+        local=endpoint.scheme=='local' or endpoint.hostname in ('localhost','127.0.0.1','::1')
+        if local:
+            host='127.0.0.1' if host in ('0.0.0.0','127.0.0.1','localhost') else host
+        elif host in ('127.0.0.1','localhost','::1'):
+            return None
+        elif host=='0.0.0.0':
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as route:
+                route.connect((endpoint.hostname,endpoint.port or 80))
+                host=route.getsockname()[0]
+        return dict(url=f'http://{host}:{port}',token=self.token)
+
+    def resize(self, identity, cpus):
+        if type(cpus) is not int or cpus<1:
+            raise ValueError('resize cpus must be a positive integer')
+        with self.condition,self.pool.condition:
+            job=self.jobs[identity];node=job.get('node')
+            if self.stopping or job['cancel'].is_set() or node is None or job['result']['status'] in TERMINAL:
+                raise Conflict('Only a running task can change its CPU grant')
+            old=job['task']['cpus']
+            job['desired_cpus']=cpus
+            if 'resize' not in node.health.get('capabilities',[]):
+                return dict(id=identity,node=node.name,cpus=old,requested_cpus=cpus,supported=False)
+            granted=cpus
+            if cpus>old:
+                resources=self.project_resources();group=job['task'].get('project') or 'default'
+                shares={name:r['resource_share'] for name,r in resources.items()}
+                demands={name:r['demand'] for name,r in resources.items()}
+                capacity=sum(n.capacity for n in self.pool.nodes if n.enabled and not n.error)
+                target=weighted_threads(capacity,shares,demands)[group]
+                room=target-resources[group]['used']+old
+                available=node.capacity-node.reserved-node.external+old
+                granted=max(old,min(cpus,room,available)) if node.enabled and not node.health.get('paused') else old
+            try:
+                result=node.client.resize(identity,granted)
+            except RemoteError as error:
+                if getattr(error,'status_code',None) is not None:
+                    raise
+                observed=node.client.status(identity)
+                result=dict(id=identity,cpus=observed['cpus'])
+            actual=result['cpus']
+            node.reserved+=actual-old
+            job['task']['cpus']=job['result']['cpus']=actual
+            self._save(job)
+            self.condition.notify_all()
+            return dict(result,node=node.name,requested_cpus=cpus)
 
     def _client(self, job):
         if job.get("node"):

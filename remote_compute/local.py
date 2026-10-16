@@ -1,6 +1,7 @@
 """Private in-process worker transport, owned only by its hybrid scheduler."""
 
 import zipfile
+import json
 from urllib.parse import unquote
 
 from .client import Client, RemoteError
@@ -13,7 +14,7 @@ class LocalClient(Client):
         super().__init__('local://' + worker.health()['node'])
         self.worker = worker
 
-    def request(self, path, data=None, *, method=None, binary=False, brief=False):
+    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         worker = self.worker
         method = method or ('POST' if data is not None else 'GET')
         parts = path.strip('/').split('/')
@@ -34,7 +35,8 @@ class LocalClient(Client):
                 identity = parts[1]
                 if len(parts) == 2:
                     if method == 'POST':
-                        result = worker.submit(identity, data)
+                        callback=json.loads((extra_headers or {}).get('X-Remote-Compute-Callback','{}'))
+                        result = worker.submit(identity, data,callback=callback)
                         worker.activity.submitted(result, worker.jobs[identity].get('task', {}), 'local')
                         return result
                     if method == 'DELETE':
@@ -43,6 +45,8 @@ class LocalClient(Client):
                     return progress(result) if brief else result
                 if parts[2:] == ['cancel']:
                     return worker.cancel(identity)
+                if parts[2:] == ['resize']:
+                    return worker.resize(identity,data['cpus'])
                 if parts[2:] == ['logs']:
                     return worker.logs(identity)
                 if parts[2:] == ['artifacts']:

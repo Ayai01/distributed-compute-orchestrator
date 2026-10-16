@@ -8,11 +8,11 @@
 
 每个工程设置 `resource_share`（默认 1.0），中心按活跃工程的相对权重分配整数线程，用最大余数补齐余量。当前 54 线程、三个工程同权且需求充足时为 18/18/18；两个工程权重 2:1 时为 36/18。不能整除时，例如 53 线程、三个工程同权，为 18/18/17。需求不足的份额供其他待运行任务使用。
 
-单线程 SPICE 任务声明 `cpus: 1`。可并行的整轮任务声明 `cpus: 0`，中心按工程份额和可用节点授予实际线程数，并把 `${cpus}` 传给程序。`cpus: 0` 由中心处理，直接 worker 任务需声明正整数。整轮任务在单个节点执行；晚加入的整轮任务会等待所需份额释放，中心预留对应节点的线程，其余可运行任务继续填补资源。在途任务保留原节点与线程数，后续派发随需求和权重变化。
+单线程 SPICE 任务声明 `cpus: 1`。可并行的整轮任务声明 `cpus: 0`，中心按工程份额和可用节点授予实际线程数，并把 `${cpus}` 传给程序。`cpus: 0` 由中心处理，直接 worker 任务需声明正整数。整轮任务在单个节点执行；晚加入的整轮任务会等待所需份额释放，中心预留对应节点的线程，其余可运行任务继续填补资源。任务保留原节点；支持协作借还的同步内核可在安全批次边界调整授予，其余在途计算保持原授予。
 
 自动线程任务按每台候选节点的实际容量计算所需线程；较大节点忙碌时，可在空闲的小节点取得相应授予，不为等待较大节点留下整台机器空闲。
 
-`queue_ratio`（默认 1.0）控制提前排队比例。调用 `Client.admission()` 获得提交窗口：
+`queue_ratio`（默认 1.0）控制提前排队比例。`Client.admission()` 返回当前窗口及 `max_in_flight` 安全上界；`Client.window()` 保存上界并每秒至多刷新一次当前份额：
 
 ```text
 运行槽位 = max(1, ceil(目标线程 / 单任务线程))
@@ -28,7 +28,7 @@
 {"resource_share": 1.0, "queue_ratio": 1.0}
 ```
 
-AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。RGCN 中心路径用滚动窗口补位，并按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
+AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。调用方按窗口上界创建线程池，按当前窗口限制 pending；长任务等待期间也定期补位，其他工程结束后可扩大在途窗口。窗口缩小时已接受任务继续完成。RGCN 按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
 
 Bench 默认每种子声明 1 CPU，由 admission 决定并发，不受工程 workers 限制。需要并行数值内核的种子可在 `remote_compute.task_cpus` 指定实际线程数，或设为 0 让中心自动授予；实际授予数传入执行端并随回执返回。取消批次会停止后续提交、取消并收齐已接受任务。
 
@@ -92,8 +92,8 @@ print(result["files"]["ngspice.log"].decode(errors="replace"))
 from remote_compute import Client, command
 
 center = Client()
-window = center.admission("my-project", resource_share=1.0, queue_ratio=1.0, cpus=1)
-print(window)
+window = center.window("my-project", resource_share=1.0, queue_ratio=1.0, cpus=1)
+print(window.maximum, window.current())
 task = command(["${tool:python}", "runner.py", "--workers", "${cpus}"],
                cpus=0, memory_mb=1024, project="my-project", resource_share=1.0,
                outputs=["measurements.json"])
@@ -102,6 +102,25 @@ print(result["status"], result["assigned_node"], result["cpus"])
 ```
 
 同一工程的任务保持相同 project 和 resource_share；多个调用者各自的有限窗口由调用者维护，中心统一控制执行资源。
+
+### 同步内核在批次边界借还线程
+
+worker 任务环境提供 `REMOTE_COMPUTE_URL`、`REMOTE_COMPUTE_JOB_ID`、`REMOTE_COMPUTE_TOKEN`、`REMOTE_COMPUTE_HOME`，支持时 `REMOTE_COMPUTE_RESIZE=1`。SDK 路径指向执行设备上的本工具，回调指向所属调度中心；独立 worker 任务回调自身。中心默认监听 LAN 的26133，hybrid 的本机 worker 仍为进程内私有调用。指定中心仅监听回环时，远端任务保持静态授予。
+
+```python
+import os
+from remote_compute import Client
+
+center = Client(os.environ['REMOTE_COMPUTE_URL'], os.environ['REMOTE_COMPUTE_TOKEN'])
+identity = os.environ['REMOTE_COMPUTE_JOB_ID']
+grant = center.resize(identity, desired_threads)
+try:
+    compute_batch(threads=grant['cpus'])
+finally:
+    center.resize(identity, 1)
+```
+
+`resize` 保留原任务ID、节点和输入摘要，返回 `id/cpus/requested_cpus/node`。增长受工程权重、节点预算和当前空闲线程约束；调用方始终使用实际 `cpus`。同步批次结束后才归还，异步 pending 期间维持固定授予。BLAS 内层保持1，避免与外层并行相乘。worker 与中心同步计账，取消、异常和完成均按最后授予释放；回执保留 `initial_cpus/peak_cpus/resize_count`。旧节点未声明 resize 能力时继续原授予。
 
 ## 任务文件与结果
 

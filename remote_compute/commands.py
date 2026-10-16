@@ -209,11 +209,31 @@ class Shell(cmd.Cmd):
                 return
         while True:
             try:
-                self.cmdloop()
+                if health and os.name != 'nt' and sys.stdin.isatty():
+                    self._poll_input(alive)
+                else:
+                    self.cmdloop()
                 return
             except KeyboardInterrupt:
                 print("\n已返回操作终端。")
                 self.intro = None
+
+    def _poll_input(self, alive):
+        """POSIX canonical input stays interruptible while a service reloads."""
+        import select
+        if self.intro:
+            print(self.intro)
+        while alive():
+            self.stdout.write(self.prompt)
+            self.stdout.flush()
+            while alive():
+                if select.select([sys.stdin],[],[],.2)[0]:
+                    line=sys.stdin.readline()
+                    break
+            else:
+                return
+            if self.postcmd(self.onecmd(self.precmd(line.rstrip('\r\n') if line else 'EOF')),line):
+                return
 
     def do_quit(self, _line):
         """退出终端，并结束本入口持有的任务。"""
@@ -485,9 +505,15 @@ class SchedulerShell(Shell):
         print(self.dispatch.sync(words(line)[0]))
 
     def do_restart(self, line):
-        """restart 节点：空闲时重新加载远程 worker 的源码和配置。"""
-        name = words(line)[0]
-        display(self.center.restart(name) if self.center else self._node(name).client.restart())
+        """restart [节点] [--wait]：重载中心或节点；--wait等待在途任务完成。"""
+        args=words(line)
+        wait='--wait' in args
+        args=[arg for arg in args if arg!='--wait']
+        if len(args)>1 or (not self.center and not args):
+            raise ValueError('restart [节点] [--wait]')
+        name=args[0] if args else None
+        client=self.center or self._node(name).client
+        self._start(client.restart,name if self.center else None,wait=wait)
 
     def do_wait(self, _line):
         """等待本终端已提交操作结束；Ctrl+C 返回提示符。"""

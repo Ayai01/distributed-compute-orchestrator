@@ -42,7 +42,8 @@ def load_nodes(path=None, url=None, local_client=None):
     return value
 
 
-def run_scheduler(args, local_client=None):
+def run_scheduler(args, local_client=None, restarting=None):
+    restarting = restarting or threading.Event()
     config = load_nodes(args.nodes, args.url, local_client)
     if local_client:
         if not args.nodes and not args.url and not (ROOT / "nodes.local.json").exists():
@@ -69,7 +70,19 @@ def run_scheduler(args, local_client=None):
             port = args.center_port if args.center_port is not None else (args.port if args.port is not None else 26133)
             if args.mode == "scheduler" and args.port is not None and args.center_port is None:
                 port = args.port
-            api = Server((args.host or "127.0.0.1", port), coordinator)
+            def restart_center(*, check=False):
+                if check:
+                    with coordinator.condition:
+                        if coordinator.stopping or any(j['result']['status'] not in TERMINAL for j in coordinator.jobs.values()):
+                            raise Conflict('Scheduler has active jobs; wait for them to finish before restarting')
+                        coordinator.stopping = True
+                        coordinator.condition.notify_all()
+                else:
+                    restarting.set()
+                    threading.Thread(target=api.shutdown, daemon=True).start()
+            coordinator.restart_available = args.service_child
+            api = Server((args.host or "0.0.0.0", port), coordinator,
+                         restart=restart_center if args.service_child else None)
             api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             api_thread.start()
             print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}", flush=True)
@@ -81,13 +94,15 @@ def run_scheduler(args, local_client=None):
                         time.sleep(0.5)
                 except KeyboardInterrupt:
                     return 0
+                return 75 if restarting.is_set() else 0
             shell = SchedulerShell(pool, dispatch)
             try:
                 shell.do_nodes("")
-                shell.loop(dispatch.health if dispatch else None, dispatch.url if dispatch else '')
+                shell.loop(dispatch.health if dispatch else None, dispatch.url if dispatch else '',
+                           api_thread.is_alive if api_thread else lambda: True)
             finally:
                 shell.close()
-            return 0
+            return 75 if restarting.is_set() else 0
         if args.action in {"run", "spice", "rtl"}:
             task, options = prepare(args.action, args)
             result = (dispatch or pool).run(task, **options)
@@ -109,7 +124,8 @@ def run_scheduler(args, local_client=None):
             print(value) if isinstance(value, str) else display(value)
             return 1 if isinstance(value, dict) and value.get("status") in {"failed", "cancelled", "timed_out", "interrupted"} else 0
         elif args.action == "restart":
-            display(dispatch.restart(args.node) if dispatch else next(n.client for n in pool.nodes if n.name == args.node).restart())
+            client = dispatch or next(n.client for n in pool.nodes if args.node is None or n.name == args.node)
+            display(client.restart(args.node if dispatch else None, wait=args.wait))
         elif args.action == 'control':
             changes = {key: getattr(args, key) for key in ('cpus', 'memory_mb', 'paused') if getattr(args, key) is not None}
             display(dispatch.control(node=args.node, worker=changes) if dispatch else next(n.client for n in pool.nodes if n.name == args.node).control(**changes))
@@ -152,7 +168,7 @@ def check_tools(config):
 
 
 def supervise(argv):
-    """Keep a headless worker launch alive across explicit remote reloads."""
+    """Keep the service terminal alive across requested code/config reloads."""
     while True:
         process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv])
         while True:
@@ -174,7 +190,7 @@ def supervise(argv):
             elif not arg.startswith(('--cpus=', '--memory-mb=')):
                 cleaned.append(arg)
         argv = cleaned
-        print("正在重新加载 worker 源码和配置。", flush=True)
+        print("正在重新加载服务源码和配置。", flush=True)
 
 
 def main(argv=None):
@@ -214,7 +230,8 @@ def main(argv=None):
     item.add_argument('--memory-mb', type=int)
     item.add_argument('--paused', choices=(True, False), type=lambda x: x == 'true')
     item = sub.add_parser("restart")
-    item.add_argument("--node", default=socket.gethostname())
+    item.add_argument("--node", help='省略时重载所连接的中心或worker')
+    item.add_argument('--wait', action='store_true', help='等待在途任务完成后重载')
     for kind in ("run", "spice", "rtl"):
         sub.add_parser(kind, parents=[submission_parser(kind)], add_help=False)
     for action in sorted(MACHINE_ACTIONS):
@@ -269,7 +286,7 @@ def main(argv=None):
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         if args.check:
             return check_tools(config)
-        if args.mode == "worker" and not args.service_child:
+        if not args.service_child and not args.url and args.action is None:
             return supervise(invocation)
         if config.get('console') and sys.stdin.isatty():
             args.headless = False
@@ -346,7 +363,7 @@ def main(argv=None):
             return 75 if restarting.is_set() else 0
         if worker:
             from .local import LocalClient
-        return run_scheduler(args, LocalClient(worker) if worker else None)
+        return run_scheduler(args, LocalClient(worker) if worker else None, restarting)
     except Cancelled as error:
         print(error)
         return 0

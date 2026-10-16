@@ -37,7 +37,7 @@ class Client:
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
 
-    def request(self, path, data=None, *, method=None, binary=False, brief=False):
+    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
@@ -46,6 +46,7 @@ class Client:
             headers["Authorization"] = "Bearer " + self.token
         if brief:
             headers['X-Remote-Compute-Brief'] = '1'
+        headers.update(extra_headers or {})
         if data is not None and not isinstance(data, bytes):
             data = json_bytes(data)
         method = method or ('POST' if data is not None else 'GET')
@@ -88,24 +89,46 @@ class Client:
     def control(self, **changes):
         return self.request("/control", changes)
 
-    def restart(self, node=None):
-        return self.request("/restart", {"node": node} if node else {})
+    def restart(self, node=None, *, wait=False, wait_timeout=None):
+        started = time.monotonic()
+        while True:
+            try:
+                return self.request("/restart", {"node": node} if node else {})
+            except RemoteError as error:
+                if not wait or getattr(error, 'status_code', None) != 409:
+                    raise
+                if wait_timeout is not None and time.monotonic()-started >= wait_timeout:
+                    raise RemoteError('Restart wait limit reached; current jobs continue') from None
+                time.sleep(.25)
 
     def submit(self, task, *, inputs=None, files=None, job_id=None):
         identity = job_id or uuid.uuid4().hex
         # A stable id can be queried or resubmitted to THIS node after a lost reply.
         return self.submit_bundle(identity, task_bundle(task, inputs, files))
 
-    def submit_bundle(self, identity, payload):
+    def submit_bundle(self, identity, payload, *, callback=None):
+        if callback:
+            return self.request('/jobs/'+identity,payload,
+                                extra_headers={'X-Remote-Compute-Callback':json.dumps(callback)})
         return self.request("/jobs/" + identity, payload)
+
+    def resize(self, identity, cpus):
+        """Change this running task's grant at an application-safe boundary."""
+        return self.request('/jobs/'+identity+'/resize',dict(cpus=cpus))
 
     def nodes(self):
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=()):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None):
         """Center-owned transport window; execution slots stay in the central queue."""
-        return self.request('/admission', dict(project=project,resource_share=resource_share,
-                                              queue_ratio=queue_ratio,cpus=cpus,requires=list(requires)))
+        request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,cpus=cpus,requires=list(requires))
+        if node:
+            request['node']=node
+        return self.request('/admission',request)
+
+    def window(self, project, **options):
+        from .admission import AdmissionWindow
+        return AdmissionWindow(self,project,**options)
 
     def machine(self, node, *, cwd="~"):
         """Operate on a named worker through this same center connection."""
