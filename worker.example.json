@@ -1,6 +1,6 @@
 {
   "host": "0.0.0.0",
-  "port": 8765,
+  "port": 26133,
   "cpus": 0,
   "memory_mb": 0,
   "memory_reserve_mb": 512,

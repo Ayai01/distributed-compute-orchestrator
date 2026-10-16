@@ -31,7 +31,7 @@ class _ConnectionOwner:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:8765", token="", *, timeout=10):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=10):
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
@@ -93,6 +93,11 @@ class Client:
 
     def nodes(self):
         return self.request("/nodes")
+
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=()):
+        """Center-owned transport window; execution slots stay in the central queue."""
+        return self.request('/admission', dict(project=project,resource_share=resource_share,
+                                              queue_ratio=queue_ratio,cpus=cpus,requires=list(requires)))
 
     def machine(self, node, *, cwd="~"):
         """Operate on a named worker through this same center connection."""
@@ -313,7 +318,7 @@ class Pool:
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
-    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, reservations=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
@@ -339,8 +344,10 @@ class Pool:
                             and n.capacity >= cpus and n.memory_capacity >= memory_mb and not n.error]
                 if not matching:
                     raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
+                needed = min(cpu_limit, max(n.capacity for n in matching)) if automatic and cpu_limit else cpus
                 ready = [n for n in matching if n.enabled and not n.health.get("paused")
-                         and n.capacity - n.reserved - n.external >= cpus
+                         and n.capacity - n.reserved - n.external -
+                             ((reservations or {}).get(n.name, 0) if not automatic else 0) >= needed
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0]
                 if ready:
@@ -366,6 +373,9 @@ class Pool:
                     node.reserved_memory_mb += memory_mb
                     return node
                 if not block:
+                    if automatic and reservations is not None:
+                        candidate = max(matching, key=lambda n: n.capacity-n.reserved-n.external)
+                        reservations[candidate.name] = max(reservations.get(candidate.name, 0), needed)
                     return None
                 self.condition.wait(0.2)
 

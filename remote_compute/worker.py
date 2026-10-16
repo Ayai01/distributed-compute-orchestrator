@@ -129,10 +129,15 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None):
         self.root = Path(root).expanduser().resolve()
-        self.capacity = cpu_budget(cpus)
-        self.cpu_limit = max(1, (os.cpu_count() or 1) - 1)
+        physical_limit = max(1, (os.cpu_count() or 1) - 1)
+        if cpu_limit is not None and (type(cpu_limit) is not int or not 1 <= cpu_limit <= physical_limit):
+            raise ValueError(f'cpu_limit must be in 1..{physical_limit}')
+        self.cpu_limit = physical_limit if cpu_limit is None else cpu_limit
+        self.capacity = cpu_budget(cpus) if cpus else self.cpu_limit
+        if self.capacity > self.cpu_limit:
+            raise ValueError(f'CPU budget exceeds configured cpu_limit={self.cpu_limit}')
         self.activity = Activity()
         self.save_settings = None
         self.token = token
@@ -175,6 +180,8 @@ class Worker:
             self.tool_info["verilator"].update(available=ready, engine=engine,
                                                engine_sha256=file_hash(engine) if ready else None)
         self.tags = sorted(set(self.tags) | {sys.platform} | {k for k, v in self.tool_info.items() if v["available"]})
+        if self.tool_info['verilator']['available']:
+            self.tags = sorted(set(self.tags) | {'rtl'})
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
         (self.root / "jobs").mkdir(exist_ok=True)
@@ -590,6 +597,8 @@ class Handler(BaseHTTPRequestHandler):
                 value = worker.health()
             elif parts == ["nodes"] and self.command == "GET" and hasattr(worker, "nodes"):
                 value = worker.nodes()
+            elif parts == ['admission'] and self.command == 'POST' and hasattr(worker, 'admission'):
+                value = worker.admission(json.loads(body))
             elif parts == ["control"] and self.command == "POST":
                 value = worker.control(json.loads(body))
                 worker.activity.notify('Control ' + body.decode('utf-8'), self.client_address[0])

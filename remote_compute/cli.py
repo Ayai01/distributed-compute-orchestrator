@@ -363,7 +363,7 @@ class SchedulerShell(Shell):
         self.do_nodes("")
 
     def do_add(self, line):
-        """add http://设备IP:8765：以设备实际名称加入节点。"""
+        """add http://设备IP:26133：以设备实际名称加入节点。"""
         url = words(line)[-1]
         name = Client(url, os.environ.get('REMOTE_COMPUTE_TOKEN', '')).health()['node']
         if self.center:
@@ -524,7 +524,7 @@ def load_nodes(path=None, url=None):
         token = os.environ.get('REMOTE_COMPUTE_TOKEN', '')
         return {"nodes": [{"name": Client(url, token).health()['node'], "url": url, "token": token}]}
     path = Path(path) if path else ROOT / "nodes.local.json"
-    value = read_json(path) if path.exists() else {"nodes": [{"name": socket.gethostname(), "url": "http://127.0.0.1:8765"}]}
+    value = read_json(path) if path.exists() else {"nodes": [{"name": socket.gethostname(), "url": "http://127.0.0.1:26134"}]}
     for node in value["nodes"]:
         node.setdefault("token", os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
         try:
@@ -558,7 +558,7 @@ def run_scheduler(args, local_url=None):
             from .ramdisk import scratch
             root = Path(args.root) / "scheduler" if args.root else scratch('Remote-Compute') / 'scheduler'
             coordinator = Coordinator(pool, root, token=args.local_token)
-            port = args.center_port if args.center_port is not None else (0 if args.port == 0 else 8766)
+            port = args.center_port if args.center_port is not None else (0 if args.port == 0 else 26133)
             if args.mode == "scheduler" and args.port is not None and args.center_port is None:
                 port = args.port
             api = Server((args.host or "127.0.0.1", port), coordinator)
@@ -679,7 +679,7 @@ def main(argv=None):
     parser.add_argument("--policy", choices=sorted(Pool.POLICIES))
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
-    parser.add_argument("--center-port", type=int, help="调度中心HTTP端口，默认8766")
+    parser.add_argument("--center-port", type=int, help="调度中心HTTP端口，默认26133")
     parser.add_argument("--cpus", type=lambda v: 0 if v == "auto" else int(v), help="本机算力预算")
     parser.add_argument("--memory-mb", type=int, dest="worker_memory_mb", help="本机提供者的任务内存总预算，MiB")
     parser.add_argument("--root", help="节点任务/资产目录；默认使用现有内存盘或系统临时目录")
@@ -773,7 +773,7 @@ def main(argv=None):
         existing_worker = None
         if not args.url:
             if args.mode != 'worker':
-                center_port = args.center_port if args.center_port is not None else (0 if args.port == 0 else 8766)
+                center_port = args.center_port if args.center_port is not None else (0 if args.port == 0 else 26133)
                 if args.mode == 'scheduler' and args.port is not None and args.center_port is None:
                     center_port = args.port
                 existing = resolve(args.host or '127.0.0.1', center_port, policy=args.on_port_conflict,
@@ -782,14 +782,14 @@ def main(argv=None):
                     args.mode, args.url = 'scheduler', existing
             if args.mode != 'scheduler':
                 existing_worker = resolve(args.host or config.get('host', '127.0.0.1'),
-                                          args.port if args.port is not None else config.get('port', 8765),
+                                          args.port if args.port is not None else config.get('port', 26134 if args.mode == 'hybrid' else 26133),
                                           policy=args.on_port_conflict, token=args.local_token,
                                           reuse_role='worker' if args.mode == 'hybrid' else None)
         if args.mode != "scheduler" and not existing_worker:
-            port = args.port if args.port is not None else config.get("port", 8765)
+            port = args.port if args.port is not None else config.get("port", 26134 if args.mode == "hybrid" else 26133)
             from .ramdisk import scratch
             root = args.root or config.get("root") or scratch('Remote-Compute') / str(port)
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit") if key in config}
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
@@ -841,7 +841,7 @@ def main(argv=None):
     except (ValueError, OSError, RuntimeError, StopIteration) as error:
         print("操作失败:", error, file=sys.stderr)
         if args.url and ('10061' in str(error) or 'Connection refused' in str(error)):
-            print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py。', file=sys.stderr)
+            print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py；统一连接地址 http://127.0.0.1:26133。', file=sys.stderr)
         return 2
     finally:
         if server:

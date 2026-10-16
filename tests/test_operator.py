@@ -13,6 +13,13 @@ from test_compute import provider, python, scratch, until
 
 
 class OperatorTests(unittest.TestCase):
+    def test_device_config_can_lower_hard_cpu_ceiling(self):
+        with scratch() as directory, patch('remote_compute.worker.os.cpu_count',return_value=28):
+            with provider(Path(directory)/'worker',cpus=0,cpu_limit=24) as (worker,client):
+                self.assertEqual(client.health()['cpus'],24)
+                self.assertEqual(client.health()['cpu_limit'],24)
+                with self.assertRaisesRegex(RemoteError,'1..24'):
+                    client.control(cpus=25)
     def test_running_job_progress_and_stop_do_not_need_a_compute_slot(self):
         with scratch() as directory, provider(Path(directory) / 'worker', cpus=1) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(directory) / 'center') as (_, client):

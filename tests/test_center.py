@@ -32,6 +32,35 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_center_sizes_prefetch_window_from_share_and_ratio(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=7) as (_,node):
+            with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
+                client.control(paused=True)
+                for _ in range(7):client.submit(python('pass',project='A',resource_share=2))
+                window=client.admission('B',resource_share=1,queue_ratio=1)
+                self.assertEqual((window['target_cpus'],window['running_tasks'],window['queued_tasks'],window['in_flight']),(2,2,2,4))
+                self.assertEqual(client.admission('B',resource_share=1,queue_ratio=0)['in_flight'],2)
+                self.assertEqual(client.admission('B',resource_share=1,queue_ratio=.5)['in_flight'],3)
+                for job in client.status():client.cancel(job['id']);client.delete(job['id'])
+    def test_late_parallel_project_waits_for_its_share_instead_of_receiving_one_thread(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, node):
+            with Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
+                task=python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",project='A')
+                jobs=[client.submit(task)['id'] for _ in range(4)]
+                until(lambda: all(client.status(job)['status']=='running' for job in jobs))
+                parallel=client.submit(python('import time; time.sleep(.4)',cpus=0,project='B'))['id']
+                client.write_job_file(jobs[0],'release','go')
+                client.wait(jobs[0]);client.fetch(jobs[0])
+                time.sleep(.1)
+                self.assertEqual(client.status(parallel)['status'],'queued')
+                client.write_job_file(jobs[1],'release','go')
+                client.wait(jobs[1]);client.fetch(jobs[1])
+                until(lambda: client.status(parallel)['status'] in ('running','succeeded'))
+                self.assertEqual(client.status(parallel)['cpus'],2)
+                for job in jobs[2:]:
+                    client.write_job_file(job,'release','go');client.wait(job);client.fetch(job)
+                client.wait(parallel);client.fetch(parallel)
+
     def test_weighted_integer_allocation_and_unused_share_lending(self):
         from remote_compute.allocation import weighted_threads
         self.assertEqual(weighted_threads(58, dict(A=1,B=1,C=1), dict(A=100,B=100,C=100)),dict(A=20,B=19,C=19))

@@ -5,6 +5,8 @@ import sys
 import threading
 import time
 import unicodedata
+import os
+import subprocess
 
 
 def _width(text):
@@ -75,6 +77,48 @@ def _gb(value):
     return f'{(value or 0) / 1024:.1f}'
 
 
+def _focus_probe():
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetConsoleWindow.restype = wintypes.HWND
+    user.GetForegroundWindow.restype = wintypes.HWND
+    user.IsWindowVisible.argtypes = [wintypes.HWND]
+    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    console = kernel.GetConsoleWindow()
+    if not console:
+        return lambda: True
+    if user.IsWindowVisible(console):
+        return lambda: user.GetForegroundWindow() == console
+    # ConPTY consoles are hidden; match the foreground editor/terminal host.
+    # Resolve its process ancestors once, never on the refresh path.
+    script = (f'$nextId={os.getpid()}; $seen=@{{}}; while ($nextId -gt 0 -and !$seen.ContainsKey($nextId)) {{ '
+              '$seen[$nextId]=$true; $p=Get-CimInstance Win32_Process -Filter ("ProcessId="+$nextId); '
+              'if (!$p -or $p.Name -eq "explorer.exe") { break }; $nextId; $nextId=$p.ParentProcessId }')
+    result = subprocess.run(['powershell','-NoProfile','-Command',script], capture_output=True, text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    hosts = {int(line) for line in result.stdout.splitlines() if line.strip().isdigit()}
+    def focused():
+        process = wintypes.DWORD()
+        user.GetWindowThreadProcessId(user.GetForegroundWindow(), ctypes.byref(process))
+        return process.value in hosts
+    return focused
+
+
+class FocusRefresh:
+    def __init__(self):
+        self.last = None
+        self.focused = False
+
+    def due(self, now, focused, *, force=False):
+        refresh = force or self.last is None or (focused and not self.focused) or now-self.last >= (1 if focused else 30)
+        self.focused = focused
+        if refresh:
+            self.last = now
+        return refresh
+
+
 def format_status(value, url=''):
     center = value.get('role') == 'scheduler'
     rows = [f"Remote Compute | {value.get('node', '')} | {'调度中心' if center else '算力提供者'} | {url}"]
@@ -129,6 +173,7 @@ class Dashboard:
         restore = _enable_ansi()
         if restore is None:
             return False
+        focus, refresh = _focus_probe(), FocusRefresh()
         line, cursor, history, selected = '', 0, [], 0
         last, offset, last_frame = 0, 0, ''
         rows, events = [], []
@@ -141,7 +186,7 @@ class Dashboard:
                     if not self.alive():
                         break
                     now = time.monotonic()
-                    if now - last >= 1:
+                    if refresh.due(now, focus(), force=last == 0):
                         try:
                             value = self.health()
                             rows = format_status(value, self.url)

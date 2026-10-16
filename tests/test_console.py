@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.cli import Shell
-from remote_compute.console import Dashboard, _enable_ansi, _input_view, _layout, _width
+from remote_compute.console import Dashboard, FocusRefresh, _enable_ansi, _input_view, _layout, _width
 
 
 class Keyboard:
@@ -53,6 +53,18 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_focus_refresh_uses_one_or_thirty_seconds_and_updates_on_return(self):
+        refresh=FocusRefresh()
+        self.assertTrue(refresh.due(0,True))
+        self.assertFalse(refresh.due(.9,True))
+        self.assertTrue(refresh.due(1,True))
+        self.assertFalse(refresh.due(2,False))
+        self.assertFalse(refresh.due(30,False))
+        self.assertTrue(refresh.due(31,False))
+        self.assertTrue(refresh.due(31.1,True))
+        self.assertFalse(refresh.due(31.9,True))
+        self.assertTrue(refresh.due(32.1,True))
+        self.assertTrue(refresh.due(32.2,False,force=True))
     def test_interrupt_help_and_parser_errors_keep_the_console_usable(self):
         keys = [*'discard', KeyboardInterrupt, *'ping\rhelp ping\rbad\rinterrupt\rping\rquit\r']
         keyboard, restore = Keyboard(keys), Mock()

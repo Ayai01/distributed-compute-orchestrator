@@ -10,12 +10,12 @@
 
 ## 实时终端与运行中控制
 
-Windows交互终端每秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签、访问IP和CPU温度。温度读取已有LibreHardwareMonitor/OpenHardwareMonitor传感器，没有传感器时显示“未提供”。最近6条指令/文件操作滚动显示；命令输入同时保持可用。`--headless` 保留无界面服务；设备配置 `console: true` 可在原headless启动终端打开看板。
+Windows交互终端在窗口获得焦点时每秒刷新、失焦时每30秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签、访问IP和CPU温度。温度读取已有LibreHardwareMonitor/OpenHardwareMonitor传感器，没有传感器时显示“未提供”。最近6条指令/文件操作滚动显示；命令输入同时保持可用。`--headless` 保留无界面服务；设备配置 `console: true` 可在原headless启动终端打开看板。
 
 `cpus N`（worker）或 `cpus Aya1-TX N`（中心）在线调整并持久保存，现有任务自然完成。也可一次性运行：
 
 ```text
-python main.py --url http://127.0.0.1:8766 control --node Aya1-TX --cpus 31
+python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 31
 ```
 
 任务运行时的进度和停止文件使用 `Client.read_job_file(id, path)` / `write_job_file(id, path, data)`，相对任务输入目录。它们直接由中心转发，不占计算线程，满载时仍可操作。
@@ -24,7 +24,7 @@ python main.py --url http://127.0.0.1:8766 control --node Aya1-TX --cpus 31
 
 所有工程使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1`。创建前持有同一个系统锁并重新检测；已存在小盘原地扩容，已有盘扩容失败时保留它并报告原因，不另建第二块。调用 `python main.py ramdisk` 可创建或检查。Windows需安装一次ImDisk驱动，首次安装/扩容使用管理员权限；驱动包存放在 `.tools/imdisk/` 后运行 `python main.py ramdisk --install`。安装时登记系统启动任务 `RemoteCompute Shared RAM`，重启后重新创建唯一共享盘；日常工程启动直接复用，每个工程使用自己的子目录。当前实现是固定8GiB内存盘。
 
-AOP、RGCN、ARH-DSE、Analog-Opt-Bench默认优先本机8766中心；中心未启动时沿用独立预算 `min(C,16)+floor(max(C-16,0)/2)`。worker子任务设置 `REMOTE_COMPUTE_WORKER=1` 防止递归提交。AOP网页只保留“本地调度器”和“本地工程”两个模式。
+AOP、RGCN、ARH-DSE、Analog-Opt-Bench默认优先本机26133中心；中心未启动时沿用独立预算 `min(C,16)+floor(max(C-16,0)/2)`。worker子任务设置 `REMOTE_COMPUTE_WORKER=1` 防止递归提交。AOP网页只保留“本地调度器”和“本地工程”两个模式。
 
 ## 启动
 
@@ -32,7 +32,7 @@ AOP、RGCN、ARH-DSE、Analog-Opt-Bench默认优先本机8766中心；中心未�
 
 Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执行 `./start.sh`（也可 `sh start.sh`）。两个脚本都会切换到工程目录并调用同一个 `main.py`，读取设备配置：Aya1-PC 启动 hybrid，Aya1-TX 启动 worker。参数原样传递，例如 `start.cmd --mode worker --host 0.0.0.0`。Windows 优先使用工程内的 `.tools/python`，随后尝试 `py -3`、`python`。
 
-启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:8766` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
+启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:26133` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
 
 端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心，hybrid 也能复用已有本机 worker）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
 
@@ -49,15 +49,15 @@ python main.py --mode worker --host 0.0.0.0 --cpus 8 --memory-mb 8192
 | `scheduler` | 调度其他设备，本机仅负责分配和回收 |
 | `worker` | 提供算力，启动本节点的操作终端 |
 
-调度中心默认端口 `8766`，算力提供者默认端口 `8765`，默认监听 `127.0.0.1`。`--center-port` 设置中心端口，worker 的 `--port` 设置提供者端口；纯 scheduler 的 `--port` 也可设置中心端口。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 启动持续运行的后台服务。
+调度中心默认端口 `26133`，独立算力提供者默认端口 `26133`；hybrid 的本机 worker 仅在回环内部使用 `26134`，默认监听 `127.0.0.1`。`--center-port` 设置中心端口，worker 的 `--port` 设置提供者端口；纯 scheduler 的 `--port` 也可设置中心端口。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 启动持续运行的后台服务。
 
-调用工程连接中心的 `8766`，多个工程共享中心队列、资源预算和分配策略。中心将任务转交给配置的 worker，回收结果后同时清理两侧的任务文件；模型和源码资产按内容同步并复用。
+调用工程连接中心的 `26133`，多个工程共享中心队列、资源预算和分配策略。中心将任务转交给配置的 worker，回收结果后同时清理两侧的任务文件；模型和源码资产按内容同步并复用。
 
 中心模式下，各工程的 workers/并发上限不再参与准入，由中心统一分配。单线程SPICE任务声明1线程；可并行的整轮任务声明 `cpus: 0`，中心在派发时授予目标节点当前空闲线程，并通过 `${cpus}` 传给任务。HTTP使用持久连接，避免高并发状态轮询耗尽Windows临时端口；提供者和中心均支持128个等待连接。
 
 各工程配置 `resource_share`（默认1.0）表达相对资源分配度：AOP、ARH-DSE、Bench放在运行配置顶层，RGCN放在 `resources.resource_share`。中心按活跃工程的权重占比分配线程，使用最大余数补齐整数余量，例如58线程、三工程同权为20/19/19，2:1为39/19。需求不足的份额借给其他待运行工程；CPU/内存/工具与设备限制仍按实际节点执行。在途任务自然结束，后续派发随活跃工程和权重调整。看板显示各工程分配度、当前目标、已分配线程与排队数。
 
-默认 CPU 预算为 `max(1, CPU_COUNT-1)`，也是本设备线程上限。Aya1-PC 默认27，Aya1-TX 默认31；`--cpus N` 可在上限内设置。每个任务声明自己的总 CPU 占用，节点将任务并发与数值内核线程共同计账。调低预算后，在途任务正常结束，后续任务按新预算启动。
+默认 CPU 预算为 `max(1, CPU_COUNT-1)`，也是本设备线程上限。当前设备配置：Aya1-PC 默认24且 cpu_limit=24，Aya1-TX 默认30（硬件上限31）；`--cpus N` 可在上限内设置。每个任务声明自己的总 CPU 占用，节点将任务并发与数值内核线程共同计账。调低预算后，在途任务正常结束，后续任务按新预算启动。
 
 `--memory-mb N` 设置提供者的任务内存总预算，单位 MiB；0/未设置使用物理内存减去预留量，`memory_reserve_mb` 默认512。任务的 `memory_mb` 默认256。中心同时参考任务预留、实际进程树 RSS 和系统可用内存，CPU与内存都够才派发；同一设备的多个 worker 共享同一份物理内存统计。`nodes` 展示主机 CPU 使用率、内存容量、占用和可用量，结果记录峰值 RSS 与 CPU 秒数。
 
@@ -71,7 +71,7 @@ worker 可以独立运行，只需 Python 和本工具源码。示例配置不�
 
 ```text
 nodes
-add http://192.168.1.10:8765
+add http://192.168.1.10:26133
 set Aya1-TX weight=2 limit=8 memory_limit_mb=4096 enabled=true
 policy adaptive
 spice examples/spice/divider.spice --output results/divider
@@ -102,7 +102,7 @@ quit
 ```text
 python main.py --mode worker --config worker.example.json --host 0.0.0.0 --headless --cpus 8 --memory-mb 8192
 
-add http://192.168.1.10:8765
+add http://192.168.1.10:26133
 save
 ```
 
@@ -128,11 +128,11 @@ get --node Aya1-TX D:/Projects/MyProject/results ./results/Aya1-TX
 一次性命令加 `--url` 会自动进入客户端模式：
 
 ```text
-python main.py --url http://127.0.0.1:8766 exec --node Aya1-TX --cwd D:/Projects/MyProject -- git status --short
-python main.py --url http://127.0.0.1:8766 python --node Aya1-TX --cwd D:/Projects/MyProject --timeout 7200 --detach ./long-operation.py
-python main.py --url http://127.0.0.1:8766 jobs
-python main.py --url http://127.0.0.1:8766 logs 任务ID
-python main.py --url http://127.0.0.1:8766 fetch 任务ID --output results/operation
+python main.py --url http://127.0.0.1:26133 exec --node Aya1-TX --cwd D:/Projects/MyProject -- git status --short
+python main.py --url http://127.0.0.1:26133 python --node Aya1-TX --cwd D:/Projects/MyProject --timeout 7200 --detach ./long-operation.py
+python main.py --url http://127.0.0.1:26133 jobs
+python main.py --url http://127.0.0.1:26133 logs 任务ID
+python main.py --url http://127.0.0.1:26133 fetch 任务ID --output results/operation
 ```
 
 远程命令与计算任务共用 CPU／内存预算、排队、优先级、超时和进程树取消。`--stdin 本地文件` 传入标准输入，`--env NAME=VALUE` 设置环境，`--output 目录` 保存完整日志。结果和实时日志包含末尾16KiB；完整日志随结果回收。长任务加 `--detach` 立即返回 ID，退出连接后可用相同中心地址和 ID 查询、取消或回收。
@@ -142,7 +142,7 @@ Codex 或其他 Python 调用者只需这一个接口：
 ```python
 from remote_compute import Client
 
-center = Client("http://127.0.0.1:8766")
+center = Client("http://127.0.0.1:26133")
 machine = center.machine("Aya1-TX", cwd="D:/Projects/MyProject")
 
 print(machine.listdir())
@@ -183,8 +183,8 @@ machine.download("./results", "./results/Aya1-TX")
 ```text
 python main.py --mode hybrid --cpus 2 batch examples/batch.json results/demo
 python main.py --mode scheduler --nodes nodes.local.json run examples/spice/task.json --input examples/spice --output results/divider
-python main.py --mode scheduler --url http://192.168.1.10:8766 jobs
-python main.py --mode scheduler --url http://192.168.1.10:8766 fetch 任务ID --output results/recovered
+python main.py --mode scheduler --url http://192.168.1.10:26133 jobs
+python main.py --mode scheduler --url http://192.168.1.10:26133 fetch 任务ID --output results/recovered
 python main.py --check
 python main.py --test
 python main.py --test-native
@@ -196,8 +196,8 @@ python main.py --test-native
 from remote_compute import Client, Pool, command, ngspice
 
 with Pool([
-    {"name": "Aya1-PC", "url": "http://127.0.0.1:8765"},
-    {"name": "Aya1-TX", "url": "http://192.168.1.10:8765", "weight": 2},
+    {"name": "Aya1-PC", "url": "http://127.0.0.1:26133"},
+    {"name": "Aya1-TX", "url": "http://192.168.1.10:26133", "weight": 2},
 ]) as pool:
     result = pool.run(
         ngspice("divider.spice"),
@@ -207,7 +207,7 @@ with Pool([
     print(result["status"], result["assigned_node"])
 
 # 不指定 output_dir 时，文件以 bytes 返回在 result["files"] 中。
-client = Client("http://127.0.0.1:8766")
+client = Client("http://127.0.0.1:26133")
 task = command(["${tool:python}", "runner.py", "--workers", "${cpus}"],
                cpus=4, memory_mb=1024, timeout=1800, outputs=["measurements.json"],
                label="candidate-batch", priority=5)
@@ -292,3 +292,7 @@ AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB�
 本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050，`--test-native` 覆盖核心回归。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。机器操作回归覆盖真实工程文件更新后执行、固定节点、原 ID 重连、标准输入、中文/二进制传输和子进程取消。独立 worker 缺少旧工程目录、Windows 执行别名不可读、远程更新后重启均已验证。通过运行中的中心读写并更新分压电路后，ngspice 输出从1.2V变为2.2V，下载文件逐字节一致；测试工程与任务临时文件已清理。真实工程对照数据保存在本机 `results/`。
 
 工具参数参考：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。
+
+提前排队由中心 `/admission` 返回窗口：`运行槽位 + ceil(运行槽位 × queue_ratio)`。`queue_ratio` 默认1.0，0关闭提前排队，1准备下一轮已就绪任务。配置位置与resource_share相同。AOP按角点、RGCN按候选/PVT、Bench按种子提前提交；RGCN中心路径用滚动窗口补位且按输入顺序返回结果。ARH-DSE按独立整轮进入中心，轮内已有原生请求队列持续补位，不跨搜索代际预生成候选或并发覆盖同一报告。独立本地执行保留原有批次策略。
+
+调度设计参考：[Dask中央排队与饱和度](https://distributed.dask.org/en/latest/scheduling-state.html)、[Ray待处理任务背压](https://docs.ray.io/en/latest/ray-core/patterns/limit-pending-tasks.html)、[Slurm资源预留与回填](https://slurm.schedmd.com/sched_config.html)。中心保持一份全局资源账本，使用有限预取、加权整数份额和回填；不引入这些框架的运行依赖。

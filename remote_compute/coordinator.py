@@ -15,6 +15,7 @@ from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .telemetry import Activity
 from .allocation import weighted_threads
 import socket
+import math
 
 
 class Coordinator:
@@ -40,6 +41,32 @@ class Coordinator:
 
     def nodes(self):
         return self.pool.snapshot()
+
+    def admission(self, request):
+        project = request.get('project') or 'default'
+        share = request.get('resource_share', 1.0)
+        ratio = request.get('queue_ratio', 1.0)
+        cpus = request.get('cpus', 1)
+        requires = request.get('requires', [])
+        if (not isinstance(project, str) or isinstance(share, bool) or not isinstance(share, (int,float))
+                or not math.isfinite(share) or share <= 0 or isinstance(ratio, bool)
+                or not isinstance(ratio, (int,float)) or not math.isfinite(ratio) or ratio < 0
+                or type(cpus) is not int or cpus < 0 or not isinstance(requires,list)
+                or any(not isinstance(tag,str) for tag in requires)):
+            raise ValueError('project, positive resource_share, nonnegative queue_ratio and cpus required')
+        resources = self.project_resources()
+        capacity = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled)
+        shares = {name: row['resource_share'] for name,row in resources.items()}
+        demands = {name: row['demand'] for name,row in resources.items()}
+        shares[project], demands[project] = share, capacity
+        target = weighted_threads(capacity, shares, demands)[project]
+        capable = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled
+                      and set(requires).issubset(n.health.get('tags',())))
+        target = min(target, capable)
+        ready = max(1, math.ceil(target / max(1, cpus))) if cpus else 1
+        return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,
+                    running_tasks=ready,queued_tasks=math.ceil(ready*ratio),
+                    in_flight=ready+math.ceil(ready*ratio))
 
     def restart_node(self, name):
         node = next((n for n in self.pool.nodes if n.name == name), None)
@@ -88,11 +115,11 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                demands[name] = demands.get(name, 0) + (task.get('cpus', 1) or largest)
+                demands[name] = demands.get(name, 0) + (largest if job.get('auto_cpus') else task.get('cpus', 1))
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
         quotas = weighted_threads(capacity, shares, demands)
-        return {name: dict(resource_share=shares[name], target=quotas[name], used=used[name], queued=queued[name]) for name in shares}
+        return {name: dict(resource_share=shares[name], target=quotas[name], demand=demands[name], used=used[name], queued=queued[name]) for name in shares}
 
     def control(self, changes):
         if isinstance(changes, dict) and "node" in changes:
@@ -138,7 +165,7 @@ class Coordinator:
             directory = self.root / "jobs" / identity
             directory.mkdir()
             (directory / "request.zip").write_bytes(payload)
-            job = {"directory": directory, "task": task, "cancel": threading.Event(), "node": None,
+            job = {"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
                    "result": {"id": identity, "status": "queued", "label": task["label"], "cpus": task["cpus"],
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
@@ -155,6 +182,7 @@ class Coordinator:
             while not self.stopping:
                 if not self.paused:
                     budgets = self.project_resources()
+                    reservations = {}
                     ordered = sorted(self.queue, key=lambda key: (-self.jobs[key]['task']['priority'],
                                      self.jobs[key]['task']['cpus'] != 0))
                     # First honor weighted targets, then lend otherwise idle slots.
@@ -167,8 +195,11 @@ class Coordinator:
                         room = budget['target'] - budget['used']
                         if not borrowing and (room <= 0 or (job['task']['cpus'] or 1) > room):
                             continue
+                        if borrowing and job['auto_cpus'] and room <= 0 and reservations:
+                            continue
                         try:
-                            node = self.pool._acquire(job["task"], block=False, cpu_limit=None if borrowing else room)
+                            node = self.pool._acquire(job["task"], block=False,
+                                cpu_limit=room if room > 0 else None, reservations=reservations)
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -207,7 +238,7 @@ class Coordinator:
                 if remote["status"] in TERMINAL:
                     result = remote
                     break
-                job["cancel"].wait(0.05 if time.time() - job["result"]["dispatched"] < 2 else 0.2)
+                job["cancel"].wait(0.15 if time.time() - job["result"]["dispatched"] < 2 else 0.2)
         except Exception as error:
             with self.condition:
                 job["result"].update(status="interrupted", error=str(error), finished=time.time())

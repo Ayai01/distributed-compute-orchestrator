@@ -55,7 +55,7 @@ class StartupTests(unittest.TestCase):
         with patch.object(startup, 'available', side_effect=[False, True]), \
                 patch.object(startup, 'owners', return_value=[{'pid': 12345}]), \
                 patch.object(startup, 'terminate') as kill:
-            self.assertIsNone(startup.resolve('127.0.0.1', 8766, policy='admin-kill'))
+            self.assertIsNone(startup.resolve('127.0.0.1', 26133, policy='admin-kill'))
             kill.assert_called_once_with([12345], admin=True)
 
     def test_noninteractive_conflict_has_actionable_message(self):
@@ -63,7 +63,7 @@ class StartupTests(unittest.TestCase):
                 patch.object(startup, 'owners', return_value=[]), \
                 patch.object(startup.sys.stdin, 'isatty', return_value=False):
             with self.assertRaisesRegex(RuntimeError, '--on-port-conflict'):
-                startup.resolve('127.0.0.1', 8766)
+                startup.resolve('127.0.0.1', 26133)
 
     def test_unstarted_center_points_to_launch_scripts(self):
         with socket.socket() as probe:
