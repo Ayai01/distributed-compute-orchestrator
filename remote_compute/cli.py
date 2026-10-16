@@ -88,6 +88,58 @@ def prepare(kind, args):
     return task, {"inputs": inputs, "output_dir": output, "keep": args.keep}
 
 
+MACHINE_ACTIONS = {"exec", "python", "ls", "read", "put", "get"}
+
+
+def machine_parser(action):
+    parser = argparse.ArgumentParser(prog=action)
+    parser.add_argument("--node", required=True, help="操作的目标节点")
+    parser.add_argument("--cwd", default="~", help="目标机工程目录，默认目标用户目录")
+    if action in {"exec", "python"}:
+        parser.add_argument("--cpus", type=int, default=1, dest="task_cpus")
+        parser.add_argument("--memory-mb", type=int, default=256)
+        parser.add_argument("--timeout", type=float, default=3600)
+        parser.add_argument("--priority", type=int, default=0)
+        parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
+        parser.add_argument("--stdin", help="将本地文件发送为标准输入")
+        parser.add_argument("--output", help="保存完整日志和结果")
+        parser.add_argument("--detach", action="store_true", help="返回任务ID，任务在现有服务中继续运行")
+        parser.add_argument("--keep", action="store_true")
+        if action == "python":
+            parser.add_argument("--tool", default="python", help="目标机的 Python 工具别名")
+            parser.add_argument("source", help="发送并执行的本地 Python 脚本")
+        parser.add_argument("argv", nargs=argparse.REMAINDER, help="-- 后为命令参数；python 模式下为脚本参数")
+    else:
+        parser.add_argument("source", help="ls/read/get 为目标机路径；put 为本地路径")
+        if action in {"put", "get"}:
+            parser.add_argument("destination")
+            parser.add_argument("--pattern", action="append", help="目录传输的文件模式，可重复设置")
+        if action == "read":
+            parser.add_argument("--encoding", default="utf-8-sig")
+    return parser
+
+
+def machine_action(client, args, *, on_submit=None):
+    machine = client.machine(args.node, cwd=args.cwd)
+    if args.action in {"exec", "python"}:
+        options = {"cpus": args.task_cpus, "memory_mb": args.memory_mb, "timeout": args.timeout,
+                   "priority": args.priority, "env": dict(item.split("=", 1) for item in args.env),
+                   "stdin": Path(args.stdin) if args.stdin else None, "wait": not args.detach,
+                   "output_dir": args.output, "keep": args.keep, "on_submit": on_submit}
+        argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        if args.action == "python":
+            return machine.python(script=args.source, args=argv, tool=args.tool, **options)
+        if not argv:
+            raise ValueError("exec --node 节点 [选项] -- 程序 参数...")
+        return machine.execute(argv, **options)
+    if args.action == "ls":
+        return machine.listdir(args.source)
+    if args.action == "read":
+        return machine.read_text(args.source, encoding=args.encoding)
+    operation = machine.upload if args.action == "put" else machine.download
+    return operation(args.source, args.destination, patterns=args.pattern or ("**/*",))
+
+
 def batch(pool, source, output, *, on_submit=None, stop_event=None):
     source = Path(source).resolve()
     entries = read_json(source)
@@ -161,7 +213,7 @@ class SchedulerShell(Shell):
     def _node(self, name):
         return next(n for n in self.pool.nodes if n.name == name)
 
-    def _start(self, function, *args, **kwargs):
+    def _start(self, function, *args, show_logs=False, **kwargs):
         future = self.executor.submit(function, *args, **kwargs)
         self.futures.append(future)
         number = len(self.futures)
@@ -172,6 +224,10 @@ class SchedulerShell(Shell):
                 results = result if isinstance(result, list) else [result]
                 for item in results:
                     print(f"\n#{number} {item['status']}  {item.get('assigned_node', '')}  {item['id']}  {item.get('output_dir', '')}")
+                    if show_logs:
+                        for stream in ("stdout", "stderr"):
+                            if item.get(stream):
+                                print(stream + ":\n" + item[stream])
             except Exception as error:
                 print(f"\n#{number} 操作失败: {error}")
         future.add_done_callback(finished)
@@ -224,6 +280,43 @@ class SchedulerShell(Shell):
     def do_rtl(self, line):
         """rtl 目录 --top tb --sources tb.sv [--cpus N] [--output 目录]"""
         self._submit("rtl", line)
+
+    def _machine(self, action, line):
+        args = machine_parser(action).parse_args(words(line))
+        args.action = action
+        client = self.center or self._node(args.node).client
+        if action in {"exec", "python"}:
+            if args.detach:
+                display(machine_action(client, args))
+            else:
+                self._start(machine_action, client, args, on_submit=self._accepted, show_logs=True)
+        else:
+            value = machine_action(client, args)
+            print(value) if isinstance(value, str) else display(value)
+
+    def do_exec(self, line):
+        """exec --node 节点 --cwd 工程目录 -- 程序 参数...：在目标机执行命令。"""
+        self._machine("exec", line)
+
+    def do_python(self, line):
+        """python --node 节点 --cwd 工程目录 本地脚本.py -- 参数...：发送并执行 Python。"""
+        self._machine("python", line)
+
+    def do_ls(self, line):
+        """ls --node 节点 远程目录：查看目标机目录。"""
+        self._machine("ls", line)
+
+    def do_read(self, line):
+        """read --node 节点 远程文件：读取文本文件。"""
+        self._machine("read", line)
+
+    def do_put(self, line):
+        """put --node 节点 本地路径 远程路径 [--pattern 模式]：上传或更新文件。"""
+        self._machine("put", line)
+
+    def do_get(self, line):
+        """get --node 节点 远程路径 本地路径 [--pattern 模式]：下载文件或目录。"""
+        self._machine("get", line)
 
     def do_batch(self, line):
         """batch 清单.json 结果目录：按优先级和可用算力并行分配。"""
@@ -475,6 +568,11 @@ def run_scheduler(args, local_url=None):
             display(dispatch.status() if dispatch else {n.name: n.client.status() for n in pool.nodes if not n.error})
         elif args.action == "sync":
             print((dispatch or pool).sync(args.source))
+        elif args.action in MACHINE_ACTIONS:
+            client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
+            value = machine_action(client, args)
+            print(value) if isinstance(value, str) else display(value)
+            return 1 if isinstance(value, dict) and value.get("status") in {"failed", "cancelled", "timed_out", "interrupted"} else 0
         else:
             client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
             method = getattr(client, args.action)
@@ -515,7 +613,7 @@ def check_tools(config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="统一入口：总调度器、本机调度+算力、远程算力提供者")
-    parser.add_argument("--mode", choices=("scheduler", "hybrid", "worker"), default="hybrid")
+    parser.add_argument("--mode", choices=("scheduler", "hybrid", "worker"), help="默认 hybrid；--url 连接现有服务时默认 scheduler")
     parser.add_argument("--config", help="本机工具链/共享目录配置 JSON")
     parser.add_argument("--nodes", help="调度器节点配置 JSON")
     parser.add_argument("--url", help="连接现有调度中心或直接连接算力提供者")
@@ -535,6 +633,8 @@ def main(argv=None):
     sub.add_parser("jobs")
     for kind in ("run", "spice", "rtl"):
         sub.add_parser(kind, parents=[submission_parser(kind)], add_help=False)
+    for action in sorted(MACHINE_ACTIONS):
+        sub.add_parser(action, parents=[machine_parser(action)], add_help=False)
     item = sub.add_parser("batch")
     item.add_argument("source")
     item.add_argument("output")
@@ -547,6 +647,7 @@ def main(argv=None):
         if action == "fetch":
             item.add_argument("--output", required=True)
     args = parser.parse_args(argv)
+    args.mode = args.mode or ("scheduler" if args.url else "hybrid")
     worker = server = thread = None
     try:
         path = Path(args.config) if args.config else ROOT / "worker.local.json"
@@ -563,6 +664,8 @@ def main(argv=None):
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         if args.check:
             return check_tools(config)
+        if getattr(args, "detach", False) and not args.url:
+            raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
         if args.mode == "worker" and args.action:
             raise ValueError("worker 模式使用本地操作终端；提交任务使用 scheduler/hybrid 模式")

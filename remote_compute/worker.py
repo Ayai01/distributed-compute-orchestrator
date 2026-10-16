@@ -1,6 +1,7 @@
 """One HTTP worker, one CPU budget, and one private directory per job."""
 
 from collections import deque
+from contextlib import nullcontext
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,7 +65,7 @@ def file_hash(path):
 def validate_task(task, capacity):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb"}
+    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
@@ -103,6 +104,12 @@ def validate_task(task, capacity):
         raise ValueError("requires must be a list of node tags")
     if task["node"] is not None and not isinstance(task["node"], str):
         raise ValueError("node must be a configured node name")
+    if "cwd" in task and (not isinstance(task["cwd"], str) or not task["cwd"] or "\0" in task["cwd"]):
+        raise ValueError("cwd must be an absolute worker path or ~ / a shared path variable")
+    if "stdin" in task:
+        if not isinstance(task["stdin"], str):
+            raise ValueError("stdin must name an input file")
+        inside(Path.cwd(), task["stdin"])
     return task
 
 
@@ -174,7 +181,8 @@ class Worker:
             return {"protocol": PROTOCOL, "node": socket.gethostname(), "platform": sys.platform,
                     "role": "worker", **resources,
                     "cpus": self.capacity, "used_cpus": self.used, "queued": len(self.queue),
-                    "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused}
+                    "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
+                    "capabilities": ["machine"], "home": Path.home().as_posix(), "shared_paths": self.shared}
 
     def control(self, value):
         if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb"}:
@@ -253,6 +261,10 @@ class Worker:
                     raise ValueError("Synchronize missing asset first: " + asset)
             # Resolve commands and references before admission, so typos do not occupy slots.
             work = self.root / "jobs" / identity / "input"
+            cwd = Path(self._expand(task["cwd"], task, work)).expanduser() if "cwd" in task else work
+            if not cwd.is_absolute():
+                raise ValueError("cwd must resolve to an absolute worker path")
+            cwd = cwd.resolve()
             commands = []
             for argv in task["steps"]:
                 match = re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0])
@@ -265,6 +277,8 @@ class Worker:
                 directory.mkdir()
                 unpack(payload, directory)
                 work.mkdir(exist_ok=True)
+                if "stdin" in task and not inside(work, task["stdin"]).is_file():
+                    raise ValueError("Missing stdin input file: " + task["stdin"])
                 for name, path in tree(work, task["render"]).items():
                     path.write_text(self._expand(path.read_text(encoding="utf-8"), task, work), encoding="utf-8")
                 result = {"id": identity, "status": "queued", "label": task["label"], "cpus": task["cpus"],
@@ -272,9 +286,9 @@ class Worker:
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
                           "stdout": "", "stderr": "", "tools": self.tool_info,
-                          "assets": task["assets"]}
+                          "assets": task["assets"], "cwd": cwd.as_posix()}
                 job = {"result": result, "cancel": threading.Event(), "task": task,
-                       "commands": commands, "directory": directory}
+                       "commands": commands, "directory": directory, "cwd": cwd}
                 self._save(job)
             except BaseException:
                 if directory.exists():
@@ -329,7 +343,9 @@ class Worker:
                     with self.condition:
                         result["steps"].append(step)
                         self._save(job)
-                    process = Process(argv, work, environment, stdout, stderr)
+                    source = inside(work, task["stdin"]).open("rb") if "stdin" in task else nullcontext(None)
+                    with source as stdin:
+                        process = Process(argv, job["cwd"], environment, stdout, stderr, stdin=stdin)
                     try:
                         while process.child.poll() is None:
                             usage = process_usage(process)

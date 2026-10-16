@@ -1,6 +1,6 @@
 # Remote-Compute
 
-简单局域网里的远程与分布式计算。用于 ngspice、Verilator、原生模拟器批次，以及现有工程的 Python 计算任务。服务、调度和终端只用 Python 3.11+ 标准库；节点复用各自已有的仿真器和工程环境。
+简单局域网里的远程与分布式计算，以及远程电脑上的工程操作。用于 ngspice、Verilator、原生模拟器批次、Python 计算、执行指令和文件更新。服务、调度和终端只用 Python 3.11+ 标准库；节点复用各自已有的仿真器和工程环境。
 
 ## 启动
 
@@ -57,7 +57,77 @@ quit
 
 `set 节点 limit=N memory_limit_mb=M` 控制**本调度器**向该节点分配的 CPU 和内存，0 跟随节点预算；`cpus 节点 N` 和 `memory 节点 MiB` 调整**提供者总预算**。`enabled=false` 暂停本调度器向该节点分配；`pause` 暂停提供者启动新任务。在途任务继续运行。
 
-算力提供者的终端支持 `status`、`jobs`、`cpus N`、`memory MiB`、`pause`、`resume`、`logs 任务ID`、`cancel 任务ID|all`、`delete 任务ID`、`quit`。空行保持状态；参数错误后继续接受操作；Ctrl+C 返回提示符。通过 `--url` 连接已有中心的终端，`quit` 取消本终端提交的单任务和批次并断开连接。托管中心或提供者的入口退出时，停止相应服务及它承接的在途任务和子进程。
+算力提供者的终端支持 `status`、`jobs`、`cpus N`、`memory MiB`、`pause`、`resume`、`logs 任务ID`、`cancel 任务ID|all`、`delete 任务ID`、`quit`。空行保持状态；参数错误后继续接受操作；Ctrl+C 返回提示符。通过 `--url` 连接已有中心的终端，`quit` 取消本终端持有的单任务和批次并断开连接；`--detach` 提交的远程操作留在服务中继续运行。托管中心或提供者的入口退出时，停止相应服务及它承接的在途任务和子进程。
+
+## 从 Codex 操作另一台电脑
+
+另一台电脑复制本工程后，先用示例配置启动 worker，在调度终端加入它并保存；随后可将工具路径写入那台电脑自己的 `worker.local.json`：
+
+```text
+python main.py --mode worker --config worker.example.json --host 0.0.0.0 --cpus 8 --memory-mb 8192
+
+add device2 http://192.168.1.20:8765
+save
+```
+
+中心能够访问该 worker 后，Codex 通过本工程的 Python 接口或 `main.py --url 中心地址` 直接操作它。远程端只需 Python 和本工程，全部操作沿用同一条 HTTP 通道，无需部署 SSH、远程桌面或额外代理。`nodes` 返回目标机的用户目录、共享工程路径和机器能力，便于定位工程。
+
+调度终端新增以下命令；`--cwd` 是目标电脑的工程目录，默认 `~`：
+
+```text
+ls --node device2 D:/Projects
+read --node device2 D:/Projects/MyProject/main.py
+put --node device2 ./updated-main.py D:/Projects/MyProject/main.py
+put --node device2 ./source D:/Projects/MyProject --pattern "*.py" --pattern "src/**/*.py"
+exec --node device2 --cwd D:/Projects/MyProject -- git status --short
+exec --node device2 --cwd D:/Projects/MyProject -- git pull --ff-only
+python --node device2 --cwd D:/Projects/MyProject ./maintenance.py -- argument
+get --node device2 D:/Projects/MyProject/results ./results/device2
+```
+
+`exec` 直接传递程序和参数；需要目标机的 shell 时可执行 `cmd /c ...`、`powershell ...` 或 `sh -c ...`。`python` 将本地脚本发送到目标机，使用目标机 Python 执行，可导入 `--cwd` 工程中的模块。`--tool rgcn_python` 等选项使用节点配置的工程解释器。复杂操作可以直接用 Python 完成，目标机无需安装 shell 扩展。
+
+文件和目录的上传、下载支持二进制与中文路径；上传目录按文件合并，单个文件原子替换。`--pattern` 可重复设置，默认传输所选目录的全部普通文件。工程文件保留在目标机，任务输入、脚本和临时日志在回收后清理。
+
+一次性命令加 `--url` 会自动进入客户端模式：
+
+```text
+python main.py --url http://127.0.0.1:8766 exec --node device2 --cwd D:/Projects/MyProject -- git status --short
+python main.py --url http://127.0.0.1:8766 python --node device2 --cwd D:/Projects/MyProject --timeout 7200 --detach ./long-operation.py
+python main.py --url http://127.0.0.1:8766 jobs
+python main.py --url http://127.0.0.1:8766 logs 任务ID
+python main.py --url http://127.0.0.1:8766 fetch 任务ID --output results/operation
+```
+
+远程命令与计算任务共用 CPU／内存预算、排队、优先级、超时和进程树取消。`--stdin 本地文件` 传入标准输入，`--env NAME=VALUE` 设置环境，`--output 目录` 保存完整日志。结果和实时日志包含末尾16KiB；完整日志随结果回收。长任务加 `--detach` 立即返回 ID，退出连接后可用相同中心地址和 ID 查询、取消或回收。
+
+Codex 或其他 Python 调用者只需这一个接口：
+
+```python
+from remote_compute import Client
+
+center = Client("http://127.0.0.1:8766")
+machine = center.machine("device2", cwd="D:/Projects/MyProject")
+
+print(machine.listdir())
+source = machine.read_text("main.py")
+machine.write_text("main.py", updated_source)
+machine.upload("./patch-files", ".", patterns=["**/*.py"])
+result = machine.execute(["git", "status", "--short"])
+print(result["stdout"])
+result = machine.python("import main; print(main.__file__)")
+
+job = machine.python(script="./maintenance.py", args=["--check"],
+                     timeout=7200, memory_mb=1024, wait=False)
+print(job["id"])
+# 后续连接使用原 ID，提交方退出后任务仍由服务持有。
+print(center.logs(job["id"]))
+center.wait(job["id"])
+center.fetch(job["id"], "./results/maintenance")
+machine.download("./results", "./results/device2")
+```
+
+`execute` 和 `python` 接受 `job_id`，在结果保留期间用相同 ID 和相同请求重提交只执行一次。操作固定到显式选择的节点；源码更新、工程环境安装、Git 操作和检查可沿用同一接口。
 
 ## 分配策略
 
@@ -124,7 +194,7 @@ result = client.run(task, inputs="my-batch")
 }
 ```
 
-变量可以出现在命令参数、环境变量，以及 `render` 指定的 UTF-8 文本文件中：
+变量可以出现在命令参数、环境变量、`cwd`，以及 `render` 指定的 UTF-8 文本文件中：
 
 | 变量 | 含义 |
 | --- | --- |
@@ -149,6 +219,8 @@ result = client.run(task, files={
 
 默认工作目录优先使用已有 `Z:` 内存盘，否则使用系统临时目录；`--root` 可指定。输入、构建中间物和日志均在任务独立目录内。客户端收齐结果后自动删除节点任务目录，`--keep` 可显式保留。用户选择的结果保存在输出目录；同步资产保留供后续复用。
 
+普通计算任务继续使用独立工作目录。指定 `cwd` 的任务在目标机该目录中执行，`cwd` 接受绝对路径、`~` 或 `${shared:工程名}`；`${work}` 和 `outputs` 始终指向任务输入目录，可将需要回收的文件明确写入 `${work}`。任务 JSON 的 `stdin` 是输入包中的相对文件路径，逐步作为标准输入传入。
+
 每份结果包含任务 ID、输入摘要、命令、退出码、CPU 数、时间和工具文件摘要。接受后的任务通过原节点和 ID 查询；相同 ID 在节点保留期间重复提交只执行一次。测量解析、科学评分、唯一设计预算与研究缓存由原工程管理。
 
 ## 现有工程接入位置
@@ -169,6 +241,6 @@ result = client.run(task, files={
 
 按需在两端设置相同的 `REMOTE_COMPUTE_TOKEN`，启用单个共享 token。节点通信直接连接配置的地址。
 
-本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050；`--test-native` 的29项回归全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。真实工程对照数据保存在本机 `results/`。
+本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050，`--test-native` 的36项回归全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。机器操作回归覆盖真实工程文件更新后执行、固定节点、原 ID 重连、标准输入、中文/二进制传输和子进程取消。通过运行中的中心读写并更新分压电路后，ngspice 输出从1.2V变为2.2V，下载文件逐字节一致；测试工程与任务临时文件已清理。真实工程对照数据保存在本机 `results/`。
 
 工具参数参考：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。

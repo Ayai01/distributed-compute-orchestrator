@@ -67,6 +67,11 @@ class Client:
     def nodes(self):
         return self.request("/nodes")
 
+    def machine(self, node, *, cwd="~"):
+        """Operate on a named worker through this same center connection."""
+        from .machine import Machine
+        return Machine(self, node, cwd=cwd)
+
     def status(self, identity=None):
         return self.request("/jobs" + ("/" + identity if identity else ""))
 
@@ -265,6 +270,8 @@ class Pool:
                  "host_memory_available_mb": n.health.get("host_memory_available_mb"),
                  "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
+                 "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
+                 "shared_paths": n.health.get("shared_paths", {}),
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 

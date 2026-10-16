@@ -6,12 +6,12 @@ import subprocess
 
 
 class Process:
-    def __init__(self, argv, cwd, env, stdout, stderr):
+    def __init__(self, argv, cwd, env, stdout, stderr, *, stdin=None):
         self.job = None
         options = {"start_new_session": True} if os.name != "nt" else {
             "creationflags": subprocess.CREATE_NO_WINDOW | 4,  # CREATE_SUSPENDED
         }
-        self.child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+        self.child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
                                       stdout=stdout, stderr=stderr, **options)
         if os.name == "nt":
             try:
