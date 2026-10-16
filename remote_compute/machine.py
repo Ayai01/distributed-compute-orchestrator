@@ -30,7 +30,7 @@ class Machine:
         if stdin is not None:
             files[_PREFIX + "/stdin"] = stdin
             options["stdin"] = _PREFIX + "/stdin"
-        options.setdefault("label", "machine/exec")
+        options.setdefault("label", "machine/exec " + str(argv[0]))
         task = command(argv, node=self.node, cwd=self.cwd if cwd is None else cwd, **options)
         accepted = self.client.submit(task, files=files, job_id=job_id)
         identity = accepted["id"]
@@ -61,7 +61,7 @@ class Machine:
         files[_PREFIX + "/files.py"] = _HELPER
         result = self.execute(["${tool:python}", "${work}/" + _PREFIX + "/files.py", action, str(path),
                                "--work", "${work}/" + _PREFIX, "--patterns", json.dumps(list(patterns))],
-                              files=files, outputs=[_PREFIX + "/result/*"], label="machine/files")
+                              files=files, outputs=[_PREFIX + "/result/*"], label="machine/" + action + ' ' + str(path))
         if result["status"] != "succeeded":
             error = RemoteError(result.get("stderr") or result.get("error") or "Remote file operation failed")
             error.result = result

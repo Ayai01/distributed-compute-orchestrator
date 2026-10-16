@@ -11,6 +11,7 @@ import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
+from urllib.parse import quote
 import uuid
 import zipfile
 
@@ -83,6 +84,14 @@ class Client:
 
     def logs(self, identity):
         return self.request("/jobs/" + identity + "/logs")
+
+    def read_job_file(self, identity, path):
+        return self.request('/jobs/' + identity + '/files/' + quote(str(path), safe='/'), binary=True)
+
+    def write_job_file(self, identity, path, data):
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        return self.request('/jobs/' + identity + '/files/' + quote(str(path), safe='/'), data)
 
     def delete(self, identity):
         return self.request("/jobs/" + identity, method="DELETE")
@@ -277,6 +286,7 @@ class Pool:
                  "shared_paths": n.health.get("shared_paths", {}),
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
+                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'active_jobs', 'root', 'version')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 

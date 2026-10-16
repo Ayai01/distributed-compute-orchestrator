@@ -17,11 +17,13 @@ import sys
 import threading
 import time
 import zipfile
+from urllib.parse import unquote
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack
 from . import __version__
 from .process import Process
 from .resources import Host, process_usage
+from .telemetry import Activity
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -55,7 +57,10 @@ def lock_root(root, role):
 
 def cpu_budget(value=0):
     count = os.cpu_count() or 1
-    return int(value) if int(value) > 0 else min(count, 16) + max(count - 16, 0) // 2
+    limit = max(1, count - 1)
+    if int(value) < 0 or int(value) > limit:
+        raise ValueError(f'CPU budget must be in 1..{limit}, or 0/auto')
+    return int(value) or limit
 
 
 def file_hash(path):
@@ -122,6 +127,9 @@ class Worker:
     def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512):
         self.root = Path(root).expanduser().resolve()
         self.capacity = cpu_budget(cpus)
+        self.cpu_limit = max(1, (os.cpu_count() or 1) - 1)
+        self.activity = Activity()
+        self.save_settings = None
         self.token = token
         self.tags = list(tags)
         self.paused = False
@@ -186,18 +194,21 @@ class Worker:
             resources = self._memory_state()
             return {"protocol": PROTOCOL, "node": socket.gethostname(), "platform": sys.platform,
                     "role": "worker", **resources,
-                    "cpus": self.capacity, "used_cpus": self.used, "queued": len(self.queue),
+                    "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "capabilities": ["machine"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
-                    "unavailable_shared": self.unavailable_shared}
+                    "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
+                    "active_jobs": [{k: j['result'].get(k) for k in ('id', 'label', 'status', 'cpus', 'memory_mb')}
+                                    for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
+                    **self.activity.snapshot()}
 
     def control(self, value):
         if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb"}:
             raise ValueError("Control accepts cpus, memory_mb and paused")
-        if "cpus" in value and (type(value["cpus"]) is not int or value["cpus"] < 1):
-            raise ValueError("cpus must be a positive integer")
+        if "cpus" in value and (type(value["cpus"]) is not int or not 1 <= value["cpus"] <= self.cpu_limit):
+            raise ValueError(f"cpus must be in 1..{self.cpu_limit}")
         if "paused" in value and not isinstance(value["paused"], bool):
             raise ValueError("paused must be true or false")
         if "memory_mb" in value and (type(value["memory_mb"]) is not int or value["memory_mb"] < 1):
@@ -209,6 +220,9 @@ class Worker:
                 self.paused = value["paused"]
             if "memory_mb" in value:
                 self.memory_capacity = value["memory_mb"]
+            if self.save_settings:
+                self.save_settings({key: value[key] for key in ('cpus', 'memory_mb') if key in value})
+            self.activity.notify('Resources ' + json.dumps(value, ensure_ascii=False))
             self.condition.notify_all()
             return self.health()
 
@@ -344,7 +358,8 @@ class Worker:
             temporary = directory / "tmp"
             temporary.mkdir()
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
-                               PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory))
+                               PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
+                               REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 for argv in job["commands"]:
                     if job["cancel"].is_set():
@@ -405,6 +420,17 @@ class Worker:
     def get(self, identity):
         with self.condition:
             return json.loads(json_bytes(self.jobs[identity]["result"]))
+
+    def job_file(self, identity, name, data=None):
+        with self.condition:
+            path = inside(self.jobs[identity]['directory'] / 'input', name)
+            if data is None:
+                return path.read_bytes()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + '.control-upload')
+            temporary.write_bytes(data)
+            temporary.replace(path)
+            return {'written': name, 'bytes': len(data)}
 
     def logs(self, identity):
         with self.condition:
@@ -514,6 +540,7 @@ class Handler(BaseHTTPRequestHandler):
         worker = self.server.worker
         if worker.token and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + worker.token):
             return self._reply({"error": "Token required"}, 401)
+        worker.activity.access(self.client_address[0])
         parts = self.path.strip("/").split("/")
         try:
             body = None
@@ -530,6 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                 value = worker.nodes()
             elif parts == ["control"] and self.command == "POST":
                 value = worker.control(json.loads(body))
+                worker.activity.notify('Control ' + body.decode('utf-8'), self.client_address[0])
             elif parts == ["restart"] and self.command == "POST":
                 if hasattr(worker, "restart_node"):
                     value = worker.restart_node(json.loads(body)["node"])
@@ -548,7 +576,9 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) >= 2 and parts[0] == "jobs":
                 identity = parts[1]
                 if len(parts) == 2 and self.command == "POST":
-                    return self._reply(worker.submit(identity, body), 202)
+                    value = worker.submit(identity, body)
+                    worker.activity.notify(value.get('label', 'job') + ' [' + identity[:8] + ']', self.client_address[0])
+                    return self._reply(value, 202)
                 if len(parts) == 2 and self.command == "GET":
                     value = worker.get(identity)
                 elif len(parts) == 2 and self.command == "DELETE":
@@ -559,6 +589,11 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.artifacts(identity)
                 elif parts[2:] == ["logs"] and self.command == "GET":
                     value = worker.logs(identity)
+                elif len(parts) >= 4 and parts[2] == 'files' and self.command in {'GET', 'POST'}:
+                    name = unquote('/'.join(parts[3:]))
+                    value = worker.job_file(identity, name, body if self.command == 'POST' else None)
+                    if self.command == 'POST':
+                        worker.activity.notify('Job file ' + name + ' [' + identity[:8] + ']', self.client_address[0])
                 else:
                     return self._reply({"error": "Unknown route"}, 404)
             else:
@@ -568,6 +603,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply({"error": "Unknown job, tool or path variable: " + str(exc)}, 404)
         except Conflict as exc:
             self._reply({"error": str(exc)}, 409)
+        except FileNotFoundError as exc:
+            self._reply({"error": str(exc)}, 404)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             self._reply({"error": str(exc)}, 400)
 

@@ -1,0 +1,210 @@
+"""Live stdlib terminal: resource dashboard with an editable command line."""
+from collections import deque
+import shutil
+import sys
+import threading
+import time
+import unicodedata
+
+
+def _width(text):
+    return sum(0 if ord(char) < 32 or unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in 'WF' else 1 for char in text)
+
+
+def _clip(text, width):
+    result, size = '', 0
+    for char in str(text).replace('\n', ' ').replace('\r', ''):
+        n = _width(char)
+        if size + n > width:
+            break
+        if ord(char) >= 32:
+            result += char
+            size += n
+    return result
+
+
+def _input_view(prompt, line, cursor, width):
+    """Keep the editable cursor visible even when a command exceeds one row."""
+    prompt = _clip(prompt, max(0, width // 3))
+    room = max(1, width - _width(prompt))
+    cursor = min(max(0, cursor), len(line))
+    start, before = 0, _width(line[:cursor])
+    while start < cursor and before >= room - int(start > 0 and room > 1):
+        before -= _width(line[start])
+        start += 1
+    marker = '‹' if start and room > 1 else ''
+    visible = _clip(line[start:], room - len(marker))
+    return prompt + marker + visible, _width(prompt + marker) + before
+
+
+def _layout(status, events, output, height):
+    """Reserve the lower rows for newest notices and command feedback."""
+    budget = max(1, height - 2)
+    sections = int(bool(events)) + int(bool(output))
+    count = min(6, max(1, (budget - 3 - sections) // sections)) if sections else 0
+    footer = (['最近操作（最多6条）:'] + events[-count:] if events else [])
+    footer += (['终端输出（PgUp/PgDn翻页）:'] + output[-count:] if output else [])
+    remaining = max(0, budget - len(footer))
+    head = status[:remaining]
+    if len(status) > remaining and head:
+        head[-1] = '… status 查看完整资源；help 查看操作'
+    return (head + footer)[-budget:]
+
+
+def _enable_ansi():
+    """Return a restoration callback, or None for a plain console/redirect."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+    kernel.GetStdHandle.restype = wintypes.HANDLE
+    kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetConsoleMode.restype = wintypes.BOOL
+    kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.SetConsoleMode.restype = wintypes.BOOL
+    handle, mode = kernel.GetStdHandle(-11 & 0xffffffff), wintypes.DWORD()
+    if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+        return None
+    if not kernel.SetConsoleMode(handle, mode.value | 4):
+        return None
+    return lambda: kernel.SetConsoleMode(handle, mode.value)
+
+
+def _gb(value):
+    return f'{(value or 0) / 1024:.1f}'
+
+
+def format_status(value, url=''):
+    center = value.get('role') == 'scheduler'
+    rows = [f"Remote Compute | {value.get('node', '')} | {'调度中心' if center else '算力提供者'} | {url}"]
+    if center:
+        rows.append(f"策略 {value.get('policy')} | 分配 {value.get('used_cpus', 0)}/{value.get('cpus', 0)} 线程 | 排队 {value.get('queued', 0)} | 内存预留 {_gb(value.get('memory_reserved_mb'))} GiB")
+        nodes = value.get('nodes', [])
+    else:
+        nodes = [{**value, 'name': value.get('node'), 'capacity': value.get('cpus')}]
+    for node in nodes:
+        total, available = node.get('memory_total_mb') or 0, node.get('host_memory_available_mb') or 0
+        temp = node.get('temperature_c')
+        state = node.get('error') or ('暂停接单' if node.get('paused') else '在线')
+        rows += [f"{node.get('node') or node.get('name')}  {node.get('url', url)}  {state}",
+                 f"  CPU {node.get('cpu_percent') or 0:.1f}% | 已分配 {node.get('used_cpus', 0)}/{node.get('capacity', 0)} | 设备 {node.get('logical_cpus', '?')} 线程 | 温度 {str(temp) + '°C' if temp is not None else '未提供'}",
+                 f"  内存 {_gb(total-available)}/{_gb(total)} GiB | 任务RSS {_gb(node.get('rss_mb'))} | 预留 {_gb(node.get('memory_reserved_mb'))} | 可分配 {_gb(node.get('memory_available_mb'))} GiB",
+                 '  能力: ' + ', '.join(node.get('tags') or []),
+                 '  访问IP: ' + (', '.join(x['ip'] for x in node.get('peers') or []) or '等待连接')]
+        for job in (node.get('active_jobs') or [])[:3]:
+            rows.append(f"  {job['status']} {job['cpus']}线程 {_gb(job.get('memory_mb'))}GiB  {job['label']} [{job['id'][:8]}]")
+    rows += ['操作: help | status | jobs | cpus ' + ('设备名 N' if center else 'N') + ' | memory | pause | resume | quit']
+    return rows
+
+
+class Dashboard:
+    def __init__(self, shell, health, url='', alive=lambda: True):
+        self.shell, self.health, self.url, self.alive = shell, health, url, alive
+        self.output = deque(maxlen=200)
+        self.output_lock = threading.RLock()
+        self.pending = ''
+        self.stream = sys.stdout
+        self.encoding = getattr(self.stream, 'encoding', 'utf-8')
+
+    def write(self, text):
+        with self.output_lock:
+            self.pending += text
+            while '\n' in self.pending:
+                line, self.pending = self.pending.split('\n', 1)
+                if line.strip():
+                    self.output.append(line)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+    def run(self):
+        import msvcrt
+        restore = _enable_ansi()
+        if restore is None:
+            return False
+        line, cursor, history, selected = '', 0, [], 0
+        last, offset, last_frame = 0, 0, ''
+        rows, events = [], []
+        stdout, stderr, shell_stdout = sys.stdout, sys.stderr, self.shell.stdout
+        try:
+            sys.stdout = sys.stderr = self.shell.stdout = self
+            self.stream.write('\x1b[?1049h\x1b[2J')
+            while True:
+                try:
+                    if not self.alive():
+                        break
+                    now = time.monotonic()
+                    if now - last >= 1:
+                        try:
+                            value = self.health()
+                            rows = format_status(value, self.url)
+                            notices = list(value.get('events', []))
+                            for node in value.get('nodes', []):
+                                notices.extend(node.get('events') or [])
+                            events = [time.strftime('%H:%M:%S', time.localtime(e['time'])) + ' ' + e['ip'] + ' ' + e['message']
+                                      for e in sorted(notices, key=lambda x: x['time'])[-6:]]
+                        except (OSError, RuntimeError, ValueError) as error:
+                            rows = ['连接状态: ' + str(error)]
+                        last = now
+                    columns, height = shutil.get_terminal_size((110, 32))
+                    with self.output_lock:
+                        output = list(self.output) + ([self.pending] if self.pending else [])
+                    offset = min(offset, max(0, len(output) - 1))
+                    if offset:
+                        output = output[:-offset]
+                    body = '\n'.join(_clip(row, columns - 1) + '\x1b[K' for row in _layout(rows, events, output, height))
+                    prompt, column = _input_view(self.shell.prompt, line, cursor, max(1, columns - 1))
+                    frame = '\x1b[H' + body + '\n\x1b[J' + prompt + f'\r\x1b[{column+1}G'
+                    if frame != last_frame:
+                        self.stream.write(frame)
+                        self.stream.flush()
+                        last_frame = frame
+                    while msvcrt.kbhit():
+                        key = msvcrt.getwch()
+                        if key in ('\x00', '\xe0'):
+                            key = msvcrt.getwch()
+                            if key == 'K': cursor = max(0, cursor - 1)
+                            elif key == 'M': cursor = min(len(line), cursor + 1)
+                            elif key == 'G': cursor = 0
+                            elif key == 'O': cursor = len(line)
+                            elif key == 'S': line = line[:cursor] + line[cursor + 1:]
+                            elif key == 'I': offset += 6
+                            elif key == 'Q': offset = max(0, offset - 6)
+                            elif key in ('H', 'P') and history:
+                                selected = max(0, min(len(history), selected + (-1 if key == 'H' else 1)))
+                                line = history[selected] if selected < len(history) else ''
+                                cursor = len(line)
+                        elif key == '\r':
+                            if line.strip():
+                                self.write(self.shell.prompt + line + '\n')
+                                history.append(line)
+                                history = history[-50:]
+                                selected = len(history)
+                                if self.shell.onecmd(line):
+                                    return True
+                            line, cursor, last, offset = '', 0, 0, 0
+                        elif key in ('\x03', '\x1b'):
+                            line, cursor = '', 0
+                        elif key == '\x08':
+                            if cursor: line, cursor = line[:cursor-1] + line[cursor:], cursor - 1
+                        elif key == '\x04':
+                            return True
+                        elif key.isprintable():
+                            line, cursor = line[:cursor] + key + line[cursor:], cursor + 1
+                    time.sleep(0.08)
+                except KeyboardInterrupt:
+                    line, cursor, last, offset = '', 0, 0, 0
+                    self.write('已返回操作终端。\n')
+            return True
+        finally:
+            sys.stdout, sys.stderr, self.shell.stdout = stdout, stderr, shell_stdout
+            try:
+                self.stream.write('\x1b[?1049l')
+                self.stream.flush()
+            finally:
+                restore()

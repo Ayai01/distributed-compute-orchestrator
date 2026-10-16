@@ -12,11 +12,14 @@ import zipfile
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
+from .telemetry import Activity
+import socket
 
 
 class Coordinator:
     def __init__(self, pool, root, *, token=""):
         self.pool, self.token = pool, token
+        self.activity = Activity()
         self.root = Path(root).resolve()
         self.root_lock = lock_root(self.root, "scheduler")
         (self.root / "jobs").mkdir(parents=True, exist_ok=True)
@@ -60,7 +63,7 @@ class Coordinator:
                     info = tools.setdefault(name, {"available": True, "variants": []})
                     info["variants"].append({"node": node.name, **value})
         with self.condition:
-            return {"protocol": PROTOCOL, "role": "scheduler", "node": "scheduler", "tools": tools,
+            return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -70,7 +73,7 @@ class Coordinator:
                                                           sum(n.memory_free for n in group))) for group in machines.values()),
                     "memory_reserved_mb": sum(n.reserved_memory_mb + n.external_memory_mb for n in online),
                     "paused": self.paused, "queued": len(self.queue), "tags": sorted(tags),
-                    "policy": snapshot["policy"], "nodes": snapshot["nodes"]}
+                    "policy": snapshot["policy"], "nodes": snapshot["nodes"], **self.activity.snapshot()}
 
     def control(self, changes):
         if isinstance(changes, dict) and "node" in changes:
@@ -193,7 +196,8 @@ class Coordinator:
         if job.get("node"):
             return job["node"].client
         assigned = job["result"].get("assigned_node")
-        return next(n.client for n in self.pool.nodes if n.name == assigned) if assigned else None
+        return next(n.client for n in self.pool.nodes if n.name == assigned
+                    or n.client.url == job['result'].get('worker_url')) if assigned else None
 
     def get(self, identity):
         with self.condition:
@@ -205,6 +209,18 @@ class Coordinator:
             job = self.jobs[identity]
             client = self._client(job)
         return client.logs(identity) if client else {"stdout": "", "stderr": ""}
+
+    def job_file(self, identity, name, data=None):
+        with self.condition:
+            client = self._client(self.jobs[identity])
+        if not client:
+            raise Conflict('Job has not been assigned yet')
+        try:
+            return client.read_job_file(identity, name) if data is None else client.write_job_file(identity, name, data)
+        except RemoteError as error:
+            if getattr(error, 'status_code', None) == 404:
+                raise FileNotFoundError(name) from None
+            raise Conflict(str(error)) from None
 
     def cancel(self, identity):
         with self.condition:

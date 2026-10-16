@@ -254,7 +254,7 @@ class ConsoleTests(unittest.TestCase):
             task_path = Path(directory) / "task.json"
             task_path.write_text(json.dumps(python("print('terminal-task')")))
             for mode, commands in [("worker", "status\ncpus 1\npause\nresume\njobs\nquit\n"),
-                                   ("hybrid", f'nodes\npolicy balanced\nset local weight=2 limit=1\nrun "{task_path}" --output "{directory}/terminal-result"\nwait\njobs\nquit\n')]:
+                                   ("hybrid", f'nodes\npolicy balanced\nset {__import__("socket").gethostname()} weight=2 limit=1\nrun "{task_path}" --output "{directory}/terminal-result"\nwait\njobs\nquit\n')]:
                 result = subprocess.run([sys.executable, "-B", str(ROOT / "main.py"), "--mode", mode,
                                          "--cpus", "1", "--port", "0", "--root", str(Path(directory) / mode)],
                                         input=commands.encode(), capture_output=True, timeout=15)

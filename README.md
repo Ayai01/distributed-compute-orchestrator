@@ -2,6 +2,30 @@
 
 简单局域网里的远程与分布式计算，以及远程电脑上的工程操作。用于 ngspice、Verilator、原生模拟器批次、Python 计算、执行指令和文件更新。服务、调度和终端只用 Python 3.11+ 标准库；节点复用各自已有的仿真器和工程环境。
 
+## 同一仓库、设备独立配置
+
+源码统一来自 https://github.com/Ayai01/Remote-Compute.git。两台设备保持同一个 main 提交；设备始终以操作系统主机名显示。首次 `git clone`，后续运行 `python main.py update`（快进更新）；`update --check` 查看远端版本。更新后从中心执行 `restart Aya1-TX` 重新加载。运行任务期间可先更新磁盘源码，空闲后重载。
+
+`worker.local.json`、`nodes.local.json`、`worker.standalone.json`、`.tools/`、`.projects/`、`.runtime/` 和 `results/` 都不上传仓库。`.tools/` 放实际Python科学环境、ngspice、RTL编译链和内存盘驱动；任务源码与小模型按内容资产同步。只有确需常驻的大工程才放 `.projects/` 并写本机shared配置。
+
+## 实时终端与运行中控制
+
+Windows交互终端每秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签、访问IP和CPU温度。温度读取已有LibreHardwareMonitor/OpenHardwareMonitor传感器，没有传感器时显示“未提供”。最近6条指令/文件操作滚动显示；命令输入同时保持可用。`--headless` 保留无界面服务；设备配置 `console: true` 可在原headless启动终端打开看板。
+
+`cpus N`（worker）或 `cpus Aya1-TX N`（中心）在线调整并持久保存，现有任务自然完成。也可一次性运行：
+
+```text
+python main.py --url http://127.0.0.1:8766 control --node Aya1-TX --cpus 31
+```
+
+任务运行时的进度和停止文件使用 `Client.read_job_file(id, path)` / `write_job_file(id, path, data)`，相对任务输入目录。它们直接由中心转发，不占计算线程，满载时仍可操作。
+
+## 每台设备唯一8 GiB共享内存盘
+
+所有工程使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1`。创建前持有同一个系统锁并重新检测；已存在小盘原地扩容，已有盘扩容失败时保留它并报告原因，不另建第二块。调用 `python main.py ramdisk` 可创建或检查。Windows需安装一次ImDisk驱动，首次安装/扩容使用管理员权限；驱动包存放在 `.tools/imdisk/` 后运行 `python main.py ramdisk --install`。安装时登记系统启动任务 `RemoteCompute Shared RAM`，重启后重新创建唯一共享盘；日常工程启动直接复用，每个工程使用自己的子目录。当前实现是固定8GiB内存盘。
+
+AOP、RGCN、ARH-DSE、Analog-Opt-Bench默认优先本机8766中心；中心未启动时沿用独立预算 `min(C,16)+floor(max(C-16,0)/2)`。worker子任务设置 `REMOTE_COMPUTE_WORKER=1` 防止递归提交。AOP网页只保留“本地调度器”和“本地工程”两个模式。
+
 ## 启动
 
 在工程目录执行，唯一入口是 `main.py`：
@@ -23,11 +47,11 @@ python main.py --mode worker --host 0.0.0.0 --cpus 8 --memory-mb 8192
 
 调用工程连接中心的 `8766`，多个工程共享中心队列、资源预算和分配策略。中心将任务转交给配置的 worker，回收结果后同时清理两侧的任务文件；模型和源码资产按内容同步并复用。
 
-默认 CPU 预算为 `min(C,16)+floor(max(C-16,0)/2)`，`--cpus N` 使用显式值。每个任务声明自己的总 CPU 占用，节点将任务并发与数值内核线程共同计账。调低预算后，在途任务正常结束，后续任务按新预算启动。
+默认 CPU 预算为 `max(1, CPU_COUNT-1)`，也是本设备线程上限。Aya1-PC 默认27，Aya1-TX 默认31；`--cpus N` 可在上限内设置。每个任务声明自己的总 CPU 占用，节点将任务并发与数值内核线程共同计账。调低预算后，在途任务正常结束，后续任务按新预算启动。
 
 `--memory-mb N` 设置提供者的任务内存总预算，单位 MiB；0/未设置使用物理内存减去预留量，`memory_reserve_mb` 默认512。任务的 `memory_mb` 默认256。中心同时参考任务预留、实际进程树 RSS 和系统可用内存，CPU与内存都够才派发；同一设备的多个 worker 共享同一份物理内存统计。`nodes` 展示主机 CPU 使用率、内存容量、占用和可用量，结果记录峰值 RSS 与 CPU 秒数。
 
-本机 `worker.local.json` 已配置现有 ngspice、ARH 的 MSYS2/Verilator，以及现有工程的共享路径。它属于本机配置，Git 忽略。迁移时按 `worker.example.json` 填写目标设备的工具和路径。
+`worker.local.json` 配置本机工具和可选共享目录。计算运行时可安装在本工程 `.tools/`，科研源码/PDK按任务闭包传输，worker无需克隆四个科研工程。它属于本机配置，Git 忽略。迁移时按 `worker.example.json` 填写目标设备的工具和路径。
 
 worker 可以独立运行，只需 Python 和本工具源码。示例配置不引用任何其他工程；复制过来的配置中，缺失共享目录记录为 `unavailable_shared`，其余能力正常启动。调度器只将引用共享目录的任务分配到具备该目录的节点。Windows 的执行别名即使无法读取文件摘要，也可以启动基本服务。
 
@@ -37,25 +61,25 @@ worker 可以独立运行，只需 Python 和本工具源码。示例配置不�
 
 ```text
 nodes
-add device2 http://192.168.1.20:8765
-set device2 weight=2 limit=8 memory_limit_mb=4096 enabled=true
+add http://192.168.1.10:8765
+set Aya1-TX weight=2 limit=8 memory_limit_mb=4096 enabled=true
 policy adaptive
 spice examples/spice/divider.spice --output results/divider
 rtl examples/rtl --top tb --sources tb.sv --output results/rtl
 batch examples/batch.json results/batch
 jobs
-logs device2 任务ID
-cancel device2 任务ID
-pause device2
-resume device2
-cpus device2 4
-memory device2 4096
+logs Aya1-TX 任务ID
+cancel Aya1-TX 任务ID
+pause Aya1-TX
+resume Aya1-TX
+cpus Aya1-TX 4
+memory Aya1-TX 4096
 save
 wait
 quit
 ```
 
-`192.168.1.20` 替换为目标设备 IP。`save` 保存节点、权重、限额和策略到 `nodes.local.json`，下次自动加载。
+`192.168.1.10` 替换为目标设备 IP。`save` 保存节点、权重、限额和策略到 `nodes.local.json`，下次自动加载。
 
 `set 节点 limit=N memory_limit_mb=M` 控制**本调度器**向该节点分配的 CPU 和内存，0 跟随节点预算；`cpus 节点 N` 和 `memory 节点 MiB` 调整**提供者总预算**。`enabled=false` 暂停本调度器向该节点分配；`pause` 暂停提供者启动新任务。在途任务继续运行。
 
@@ -68,7 +92,7 @@ quit
 ```text
 python main.py --mode worker --config worker.example.json --host 0.0.0.0 --headless --cpus 8 --memory-mb 8192
 
-add device2 http://192.168.1.20:8765
+add http://192.168.1.10:8765
 save
 ```
 
@@ -77,14 +101,14 @@ save
 调度终端新增以下命令；`--cwd` 是目标电脑的工程目录，默认 `~`：
 
 ```text
-ls --node device2 D:/Projects
-read --node device2 D:/Projects/MyProject/main.py
-put --node device2 ./updated-main.py D:/Projects/MyProject/main.py
-put --node device2 ./source D:/Projects/MyProject --pattern "*.py" --pattern "src/**/*.py"
-exec --node device2 --cwd D:/Projects/MyProject -- git status --short
-exec --node device2 --cwd D:/Projects/MyProject -- git pull --ff-only
-python --node device2 --cwd D:/Projects/MyProject ./maintenance.py -- argument
-get --node device2 D:/Projects/MyProject/results ./results/device2
+ls --node Aya1-TX D:/Projects
+read --node Aya1-TX D:/Projects/MyProject/main.py
+put --node Aya1-TX ./updated-main.py D:/Projects/MyProject/main.py
+put --node Aya1-TX ./source D:/Projects/MyProject --pattern "*.py" --pattern "src/**/*.py"
+exec --node Aya1-TX --cwd D:/Projects/MyProject -- git status --short
+exec --node Aya1-TX --cwd D:/Projects/MyProject -- git pull --ff-only
+python --node Aya1-TX --cwd D:/Projects/MyProject ./maintenance.py -- argument
+get --node Aya1-TX D:/Projects/MyProject/results ./results/Aya1-TX
 ```
 
 `exec` 直接传递程序和参数；需要目标机的 shell 时可执行 `cmd /c ...`、`powershell ...` 或 `sh -c ...`。`python` 将本地脚本发送到目标机，使用目标机 Python 执行，可导入 `--cwd` 工程中的模块。`--tool rgcn_python` 等选项使用节点配置的工程解释器。复杂操作可以直接用 Python 完成，目标机无需安装 shell 扩展。
@@ -94,8 +118,8 @@ get --node device2 D:/Projects/MyProject/results ./results/device2
 一次性命令加 `--url` 会自动进入客户端模式：
 
 ```text
-python main.py --url http://127.0.0.1:8766 exec --node device2 --cwd D:/Projects/MyProject -- git status --short
-python main.py --url http://127.0.0.1:8766 python --node device2 --cwd D:/Projects/MyProject --timeout 7200 --detach ./long-operation.py
+python main.py --url http://127.0.0.1:8766 exec --node Aya1-TX --cwd D:/Projects/MyProject -- git status --short
+python main.py --url http://127.0.0.1:8766 python --node Aya1-TX --cwd D:/Projects/MyProject --timeout 7200 --detach ./long-operation.py
 python main.py --url http://127.0.0.1:8766 jobs
 python main.py --url http://127.0.0.1:8766 logs 任务ID
 python main.py --url http://127.0.0.1:8766 fetch 任务ID --output results/operation
@@ -109,7 +133,7 @@ Codex 或其他 Python 调用者只需这一个接口：
 from remote_compute import Client
 
 center = Client("http://127.0.0.1:8766")
-machine = center.machine("device2", cwd="D:/Projects/MyProject")
+machine = center.machine("Aya1-TX", cwd="D:/Projects/MyProject")
 
 print(machine.listdir())
 source = machine.read_text("main.py")
@@ -126,12 +150,12 @@ print(job["id"])
 print(center.logs(job["id"]))
 center.wait(job["id"])
 center.fetch(job["id"], "./results/maintenance")
-machine.download("./results", "./results/device2")
+machine.download("./results", "./results/Aya1-TX")
 ```
 
 `execute` 和 `python` 接受 `job_id`，在结果保留期间用相同 ID 和相同请求重提交只执行一次。操作固定到显式选择的节点；源码更新、工程环境安装、Git 操作和检查可沿用同一接口。
 
-以 `worker --headless` 启动时，入口保留一个轻量 Python 启动进程，支持远程重新加载自身。通过 `machine.upload()` / `write_text()` 更新本工具源码或该节点配置后，调用 `machine.restart()`，或在中心终端执行 `restart device2` / `python main.py --url 中心地址 restart --node device2`。节点空闲时自动重启并重新读取磁盘上的代码和配置，地址保持原配置；在途任务存在时返回409，待任务结束后再操作。`health` 返回 `pid`、`tool_root` 和 `restart` 能力，便于核对更新已生效。启动终端保持运行，之后的文件修改和重启均可远程完成。
+以 `worker` 或 `worker --headless` 启动时，入口保留一个轻量 Python 启动进程，支持远程重新加载自身。通过 `machine.upload()` / `write_text()` 更新本工具源码或该节点配置后，调用 `machine.restart()`，或在中心终端执行 `restart Aya1-TX` / `python main.py --url 中心地址 restart --node Aya1-TX`。节点空闲时自动重启并重新读取磁盘上的代码和配置，地址保持原配置；在途任务存在时返回409，待任务结束后再操作。`health` 返回 `pid`、`tool_root` 和 `restart` 能力，便于核对更新已生效。启动终端保持运行，之后的文件修改和重启均可远程完成。
 
 ## 分配策略
 
@@ -149,8 +173,8 @@ machine.download("./results", "./results/device2")
 ```text
 python main.py --mode hybrid --cpus 2 batch examples/batch.json results/demo
 python main.py --mode scheduler --nodes nodes.local.json run examples/spice/task.json --input examples/spice --output results/divider
-python main.py --mode scheduler --url http://192.168.1.20:8766 jobs
-python main.py --mode scheduler --url http://192.168.1.20:8766 fetch 任务ID --output results/recovered
+python main.py --mode scheduler --url http://192.168.1.10:8766 jobs
+python main.py --mode scheduler --url http://192.168.1.10:8766 fetch 任务ID --output results/recovered
 python main.py --check
 python main.py --test
 python main.py --test-native
@@ -162,8 +186,8 @@ python main.py --test-native
 from remote_compute import Client, Pool, command, ngspice
 
 with Pool([
-    {"name": "local", "url": "http://127.0.0.1:8765"},
-    {"name": "device2", "url": "http://192.168.1.20:8765", "weight": 2},
+    {"name": "Aya1-PC", "url": "http://127.0.0.1:8765"},
+    {"name": "Aya1-TX", "url": "http://192.168.1.10:8765", "weight": 2},
 ]) as pool:
     result = pool.run(
         ngspice("divider.spice"),
@@ -237,7 +261,17 @@ result = client.run(task, files={
 | Analog-Opt-Bench-v2 | `main.py run --remote-url URL` 或配置 `remote_compute.url`，按算法/种子批次分配；Class-AB与ZDT1四任务、每任务512次评价的科学数组完全一致，持久Numba缓存将同批热运行从61秒降至7.885秒 |
 | Rocket 神经网络工程 | 按硬件配置构建后，在同一任务内执行多程序和网络批次 |
 
-现有工程默认保持独立本机计算；显式设置中心才接入。其他工程由各自正在工作的会话在运行边界适配，具体入口随验证结果更新。
+四个工程默认优先本机调度中心；中心缺席时使用原独立预算。AOP网页直接选本地调度器/本地工程，RGCN使用COMPUTE_URL=auto，ARH与Bench使用compute-mode=auto，显式local固定独立执行。
+
+## 工程内工具安装
+
+```text
+python main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source "D:/Projects/#4-Arclight/ARH-DSE-v2/.tools/msys64"
+```
+
+`setup` 安装固定版本的可移动Python3.12科学环境，验证Numba JIT、OpenCV与ONNX Runtime CPU推理后写入本机工具配置；首次可直接下载Python/ngspice，也可复用已有ngspice。`--rtl-source` 提取现有MSYS2中GCC/Verilator的实际依赖，排除编译链无关组件与下载缓存。
+
+AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB）；`.tools/ngspice`约38MiB，精简RTL环境约608MiB。原工程模型训练仍使用各工程环境。跨机复制运行时后，用`setup`校验版本并重定位路径，再从中心重载worker。
 
 ## 部署到其他设备
 
@@ -245,6 +279,6 @@ result = client.run(task, files={
 
 按需在两端设置相同的 `REMOTE_COMPUTE_TOKEN`，启用单个共享 token。节点通信直接连接配置的地址。
 
-本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050，`--test-native` 的39项回归全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。机器操作回归覆盖真实工程文件更新后执行、固定节点、原 ID 重连、标准输入、中文/二进制传输和子进程取消。独立 worker 缺少旧工程目录、Windows 执行别名不可读、远程更新后重启均已验证。通过运行中的中心读写并更新分压电路后，ngspice 输出从1.2V变为2.2V，下载文件逐字节一致；测试工程与任务临时文件已清理。真实工程对照数据保存在本机 `results/`。
+本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050，`--test-native` 覆盖核心回归。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。机器操作回归覆盖真实工程文件更新后执行、固定节点、原 ID 重连、标准输入、中文/二进制传输和子进程取消。独立 worker 缺少旧工程目录、Windows 执行别名不可读、远程更新后重启均已验证。通过运行中的中心读写并更新分压电路后，ngspice 输出从1.2V变为2.2V，下载文件逐字节一致；测试工程与任务临时文件已清理。真实工程对照数据保存在本机 `results/`。
 
 工具参数参考：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。
