@@ -280,7 +280,13 @@ class Coordinator:
         with self.condition:
             job = self.jobs[identity]
             client = self._client(job)
-        return client.logs(identity) if client else {"stdout": "", "stderr": ""}
+        if client:
+            try:
+                return client.logs(identity)
+            except RemoteError as error:
+                if getattr(error, 'status_code', None) != 404 or job['result']['status'] != 'dispatching':
+                    raise Conflict(str(error)) from None
+        return {"stdout": "", "stderr": ""}
 
     def job_file(self, identity, name, data=None):
         with self.condition:

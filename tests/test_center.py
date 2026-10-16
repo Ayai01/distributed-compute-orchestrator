@@ -32,6 +32,25 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_logs_are_empty_while_worker_submission_is_in_progress(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,node):
+            with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
+                entered, release = threading.Event(), threading.Event()
+                original = pool.nodes[0].client.submit_bundle
+                def delayed(*args):
+                    entered.set()
+                    release.wait(5)
+                    return original(*args)
+                with patch.object(pool.nodes[0].client,'submit_bundle',side_effect=delayed):
+                    identity = client.submit(python("print('ready')"))['id']
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        self.assertEqual(client.logs(identity),dict(stdout='',stderr=''))
+                    finally:
+                        release.set()
+                    client.wait(identity)
+                    self.assertIn('ready',client.fetch(identity)['stdout'])
+
     def test_worker_control_errors_return_an_http_response(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, node):
             with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):

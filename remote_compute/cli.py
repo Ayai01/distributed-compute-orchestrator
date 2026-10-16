@@ -781,7 +781,7 @@ def main(argv=None):
                 if existing:
                     args.mode, args.url = 'scheduler', existing
             if args.mode != 'scheduler':
-                existing_worker = resolve(args.host or config.get('host', '127.0.0.1'),
+                existing_worker = resolve('127.0.0.1' if args.mode == 'hybrid' else args.host or config.get('host', '127.0.0.1'),
                                           args.port if args.port is not None else config.get('port', 26134 if args.mode == 'hybrid' else 26133),
                                           policy=args.on_port_conflict, token=args.local_token,
                                           reuse_role='worker' if args.mode == 'hybrid' else None)
@@ -817,7 +817,7 @@ def main(argv=None):
                 else:
                     restarting.set()
                     threading.Thread(target=server.shutdown, daemon=True).start()
-            host = args.host or config.get("host", "127.0.0.1")
+            host = '127.0.0.1' if args.mode == 'hybrid' else args.host or config.get("host", "127.0.0.1")
             reloadable = args.mode == "worker" and args.service_child
             worker.restart_available = reloadable
             server = Server((host, port), worker, restart=restart_worker if reloadable else None)

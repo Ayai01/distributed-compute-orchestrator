@@ -1,0 +1,159 @@
+# 调度、任务接口与工程接入
+
+[返回首页](../README.md) · [启动与维护](operations.md)
+
+## 算力分配与提前排队
+
+默认部署中，科研工程运行在 Aya1-PC，向本机中心 `http://127.0.0.1:26133` 提交任务。Aya1-TX 的同一端口提供 worker 服务；在该设备运行科研工程时，auto 会检查服务角色，未检测到本地中心便独立计算，需要接入 Aya1-PC 时显式填写其中心地址。中心模式下，工程原有 workers / 并发上限不参与 CPU 准入；有限的提交窗口用于提前准备任务，实际 CPU 和内存由中心统一分配。
+
+每个工程设置 `resource_share`（默认 1.0），中心按活跃工程的相对权重分配整数线程，用最大余数补齐余量。当前 54 线程、三个工程同权且需求充足时为 18/18/18；两个工程权重 2:1 时为 36/18。不能整除时，例如 53 线程、三个工程同权，为 18/18/17。需求不足的份额供其他待运行任务使用。
+
+单线程 SPICE 任务声明 `cpus: 1`。可并行的整轮任务声明 `cpus: 0`，中心按工程份额和可用节点授予实际线程数，并把 `${cpus}` 传给程序。`cpus: 0` 由中心处理，直接 worker 任务需声明正整数。整轮任务在单个节点执行；晚加入的整轮任务会等待所需份额释放，中心预留对应节点的线程，其余可运行任务继续填补资源。在途任务保留原节点与线程数，后续派发随需求和权重变化。
+
+`queue_ratio`（默认 1.0）控制提前排队比例。调用 `Client.admission()` 获得提交窗口：
+
+```text
+运行槽位 = max(1, ceil(目标线程 / 单任务线程))
+预取任务 = ceil(运行槽位 × queue_ratio)
+提交窗口 = 运行槽位 + 预取任务
+```
+
+整轮 `cpus: 0` 的运行槽位为 1。`queue_ratio: 0` 不额外预取，1 准备下一波已就绪任务。CPU、内存、工具、共享路径和指定节点仍决定实际派发；提交窗口不是 CPU 授权，也不是服务端全局队列硬上限。工程只预取已就绪工作，保留搜索批次和代际边界。
+
+配置位置：AOP 原运行配置、ARH-DSE、Bench 顶层使用这两个字段；AOP 规范化配置在 `execution` 中映射，RGCN 放在 `resources` 中。
+
+```json
+{"resource_share": 1.0, "queue_ratio": 1.0}
+```
+
+AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。RGCN 中心路径用滚动窗口补位，并按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
+
+节点 CPU 预算、硬上限和内存配置见[算力控制](operations.md#设备预算与配置文件)。看板同时显示各工程的权重、目标份额、已分配线程和排队数。焦点刷新只影响终端展示，后台调度和资源探测持续工作。
+
+调度思路参考 [Dask 中央排队与饱和度](https://distributed.dask.org/en/latest/scheduling-state.html)、[Ray 有限待处理任务](https://docs.ray.io/en/latest/ray-core/patterns/limit-pending-tasks.html)、[Slurm 资源预留与回填](https://slurm.schedmd.com/sched_config.html)。实现使用 Python 标准库。
+
+## 分配策略
+
+- `adaptive`：结合空闲 CPU、主机负载、可用内存、节点权重和同类任务实测耗时分配。首次接触节点时先取得样本，之后按耗时的指数移动平均调整选择。
+- `balanced`：按相对 CPU 负载和权重均衡分配。
+- `round_robin`：在满足资源条件的节点之间轮询，便于固定分配实验。
+
+任务还可设置 `priority`、`node`、`requires`。较大的 `priority` 先启动；`node` 固定节点名称；`requires` 要求节点标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选节点。多个批次共享同一调度器的资源账本，节点再按自身预算统一准入。
+
+用 `label` 区分电路、保真度或相近工作量的批次，使同类耗时具有可比性。执行中的任务保留原节点；中断任务的状态和已有产物留在节点，便于查询和回收。
+中心的工具变体包含节点名和可执行文件摘要，调用工程可核对固定节点的引擎身份。
+
+## 现有工程接入
+
+四个工程默认优先本机 26133 中心。中心缺席时 auto 模式回到独立执行，沿用 `min(C,16)+floor(max(C-16,0)/2)`；RGCN 的显式中心 URL、ARH/Bench 的显式 scheduler 要求中心可用；AOP 的 scheduler 模式表示优先本地中心，显式 compute-center URL 才要求指定中心可用。显式 local 固定独立计算。worker 子任务设置 `REMOTE_COMPUTE_WORKER=1`，避免递归提交。
+
+| 工程 | 选择中心 | 执行粒度与节点要求 |
+| --- | --- | --- |
+| AOP_v2 | `--compute-center URL` 或 `compute.center`；网页选本地调度器 / 本地工程 | 每角点任务；源码、模型按内容同步，沿用原测量与解析。 |
+| RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | 每候选 PRE/POST 分析；源码和模型闭包同步，保留后仿恢复与原任务 ID。 |
+| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；执行节点需要 `shared.arh` 指向 ARH 工程及其原生计算环境。当前此节点为 Aya1-PC；Aya1-TX 独立 RTL 能力通过 Verilator 任务提供。 |
+| Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码同步，需要 bench_python 科学环境。 |
+
+仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告；本次验证使用该隔离方式，正式结果与已有报告保持原样。日常正式运行仍按各工程规则更新当前成功报告。
+
+## 脚本与 Python 接口
+
+```text
+python main.py --mode hybrid --port 26134 --cpus 2 batch examples/batch.json results/demo
+python main.py --mode scheduler --nodes nodes.local.json run examples/spice/task.json --input examples/spice --output results/divider
+python main.py --mode scheduler --url http://192.168.1.10:26133 jobs
+python main.py --mode scheduler --url http://192.168.1.10:26133 fetch 任务ID --output results/recovered
+python main.py --check
+python main.py --test
+python main.py --test-native
+```
+
+全局 `--cpus` / `--memory-mb` 是本机提供者预算；任务命令后面的同名选项是该任务的资源预留。单任务命令成功返回 0，执行失败返回 1，配置或通信错误返回 2。
+
+```python
+from remote_compute import Client, ngspice
+
+result = Client().run(ngspice("divider.spice"), inputs="examples/spice")
+print(result["status"], result["assigned_node"])
+print(result["files"]["ngspice.log"].decode(errors="replace"))
+```
+
+指定 `output_dir` 时产物保存到该目录；省略时以 bytes 返回在 `result["files"]` 中。高级脚本可使用 `Pool` 直接连接 worker（Aya1-PC 为 `127.0.0.1:26134`、Aya1-TX 为 `192.168.1.10:26133`）；接入统一调度使用 `Client(中心地址)`，让中心管理多工程份额。
+
+其他工程可把此工程目录加入 Python 的模块搜索路径，再导入 `remote_compute`。工程本身没有 pip 安装步骤。
+
+### 向中心提交与查询窗口
+
+```python
+from remote_compute import Client, command
+
+center = Client()
+window = center.admission("my-project", resource_share=1.0, queue_ratio=1.0, cpus=1)
+print(window)
+task = command(["${tool:python}", "runner.py", "--workers", "${cpus}"],
+               cpus=0, memory_mb=1024, project="my-project", resource_share=1.0,
+               outputs=["measurements.json"])
+result = center.run(task, inputs="my-batch")
+print(result["status"], result["assigned_node"], result["cpus"])
+```
+
+同一工程的任务保持相同 project 和 resource_share；多个调用者各自的有限窗口由调用者维护，中心统一控制执行资源。
+
+## 任务文件与结果
+
+一个任务由顺序执行的 `steps`、输入文件和输出模式组成。任何一步失败即结束该任务，保留退出码和日志。`timeout` 覆盖整条执行链。取消和超时会结束所持有的进程树，包括编译器子进程。
+
+```json
+{
+  "label": "my-batch",
+  "cpus": 2,
+  "memory_mb": 512,
+  "priority": 5,
+  "timeout": 300,
+  "steps": [["${tool:python}", "runner.py", "--workers", "${cpus}"]],
+  "outputs": ["measurements.json"]
+}
+```
+
+变量可以出现在命令参数、环境变量、`cwd`，以及 `render` 指定的 UTF-8 文本文件中：
+
+| 变量 | 含义 |
+| --- | --- |
+| `${tool:python}` / `${tool:ngspice}` / `${tool:verilator}` | 节点配置的工具；多参数前缀放在每步第一个参数，单个可执行路径也可嵌入环境和输入文件 |
+| `${work}` | 当前任务的独立工作目录 |
+| `${cpus}` | 当前任务占用的 CPU 数，用于程序线程数或编译 `-j` |
+| `${exe}` | Windows 为 `.exe`，Linux 为空串 |
+| `${asset:models}` | 本任务引用的已同步只读资产目录 |
+| `${shared:pdk}` | 节点预部署的共享目录 |
+
+大模型或 PDK 可以预部署到各节点，通过 `worker.local.json` 的 `shared` 配置引用。小型模型包可以同步一次后复用：
+
+```python
+asset_id = client.sync("my-models")
+task = ngspice("circuit.spice", assets={"models": asset_id}, render=["circuit.spice"])
+result = client.run(task, files={
+    "circuit.spice": '* deck\n.include "${asset:models}/device.lib"\n...'
+})
+```
+
+资产按文件内容生成 ID；模型变动产生新 ID。节点部署路径分别配置，任务保持同一份逻辑输入。`shared` 中的预部署内容版本由调用工程维护。
+
+默认工作目录优先使用已有 `Z:` 内存盘，否则使用系统临时目录；`--root` 可指定。输入、构建中间物和日志均在任务独立目录内。客户端收齐结果后自动删除节点任务目录，`--keep` 可显式保留。用户选择的结果保存在输出目录；同步资产保留供后续复用。
+
+普通计算任务继续使用独立工作目录。指定 `cwd` 的任务在目标机该目录中执行，`cwd` 接受绝对路径、`~` 或 `${shared:工程名}`；`${work}` 和 `outputs` 始终指向任务输入目录，可将需要回收的文件明确写入 `${work}`。任务 JSON 的 `stdin` 是输入包中的相对文件路径，逐步作为标准输入传入。
+
+每份结果包含任务 ID、输入摘要、命令、退出码、CPU 数、时间和工具文件摘要。接受后的任务通过原节点和 ID 查询；相同 ID 在节点保留期间重复提交只执行一次。测量解析、科学评分、唯一设计预算与研究缓存由原工程管理。
+
+## 验证入口
+
+```text
+python main.py --check
+python main.py --test
+python main.py --test-native
+```
+
+核心回归覆盖份额、预取窗口、整轮线程授予、CPU/内存准入、连接复用、取消、文件操作、重启与结果回收。原生检查需要节点的 ngspice 和 Verilator。
+
+2026-10-17 的隔离实测：三工程持续提交 300 秒，AOP 完成 1188 个角点任务、RGCN 完成 638 个候选、ARH 完成 13 轮，均无错误；当时预算为 27+31，暖机后平均分配 51.8/58 线程，平均 CPU 为本机 95.4%、Aya1-TX 86.4%。随后按新预算 24+30 复查，达到 54/54 分配，AOP 125 个角点、RGCN 108 个候选、ARH 2 轮均无错误。两次检查保护的 16,252 个原结果/报告文件保持不变。Aya1-TX 的 RTL 编译与 4096 周期断言通过；Bench 的四个 ZDT1/Class-AB 配对任务、每任务 128 次评价，关键科学数组逐项一致。实测临时文件在完成后清理。
+
+工具参数：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。

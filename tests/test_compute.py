@@ -242,6 +242,19 @@ class PoolTests(unittest.TestCase):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_hybrid_keeps_worker_on_loopback_when_center_listens_on_lan(self):
+        with scratch() as directory:
+            config = Path(directory)/'worker.json'
+            config.write_text(json.dumps({'host':'0.0.0.0','shared':{},'tools':{}}))
+            result = subprocess.run([sys.executable,'-B',str(ROOT/'main.py'),'--config',str(config),
+                                     '--mode','hybrid','--host','0.0.0.0','--port','0','--cpus','1',
+                                     '--root',str(Path(directory)/'service')],
+                                    input=b'quit\n',capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+            output = result.stdout.decode('utf8')
+            self.assertIn('算力提供者 http://127.0.0.1:',output)
+            self.assertIn('调度中心 http://0.0.0.0:',output)
+
     def test_modes_have_one_entry_and_stable_help(self):
         result = subprocess.run([sys.executable, "-B", str(ROOT / "main.py"), "--help"], capture_output=True)
         self.assertEqual(result.returncode, 0)
