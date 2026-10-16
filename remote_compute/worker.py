@@ -72,16 +72,21 @@ def file_hash(path):
         return None
 
 
-def validate_task(task, capacity):
+def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin"}
+    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
             "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256, **task}
     cpus, timeout = task["cpus"], task["timeout"]
-    if type(cpus) is not int or not 1 <= cpus <= capacity:
+    if not isinstance(task.get('project', ''), str):
+        raise ValueError('project must be a string')
+    share = task.get('resource_share', 1.0)
+    if isinstance(share, bool) or not isinstance(share, (int, float)) or not math.isfinite(share) or share <= 0:
+        raise ValueError('resource_share must be positive and finite')
+    if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
         raise ValueError(f"Task cpus must be in 1..{capacity}")
     if type(task["memory_mb"]) is not int or task["memory_mb"] < 1:
         raise ValueError("memory_mb must be a positive integer in MiB")
@@ -513,14 +518,44 @@ class Worker:
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128
 
     def __init__(self, address, worker, *, restart=None):
         self.worker = worker
         self.restart = restart
+        self.connections = set()
+        self.connections_lock = threading.Lock()
         super().__init__(address, Handler)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        with self.connections_lock:
+            self.connections.add(connection)
+        return connection, address
+
+    def shutdown_request(self, request):
+        with self.connections_lock:
+            self.connections.discard(request)
+        super().shutdown_request(request)
+
+    def server_close(self):
+        super().server_close()
+        with self.connections_lock:
+            connections = list(self.connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def setup(self):
+        super().setup()
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     def log_message(self, *_args):
         pass
 

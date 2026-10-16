@@ -13,6 +13,7 @@ from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .telemetry import Activity
+from .allocation import weighted_threads
 import socket
 
 
@@ -73,7 +74,25 @@ class Coordinator:
                                                           sum(n.memory_free for n in group))) for group in machines.values()),
                     "memory_reserved_mb": sum(n.reserved_memory_mb + n.external_memory_mb for n in online),
                     "paused": self.paused, "queued": len(self.queue), "tags": sorted(tags),
-                    "policy": snapshot["policy"], "nodes": snapshot["nodes"], **self.activity.snapshot()}
+                    "policy": snapshot["policy"], "nodes": snapshot["nodes"],
+                    'projects': self.project_resources(), **self.activity.snapshot()}
+
+    def project_resources(self):
+        shares, demands, used, queued = {}, {}, {}, {}
+        capacity = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled)
+        largest = max((n.capacity for n in self.pool.nodes if not n.error and n.enabled), default=1)
+        with self.condition:
+            for job in self.jobs.values():
+                if job['result']['status'] in TERMINAL:
+                    continue
+                task = job.get('task', {})
+                name = task.get('project') or 'default'
+                shares[name] = task.get('resource_share', 1.0)
+                demands[name] = demands.get(name, 0) + (task.get('cpus', 1) or largest)
+                used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
+                queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
+        quotas = weighted_threads(capacity, shares, demands)
+        return {name: dict(resource_share=shares[name], target=quotas[name], used=used[name], queued=queued[name]) for name in shares}
 
     def control(self, changes):
         if isinstance(changes, dict) and "node" in changes:
@@ -115,7 +134,7 @@ class Coordinator:
                 return dict(saved)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")),
-                                     max((n.capacity for n in self.pool.nodes), default=1))
+                                     max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
             directory = self.root / "jobs" / identity
             directory.mkdir()
             (directory / "request.zip").write_bytes(payload)
@@ -135,10 +154,21 @@ class Coordinator:
         with self.condition:
             while not self.stopping:
                 if not self.paused:
-                    for identity in list(self.queue):
+                    budgets = self.project_resources()
+                    ordered = sorted(self.queue, key=lambda key: (-self.jobs[key]['task']['priority'],
+                                     self.jobs[key]['task']['cpus'] != 0))
+                    # First honor weighted targets, then lend otherwise idle slots.
+                    for identity, borrowing in [(key, False) for key in ordered] + [(key, True) for key in ordered]:
+                        if identity not in self.queue:
+                            continue
                         job = self.jobs[identity]
+                        group = job['task'].get('project') or 'default'
+                        budget = budgets[group]
+                        room = budget['target'] - budget['used']
+                        if not borrowing and (room <= 0 or (job['task']['cpus'] or 1) > room):
+                            continue
                         try:
-                            node = self.pool._acquire(job["task"], block=False)
+                            node = self.pool._acquire(job["task"], block=False, cpu_limit=None if borrowing else room)
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -148,8 +178,9 @@ class Coordinator:
                             continue
                         self.queue.remove(identity)
                         job["node"] = node
+                        budget['used'] += job['task']['cpus']
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
-                                             dispatched=time.time())
+                                             dispatched=time.time(), cpus=job['task']['cpus'])
                         self._save(job)
                         thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
                         self.threads.add(thread)
@@ -163,7 +194,10 @@ class Coordinator:
             for asset in task["assets"].values():
                 if not node.client.request("/assets/" + asset)["exists"]:
                     node.client.request("/assets/" + asset, (self.root / "assets" / (asset + ".zip")).read_bytes())
-            node.client.submit_bundle(identity, (job["directory"] / "request.zip").read_bytes())
+            with zipfile.ZipFile(job['directory'] / 'request.zip') as archive:
+                payload = {name: archive.read(name) for name in archive.namelist()}
+            payload['task.json'] = json_bytes(task)
+            node.client.submit_bundle(identity, pack(payload))
             while True:
                 if job["cancel"].is_set():
                     node.client.cancel(identity)
@@ -242,9 +276,14 @@ class Coordinator:
             result, client = self.get(identity), self._client(job)
         files = {}
         if client:
-            raw = client.request("/jobs/" + identity + "/artifacts", binary=True)
-            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-                files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
+            try:
+                raw = client.request("/jobs/" + identity + "/artifacts", binary=True)
+            except RemoteError as error:
+                if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
+                    raise
+            else:
+                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                    files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
         files["result.json"] = json_bytes(result)
         return pack(files)
 
@@ -255,7 +294,11 @@ class Coordinator:
                 raise Conflict("Cancel and wait before deleting the job")
             client = self._client(job)
             if client:
-                client.delete(identity)
+                try:
+                    client.delete(identity)
+                except RemoteError as error:
+                    if getattr(error, 'status_code', None) != 404:
+                        raise
             shutil.rmtree(job["directory"])
             del self.jobs[identity]
             return {"deleted": identity}

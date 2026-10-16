@@ -3,15 +3,15 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
+import http.client
 import io
 import json
 from pathlib import Path
 import re
 import threading
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, Request, build_opener
 from urllib.parse import quote
+from urllib.parse import urlsplit
 import uuid
 import zipfile
 
@@ -22,11 +22,19 @@ class RemoteError(RuntimeError):
     pass
 
 
+class _ConnectionOwner:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __del__(self):
+        self.connection.close()
+
+
 class Client:
     def __init__(self, url="http://127.0.0.1:8765", token="", *, timeout=10):
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
-        # LAN traffic goes directly to the worker, independent of system proxy setup.
-        self.http = build_opener(ProxyHandler({}))
+        self.endpoint = urlsplit(self.url)
+        self.connections = threading.local()
 
     def request(self, path, data=None, *, method=None, binary=False):
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json"}
@@ -34,18 +42,33 @@ class Client:
             headers["Authorization"] = "Bearer " + self.token
         if data is not None and not isinstance(data, bytes):
             data = json_bytes(data)
-        request = Request(self.url + path, data=data, headers=headers, method=method)
-        try:
-            with self.http.open(request, timeout=self.timeout) as response:
+        method = method or ('POST' if data is not None else 'GET')
+        for attempt in range(2):
+            connection = getattr(self.connections, 'connection', None)
+            if connection is None:
+                factory = http.client.HTTPSConnection if self.endpoint.scheme == 'https' else http.client.HTTPConnection
+                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=self.timeout)
+                self.connections.connection = connection
+                self.connections.owner = _ConnectionOwner(connection)
+            connection.timeout = self.timeout
+            if connection.sock is not None:
+                connection.sock.settimeout(self.timeout)
+            try:
+                connection.request(method, self.endpoint.path.rstrip('/') + path, body=data, headers=headers)
+                response = connection.getresponse()
                 raw = response.read()
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            exc.close()
-            error = RemoteError(f"{self.url}{path}: HTTP {exc.code}: {detail}")
-            error.status_code = exc.code
-            raise error from None
-        except (URLError, OSError) as exc:
-            raise RemoteError(f"{self.url}{path}: {exc}") from None
+                if response.status >= 400:
+                    detail = raw.decode('utf-8', errors='replace')
+                    error = RemoteError(f'{self.url}{path}: HTTP {response.status}: {detail}')
+                    error.status_code = response.status
+                    raise error
+                break
+            except (http.client.HTTPException, OSError) as exc:
+                connection.close()
+                self.connections.connection = None
+                if method != 'GET' or attempt:
+                    raise RemoteError(f'{self.url}{path}: {exc}') from None
+                time.sleep(.1)
         return raw if binary else json.loads(raw)
 
     def health(self):
@@ -290,11 +313,12 @@ class Pool:
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
-    def _acquire(self, task, *, block=True, cancel_event=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
-        cpus = task.get("cpus", 1)
+        automatic = task.get('cpus') == 0
+        cpus = task.get("cpus", 1) or 1
         memory_mb = task.get("memory_mb", 256)
         label = task.get("label", "")
         required_tools = {m[1] for argv in task.get("steps", ())
@@ -333,6 +357,11 @@ class Pool:
                             return (load + cpus) * speed * (1 + pressure) / (n.capacity * n.weight)
                         unexplored = [n for n in ready if label not in n.durations] if self.policy == "adaptive" else []
                         node = min(unexplored or ready, key=score)
+                    if automatic:
+                        cpus = node.capacity - node.reserved - node.external
+                        if cpu_limit is not None:
+                            cpus = min(cpus, cpu_limit)
+                        task['cpus'] = cpus
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
                     return node

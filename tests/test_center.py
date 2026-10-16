@@ -32,6 +32,48 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_weighted_integer_allocation_and_unused_share_lending(self):
+        from remote_compute.allocation import weighted_threads
+        self.assertEqual(weighted_threads(58, dict(A=1,B=1,C=1), dict(A=100,B=100,C=100)),dict(A=20,B=19,C=19))
+        self.assertEqual(weighted_threads(58, dict(A=2,B=1), dict(A=100,B=100)),dict(A=39,B=19))
+        self.assertEqual(weighted_threads(58, dict(A=1,B=1,C=1), dict(A=1,B=100,C=100)),dict(A=1,B=29,C=28))
+
+    def test_three_projects_share_all_threads_and_auto_job_obeys_share(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=7) as (_, node):
+            with Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
+                client.control(paused=True)
+                identities=[]
+                identities.append(client.submit(python('import time; time.sleep(1)',cpus=0,project='A'))['id'])
+                for project in ('B','C'):
+                    for _ in range(2):
+                        identities.append(client.submit(python('import time; time.sleep(1)',project=project))['id'])
+                client.control(paused=False)
+                until(lambda: sum(p['used'] for p in client.health()['projects'].values()) == 7)
+                allocations=client.health()['projects']
+                self.assertEqual({k:v['used'] for k,v in allocations.items()},dict(A=3,B=2,C=2))
+                for identity in identities:
+                    client.wait(identity);client.fetch(identity)
+
+    def test_automatic_cpu_grant_uses_remaining_node_slots(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, node):
+            with Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
+                busy = client.submit(python('import time; time.sleep(1)', cpus=1))['id']
+                until(lambda: client.status(busy)['status'] == 'running')
+                result = client.run(python("import os; print(os.environ['GRANT'])", cpus=0, env={'GRANT':'${cpus}'}))
+                self.assertEqual(result['status'], 'succeeded')
+                self.assertEqual(result['cpus'], 3)
+                self.assertEqual(result['stdout'].strip(), '3')
+                client.wait(busy)
+                client.fetch(busy)
+
+    def test_polling_reuses_one_tcp_connection(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, client):
+            ports = set()
+            for _ in range(300):
+                client.health()
+                ports.add(client.connections.connection.sock.getsockname()[1])
+            self.assertEqual(len(ports), 1)
+
     def test_forward_result_provenance_and_two_sided_collection(self):
         with scratch() as root, provider(Path(root)/'worker') as (worker, node):
             with Pool([node]) as pool, center(pool, Path(root)/'center') as (state, client):

@@ -80,6 +80,8 @@ def format_status(value, url=''):
     rows = [f"Remote Compute | {value.get('node', '')} | {'调度中心' if center else '算力提供者'} | {url}"]
     if center:
         rows.append(f"策略 {value.get('policy')} | 分配 {value.get('used_cpus', 0)}/{value.get('cpus', 0)} 线程 | 排队 {value.get('queued', 0)} | 内存预留 {_gb(value.get('memory_reserved_mb'))} GiB")
+        for name, allocation in value.get('projects', {}).items():
+            rows.append(f"项目 {name} | 分配度 {allocation['resource_share']:g} | 已分配 {allocation['used']} / 当前份额 {allocation['target']} | 排队 {allocation['queued']}")
         nodes = value.get('nodes', [])
     else:
         nodes = [{**value, 'name': value.get('node'), 'capacity': value.get('cpus')}]
