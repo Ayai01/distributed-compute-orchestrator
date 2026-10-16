@@ -3,6 +3,7 @@
 import os
 import signal
 import subprocess
+import time
 
 
 class Process:
@@ -69,6 +70,21 @@ class Process:
             except ProcessLookupError:
                 pass
         self.child.wait()
+        if os.name == 'nt' and self.job:
+            # TerminateJobObject starts termination of the whole tree. Wait for
+            # grandchildren too before their scratch/lock files are reclaimed.
+            import ctypes as c
+            from ctypes import wintypes as w
+            class Accounting(c.Structure):
+                _fields_ = [(name, c.c_int64) for name in ('user', 'kernel', 'period_user', 'period_kernel')] + [
+                    (name, w.DWORD) for name in ('faults', 'total', 'active', 'terminated')]
+            self.kernel.QueryInformationJobObject.argtypes = [w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.c_void_p]
+            info = Accounting()
+            deadline = time.monotonic() + 5
+            while self.kernel.QueryInformationJobObject(self.job, 1, c.byref(info), c.sizeof(info), None) and info.active:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Cancelled process tree did not finish terminating')
+                time.sleep(.01)
 
     def close(self):
         if self.job:
