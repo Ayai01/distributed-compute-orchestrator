@@ -532,5 +532,3 @@ class WorkerShell(Shell):
     def do_delete(self, line):
         """delete 任务ID：删除已经结束且不再需要的任务文件。"""
         display(self.worker.delete(line.strip()))
-
-
