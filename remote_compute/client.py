@@ -297,7 +297,11 @@ class Pool:
             except RemoteError as exc:
                 value, error = {}, str(exc)
             with self.condition:
-                node.health, node.error = value, error
+                node.error = error
+                if error:
+                    self.condition.notify_all()
+                    return
+                node.health = value
                 jobs = value.get('active_jobs')
                 if jobs is None:
                     node.external = max(0, value.get("used_cpus", 0) - node.reserved)
@@ -361,9 +365,10 @@ class Pool:
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
                  "shared_paths": n.health.get("shared_paths", {}),
+                 "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
-                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'active_jobs', 'root', 'version')},
+                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
@@ -390,12 +395,12 @@ class Pool:
                             and set(task.get("requires", ())).issubset(n.health.get("tags", ()))
                             and all(n.health.get("tools", {}).get(tool, {}).get("available") for tool in required_tools)
                             and required_shared.issubset(n.health.get("shared", ()))
-                            and n.capacity >= cpus and n.memory_capacity >= memory_mb and not n.error]
+                            and n.capacity >= cpus and n.memory_capacity >= memory_mb]
                 if not matching:
                     raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
                 def needed(node):
                     return min(cpu_limit, node.capacity) if automatic and cpu_limit else cpus
-                ready = [n for n in matching if n.enabled and not n.health.get("paused")
+                ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
                          and n.capacity - n.reserved - n.external -
                              ((reservations or {}).get(n.name, 0) if not automatic else 0) >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb

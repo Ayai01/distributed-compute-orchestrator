@@ -281,10 +281,13 @@ class ConsoleTests(unittest.TestCase):
         with scratch() as directory:
             task_path = Path(directory) / "task.json"
             task_path.write_text(json.dumps(python("print('terminal-task')")))
+            nodes_path = Path(directory) / 'nodes.json'
+            nodes_path.write_text(json.dumps({'nodes':[]}))
             for mode, commands in [("worker", "status\ncpus 1\npause\nresume\njobs\nquit\n"),
                                    ("hybrid", f'nodes\npolicy balanced\nset {__import__("socket").gethostname()} weight=2 limit=1\nrun "{task_path}" --output "{directory}/terminal-result"\nwait\njobs\nquit\n')]:
                 result = subprocess.run([sys.executable, "-B", str(ROOT / "main.py"), "--mode", mode,
-                                         "--cpus", "1", "--port", "0", "--root", str(Path(directory) / mode)],
+                                         "--cpus", "1", "--port", "0", "--nodes", str(nodes_path),
+                                         "--root", str(Path(directory) / mode)],
                                         input=commands.encode(), capture_output=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
                 self.assertNotIn("操作失败", result.stdout.decode("utf-8"))

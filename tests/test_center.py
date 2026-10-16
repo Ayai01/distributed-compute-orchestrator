@@ -39,6 +39,58 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_offline_worker_keeps_health_and_local_submission_available(self):
+        with scratch() as root, provider(Path(root)/'local') as (_,local), provider(Path(root)/'offline') as (_,offline):
+            with patch.object(offline,'health',side_effect=RemoteError('worker unavailable')):
+                with Pool([dict(name='local',client=local),dict(name='offline',client=offline)]) as pool:
+                    with center(pool,Path(root)/'center') as (_,client):
+                        health=client.health()
+                        self.assertEqual(health['cpus'],1)
+                        self.assertEqual(health['nodes'][1]['active_jobs'],[])
+                        self.assertIn('worker unavailable',health['nodes'][1]['error'])
+                        self.assertEqual(client.run(python("print('local works')"))['stdout'].strip(),'local works')
+
+    def test_known_offline_worker_keeps_queued_work_until_reconnected(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,worker), Pool([dict(name='remote',client=worker)],refresh=60) as pool:
+            with center(pool,Path(root)/'center') as (_,client):
+                with patch.object(worker,'health',side_effect=RemoteError('worker unavailable')):
+                    pool.refresh()
+                    identity=client.submit(python("print('executed once')",node='remote'))['id']
+                    time.sleep(.15)
+                    self.assertEqual(client.status(identity)['status'],'queued')
+                    self.assertEqual(worker.status(),[])
+                    self.assertEqual(client.health()['cpus'],0)
+                pool.refresh()
+                client.wait(identity)
+                self.assertEqual(client.fetch(identity)['stdout'].strip(),'executed once')
+
+    def test_interrupted_result_recovers_worker_outcome_and_upstream_failure_is_typed(self):
+        for private in (False,True):
+            with self.subTest(private=private),scratch() as root,provider(Path(root)/'worker') as (state,worker):
+                if private:
+                    from remote_compute.local import LocalClient
+                    worker=LocalClient(state)
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (coordinator,client):
+                    for code,expected in (("from pathlib import Path;Path('value').write_text('42')",'succeeded'),("raise RuntimeError('actual failure')",'failed')):
+                        identity=client.submit(python(code,outputs=['value']))['id']
+                        client.wait(identity)
+                        with coordinator.condition:
+                            coordinator.jobs[identity]['result'].update(status='interrupted',error='connection lost')
+                        with patch.object(worker,'request',side_effect=RemoteError('still unavailable')):
+                            with self.assertRaises(RemoteError) as raised:client.fetch(identity,delete=False)
+                            self.assertEqual(raised.exception.status_code,502)
+                        result=client.fetch(identity,delete=False)
+                        self.assertEqual(result['status'],expected)
+                        self.assertEqual(result['id'],identity)
+                        self.assertEqual(result['assigned_node'],'node1')
+                        if expected=='succeeded':
+                            self.assertEqual(result['files']['value'],b'42')
+                            self.assertNotIn('error',result)
+                        else:
+                            self.assertIn('actual failure',result['stderr'])
+                        self.assertEqual(client.status(identity)['status'],expected)
+                        client.delete(identity)
+
     def test_cpu_placement_prefers_idle_host_then_fills_thread_budgets(self):
         code="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.05)"
         for policy in ('adaptive','balanced'):
@@ -140,24 +192,30 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(pool.nodes[0].external,0)
                 self.assertEqual(pool.nodes[0].external_memory_mb,0)
 
-    def test_disconnected_running_job_remains_counted_by_worker(self):
+    def test_disconnected_running_job_keeps_grant_and_recovers_original_id(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,worker):
             with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):
-                backend=pool.nodes[0].client;original=backend.status
+                backend=pool.nodes[0].client;original=backend.status;failed=threading.Event();restored=threading.Event()
                 def disconnected(*args,**kwargs):
                     result=original(*args,**kwargs)
-                    if result['status']=='running':raise RemoteError('test connection interrupted')
+                    if not restored.is_set():
+                        failed.set()
+                        raise RemoteError('test connection interrupted')
                     return result
                 with patch.object(backend,'status',side_effect=disconnected):
-                    identity=client.submit(python('import time;time.sleep(30)'))['id']
-                    until(lambda:client.status(identity)['status']=='interrupted')
+                    code="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)\nPath('value').write_text('42')"
+                    identity=client.submit(python(code,outputs=['value']))['id']
+                    self.assertTrue(failed.wait(3))
+                    self.assertNotEqual(client.status(identity)['status'],'interrupted')
+                    self.assertEqual(pool.nodes[0].reserved,1)
+                    pool.refresh()
+                    self.assertEqual(pool.nodes[0].external,0)
+                    worker.write_job_file(identity,'release','done')
+                    restored.set()
+                    self.assertEqual(client.wait(identity)['status'],'succeeded')
+                    self.assertNotIn('connection_error',client.status(identity))
+                    self.assertEqual(client.fetch(identity)['files']['value'],b'42')
                 until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(worker.status(identity)['status'],'running')
-                pool.refresh()
-                self.assertEqual(pool.nodes[0].external,1)
-                self.assertEqual(pool.nodes[0].external_memory_mb,256)
-                self.assertFalse(pool.nodes[0].known_jobs)
-                worker.cancel(identity);worker.wait(identity);client.delete(identity)
                 pool.refresh()
                 self.assertEqual(pool.nodes[0].external,0)
 

@@ -25,6 +25,7 @@ from . import __version__
 from .process import Process
 from .resources import Host, process_usage
 from .telemetry import Activity
+from .client import RemoteError
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -702,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply({"error": "Unknown job, tool or path variable: " + str(exc)}, 404)
         except Conflict as exc:
             self._reply({"error": str(exc)}, 409)
+        except RemoteError as exc:
+            self._reply({"error": str(exc)}, 502)
         except FileNotFoundError as exc:
             self._reply({"error": str(exc)}, 404)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:

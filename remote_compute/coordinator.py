@@ -270,13 +270,22 @@ class Coordinator:
             node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
             cancel_sent=False
             while True:
-                if job["cancel"].is_set() and not cancel_sent:
-                    node.client.cancel(identity)
-                    cancel_sent=True
-                remote = node.client.status(identity, brief=True)
-                if remote['status'] in TERMINAL:
-                    remote = node.client.status(identity)
+                try:
+                    if job["cancel"].is_set() and not cancel_sent:
+                        node.client.cancel(identity)
+                        cancel_sent=True
+                    remote = node.client.status(identity, brief=True)
+                    if remote['status'] in TERMINAL:
+                        remote = node.client.status(identity)
+                except RemoteError as error:
+                    if self.stopping or getattr(error,'status_code',None) is not None:
+                        raise
+                    with self.condition:
+                        job['result']['connection_error']=str(error)
+                    time.sleep(.5)
+                    continue
                 with self.condition:
+                    job['result'].pop('connection_error',None)
                     self._update(job, remote)
                 if remote["status"] in TERMINAL:
                     result = remote
@@ -426,7 +435,7 @@ class Coordinator:
         files = {}
         if client:
             from .local import LocalClient
-            if isinstance(client, LocalClient):
+            if isinstance(client, LocalClient) and result['status'] != 'interrupted':
                 return client.worker.artifacts(identity, result=result)
             try:
                 raw = client.request("/jobs/" + identity + "/artifacts", binary=True)
@@ -436,6 +445,13 @@ class Coordinator:
             else:
                 with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                     files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
+                    if result['status']=='interrupted':
+                        remote=json.loads(archive.read('result.json'))
+                        with self.condition:
+                            job['result'].pop('error',None)
+                            job['result'].pop('connection_error',None)
+                            self._update(job,remote)
+                            result=self.get(identity)
         files["result.json"] = json_bytes(result)
         return pack(files)
 
