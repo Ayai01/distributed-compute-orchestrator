@@ -53,6 +53,21 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_command_tables_fit_inside_the_dashboard_and_keep_complete_ids(self):
+        from remote_compute.commands import table
+        identity = '1234567890abcdef'*2
+        row = dict(node='Aya1-TX',id=identity,status='running',cpus=30,memory_mb=512,
+                   label='长标签工程/电路仿真/'+'corner-validation-'*20+'ss27')
+        for columns in (44,64,80,110,140):
+            with patch('remote_compute.console.shutil.get_terminal_size',return_value=os.terminal_size((columns,32))):
+                dashboard=Dashboard(OperatorShell(),lambda: {})
+                with redirect_stdout(dashboard):
+                    table([row],['node','id','status','label','cpus','memory_mb'])
+                output=list(dashboard.output)
+                self.assertTrue(all(_width(line)<=columns-5 for line in output))
+                self.assertIn(identity,'\n'.join(output))
+                self.assertIn('ss27','\n'.join(output))
+
     def test_framed_columns_fit_chinese_and_long_labels_at_multiple_widths(self):
         from remote_compute.view import _label
         job=dict(id='a'*32,project='AOP',label='check/AOP/aop/ngspice/BGR_SKY130_SSFF_m40_p125_4corners/ss27',

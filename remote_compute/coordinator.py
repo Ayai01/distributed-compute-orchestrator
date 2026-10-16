@@ -78,6 +78,10 @@ class Coordinator:
             raise Conflict(str(error)) from None
 
     def health(self):
+        with self.condition, self.pool.condition:
+            return self._health()
+
+    def _health(self):
         snapshot = self.pool.snapshot()
         online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled]
         machines = {}
@@ -99,7 +103,11 @@ class Coordinator:
                     item['project'] = job.get('task',{}).get('project','')
                     active.setdefault(result['assigned_node'],[]).append(item)
             for node in snapshot['nodes']:
-                external = [item for item in node.get('active_jobs',[]) if item['id'] not in self.jobs]
+                external, remaining = [], node['external_cpus']
+                for item in node.get('active_jobs',[]):
+                    if item['id'] not in self.jobs and 0 < item.get('cpus',0) <= remaining:
+                        external.append(item)
+                        remaining -= item['cpus']
                 node['active_jobs'] = active.get(node['name'],[]) + external
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
@@ -183,7 +191,7 @@ class Coordinator:
             directory.mkdir()
             (directory / "request.zip").write_bytes(payload)
             job = {"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
-                   "result": {"id": identity, "status": "queued", "label": task["label"], "cpus": task["cpus"],
+                   "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
                               "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}}

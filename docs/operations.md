@@ -87,6 +87,8 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 耗时计算、命令和文件传输在后台执行，输入行持续可用。help 按资源、任务、机器、终端分组显示操作；完成后的后台操作及时释放结果引用。看板按总览、设备资源、工程份额、当前任务、最近通知分区，使用按终端字符宽度对齐的框表；相同设备/工程/标签的任务合并显示数量与总线程，长标签保留首尾，窄窗口优先保留每台设备和任务摘要；status / jobs 查看完整明细。输入行固定在底部，状态与输出未变化时复用上一帧。
 
+命令表格按外框内部宽度排版；窗口过窄时切换为字段列表，保留完整任务ID，避免外框再次裁掉内容。`jobs 完整任务ID` 查看完整标签与记录。中心任务明细与资源账本取同一快照，已回收任务不再因节点状态缓存重新出现。
+
 常用操作：
 
 ```text
@@ -231,6 +233,8 @@ AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB�
 ## 部署到其他设备
 
 复制工程源码，准备 Python 3.11+，即可使用 worker 模式提供远程 Python、文件访问和控制。`worker.example.json` 是独立节点的最小配置，不依赖 AOP、RGCN、ARH-DSE 或 Analog-Opt-Bench。计算任务需要的源码可以通过资产包发送，依赖和工具按实际任务安装；工程解释器别名可在 `tools` 中追加。`python main.py --check` 用于检查仿真工具。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 在 Python 环境中按调用工程安装科学依赖，配置 tools 指向解释器与 ngspice，Verilator 和编译器使用 PATH 中的工具；setup 当前提供 Windows 可移动工具链。
+
+Windows Verilator 支持 `--binary` 与 `--cc --exe --build` 自定义 C++ harness。两者均先生成代码、修正 Makefile 的工具链路径，再按任务 `-j` 编译并静态链接运行库；自定义 harness 保留自己的 main 与时间回调，源码目录含 `#` 也可构建。未指定 C++ 标准时使用 C++17。
 
 ## 常见问题
 

@@ -111,6 +111,10 @@ class Dashboard:
     def isatty(self):
         return True
 
+    @property
+    def output_width(self):
+        return max(1, shutil.get_terminal_size((110, 32)).columns - 5)
+
     def run(self):
         import msvcrt
         restore = _enable_ansi()

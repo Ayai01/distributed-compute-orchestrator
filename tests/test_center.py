@@ -32,6 +32,29 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_completed_cached_tasks_do_not_reappear_as_external_work(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,worker):
+            with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):
+                identity=client.submit(python('import time;time.sleep(.5)',project='test'))['id']
+                self.assertEqual(client.status(identity)['project'],'test')
+                until(lambda: client.status(identity)['status']=='running')
+                pool.refresh()
+                self.assertEqual(len(pool.nodes[0].health['active_jobs']),1)
+                client.wait(identity)
+                client.fetch(identity)
+                until(lambda: pool.nodes[0].reserved==0)
+                snapshot=client.health()
+                self.assertEqual(snapshot['used_cpus'],0)
+                self.assertEqual(snapshot['nodes'][0]['active_jobs'],[])
+                direct=worker.submit(python('import time;time.sleep(.5)'))['id']
+                until(lambda: worker.status(direct)['status']=='running')
+                pool.refresh()
+                snapshot=client.health()
+                self.assertEqual(snapshot['used_cpus'],1)
+                self.assertEqual([j['id'] for j in snapshot['nodes'][0]['active_jobs']],[direct])
+                worker.wait(direct)
+                worker.fetch(direct)
+
     def test_brief_polling_omits_payload_and_wait_returns_full_provenance(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
             identity=client.submit(python("import time; print('complete'); time.sleep(.2)"))['id']

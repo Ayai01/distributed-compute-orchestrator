@@ -52,7 +52,9 @@ def main(arguments=None):
     environment["PATH"] = str(ucrt) + os.pathsep + environment.get("PATH", "")
     def run(argv):
         return subprocess.call([bash, "-lc", shlex.join(argv)], env=environment)
-    if "--binary" not in arguments:
+    binary = "--binary" in arguments
+    build = "--build" in arguments and ("--cc" in arguments or "--sc" in arguments)
+    if not binary and not build:
         return run(["verilator", *arguments])
     # Scope the label to the private job workspace and job temporary directory.
     owned = os.environ.get("REMOTE_COMPUTE_JOB_DIR")
@@ -67,15 +69,18 @@ def main(arguments=None):
     directory = Path(option("--Mdir", "obj_dir"))
     directory.mkdir(parents=True, exist_ok=True)
     cpus = option("-j", "1")
-    generated = [x for x in arguments if x != "--binary"]
-    generated += ["--cc", "--main", "--exe", "--timing", "-CFLAGS", "-std=c++17 -DVL_TIME_CONTEXT",
-                  "-LDFLAGS", "-static-libgcc -static-libstdc++ -static"]
+    generated = [x for x in arguments if x not in {"--binary", "--build"}]
+    if binary:
+        generated += ["--cc", "--main", "--exe", "--timing", "-CFLAGS", "-DVL_TIME_CONTEXT"]
+    if not any('-std=' in value for value in arguments):
+        generated += ["-CFLAGS", "-std=c++17"]
+    generated += ["-LDFLAGS", "-static-libgcc -static-libstdc++ -static"]
     if "-o" not in generated:
         generated += ["-o", "V" + top + ".exe"]
     code = run(["verilator", *generated])
     if code:
         return code
-    makefile = directory / ("V" + top + ".mk")
+    makefile = directory / (option("--prefix", "V" + top) + ".mk")
     text = makefile.read_text(encoding="utf-8")
     makefile.write_text(re.sub(r"(?m)^VERILATOR_ROOT\s*=.*$", "VERILATOR_ROOT = /ucrt64/share/verilator", text), encoding="utf-8")
     return run(["make", "-C", directory.resolve().as_posix(), "-f", makefile.name, "-j", cpus])

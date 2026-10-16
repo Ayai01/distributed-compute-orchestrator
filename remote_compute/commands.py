@@ -37,20 +37,27 @@ def display(value):
 
 
 def table(rows, columns):
-    from .view import _width, _cell
+    from .view import _width, _cell, wrap_lines
     names=dict(name='设备',node='设备',capacity='预算',used_cpus='分配',cpu_percent='CPU%',
                memory_available_mb='可用MiB',memory_reserved_mb='预留MiB',memory_mb='内存MiB',
                weight='权重',enabled='启用',paused='暂停',status='状态',cpus='线程',label='标签',id='ID')
     headers=[names.get(key,key) for key in columns]
     rows = [[str(row.get(key, "")) for key in columns] for row in rows]
     widths = [max([_width(headers[i]), *(_width(row[i]) for row in rows)]) for i in range(len(columns))]
-    available=max(1,shutil.get_terminal_size((110,32)).columns-1-2*(len(columns)-1))
+    width = getattr(sys.stdout, 'output_width', shutil.get_terminal_size((110,32)).columns-1)
+    available=max(1,width-2*(len(columns)-1))
     while sum(widths)>available:
-        candidates=[i for i,size in enumerate(widths) if size>max(32 if columns[i]=='id' else 4,_width(headers[i]))]
+        candidates=[i for i,size in enumerate(widths) if size>max({'id':32,'label':15}.get(columns[i],4),_width(headers[i]))]
         if not candidates:
             break
         index=max(candidates,key=lambda i: widths[i])
         widths[index]-=1
+    if sum(widths)>available:
+        for row in rows:
+            for key, value in zip(headers, row):
+                print('\n'.join(wrap_lines(key+': '+value, width)))
+            print()
+        return
     print("  ".join(_cell(key,widths[i]) for i,key in enumerate(headers)))
     for row in rows:
         print("  ".join(_cell(value,widths[i]) for i,value in enumerate(row)))

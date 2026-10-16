@@ -332,6 +332,19 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(rtl["status"], "succeeded", rtl.get("stderr"))
                 self.assertIn("PASS counter 4096", rtl["stdout"])
                 self.assertEqual(json.loads(rtl["files"]["metrics.json"]), {"cycles": 4096, "passed": True})
+                custom=command(["${tool:verilator}","--cc","adder.sv","--top-module","adder",
+                                "--exe","${work}/main.cpp","--build","-j","${cpus}","-o","probe${exe}"],
+                               outputs=["metrics.json"])
+                custom['steps'].append(["${work}/obj_dir/probe${exe}"])
+                result=pool.run(custom,files={
+                    'adder.sv':'module adder(input logic [31:0] a,b, output logic [31:0] sum); assign sum=a+b; endmodule\n',
+                    'main.cpp':'#include "Vadder.h"\n#include <fstream>\ndouble sc_time_stamp(){return 0;}\n'
+                               'int main(){Vadder top; unsigned long long sum=0;'
+                               'for(unsigned i=0;i<100000;i++){top.a=i;top.b=i*3;top.eval();'
+                               'if(top.sum!=i*4)return 1;sum+=top.sum;}'
+                               'std::ofstream("metrics.json")<<"{\\\"cycles\\\":100000,\\\"checksum\\\":"<<sum<<"}";}\n'})
+                self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                self.assertEqual(json.loads(result['files']['metrics.json']),dict(cycles=100000,checksum=19999800000))
                 self.assertEqual(one.status(), [])
                 self.assertEqual(two.status(), [])
 
