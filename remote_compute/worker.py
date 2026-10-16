@@ -214,7 +214,8 @@ class Worker:
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
-                    "active_jobs": [{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb')}
+                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb')},
+                                     'rss_mb':round(j.get('rss_mb',0),2)}
                                     for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
 

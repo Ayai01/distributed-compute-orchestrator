@@ -71,7 +71,7 @@ class Coordinator:
         capable=sum(n.capacity for n in eligible)
         maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
         target = min(target, capable)
-        ready = max(1, math.ceil(target / max(1, cpus))) if cpus else 1
+        ready = max(1, math.ceil(target / cpus)) if cpus else max(1,min(len(eligible),target))
         ceiling=max(1,math.ceil(maximum/max(1,cpus))) if cpus else max(1,len(eligible))
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,
                     running_tasks=ready,queued_tasks=math.ceil(ready*ratio),
@@ -236,7 +236,7 @@ class Coordinator:
                             continue
                         try:
                             node = self.pool._acquire(job["task"], block=False,
-                                cpu_limit=room if room > 0 else None, reservations=reservations)
+                                cpu_limit=room if room > 0 else None, reservations=reservations,job_id=identity)
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -253,7 +253,7 @@ class Coordinator:
                         thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
                         self.threads.add(thread)
                         thread.start()
-                self.condition.wait(0.05)
+                self.condition.wait(0.05 if self.queue else None)
 
     def _execute(self, job):
         node, identity, task = job["node"], job["result"]["id"], job["task"]
@@ -268,9 +268,11 @@ class Coordinator:
                 payload = pack(files)
             callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
             node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
+            cancel_sent=False
             while True:
-                if job["cancel"].is_set():
+                if job["cancel"].is_set() and not cancel_sent:
                     node.client.cancel(identity)
+                    cancel_sent=True
                 remote = node.client.status(identity, brief=True)
                 if remote['status'] in TERMINAL:
                     remote = node.client.status(identity)
@@ -279,13 +281,17 @@ class Coordinator:
                 if remote["status"] in TERMINAL:
                     result = remote
                     break
-                job["cancel"].wait(0.15 if time.time() - job["result"]["dispatched"] < 2 else 0.2)
+                interval=0.15 if time.time()-job['result']['dispatched']<2 else 0.2
+                if cancel_sent:
+                    time.sleep(interval)
+                else:
+                    job['cancel'].wait(interval)
         except Exception as error:
             with self.condition:
                 job["result"].update(status="interrupted", error=str(error), finished=time.time())
                 self._save(job)
         finally:
-            self.pool._release(node, task, result)
+            self.pool._release(node, task, result,job_id=identity)
             with self.condition:
                 self.threads.discard(threading.current_thread())
                 self.condition.notify_all()

@@ -181,8 +181,8 @@ class Client:
             self.delete(identity)
         return result
 
-    def run(self, task, *, inputs=None, files=None, output_dir=None, keep=False, on_submit=None):
-        identity = uuid.uuid4().hex
+    def run(self, task, *, inputs=None, files=None, output_dir=None, keep=False, on_submit=None, job_id=None):
+        identity = job_id or uuid.uuid4().hex
         self.submit(task, inputs=inputs, files=files, job_id=identity)
         if on_submit:
             on_submit(self, identity)
@@ -224,6 +224,8 @@ class Node:
     asset_lock: object = field(default_factory=threading.Lock)
     asset_session: object = None
     known_assets: set = field(default_factory=set)
+    known_jobs: set = field(default_factory=set)
+    live_jobs: set = field(default_factory=set)
 
     @property
     def capacity(self):
@@ -252,6 +254,7 @@ class Pool:
 
     def __init__(self, nodes, *, policy="adaptive", refresh=2):
         self.condition = threading.Condition(threading.RLock())
+        self.refresh_lock = threading.Lock()
         self.nodes = []
         self.policy = policy
         self.refresh_seconds = refresh
@@ -295,10 +298,21 @@ class Pool:
                 value, error = {}, str(exc)
             with self.condition:
                 node.health, node.error = value, error
-                node.external = max(0, value.get("used_cpus", 0) - node.reserved)
-                node.external_memory_mb = max(0, value.get("memory_reserved_mb", 0) - node.reserved_memory_mb)
+                jobs = value.get('active_jobs')
+                if jobs is None:
+                    node.external = max(0, value.get("used_cpus", 0) - node.reserved)
+                    node.external_memory_mb = max(0, value.get("memory_reserved_mb", 0) - node.reserved_memory_mb)
+                else:
+                    running = [job for job in jobs if job['status']=='running']
+                    node.external = sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
+                    owned_memory = sum(max(job['memory_mb'],job.get('rss_mb',0)) for job in running
+                                       if job['id'] in node.known_jobs)
+                    node.external_memory_mb = max(0,value.get('memory_reserved_mb',0)-owned_memory)
+                    # Keep completed identities until a fresh worker snapshot
+                    # drops them; a slow probe must not resurrect our released work.
+                    node.known_jobs.intersection_update({job['id'] for job in jobs} | node.live_jobs)
                 self.condition.notify_all()
-        with ThreadPoolExecutor(max_workers=len(self.nodes)) as executor:
+        with self.refresh_lock, ThreadPoolExecutor(max_workers=len(self.nodes)) as executor:
             list(executor.map(probe, self.nodes))
 
     def _monitor(self):
@@ -353,7 +367,7 @@ class Pool:
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
-    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, reservations=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, reservations=None, job_id=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
@@ -407,6 +421,9 @@ class Pool:
                         task['cpus'] = cpus
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
+                    if job_id:
+                        node.known_jobs.add(job_id)
+                        node.live_jobs.add(job_id)
                     return node
                 if not block:
                     if automatic and reservations is not None:
@@ -423,11 +440,16 @@ class Pool:
         unallocated = sum(max(0, n.reserved_memory_mb + n.external_memory_mb - n.health.get("rss_mb", 0)) for n in siblings)
         return physical - unallocated
 
-    def _release(self, node, task, result=None):
+    def _release(self, node, task, result=None, *, job_id=None):
         label = task.get("label", "")
         with self.condition:
             node.reserved -= task.get("cpus", 1)
             node.reserved_memory_mb -= task.get("memory_mb", 256)
+            node.live_jobs.discard(job_id)
+            if result is None:
+                # A lost connection can leave the worker running this job;
+                # its next health snapshot must account for that work.
+                node.known_jobs.discard(job_id)
             if result is not None:
                 node.completed += 1
                 if result["status"] == "succeeded":
@@ -438,27 +460,23 @@ class Pool:
             self.condition.notify_all()
 
     def run(self, task, *, inputs=None, files=None, output_dir=None, keep=False, on_submit=None):
-        node = self._acquire(task)
-        cpus, label = task.get("cpus", 1), task.get("label", "")
-        identity = None
+        identity = uuid.uuid4().hex
+        node = self._acquire(task, job_id=identity)
         def submitted(client, job_id):
-            nonlocal identity
-            identity = job_id
             with self.condition:
-                self.active[(node.name, identity)] = client
+                self.active[(node.name, job_id)] = client
             if on_submit:
                 on_submit(client, job_id)
         result = None
         try:
             result = node.client.run(task, inputs=inputs, files=files, output_dir=output_dir,
-                                     keep=keep, on_submit=submitted)
+                                     keep=keep, on_submit=submitted, job_id=identity)
             result["assigned_node"] = node.name
             return result
         finally:
             with self.condition:
-                if identity:
-                    self.active.pop((node.name, identity), None)
-                self._release(node, task, result)
+                self.active.pop((node.name, identity), None)
+                self._release(node, task, result, job_id=identity)
 
     def map(self, tasks, *, inputs=None, output_root=None, keep=False):
         tasks = list(tasks)

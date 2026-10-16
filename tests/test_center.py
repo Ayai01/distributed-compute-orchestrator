@@ -32,6 +32,87 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_auto_window_runs_both_nodes_without_extra_prefetch(self):
+        with scratch() as root, provider(Path(root)/'one',cpus=2) as (_,one), provider(Path(root)/'two',cpus=2) as (_,two):
+            with Pool([one,two]) as pool, center(pool,Path(root)/'center') as (_,client):
+                window=client.window('automatic',cpus=0,queue_ratio=0)
+                self.assertEqual(window.current(),2)
+                ids=[client.submit(python("from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)",
+                    cpus=0,project='automatic'))['id'] for _ in range(window.current())]
+                until(lambda:client.health()['used_cpus']==4)
+                self.assertEqual(len({client.status(i)['assigned_node'] for i in ids}),2)
+                for identity in ids:
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
+    def test_cancellation_is_sent_once_and_terminal_polling_stays_bounded(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                identity=client.submit(python('import time;time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                backend=pool.nodes[0].client;original=backend.status;deadline=time.monotonic()+.7
+                def delayed_terminal(*args,**kwargs):
+                    result=original(*args,**kwargs)
+                    if time.monotonic()<deadline:result['status']='running'
+                    return result
+                with patch.object(backend,'cancel',wraps=backend.cancel) as cancel,patch.object(backend,'status',side_effect=delayed_terminal) as status:
+                    client.cancel(identity);client.wait(identity)
+                    self.assertEqual(cancel.call_count,1)
+                    self.assertLessEqual(status.call_count,9)
+                client.fetch(identity)
+
+    def test_stale_probe_does_not_count_our_released_job_as_external(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):
+                code='import time;time.sleep(30)'
+                identity=client.submit(python(code,memory_mb=1))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                until(lambda:any(j['id']==identity and j['rss_mb']>1 for j in worker.health()['active_jobs']))
+                external=worker.submit(python(code))['id']
+                until(lambda:worker.status(external)['status']=='running')
+                self.assertEqual(client.resize(identity,3)['cpus'],3)
+                entered,release=threading.Event(),threading.Event();original=pool.nodes[0].client.health
+                def delayed_health():
+                    result=original();entered.set();release.wait(5);return result
+                with patch.object(pool.nodes[0].client,'health',side_effect=delayed_health):
+                    probe=threading.Thread(target=pool.refresh);probe.start()
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        self.assertEqual(client.resize(identity,1)['cpus'],1)
+                        client.cancel(identity);client.wait(identity);client.fetch(identity)
+                        until(lambda:pool.nodes[0].reserved==0)
+                    finally:release.set();probe.join(5)
+                self.assertEqual(pool.nodes[0].external,1)
+                self.assertAlmostEqual(pool.nodes[0].external_memory_mb,256,places=2)
+                self.assertIn(identity,pool.nodes[0].known_jobs)
+                self.assertFalse(pool.nodes[0].live_jobs)
+                pool.refresh()
+                self.assertFalse(pool.nodes[0].known_jobs)
+                worker.cancel(external);worker.wait(external);worker.fetch(external)
+                pool.refresh()
+                self.assertEqual(pool.nodes[0].external,0)
+                self.assertEqual(pool.nodes[0].external_memory_mb,0)
+
+    def test_disconnected_running_job_remains_counted_by_worker(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,worker):
+            with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):
+                backend=pool.nodes[0].client;original=backend.status
+                def disconnected(*args,**kwargs):
+                    result=original(*args,**kwargs)
+                    if result['status']=='running':raise RemoteError('test connection interrupted')
+                    return result
+                with patch.object(backend,'status',side_effect=disconnected):
+                    identity=client.submit(python('import time;time.sleep(30)'))['id']
+                    until(lambda:client.status(identity)['status']=='interrupted')
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(worker.status(identity)['status'],'running')
+                pool.refresh()
+                self.assertEqual(pool.nodes[0].external,1)
+                self.assertEqual(pool.nodes[0].external_memory_mb,256)
+                self.assertFalse(pool.nodes[0].known_jobs)
+                worker.cancel(identity);worker.wait(identity);client.delete(identity)
+                pool.refresh()
+                self.assertEqual(pool.nodes[0].external,0)
+
     def test_client_reset_closes_keepalive_without_a_server_traceback(self):
         import http.client
         import os

@@ -192,7 +192,7 @@ machine.download("./results", "./results/Aya1-TX")
 
 ## 同一仓库、设备独立配置
 
-源码统一来自 https://github.com/Ayai01/Remote-Compute.git。两台设备保持同一个 main 提交；设备始终以操作系统主机名显示。首次 `git clone`，后续运行 `python main.py update`（快进更新）；`update --check` 查看远端版本。更新后从中心执行 `restart Aya1-TX` 重新加载。先确认节点空闲，再更新并重载。
+源码统一来自 https://github.com/Ayai01/Remote-Compute.git。两台设备保持同一个 main 提交；设备始终以操作系统主机名显示。首次 `git clone`，后续运行 `python main.py update`（快进更新）；`update --check` 查看远端版本。更新仅修改磁盘源码；运行版本以 `health.version` 和 `pid` 为准。科研任务运行期间可先同步源码，留待自然重启生效；需要立即生效时，先确认空闲，再从中心执行 `restart Aya1-TX` 和 `restart --wait`。
 
 `worker.local.json`、`nodes.local.json`、`worker.standalone.json`、`.tools/`、`.projects/`、`.runtime/` 和 `results/` 都不上传仓库。`.tools/` 放实际Python科学环境、ngspice、RTL编译链和内存盘驱动；任务源码与小模型按内容资产同步。只有确需常驻的大工程才放 `.projects/` 并写本机shared配置。
 

@@ -194,6 +194,11 @@ class PoolTests(unittest.TestCase):
                 self.assertEqual({x["assigned_node"] for x in results}, {"one", "two"})
                 self.assertEqual(one.status(), [])
                 self.assertEqual(two.status(), [])
+                pool.refresh()
+                for node in pool.nodes:
+                    self.assertFalse(node.known_jobs)
+                    self.assertFalse(node.live_jobs)
+                    self.assertEqual((node.reserved,node.external),(0,0))
 
     def test_adaptive_learns_fast_node_and_controls_route(self):
         with scratch() as directory, provider(Path(directory) / "slow", tags=["spice"], env={"DELAY": ".2"}) as (_, slow), provider(Path(directory) / "fast", tags=["rtl"], env={"DELAY": ".01"}) as (_, fast):
