@@ -124,11 +124,18 @@ class Coordinator:
     def control(self, changes):
         if isinstance(changes, dict) and "node" in changes:
             name = changes["node"]
-            node = next(n for n in self.pool.nodes if n.name == name)
+            node = next((n for n in self.pool.nodes if n.name == name), None)
+            if node is None:
+                raise ValueError('Unknown node: ' + str(name))
             if "routing" in changes:
                 self.pool.configure(name, **changes["routing"])
             if "worker" in changes:
-                node.client.control(**changes["worker"])
+                try:
+                    node.client.control(**changes["worker"])
+                except RemoteError as error:
+                    if getattr(error, 'status_code', None) == 400:
+                        raise ValueError(str(error)) from None
+                    raise Conflict(str(error)) from None
                 self.pool.refresh()
             return self.health()
         if isinstance(changes, dict) and set(changes) == {"policy"}:

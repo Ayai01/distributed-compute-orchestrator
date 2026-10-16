@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from remote_compute import Client, Pool
+from remote_compute import Client, Pool, RemoteError
 from remote_compute.coordinator import Coordinator
 from remote_compute.cli import SchedulerShell
 from remote_compute.worker import Conflict, Server
@@ -32,6 +32,15 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_worker_control_errors_return_an_http_response(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, node):
+            with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
+                for changes in ({'node':'node1','worker':{'cpus':999999}}, {'node':'missing','worker':{'cpus':1}}):
+                    with self.assertRaises(RemoteError) as raised:
+                        client.control(**changes)
+                    self.assertEqual(raised.exception.status_code,400)
+                self.assertEqual(client.health()['cpus'],2)
+
     def test_center_sizes_prefetch_window_from_share_and_ratio(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=7) as (_,node):
             with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
