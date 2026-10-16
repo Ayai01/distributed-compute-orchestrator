@@ -5,6 +5,7 @@ import cmd
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import shutil
 from pathlib import Path
 import shlex
 import sys
@@ -36,11 +37,23 @@ def display(value):
 
 
 def table(rows, columns):
+    from .view import _width, _cell
+    names=dict(name='设备',node='设备',capacity='预算',used_cpus='分配',cpu_percent='CPU%',
+               memory_available_mb='可用MiB',memory_reserved_mb='预留MiB',memory_mb='内存MiB',
+               weight='权重',enabled='启用',paused='暂停',status='状态',cpus='线程',label='标签',id='ID')
+    headers=[names.get(key,key) for key in columns]
     rows = [[str(row.get(key, "")) for key in columns] for row in rows]
-    widths = [max([len(columns[i]), *(len(row[i]) for row in rows)]) for i in range(len(columns))]
-    print("  ".join(key.ljust(widths[i]) for i, key in enumerate(columns)))
+    widths = [max([_width(headers[i]), *(_width(row[i]) for row in rows)]) for i in range(len(columns))]
+    available=max(1,shutil.get_terminal_size((110,32)).columns-1-2*(len(columns)-1))
+    while sum(widths)>available:
+        candidates=[i for i,size in enumerate(widths) if size>max(32 if columns[i]=='id' else 4,_width(headers[i]))]
+        if not candidates:
+            break
+        index=max(candidates,key=lambda i: widths[i])
+        widths[index]-=1
+    print("  ".join(_cell(key,widths[i]) for i,key in enumerate(headers)))
     for row in rows:
-        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+        print("  ".join(_cell(value,widths[i]) for i,value in enumerate(row)))
 
 
 def submission_parser(kind):
@@ -269,9 +282,17 @@ class SchedulerShell(Shell):
         print('\n'.join(format_status(self.center.health(), self.center.url)))
 
     def do_jobs(self, line):
-        """jobs [节点]：查看任务；id 可用于 logs/cancel/fetch。"""
+        """jobs [节点|任务ID]：查看任务；指定完整任务ID查看完整标签和记录。"""
         rows = []
         if self.center:
+            identity=line.strip()
+            if len(identity)==32 and all(c in '0123456789abcdef' for c in identity):
+                from .view import wrap_lines
+                width=max(20,shutil.get_terminal_size((110,32)).columns-5)
+                for row in json.dumps(self.center.status(identity),ensure_ascii=False,indent=2).splitlines():
+                    for part in wrap_lines(row,width):
+                        print(part)
+                return
             rows = [{**item, "node": item.get("assigned_node", "queued")} for item in self.center.status()]
             table(rows, ["node", "id", "status", "label", "cpus", "memory_mb"])
             return

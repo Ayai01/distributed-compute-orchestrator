@@ -19,4 +19,4 @@
 - 设备始终使用系统主机名；两台设备源码统一从 Ayai01/Remote-Compute 的 main 快进更新。`.tools/`、`.projects/`、结果和设备本地配置不入库。
 - 每台设备只创建/复用一块8GiB共享RAM盘；统一ramdisk.ensure_shared、全局mutex和标记，工程目录各自独立。
 
-- CLI启动与服务生命周期在cli.py，命令与参数在commands.py，看板与键盘交互在console.py。保持状态与输出变更时才重绘；耗时文件操作后台执行，完成的future与句柄及时释放。
+- CLI启动与服务生命周期在cli.py，命令与参数在commands.py，框表与标签格式在view.py，看板与键盘交互在console.py。保持状态与输出变更时才重绘；耗时文件操作后台执行，完成的future与句柄及时释放。

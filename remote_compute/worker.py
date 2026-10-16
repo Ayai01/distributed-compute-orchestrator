@@ -213,7 +213,7 @@ class Worker:
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
-                    "active_jobs": [{k: j['result'].get(k) for k in ('id', 'label', 'status', 'cpus', 'memory_mb')}
+                    "active_jobs": [{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb')}
                                     for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
 
@@ -319,7 +319,7 @@ class Worker:
                     raise ValueError("Missing stdin input file: " + task["stdin"])
                 for name, path in tree(work, task["render"]).items():
                     path.write_text(self._expand(path.read_text(encoding="utf-8"), task, work), encoding="utf-8")
-                result = {"id": identity, "status": "queued", "label": task["label"], "cpus": task["cpus"],
+                result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"],
                           "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
@@ -628,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
                 identity = parts[1]
                 if len(parts) == 2 and self.command == "POST":
                     value = worker.submit(identity, body)
-                    worker.activity.notify(value.get('label', 'job') + ' [' + identity[:8] + ']', self.client_address[0])
+                    worker.activity.submitted(value, worker.jobs[identity].get('task', {}), self.client_address[0])
                     return self._reply(value, 202)
                 if len(parts) == 2 and self.command == "GET":
                     value = worker.get(identity)

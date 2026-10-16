@@ -13,6 +13,17 @@ from test_compute import provider, python, scratch, until
 
 
 class OperatorTests(unittest.TestCase):
+    def test_compute_submissions_do_not_displace_operator_notices(self):
+        activity=Activity()
+        activity.notify('write source.py','192.168.1.6')
+        for i in range(100):
+            activity.submitted(dict(id=str(i),label='candidate'),dict(project='RGCN'),'192.168.1.6')
+        activity.submitted(dict(id='abcdef12',label='machine/exec git'),dict(project='maintenance'),'192.168.1.6')
+        events=activity.snapshot()['events']
+        self.assertEqual(len(events),2)
+        self.assertEqual(events[0]['message'],'write source.py')
+        self.assertIn('machine/exec git',events[1]['message'])
+
     def test_device_config_can_lower_hard_cpu_ceiling(self):
         with scratch() as directory, patch('remote_compute.worker.os.cpu_count',return_value=28):
             with provider(Path(directory)/'worker',cpus=0,cpu_limit=24) as (worker,client):

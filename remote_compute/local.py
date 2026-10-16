@@ -35,7 +35,7 @@ class LocalClient(Client):
                 if len(parts) == 2:
                     if method == 'POST':
                         result = worker.submit(identity, data)
-                        worker.activity.notify(result.get('label', 'job') + ' [' + identity[:8] + ']', 'local')
+                        worker.activity.submitted(result, worker.jobs[identity].get('task', {}), 'local')
                         return result
                     if method == 'DELETE':
                         return worker.delete(identity)

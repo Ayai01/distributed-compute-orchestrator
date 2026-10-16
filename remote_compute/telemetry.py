@@ -19,6 +19,11 @@ class Activity:
         with self.lock:
             self.events.append(dict(time=time.time(), ip=address, message=message))
 
+    def submitted(self, result, task, address):
+        label = result.get('label', 'job')
+        if not task.get('project') or label.startswith('machine/'):
+            self.notify(label + ' [' + result['id'][:8] + ']', address)
+
     def snapshot(self):
         with self.lock:
             return dict(events=list(self.events), peers=[dict(ip=k, seen=v) for k, v in self.peers.items()

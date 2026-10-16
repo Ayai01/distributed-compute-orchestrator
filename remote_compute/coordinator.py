@@ -91,6 +91,16 @@ class Coordinator:
                     info = tools.setdefault(name, {"available": True, "variants": []})
                     info["variants"].append({"node": node.name, **value})
         with self.condition:
+            active = {}
+            for job in self.jobs.values():
+                result = job['result']
+                if result['status'] not in TERMINAL and result.get('assigned_node'):
+                    item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb')}
+                    item['project'] = job.get('task',{}).get('project','')
+                    active.setdefault(result['assigned_node'],[]).append(item)
+            for node in snapshot['nodes']:
+                external = [item for item in node.get('active_jobs',[]) if item['id'] not in self.jobs]
+                node['active_jobs'] = active.get(node['name'],[]) + external
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),

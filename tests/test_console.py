@@ -53,6 +53,23 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_framed_columns_fit_chinese_and_long_labels_at_multiple_widths(self):
+        from remote_compute.view import _label
+        job=dict(id='a'*32,project='AOP',label='check/AOP/aop/ngspice/BGR_SKY130_SSFF_m40_p125_4corners/ss27',
+                 cpus=1,memory_mb=256,status='running')
+        self.assertEqual(_label(job),'BGR/ss27')
+        value=dict(role='scheduler',node='Aya1-PC',cpus=54,used_cpus=24,
+            nodes=[dict(node='Aya1-PC',capacity=24,logical_cpus=28,active_jobs=[job]*24)],projects={})
+        for width in (44,64,80,110,140):
+            status=format_status(value,width=width)
+            rows=_layout(status,['write D:/工程目录/'+'很长的目录/'*20+'main.py'],[],32)
+            for row in rows:
+                self.assertEqual(_width(row),width)
+            text='\n'.join(rows)
+            self.assertIn('BGR/ss27',text)
+            self.assertIn('24 个 / 1 组',text)
+            self.assertNotIn('m40_p125',text)
+
     def test_small_dashboard_keeps_both_devices_and_tasks_visible(self):
         nodes=[]
         for name in ('Aya1-PC','Aya1-TX'):
@@ -63,7 +80,7 @@ class ConsoleTests(unittest.TestCase):
         rows=_layout(status,[f'notice {i}' for i in range(6)],[f'output {i}' for i in range(10)],24)
         text='\n'.join(rows)
         self.assertLessEqual(len(rows),22)
-        for expected in ('task-Aya1-PC','task-Aya1-TX','notice 5','output 9','[设备资源]','[工程份额]','[当前任务]'):
+        for expected in ('task-Aya1-PC','task-Aya1-TX','notice 5','output 9','设备资源','工程份额','当前任务'):
             self.assertIn(expected,text)
 
     def test_focus_refresh_uses_one_or_thirty_seconds_and_updates_on_return(self):
@@ -115,7 +132,7 @@ class ConsoleTests(unittest.TestCase):
                     patch('remote_compute.console._enable_ansi', return_value=lambda: None), \
                     patch('remote_compute.console.time.sleep'):
                 dashboard.run()
-        self.assertIn('log 08', stream.getvalue())
+        self.assertIn('log 14', stream.getvalue())
         self.assertIn('log 19', stream.getvalue())
         self.assertIn('log 00', dashboard.output)
 
