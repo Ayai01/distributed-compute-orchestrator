@@ -31,7 +31,55 @@ def center(pool, root):
         server.server_close()
 
 
+@contextmanager
+def host_load(worker, percent, machine):
+    sample = dict(worker.host.sample(), cpu_percent=percent, logical_cpus=8, machine_id=machine)
+    with patch.object(worker.host, 'sample', return_value=sample):
+        yield
+
+
 class CenterTests(unittest.TestCase):
+    def test_cpu_placement_prefers_idle_host_then_fills_thread_budgets(self):
+        code="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.05)"
+        for policy in ('adaptive','balanced'):
+            with self.subTest(policy=policy), scratch() as root:
+                with provider(Path(root)/'busy',cpus=8) as (busy,one), provider(Path(root)/'idle',cpus=8) as (idle,two):
+                    with host_load(busy,75,'busy-host'), host_load(idle,0,'idle-host'):
+                        with Pool([dict(name='busy',url=one.url),dict(name='idle',url=two.url)],policy=policy,refresh=60) as pool:
+                            pool.nodes[0].durations['cpu-placement']=.01
+                            pool.nodes[1].durations['cpu-placement']=1
+                            with center(pool,Path(root)/'center') as (_,client):
+                                client.control(paused=True)
+                                ids=[client.submit(python(code,project='CPU-placement',label='cpu-placement'))['id'] for _ in range(16)]
+                                client.control(paused=False)
+                                until(lambda:client.health()['used_cpus']==16)
+                                assigned=[client.status(i)['assigned_node'] for i in ids]
+                                self.assertEqual(assigned[:6],['idle']*6)
+                                self.assertEqual((assigned.count('busy'),assigned.count('idle')),(8,8))
+                                for identity in ids:
+                                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+                                until(lambda:all(n.reserved==0 for n in pool.nodes))
+                                client.control(node='idle',routing=dict(memory_limit_mb=128))
+                                result=client.run(python('pass',project='CPU-placement',memory_mb=256))
+                                self.assertEqual(result['assigned_node'],'busy')
+
+    def test_cpu_placement_counts_sampled_work_once_and_pending_grants_immediately(self):
+        code="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.05)"
+        with scratch() as root, provider(Path(root)/'warm',cpus=8) as (warm,one), provider(Path(root)/'busy',cpus=8) as (busy,two):
+            with host_load(warm,50,'warm-host'), host_load(busy,75,'busy-host'):
+                with Pool([dict(name='warm',url=one.url),dict(name='busy',url=two.url)],refresh=60) as pool:
+                    with center(pool,Path(root)/'center') as (_,client):
+                        initial=client.submit(python(code,cpus=4,node='warm',project='CPU-placement'))['id']
+                        until(lambda:client.status(initial)['status']=='running')
+                        pool.refresh()
+                        client.control(paused=True)
+                        ids=[client.submit(python(code,project='CPU-placement'))['id'] for _ in range(3)]
+                        client.control(paused=False)
+                        until(lambda:client.health()['used_cpus']==7)
+                        self.assertEqual([client.status(i)['assigned_node'] for i in ids],['warm','warm','busy'])
+                        for identity in [initial,*ids]:
+                            client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
     def test_auto_window_runs_both_nodes_without_extra_prefetch(self):
         with scratch() as root, provider(Path(root)/'one',cpus=2) as (_,one), provider(Path(root)/'two',cpus=2) as (_,two):
             with Pool([one,two]) as pool, center(pool,Path(root)/'center') as (_,client):

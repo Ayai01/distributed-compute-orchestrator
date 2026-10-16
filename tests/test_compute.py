@@ -56,6 +56,15 @@ def until(check, seconds=5):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_explicit_numerical_threads_survive_worker_defaults(self):
+        keys=('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS')
+        with scratch() as directory, provider(Path(directory)/'worker',cpus=3,env={key:'99' for key in keys}) as (_,client):
+            task=python("import json,os;print(json.dumps({k:os.environ[k] for k in " + repr(keys) + "}))",
+                        cpus=3,env={'OMP_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1','NUMEXPR_NUM_THREADS':'${cpus}'})
+            result=client.run(task)
+            self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+            self.assertEqual(json.loads(result['stdout']),dict(zip(keys,('1','1','3','3'))))
+
     def setUp(self):
         self.temp = scratch()
         self.root = Path(self.temp.name)

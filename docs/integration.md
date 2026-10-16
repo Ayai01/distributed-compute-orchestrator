@@ -34,13 +34,24 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 节点 CPU 预算、硬上限和内存配置见[算力控制](operations.md#设备预算与配置文件)。看板同时显示各工程的权重、目标份额、已分配线程和排队数。焦点刷新只影响终端展示，后台调度和资源探测持续工作。
 
-调度思路参考 [Dask 中央排队与饱和度](https://distributed.dask.org/en/latest/scheduling-state.html)、[Ray 有限待处理任务](https://docs.ray.io/en/latest/ray-core/patterns/limit-pending-tasks.html)、[Slurm 资源预留与回填](https://slurm.schedmd.com/sched_config.html)。实现使用 Python 标准库。
+调度思路参考 [Dask 排队与负载选择](https://distributed.dask.org/en/stable/scheduling-policies.html)、[Ray 有限待处理任务](https://docs.ray.io/en/latest/ray-core/patterns/limit-pending-tasks.html)、[Slurm 资源预留与回填](https://slurm.schedmd.com/sched_config.html)。实现使用 Python 标准库。
 
 ## 分配策略
 
-- `adaptive`：结合空闲 CPU、主机负载、可用内存、节点权重和同类任务实测耗时分配。首次接触节点时先取得样本，之后按耗时的指数移动平均调整选择。
-- `balanced`：按相对 CPU 负载和权重均衡分配。
+- `adaptive`：先满足线程、内存、工具与工程份额，优先选择预计 CPU 负载较低的设备。候选负载相差不足一个逻辑线程时，再参考同类任务耗时的指数移动平均、节点权重和未采样节点。
+- `balanced`：使用相同的 CPU 负载优先规则，接近时按线程占比与节点权重选择。
 - `round_robin`：在满足资源条件的节点之间轮询，便于固定分配实验。
+
+负载按设备的逻辑线程数归一化，并把尚未反映在采样中的派发和线程借还立即计入：
+
+```text
+背景占用线程 = max(0, 采样CPU比例 × 逻辑线程数 - worker快照已分配线程)
+预计负载 = (背景占用线程 + 当前预留线程 + 外部任务线程 + 新任务线程) / 逻辑线程数
+```
+
+同设备的多个 worker 合并计算主机占用，避免重复计入 CPU。整轮 `cpus: 0` 比较节点时按一个启动线程计价，选定后仍按可用线程和工程份额授予。采样中的在途任务已包含在 CPU 使用率内，用当前账本替换其旧授予；连续提交不用等待下一次采样才更新负载。CPU 使用率参与节点选择，线程和内存预算决定准入；其余设备已满且该设备仍有可用额度时，可继续派发。指定 `node` 保持约束，已运行任务保持原节点。
+
+worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 
 任务还可设置 `priority`、`node`、`requires`。较大的 `priority` 先启动；`node` 固定节点名称；`requires` 要求节点标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选节点。多个批次共享同一调度器的资源账本，节点再按自身预算统一准入。
 

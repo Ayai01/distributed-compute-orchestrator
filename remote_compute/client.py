@@ -247,8 +247,8 @@ class Node:
 class Pool:
     """Shared admission across concurrent batches; workers enforce the final budget.
 
-    balanced uses relative CPU load; adaptive adds an EMA of same-label elapsed
-    time; round_robin gives predictable rotation. No accepted task is moved.
+    CPU pressure chooses the least-busy host; adaptive uses same-label elapsed
+    time for near ties. round_robin gives predictable rotation. Accepted work stays put.
     """
     POLICIES = {"adaptive", "balanced", "round_robin"}
 
@@ -405,15 +405,21 @@ class Pool:
                         node = next((n for n in self.nodes[self.rotation:] + self.nodes[:self.rotation] if n in ready))
                         self.rotation = (self.nodes.index(node) + 1) % len(self.nodes)
                     else:
+                        pressures = {n.name: self._cpu_pressure(n, cpus) for n in ready}
+                        least = min(ready, key=lambda n: pressures[n.name])
+                        logical = lambda n: n.health.get('logical_cpus') or n.capacity
+                        # CPU load has priority. Below one logical thread of
+                        # difference, retain speed learning and operator weights.
+                        close = [n for n in ready if pressures[n.name] - pressures[least.name]
+                                 < max(1 / logical(n), 1 / logical(least))]
                         observations = [n.durations[label] for n in matching if label in n.durations]
                         typical = sum(observations) / len(observations) if observations else 1.0
                         def score(n):
                             speed = n.durations.get(label, typical * 0.8) / typical if self.policy == "adaptive" else 1.0
                             load = n.reserved + n.external
-                            pressure = (n.health.get("cpu_percent") or 0) / 100
-                            return (load + cpus) * speed * (1 + pressure) / (n.capacity * n.weight)
-                        unexplored = [n for n in ready if label not in n.durations] if self.policy == "adaptive" else []
-                        node = min(unexplored or ready, key=score)
+                            return ((load + cpus) * speed / (n.capacity * n.weight), pressures[n.name])
+                        unexplored = [n for n in close if label not in n.durations] if self.policy == "adaptive" else []
+                        node = min(unexplored or close, key=score)
                     if automatic:
                         cpus = node.capacity - node.reserved - node.external
                         if cpu_limit is not None:
@@ -431,6 +437,18 @@ class Pool:
                         reservations[candidate.name] = max(reservations.get(candidate.name, 0), needed(candidate))
                     return None
                 self.condition.wait(0.2)
+
+    def _cpu_pressure(self, node, cpus):
+        machine = node.health.get('machine_id', node.client.url)
+        siblings = [n for n in self.nodes if not n.error
+                    and n.health.get('machine_id', n.client.url) == machine]
+        logical = max(n.health.get('logical_cpus') or n.capacity for n in siblings)
+        sampled = max(n.health.get('cpu_percent') or 0 for n in siblings) * logical / 100
+        reported = sum(n.health.get('used_cpus', 0) for n in siblings)
+        committed = sum(n.reserved + n.external for n in siblings)
+        # The sample already includes running work. Replace its reported grants
+        # with today's ledger, including dispatches and resizes not sampled yet.
+        return (max(0, sampled - reported) + committed + cpus) / logical
 
     def _host_memory_free(self, node):
         machine = node.health.get("machine_id", node.client.url)

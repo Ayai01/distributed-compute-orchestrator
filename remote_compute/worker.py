@@ -387,9 +387,11 @@ class Worker:
         try:
             environment = dict(os.environ, **self.env)
             environment.update({key: self._expand(value, task, work) for key, value in task["env"].items()})
-            # One admission charge covers task processes AND their numerical threads.
+            # Default libraries to the grant; callers with outer parallelism
+            # can explicitly keep each numerical kernel single-threaded.
             for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-                environment[key] = str(task["cpus"])
+                if key not in task['env']:
+                    environment[key] = str(task["cpus"])
             temporary = directory / "tmp"
             temporary.mkdir()
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
