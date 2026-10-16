@@ -3,6 +3,7 @@
 - 本工程提供远程任务执行与调度；电路测量、科学评分、实验预算和缓存归调用工程管理。
 - README保留快速入口；docs/operations.md维护启动、算力控制、远程操作与部署，docs/integration.md维护调度规则、API、任务与工程接入。参数变化同步对应文档和调用工程的现有说明，避免重复指南与临时审查报告。
 - 入口统一为 `main.py`，支持 scheduler / hybrid / worker；服务和终端保持 Python 标准库实现。
+- Linux 当前仅做源码可移植性和算法逻辑检查，保留待实测提醒，不实际执行 Linux 验证；创建或启动虚拟机必须先取得用户明确同意。保持现有 Windows 任务运行。
 - 独立 worker 只依赖 Python 和本工具。其他工程目录及解释器属于可选能力；缺失共享目录不阻止启动，需要该路径的任务只匹配具备它的节点。
 - scheduler / hybrid / worker 均由统一入口托管，支持在原终端重新加载。先写完源码/配置，再 `Client(中心URL).restart(节点名或None, wait=True)` 等待空闲；用户已授权必要的进程关闭与重启，身份核对后直接完成，无需反复要求手动重开。
 - 操作远程机器统一使用 `Client(中心URL).machine(节点名, cwd=目标工程目录)`，执行命令/Python及读写、上传下载文件；可用 `main.py --url 中心URL exec/python/ls/read/put/get`。无需另设 SSH 或远程工具。先用 `nodes` 查实际节点和共享路径，工程更新前查看在途任务与相关会话。
