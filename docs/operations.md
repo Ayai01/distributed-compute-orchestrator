@@ -236,6 +236,8 @@ AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB�
 
 Windows Verilator 支持 `--binary` 与 `--cc --exe --build` 自定义 C++ harness。两者均先生成代码、修正 Makefile 的工具链路径，再按任务 `-j` 编译并静态链接运行库；自定义 harness 保留自己的 main 与时间回调，源码目录含 `#` 也可构建。未指定 C++ 标准时使用 C++17。
 
+精简工具链仅排除文档、翻译目录与安装缓存，保留同名的标准库文件（例如 C++ 的 `locale` 头）。原生回归包含 `<filesystem>`、UTF-8 中文/空格路径和文件读写。
+
 ## 常见问题
 
 | 现象 | 操作 |

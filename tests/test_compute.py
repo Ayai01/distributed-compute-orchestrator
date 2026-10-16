@@ -338,10 +338,14 @@ class NativeTests(unittest.TestCase):
                 custom['steps'].append(["${work}/obj_dir/probe${exe}"])
                 result=pool.run(custom,files={
                     'adder.sv':'module adder(input logic [31:0] a,b, output logic [31:0] sum); assign sum=a+b; endmodule\n',
-                    'main.cpp':'#include "Vadder.h"\n#include <fstream>\ndouble sc_time_stamp(){return 0;}\n'
+                    'main.cpp':'#include "Vadder.h"\n#include <fstream>\n#include <filesystem>\ndouble sc_time_stamp(){return 0;}\n'
                                'int main(){Vadder top; unsigned long long sum=0;'
                                'for(unsigned i=0;i<100000;i++){top.a=i;top.b=i*3;top.eval();'
                                'if(top.sum!=i*4)return 1;sum+=top.sum;}'
+                               'auto path=std::filesystem::u8path(u8"中文 路径.txt");'
+                               '{std::ofstream stream(path);stream<<"portable";}'
+                               'std::ifstream stream(path);std::string value;stream>>value;'
+                               'if(value!="portable")return 2;'
                                'std::ofstream("metrics.json")<<"{\\\"cycles\\\":100000,\\\"checksum\\\":"<<sum<<"}";}\n'})
                 self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                 self.assertEqual(json.loads(result['files']['metrics.json']),dict(cycles=100000,checksum=19999800000))

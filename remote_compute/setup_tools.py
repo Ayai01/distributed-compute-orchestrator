@@ -169,7 +169,7 @@ def rtl_files(source):
         pending.extend(re.split('[<>=]', value, maxsplit=1)[0] for value in metadata.get('DEPENDS', []))
         for name in sections(folder/'files').get('FILES', []):
             if ((source/name).is_file() and not
-                    {'doc','man','locale','info','post-install','__pycache__'}.intersection(Path(name).parts)):
+                    {'doc','man','locale','info','post-install','__pycache__'}.intersection(Path(name).parts[:-1])):
                 files.add(name)
     return sorted(files), dict(sorted(selected.items()))
 

@@ -32,6 +32,21 @@ def center(pool, root):
 
 
 class CenterTests(unittest.TestCase):
+    def test_auto_uses_idle_smaller_node_while_larger_node_is_busy(self):
+        with scratch() as root, provider(Path(root)/'big',cpus=3) as (_,big), provider(Path(root)/'small',cpus=2) as (_,small):
+            with Pool([dict(name='big',url=big.url),dict(name='small',url=small.url)]) as pool, center(pool,Path(root)/'center') as (_,client):
+                busy=client.submit(python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",
+                                          cpus=3,node='big',project='busy'))['id']
+                until(lambda: client.status(busy)['status']=='running')
+                automatic=client.submit(python("print('parallel')",cpus=0,project='auto'))['id']
+                until(lambda: client.status(automatic)['status'] in ('running','succeeded'))
+                result=client.wait(automatic)
+                self.assertEqual((result['assigned_node'],result['cpus']),('small',2))
+                self.assertEqual(client.status(busy)['status'],'running')
+                client.fetch(automatic)
+                client.write_job_file(busy,'release','done')
+                client.wait(busy);client.fetch(busy)
+
     def test_completed_cached_tasks_do_not_reappear_as_external_work(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,worker):
             with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):

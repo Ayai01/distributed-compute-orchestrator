@@ -356,10 +356,11 @@ class Pool:
                             and n.capacity >= cpus and n.memory_capacity >= memory_mb and not n.error]
                 if not matching:
                     raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
-                needed = min(cpu_limit, max(n.capacity for n in matching)) if automatic and cpu_limit else cpus
+                def needed(node):
+                    return min(cpu_limit, node.capacity) if automatic and cpu_limit else cpus
                 ready = [n for n in matching if n.enabled and not n.health.get("paused")
                          and n.capacity - n.reserved - n.external -
-                             ((reservations or {}).get(n.name, 0) if not automatic else 0) >= needed
+                             ((reservations or {}).get(n.name, 0) if not automatic else 0) >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0]
                 if ready:
@@ -387,7 +388,7 @@ class Pool:
                 if not block:
                     if automatic and reservations is not None:
                         candidate = max(matching, key=lambda n: n.capacity-n.reserved-n.external)
-                        reservations[candidate.name] = max(reservations.get(candidate.name, 0), needed)
+                        reservations[candidate.name] = max(reservations.get(candidate.name, 0), needed(candidate))
                     return None
                 self.condition.wait(0.2)
 
