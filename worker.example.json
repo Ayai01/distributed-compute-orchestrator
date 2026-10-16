@@ -5,13 +5,7 @@
   "memory_mb": 0,
   "memory_reserve_mb": 512,
   "tags": ["cpu"],
-  "tools": {
-    "ngspice": "ngspice",
-    "aop_python": "python",
-    "rgcn_python": "python",
-    "bench_python": "python",
-    "arh_python": "python"
-  },
+  "tools": {},
   "shared": {},
   "env": {}
 }

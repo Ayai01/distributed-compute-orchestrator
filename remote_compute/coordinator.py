@@ -10,6 +10,7 @@ import time
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
+from .client import RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 
 
@@ -35,6 +36,15 @@ class Coordinator:
 
     def nodes(self):
         return self.pool.snapshot()
+
+    def restart_node(self, name):
+        node = next((n for n in self.pool.nodes if n.name == name), None)
+        if node is None:
+            raise ValueError("Unknown node: " + str(name))
+        try:
+            return {"node": name, **node.client.restart()}
+        except RemoteError as error:
+            raise Conflict(str(error)) from None
 
     def health(self):
         snapshot = self.pool.snapshot()

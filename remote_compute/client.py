@@ -56,6 +56,9 @@ class Client:
     def control(self, **changes):
         return self.request("/control", changes)
 
+    def restart(self, node=None):
+        return self.request("/restart", {"node": node} if node else {})
+
     def submit(self, task, *, inputs=None, files=None, job_id=None):
         identity = job_id or uuid.uuid4().hex
         # A stable id can be queried or resubmitted to THIS node after a lost reply.
@@ -272,6 +275,8 @@ class Pool:
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
                  "shared_paths": n.health.get("shared_paths", {}),
+                 "unavailable_shared": n.health.get("unavailable_shared", {}),
+                 "tool_root": n.health.get("tool_root"),
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
@@ -284,6 +289,9 @@ class Pool:
         label = task.get("label", "")
         required_tools = {m[1] for argv in task.get("steps", ())
                           if (m := re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0]))}
+        texts = [*task.get("env", {}).values(), task.get("cwd", ""),
+                 *(arg for argv in task["steps"] for arg in argv)]
+        required_shared = {name for text in texts for name in re.findall(r"\$\{shared:([\w-]+)\}", text)}
         with self.condition:
             while True:
                 if self.closed:
@@ -293,9 +301,10 @@ class Pool:
                 matching = [n for n in self.nodes if (not task.get("node") or n.name == task["node"])
                             and set(task.get("requires", ())).issubset(n.health.get("tags", ()))
                             and all(n.health.get("tools", {}).get(tool, {}).get("available") for tool in required_tools)
+                            and required_shared.issubset(n.health.get("shared", ()))
                             and n.capacity >= cpus and n.memory_capacity >= memory_mb and not n.error]
                 if not matching:
-                    raise RemoteError("No matching online node for task CPU count, tools, node name and tags")
+                    raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
                 ready = [n for n in matching if n.enabled and not n.health.get("paused")
                          and n.capacity - n.reserved - n.external >= cpus
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb

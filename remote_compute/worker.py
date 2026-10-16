@@ -19,6 +19,7 @@ import time
 import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack
+from . import __version__
 from .process import Process
 from .resources import Host, process_usage
 
@@ -58,8 +59,12 @@ def cpu_budget(value=0):
 
 
 def file_hash(path):
-    with open(path, "rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    try:
+        with open(path, "rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError:
+        # Windows execution aliases can launch a tool without exposing readable file bytes.
+        return None
 
 
 def validate_task(task, capacity):
@@ -127,10 +132,11 @@ class Worker:
         self.memory_capacity = memory_mb or max(1, total_mb - memory_reserve_mb)
         self.memory_reserve = memory_reserve_mb
         self.env = dict(env or {})
-        self.shared = {k: Path(v).expanduser().resolve().as_posix() for k, v in (shared or {}).items()}
-        for path in self.shared.values():
-            if not Path(path).is_dir():
-                raise ValueError("Missing shared directory: " + path)
+        self.shared, self.unavailable_shared = {}, {}
+        for name, value in (shared or {}).items():
+            path = Path(value).expanduser().absolute().resolve()
+            (self.shared if path.is_dir() else self.unavailable_shared)[name] = path.as_posix()
+        self.restart_available = False
         self.tools = {"python": [sys.executable], "ngspice": ["ngspice"],
                       "verilator": [sys.executable, str(Path(__file__).with_name("rtl.py"))]}
         for name, value in (tools or {}).items():
@@ -182,7 +188,10 @@ class Worker:
                     "role": "worker", **resources,
                     "cpus": self.capacity, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
-                    "capabilities": ["machine"], "home": Path.home().as_posix(), "shared_paths": self.shared}
+                    "capabilities": ["machine"] + (["restart"] if self.restart_available else []),
+                    "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
+                    "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
+                    "unavailable_shared": self.unavailable_shared}
 
     def control(self, value):
         if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb"}:
@@ -228,6 +237,8 @@ class Worker:
                 return ".exe" if os.name == "nt" else ""
             kind, name = key.split(":", 1)
             if kind == "shared":
+                if name in self.unavailable_shared:
+                    raise ValueError("Shared directory is unavailable on this worker: " + name)
                 return self.shared[name]
             if kind == "asset":
                 return (self.root / "assets" / task["assets"][name]).as_posix()
@@ -477,8 +488,9 @@ class Worker:
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, worker):
+    def __init__(self, address, worker, *, restart=None):
         self.worker = worker
+        self.restart = restart
         super().__init__(address, Handler)
 
 
@@ -518,6 +530,16 @@ class Handler(BaseHTTPRequestHandler):
                 value = worker.nodes()
             elif parts == ["control"] and self.command == "POST":
                 value = worker.control(json.loads(body))
+            elif parts == ["restart"] and self.command == "POST":
+                if hasattr(worker, "restart_node"):
+                    value = worker.restart_node(json.loads(body)["node"])
+                elif self.server.restart:
+                    self.server.restart(check=True)
+                    self._reply({"restarting": True, "pid": os.getpid()}, 202)
+                    self.server.restart()
+                    return
+                else:
+                    raise ValueError("Remote restart requires worker --headless")
             elif parts == ["jobs"] and self.command == "GET":
                 with worker.condition:
                     value = [worker.get(identity) for identity in worker.jobs]

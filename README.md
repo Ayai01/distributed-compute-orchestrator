@@ -29,6 +29,8 @@ python main.py --mode worker --host 0.0.0.0 --cpus 8 --memory-mb 8192
 
 本机 `worker.local.json` 已配置现有 ngspice、ARH 的 MSYS2/Verilator，以及现有工程的共享路径。它属于本机配置，Git 忽略。迁移时按 `worker.example.json` 填写目标设备的工具和路径。
 
+worker 可以独立运行，只需 Python 和本工具源码。示例配置不引用任何其他工程；复制过来的配置中，缺失共享目录记录为 `unavailable_shared`，其余能力正常启动。调度器只将引用共享目录的任务分配到具备该目录的节点。Windows 的执行别名即使无法读取文件摘要，也可以启动基本服务。
+
 ## 终端操作
 
 总调度器的操作不会阻塞后续输入，任务在后台执行：
@@ -64,7 +66,7 @@ quit
 另一台电脑复制本工程后，先用示例配置启动 worker，在调度终端加入它并保存；随后可将工具路径写入那台电脑自己的 `worker.local.json`：
 
 ```text
-python main.py --mode worker --config worker.example.json --host 0.0.0.0 --cpus 8 --memory-mb 8192
+python main.py --mode worker --config worker.example.json --host 0.0.0.0 --headless --cpus 8 --memory-mb 8192
 
 add device2 http://192.168.1.20:8765
 save
@@ -128,6 +130,8 @@ machine.download("./results", "./results/device2")
 ```
 
 `execute` 和 `python` 接受 `job_id`，在结果保留期间用相同 ID 和相同请求重提交只执行一次。操作固定到显式选择的节点；源码更新、工程环境安装、Git 操作和检查可沿用同一接口。
+
+以 `worker --headless` 启动时，入口保留一个轻量 Python 启动进程，支持远程重新加载自身。通过 `machine.upload()` / `write_text()` 更新本工具源码或该节点配置后，调用 `machine.restart()`，或在中心终端执行 `restart device2` / `python main.py --url 中心地址 restart --node device2`。节点空闲时自动重启并重新读取磁盘上的代码和配置，地址保持原配置；在途任务存在时返回409，待任务结束后再操作。`health` 返回 `pid`、`tool_root` 和 `restart` 能力，便于核对更新已生效。启动终端保持运行，之后的文件修改和重启均可远程完成。
 
 ## 分配策略
 
@@ -237,10 +241,10 @@ result = client.run(task, files={
 
 ## 部署到其他设备
 
-复制工程源码，准备 Python 3.11+ 和该节点要使用的计算工具。运行 `python main.py --check` 检查，再以 worker 模式启动。`worker.example.json` 中各工程的 Python 别名要指向已安装相应依赖的解释器。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 使用 PATH 中的 Verilator 和编译器。
+复制工程源码，准备 Python 3.11+，即可使用 worker 模式提供远程 Python、文件访问和控制。`worker.example.json` 是独立节点的最小配置，不依赖 AOP、RGCN、ARH-DSE 或 Analog-Opt-Bench。计算任务需要的源码可以通过资产包发送，依赖和工具按实际任务安装；工程解释器别名可在 `tools` 中追加。`python main.py --check` 用于检查仿真工具。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 使用 PATH 中的 Verilator 和编译器。
 
 按需在两端设置相同的 `REMOTE_COMPUTE_TOKEN`，启用单个共享 token。节点通信直接连接配置的地址。
 
-本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050，`--test-native` 的36项回归全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。机器操作回归覆盖真实工程文件更新后执行、固定节点、原 ID 重连、标准输入、中文/二进制传输和子进程取消。通过运行中的中心读写并更新分压电路后，ngspice 输出从1.2V变为2.2V，下载文件逐字节一致；测试工程与任务临时文件已清理。真实工程对照数据保存在本机 `results/`。
+本机验证使用 Python 3.14.4、ngspice 47、Verilator 5.050，`--test-native` 的39项回归全部通过。两个本机独立节点分发的四次 ngspice 均测得 1.2 V；RTL 完成编译和 4096 周期断言，成功回收 `metrics.json`。中心转发、资产复用、CPU/内存准入、同设备统计、终端批次取消和两侧回收均有核心回归。机器操作回归覆盖真实工程文件更新后执行、固定节点、原 ID 重连、标准输入、中文/二进制传输和子进程取消。独立 worker 缺少旧工程目录、Windows 执行别名不可读、远程更新后重启均已验证。通过运行中的中心读写并更新分压电路后，ngspice 输出从1.2V变为2.2V，下载文件逐字节一致；测试工程与任务临时文件已清理。真实工程对照数据保存在本机 `results/`。
 
 工具参数参考：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。

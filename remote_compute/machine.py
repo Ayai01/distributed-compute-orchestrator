@@ -17,6 +17,10 @@ class Machine:
             raise ValueError("Choose a worker node name for machine operations")
         self.client, self.node, self.cwd = client, node, str(cwd)
 
+    def restart(self):
+        """Reload this worker's code and configuration after its jobs finish."""
+        return self.client.restart(self.node)
+
     def execute(self, argv, *, cwd=None, stdin=None, files=None, wait=True, job_id=None,
                 output_dir=None, keep=False, on_submit=None, **options):
         """Run an argv on the host; wait=False returns a persistent job id."""

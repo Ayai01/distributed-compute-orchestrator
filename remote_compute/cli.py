@@ -17,7 +17,8 @@ import uuid
 from .client import Client, Pool, RemoteError
 from .coordinator import Coordinator
 from .tasks import ngspice, verilator
-from .worker import Server, Worker
+from .bundle import TERMINAL
+from .worker import Conflict, Server, Worker
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -429,6 +430,11 @@ class SchedulerShell(Shell):
         """sync 目录：将模型/只读文件同步到在线节点，返回内容ID。"""
         print(self.dispatch.sync(words(line)[0]))
 
+    def do_restart(self, line):
+        """restart 节点：空闲时重新加载远程 worker 的源码和配置。"""
+        name = words(line)[0]
+        display(self.center.restart(name) if self.center else self._node(name).client.restart())
+
     def do_wait(self, _line):
         """等待本终端已提交操作结束；Ctrl+C 返回提示符。"""
         for future in self.futures:
@@ -573,6 +579,8 @@ def run_scheduler(args, local_url=None):
             value = machine_action(client, args)
             print(value) if isinstance(value, str) else display(value)
             return 1 if isinstance(value, dict) and value.get("status") in {"failed", "cancelled", "timed_out", "interrupted"} else 0
+        elif args.action == "restart":
+            display(dispatch.restart(args.node) if dispatch else next(n.client for n in pool.nodes if n.name == args.node).restart())
         else:
             client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
             method = getattr(client, args.action)
@@ -611,7 +619,23 @@ def check_tools(config):
     return 0 if all(x["ready"] for x in result) else 1
 
 
+def supervise(argv):
+    """Keep a headless worker launch alive across explicit remote reloads."""
+    while True:
+        process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv])
+        while True:
+            try:
+                code = process.wait()
+                break
+            except KeyboardInterrupt:
+                continue  # the child receives the same console signal
+        if code != 75:
+            return code
+        print("正在重新加载 worker 源码和配置。", flush=True)
+
+
 def main(argv=None):
+    invocation = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="统一入口：总调度器、本机调度+算力、远程算力提供者")
     parser.add_argument("--mode", choices=("scheduler", "hybrid", "worker"), help="默认 hybrid；--url 连接现有服务时默认 scheduler")
     parser.add_argument("--config", help="本机工具链/共享目录配置 JSON")
@@ -625,12 +649,15 @@ def main(argv=None):
     parser.add_argument("--memory-mb", type=int, dest="worker_memory_mb", help="本机提供者的任务内存总预算，MiB")
     parser.add_argument("--root", help="节点任务/资产目录；默认使用现有内存盘或系统临时目录")
     parser.add_argument("--headless", action="store_true", help="启动后台服务，不打开交互终端")
+    parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--check", action="store_true", help="检查本机仿真工具")
     parser.add_argument("--test", action="store_true", help="运行核心回归")
     parser.add_argument("--test-native", action="store_true", help="同时验证真实ngspice和Verilator")
     sub = parser.add_subparsers(dest="action")
     sub.add_parser("nodes")
     sub.add_parser("jobs")
+    item = sub.add_parser("restart")
+    item.add_argument("--node", default="local")
     for kind in ("run", "spice", "rtl"):
         sub.add_parser(kind, parents=[submission_parser(kind)], add_help=False)
     for action in sorted(MACHINE_ACTIONS):
@@ -646,9 +673,10 @@ def main(argv=None):
         item.add_argument("--node", default="local")
         if action == "fetch":
             item.add_argument("--output", required=True)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(invocation)
     args.mode = args.mode or ("scheduler" if args.url else "hybrid")
     worker = server = thread = None
+    restarting = threading.Event()
     try:
         path = Path(args.config) if args.config else ROOT / "worker.local.json"
         if args.config and not path.exists():
@@ -664,6 +692,8 @@ def main(argv=None):
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         if args.check:
             return check_tools(config)
+        if args.mode == "worker" and args.headless and not args.service_child:
+            return supervise(invocation)
         if getattr(args, "detach", False) and not args.url:
             raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
@@ -679,8 +709,20 @@ def main(argv=None):
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
             options["token"] = args.local_token
             worker = Worker(root, args.cpus if args.cpus is not None else config.get("cpus", 0), **options)
+            def restart_worker(*, check=False):
+                if check:
+                    with worker.condition:
+                        if worker.stopping or any(j["result"]["status"] not in TERMINAL for j in worker.jobs.values()):
+                            raise Conflict("Worker has active jobs; wait for them to finish before restarting")
+                        worker.stopping = True
+                        worker.condition.notify_all()
+                else:
+                    restarting.set()
+                    threading.Thread(target=server.shutdown, daemon=True).start()
             host = args.host or config.get("host", "127.0.0.1")
-            server = Server((host, port), worker)
+            reloadable = args.mode == "worker" and args.headless and args.service_child
+            worker.restart_available = reloadable
+            server = Server((host, port), worker, restart=restart_worker if reloadable else None)
             print(f"算力提供者 http://{host}:{server.server_port}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             thread.start()
@@ -693,7 +735,7 @@ def main(argv=None):
                     pass
             else:
                 WorkerShell(worker).loop()
-            return 0
+            return 75 if restarting.is_set() else 0
         return run_scheduler(args, f"http://127.0.0.1:{server.server_port}" if server else None)
     except (ValueError, OSError, RuntimeError, StopIteration) as error:
         print("操作失败:", error, file=sys.stderr)
