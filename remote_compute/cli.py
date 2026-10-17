@@ -160,7 +160,8 @@ def check_tools(config):
     for name, prefix in tools.items():
         prefix = [prefix] if isinstance(prefix, str) else prefix
         try:
-            run = subprocess.run([*prefix, "--version"], env=env, capture_output=True,
+            version_flag = '-V' if name == 'iverilog' else '--version'
+            run = subprocess.run([*prefix, version_flag], env=env, capture_output=True,
                                  text=True, errors="replace", timeout=10)
             result.append({"tool": name, "ready": run.returncode == 0, "version": (run.stdout + run.stderr).strip()[:500]})
         except (OSError, subprocess.TimeoutExpired) as error:

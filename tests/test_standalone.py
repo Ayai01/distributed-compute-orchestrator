@@ -1,5 +1,7 @@
 """A copied worker starts alone and reloads updates over its existing connection."""
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,19 @@ from test_compute import provider, python, scratch, until
 
 
 class StandaloneTests(unittest.TestCase):
+    def test_tool_check_uses_icarus_version_flag_and_preserves_failure_exit(self):
+        from remote_compute.cli import check_tools
+        generic=[sys.executable,'-c',"import sys;print('tool 1.0');sys.exit(0 if sys.argv[1:]==['--version'] else 2)"]
+        icarus=[sys.executable,'-c',"import sys;print('Icarus Verilog 12.0');sys.exit(0 if sys.argv[1:]==['-V'] else 2)"]
+        tools={name:generic for name in ('python','ngspice','verilator')}
+        tools['iverilog']=icarus
+        with io.StringIO() as output,redirect_stdout(output):
+            self.assertEqual(check_tools({'tools':tools}),0)
+            self.assertIn('Icarus Verilog 12.0',output.getvalue())
+        tools['iverilog']=[sys.executable,'-c',"import sys;print('broken compiler');sys.exit(1)"]
+        with io.StringIO() as output,redirect_stdout(output):
+            self.assertEqual(check_tools({'tools':tools}),1)
+
     def test_missing_projects_and_unreadable_execution_alias_do_not_block_worker(self):
         with scratch() as directory:
             root = Path(directory)
