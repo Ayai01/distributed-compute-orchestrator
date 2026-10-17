@@ -366,6 +366,8 @@ class Coordinator:
             self._save(job)
 
     def _callback(self, node):
+        if getattr(node, 'callback_url', ''):
+            return dict(url=node.callback_url.rstrip('/'), token=self.token)
         if not self.callback_address:
             return None
         host,port=self.callback_address[:2]

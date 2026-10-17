@@ -39,6 +39,60 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_explicit_node_callback_reaches_center_and_resizes_original_task(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=2,token='worker-token') as (_,worker):
+            with Pool([dict(name='tunnel',client=worker)]) as pool, center(pool,Path(root)/'center') as (state,client):
+                # A second loopback listener models the reverse end of a tunnel.
+                reverse=Server(('127.0.0.1',0),state)
+                thread=threading.Thread(target=reverse.serve_forever,kwargs={'poll_interval':.05},daemon=True)
+                thread.start()
+                try:
+                    callback=f'http://127.0.0.1:{reverse.server_port}'
+                    client.control(node='tunnel',routing={'callback_url':callback})
+                    state.callback_address=('127.0.0.1',1)  # Automatic LAN routing would be wrong.
+                    code=("import os,json,sys\nfrom pathlib import Path\n"
+                          "sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\nfrom remote_compute import Client\n"
+                          "c=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'])\n"
+                          "grant=c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],2,memory_mb=128)\n"
+                          "Path('grant.json').write_text(json.dumps(grant))\n")
+                    result=client.run(python(code,node='tunnel',outputs=['grant.json']))
+                    self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                    grant=json.loads(result['files']['grant.json'])
+                    self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb']),(result['id'],2,128))
+                    self.assertEqual(client.nodes()['nodes'][0]['callback_url'],callback)
+                    client.control(node='tunnel',routing={'callback_url':''})
+                    self.assertEqual(state._callback(pool.nodes[0])['url'],'http://127.0.0.1:1')
+                finally:
+                    reverse.shutdown();thread.join();reverse.server_close()
+
+    def test_node_callback_load_add_and_validation(self):
+        with scratch() as root, provider(Path(root)/'one') as (_,one), provider(Path(root)/'two') as (_,two):
+            callback='http://127.0.0.1:26134'
+            with Pool([dict(name='one',client=one,callback_url=callback)]) as pool:
+                self.assertEqual(pool.nodes[0].callback_url,callback)
+                pool.add('two',two.url,callback_url=callback)
+                self.assertEqual(pool.snapshot()['nodes'][1]['callback_url'],callback)
+                for invalid in (None,'file:///tmp/center','http://','http://127.0.0.1/?token=secret'):
+                    with self.subTest(value=invalid),self.assertRaises(ValueError):
+                        pool.configure('one',callback_url=invalid)
+                    self.assertEqual(pool.nodes[0].callback_url,callback)
+
+    def test_saved_tunnel_node_keeps_local_token_when_console_only_has_center_client(self):
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        with scratch() as directory:
+            root=Path(directory)
+            remote=dict(name='tunnel',url='http://127.0.0.1:26134',weight=1.0,limit=0,
+                        memory_limit_mb=0,enabled=True,callback_url='http://127.0.0.1:26134')
+            (root/'nodes.local.json').write_text(json.dumps({'nodes':[dict(remote,token='private-worker-token')]}))
+            shell=SimpleNamespace(pool=SimpleNamespace(nodes=[]),
+                                  center=SimpleNamespace(nodes=lambda:dict(policy='adaptive',nodes=[remote]),token=''))
+            with patch('remote_compute.commands.ROOT',root),io.StringIO() as output,redirect_stdout(output):
+                SchedulerShell.do_save(shell,'')
+            saved=json.loads((root/'nodes.local.json').read_text())['nodes'][0]
+            self.assertEqual(saved['callback_url'],remote['callback_url'])
+            self.assertEqual(saved['token'],'private-worker-token')
+
     def test_offline_worker_keeps_health_and_local_submission_available(self):
         with scratch() as root, provider(Path(root)/'local') as (_,local), provider(Path(root)/'offline') as (_,offline):
             with patch.object(offline,'health',side_effect=RemoteError('worker unavailable')):

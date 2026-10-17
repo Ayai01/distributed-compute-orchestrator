@@ -240,6 +240,7 @@ class Node:
     known_assets: set = field(default_factory=set)
     known_jobs: set = field(default_factory=set)
     live_jobs: set = field(default_factory=set)
+    callback_url: str = ""
 
     @property
     def capacity(self):
@@ -287,6 +288,7 @@ class Pool:
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
+                node.callback_url = entry.get("callback_url", "")
             self._validate_node(node)
             self.nodes.append(node)
         if not self.nodes or len({x.name for x in self.nodes}) != len(self.nodes):
@@ -303,6 +305,11 @@ class Pool:
                 or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)
                 or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
             raise ValueError("Node weight must be positive; limit is 0/auto or a positive integer")
+        callback = getattr(node, 'callback_url', '')
+        if not isinstance(callback, str) or (callback and (
+                urlsplit(callback).scheme not in {'http', 'https'} or not urlsplit(callback).hostname
+                or urlsplit(callback).query or urlsplit(callback).fragment)):
+            raise ValueError('Node callback_url must be an HTTP(S) base URL or empty for automatic routing')
 
     def refresh(self):
         def probe(node):
@@ -345,17 +352,19 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb"}:
-                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url")
                 proposed = Node(node.name, node.client, **{
                     key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled", "memory_limit_mb")})
+                proposed.callback_url = changes.get('callback_url', getattr(node, 'callback_url', ''))
                 self._validate_node(proposed)
                 for key, value in changes.items():
                     setattr(node, key, value)
             self.condition.notify_all()
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0):
+    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url=""):
         node = Node(name, Client(url, token), weight=weight, limit=limit)
+        node.callback_url = callback_url
         self._validate_node(node)
         with self.condition:
             if any(n.name == name or n.client.url == node.client.url for n in self.nodes):
@@ -367,6 +376,7 @@ class Pool:
         with self.condition:
             return {"policy": self.policy, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
+                 "callback_url": getattr(n, 'callback_url', ''),
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),

@@ -424,7 +424,7 @@ class SchedulerShell(Shell):
                 if value.lower() not in {"true", "false"}:
                     raise ValueError("enabled=true|false")
                 value = value.lower() == "true"
-            else:
+            elif key != 'callback_url':
                 value = int(value) if key in {"limit", "memory_limit_mb"} else float(value)
             changes[key] = value
         if self.center:
@@ -447,15 +447,19 @@ class SchedulerShell(Shell):
     def do_save(self, _line):
         """保存当前节点和策略到 nodes.local.json，下次启动自动加载。"""
         snapshot = self.center.nodes() if self.center else self.pool.snapshot()
-        tokens = {n.client.url: n.client.token for n in self.pool.nodes}
+        path = ROOT / "nodes.local.json"
+        previous = read_json(path) if path.exists() else {}
+        tokens = {n['url']: n.get('token', '') for n in previous.get('nodes', [])}
+        tokens.update({n.client.url: n.client.token for n in self.pool.nodes})
         value = {"policy": snapshot["policy"], "nodes": []}
         for row in snapshot["nodes"]:
             node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
+            if row.get('callback_url'):
+                node['callback_url'] = row['callback_url']
             token = tokens.get(row["url"], self.center.token if self.center else "")
             if token:
                 node["token"] = token
             value["nodes"].append(node)
-        path = ROOT / "nodes.local.json"
         path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print("已保存:", path)
 

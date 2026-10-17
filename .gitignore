@@ -6,4 +6,5 @@ results/
 .tools/
 .projects/
 .vscode/
+.local/
 worker.standalone.json

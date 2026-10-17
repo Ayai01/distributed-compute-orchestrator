@@ -258,6 +258,10 @@ Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/Remote-Compu
 
 ## 部署到其他设备
 
+Linux 使用普通磁盘时，在设备配置中显式指定 `root` 为用户可写的磁盘绝对路径，例如 `~` 展开后的 `/home/user/.local/state/dco/worker`，并将进程 `TMPDIR` 指向普通磁盘；不运行 `ramdisk`。例如 `mode=worker`、`cpus=96`、`cpu_limit=96`、`memory_mb=98304`、`memory_reserve_mb=4096`，然后执行 `python3 -B main.py --config worker.local.json --headless`。节点使用系统 hostname，跨平台任务按实际工具和 `requires` 标签匹配；Linux 节点不会声明 `win32`。
+
+公网部署可复用受控 SSH 通道：worker 仅监听 `127.0.0.1:26133`，中心通过本机转发端口访问 worker，worker 经反向转发端口回调中心。节点的 `callback_url` 显式指向 worker 一侧的反向转发地址；转发端口只监听回环。各节点独立令牌保存在本机忽略配置中，中心按节点填写令牌，不改已有节点的认证。必要的私密交接配置使用忽略目录 `.local/`。
+
 复制工程源码，准备 Python 3.11+，即可使用 worker 模式提供远程 Python、文件访问和控制。`worker.example.json` 是独立节点的最小配置，不依赖 AOP、RGCN、ARH-DSE 或 Analog-Opt-Bench。计算任务需要的源码可以通过资产包发送，依赖和工具按实际任务安装；工程解释器别名可在 `tools` 中追加。`python main.py --check` 用于检查仿真工具。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 在 Python 环境中按调用工程安装科学依赖，配置 tools 指向解释器与 ngspice，Verilator 和编译器使用 PATH 中的工具；setup 当前提供 Windows 可移动工具链。
 
 Windows Verilator 支持 `--binary` 与 `--cc --exe --build` 自定义 C++ harness。两者均先生成代码、修正 Makefile 的工具链路径，再按任务 `-j` 编译并静态链接运行库；自定义 harness 保留自己的 main 与时间回调，源码目录含 `#` 也可构建。未指定 C++ 标准时使用 C++17。
