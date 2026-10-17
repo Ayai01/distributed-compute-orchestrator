@@ -5,7 +5,7 @@
 - README保留快速入口；docs/operations.md维护启动、算力控制、远程操作与部署，docs/integration.md维护调度规则、API、任务与工程接入。参数变化同步对应文档和调用工程的现有说明，避免重复指南与临时审查报告。
 - 入口统一为 `main.py`，支持 scheduler / hybrid / worker；服务和终端保持 Python 标准库实现。
 - 日常启动优先本机系统的标准GIL x64 CPython 3.14维护版，科学包安装绑定该解释器；setup复用系统环境，不再复制独立Python。源码与接入协议保留3.7–3.15兼容，关键新版API使用轻量等价实现；运行验收集中3.14，不为每次修改做版本矩阵。Codium与终端使用同一解释器及UTF-8。
-- Linux 当前仅做源码可移植性和算法逻辑检查，保留待实测提醒，不实际执行 Linux 验证；创建或启动虚拟机必须先取得用户明确同意。保持现有 Windows 任务运行。
+- Linux 默认做源码可移植性和算法逻辑检查；用户已授权的现有 Linux worker 可通过 DCO 执行接入验收和任务，按实际工具与 requires 匹配。创建或启动其他虚拟机仍须用户明确同意，保持现有 Windows 任务运行。
 - 独立 worker 只依赖 Python 和本工具。其他工程目录及解释器属于可选能力；缺失共享目录不阻止启动，需要该路径的任务只匹配具备它的节点。
 - scheduler / hybrid / worker 均由统一入口托管，支持在原终端重新加载。先写完源码/配置，再 `Client(中心URL).restart(节点名或None, wait=True)` 等待空闲；用户已授权必要的进程关闭与重启，身份核对后直接完成，无需反复要求手动重开。
 - 操作远程机器统一使用 `Client(中心URL).machine(节点名, cwd=目标工程目录)`，执行命令/Python及读写、上传下载文件；可用 `main.py --url 中心URL exec/python/ls/read/put/get`。无需另设 SSH 或远程工具。先用 `nodes` 查实际节点和共享路径，工程更新前查看在途任务与相关会话。
@@ -26,7 +26,7 @@
 - 保留其他会话和用户的改动。交付说明实际入口、实测结果和当前接入状态，表达直接。
 
 - 设备始终使用系统主机名；两台设备源码统一从 Ayai01/distributed-compute-orchestrator 的 main 快进更新。`.tools/`、`.projects/`、结果和设备本地配置不入库。
-- 每台设备只创建/复用一块8GiB共享RAM盘；统一ramdisk.ensure_shared、全局mutex和标记，工程目录各自独立。
+- 每台 Windows 设备只创建/复用一块8GiB共享RAM盘；统一ramdisk.ensure_shared、全局mutex和标记，工程目录各自独立。用户指定普通磁盘的 Linux worker 显式配置磁盘 root 和 TMPDIR，不创建RAM盘或使用 /dev/shm。
 
 - CLI启动与服务生命周期在cli.py，命令与参数在commands.py，框表与标签格式在view.py，看板与键盘交互在console.py。保持状态与输出变更时才重绘；耗时文件操作后台执行，完成的future与句柄及时释放。
 - 看板宽屏采用左侧设备/工程份额、右侧逐任务两栏；每行4位ID、任务/线程合并显示，不合并任务行。Tab/ShiftTab翻任务页，PgUp/PgDn翻输出；短ID仅作展示和唯一前缀查询，API保留完整ID。经典Windows终端仅启动时按屏幕上限增大至160×50，尊重更大窗口和ConPTY宿主尺寸。
