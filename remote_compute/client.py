@@ -112,18 +112,23 @@ class Client:
                                 extra_headers={'X-Remote-Compute-Callback':json.dumps(callback)})
         return self.request("/jobs/" + identity, payload)
 
-    def resize(self, identity, cpus):
-        """Change this running task's grant at an application-safe boundary."""
-        return self.request('/jobs/'+identity+'/resize',dict(cpus=cpus))
+    def resize(self, identity, cpus, *, memory_mb=None):
+        """Borrow/return resources at a safe boundary; use the actual returned grant."""
+        request = dict(cpus=cpus)
+        if memory_mb is not None:
+            request['memory_mb'] = memory_mb
+        return self.request('/jobs/'+identity+'/resize', request)
 
     def nodes(self):
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,cpus=cpus,requires=list(requires))
         if node:
             request['node']=node
+        if max_cpus is not None:
+            request['max_cpus'] = max_cpus
         return self.request('/admission',request)
 
     def window(self, project, **options):
@@ -374,7 +379,7 @@ class Pool:
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
-    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, reservations=None, job_id=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=False, job_id=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
@@ -401,10 +406,11 @@ class Pool:
                 if not matching:
                     raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
                 def needed(node):
-                    return min(cpu_limit, node.capacity) if automatic and cpu_limit else cpus
+                    # Automatic jobs can start with a partial grant. Waiting for
+                    # an entire target reserved idle CPUs behind long-running jobs.
+                    return min(cpu_limit,node.capacity,task.get('max_cpus',node.capacity)) if automatic and cpu_limit and not partial_cpus else cpus
                 ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
-                         and n.capacity - n.reserved - n.external -
-                             ((reservations or {}).get(n.name, 0) if not automatic else 0) >= needed(n)
+                         and n.capacity - n.reserved - n.external >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0]
                 if ready:
@@ -431,6 +437,7 @@ class Pool:
                         cpus = node.capacity - node.reserved - node.external
                         if cpu_limit is not None:
                             cpus = min(cpus, cpu_limit)
+                        cpus = min(cpus, task.get('max_cpus',node.capacity))
                         task['cpus'] = cpus
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
@@ -439,9 +446,6 @@ class Pool:
                         node.live_jobs.add(job_id)
                     return node
                 if not block:
-                    if automatic and reservations is not None:
-                        candidate = max(matching, key=lambda n: n.capacity-n.reserved-n.external)
-                        reservations[candidate.name] = max(reservations.get(candidate.name, 0), needed(candidate))
                     return None
                 self.condition.wait(0.2)
 

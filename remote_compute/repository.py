@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
-URL = 'https://github.com/Ayai01/Remote-Compute.git'
+URL = 'https://github.com/Ayai01/distributed-compute-orchestrator.git'
 
 
 def git(*args):

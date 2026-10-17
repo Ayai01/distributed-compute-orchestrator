@@ -53,13 +53,15 @@ class Coordinator:
         share = request.get('resource_share', 1.0)
         ratio = request.get('queue_ratio', 1.0)
         cpus = request.get('cpus', 1)
+        maximum_cpus = request.get('max_cpus')
         requires = request.get('requires', [])
         node_name=request.get('node')
         if (not isinstance(project, str) or isinstance(share, bool) or not isinstance(share, (int,float))
                 or not math.isfinite(share) or share <= 0 or isinstance(ratio, bool)
                 or not isinstance(ratio, (int,float)) or not math.isfinite(ratio) or ratio < 0
                 or type(cpus) is not int or cpus < 0 or not isinstance(requires,list)
-                or any(not isinstance(tag,str) for tag in requires) or (node_name is not None and not isinstance(node_name,str))):
+                or any(not isinstance(tag,str) for tag in requires) or (node_name is not None and not isinstance(node_name,str))
+                or (maximum_cpus is not None and (type(maximum_cpus) is not int or maximum_cpus<max(1,cpus)))):
             raise ValueError('project, positive resource_share, nonnegative queue_ratio and cpus required')
         resources = self.project_resources()
         capacity = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled)
@@ -72,8 +74,9 @@ class Coordinator:
         capable=sum(n.capacity for n in eligible)
         maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
         target = min(target, capable)
-        ready = max(1, math.ceil(target / cpus)) if cpus else max(1,min(len(eligible),target))
-        ceiling=max(1,math.ceil(maximum/max(1,cpus))) if cpus else max(1,len(eligible))
+        unit = cpus or maximum_cpus
+        ready = max(1, math.ceil(target / unit)) if unit else max(1,min(len(eligible),target))
+        ceiling=max(1,math.ceil(maximum/unit)) if unit else max(1,len(eligible))
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,
                     running_tasks=ready,queued_tasks=math.ceil(ready*ratio),
                     in_flight=ready+math.ceil(ready*ratio),max_in_flight=ceiling+math.ceil(ceiling*ratio))
@@ -122,7 +125,7 @@ class Coordinator:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
-                    'capabilities':['resize']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','max_cpus']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -146,7 +149,8 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                demands[name] = demands.get(name, 0) + job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
+                demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
+                demands[name] = demands.get(name, 0) + min(demand,task.get('max_cpus',demand))
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
         quotas = weighted_threads(capacity, shares, demands)
@@ -220,9 +224,8 @@ class Coordinator:
             while not self.stopping:
                 if not self.paused:
                     budgets = self.project_resources()
-                    reservations = {}
                     ordered = sorted(self.queue, key=lambda key: (-self.jobs[key]['task']['priority'],
-                                     self.jobs[key]['task']['cpus'] != 0))
+                                     self.jobs[key]['task']['cpus'] == 0))
                     # First honor weighted targets, then lend otherwise idle slots.
                     for identity, borrowing in [(key, False) for key in ordered] + [(key, True) for key in ordered]:
                         if identity not in self.queue:
@@ -233,11 +236,10 @@ class Coordinator:
                         room = budget['target'] - budget['used']
                         if not borrowing and (room <= 0 or (job['task']['cpus'] or 1) > room):
                             continue
-                        if borrowing and job['auto_cpus'] and room <= 0 and reservations:
-                            continue
                         try:
                             node = self.pool._acquire(job["task"], block=False,
-                                cpu_limit=room if room > 0 else None, reservations=reservations,job_id=identity)
+                                cpu_limit=room if room > 0 else None,
+                                partial_cpus=time.time()-job['result']['submitted']>=1,job_id=identity)
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -262,10 +264,13 @@ class Coordinator:
         try:
             self._ensure_assets(node, task['assets'].values())
             payload = (job['directory'] / 'request.zip').read_bytes()
-            if job['auto_cpus']:
+            if job['auto_cpus'] or 'max_cpus' in task:
                 with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                     files = {name: archive.read(name) for name in archive.namelist()}
-                files['task.json'] = json_bytes(task)
+                worker_task = dict(task)
+                if 'max_cpus' not in node.health.get('capabilities',[]):
+                    worker_task.pop('max_cpus',None)
+                files['task.json'] = json_bytes(worker_task)
                 payload = pack(files)
             callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
             try:
@@ -331,6 +336,7 @@ class Coordinator:
         assigned = {key: job["result"][key] for key in ("assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
         if job.get('task'):
             assigned['cpus']=job['task']['cpus']
+            assigned['memory_mb']=job['task']['memory_mb']
         job["result"].update(remote, **assigned, center_submitted=submitted)
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
@@ -352,19 +358,29 @@ class Coordinator:
                 host=route.getsockname()[0]
         return dict(url=f'http://{host}:{port}',token=self.token)
 
-    def resize(self, identity, cpus):
+    def resize(self, identity, cpus, *, memory_mb=None):
         if type(cpus) is not int or cpus<1:
             raise ValueError('resize cpus must be a positive integer')
+        if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
+            raise ValueError('resize memory_mb must be a positive integer in MiB')
         with self.condition,self.pool.condition:
             job=self.jobs[identity];node=job.get('node')
             if self.stopping or job['cancel'].is_set() or node is None or job['result']['status'] in TERMINAL:
                 raise Conflict('Only a running task can change its CPU grant')
             old=job['task']['cpus']
-            job['desired_cpus']=cpus
-            if 'resize' not in node.health.get('capabilities',[]):
-                return dict(id=identity,node=node.name,cpus=old,requested_cpus=cpus,supported=False)
-            granted=cpus
-            if cpus>old:
+            old_memory=job['task']['memory_mb']
+            memory=old_memory if memory_mb is None else memory_mb
+            capabilities=node.health.get('capabilities',[])
+            if 'resize' not in capabilities or (memory_mb is not None and 'resize_memory' not in capabilities):
+                return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus,supported=False)
+            extra=max(0,memory-old_memory)
+            if memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
+                raise Conflict('Insufficient memory for resource resize; existing grant retained')
+            desired=min(cpus,job['task'].get('max_cpus',cpus))
+            previous_desired=job.get('desired_cpus')
+            job['desired_cpus']=desired
+            granted=desired
+            if desired>old:
                 resources=self.project_resources();group=job['task'].get('project') or 'default'
                 shares={name:r['resource_share'] for name,r in resources.items()}
                 demands={name:r['demand'] for name,r in resources.items()}
@@ -372,18 +388,27 @@ class Coordinator:
                 target=weighted_threads(capacity,shares,demands)[group]
                 room=target-resources[group]['used']+old
                 available=node.capacity-node.reserved-node.external+old
-                granted=max(old,min(cpus,room,available)) if node.enabled and not node.health.get('paused') else old
+                granted=max(old,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
             try:
-                result=node.client.resize(identity,granted)
+                result=(node.client.resize(identity,granted,memory_mb=memory) if memory_mb is not None
+                        else node.client.resize(identity,granted))
             except RemoteError as error:
                 if getattr(error,'status_code',None) is not None:
+                    if previous_desired is None:
+                        job.pop('desired_cpus',None)
+                    else:
+                        job['desired_cpus']=previous_desired
                     raise
                 observed=node.client.status(identity)
-                result=dict(id=identity,cpus=observed['cpus'])
+                result=dict(id=identity,cpus=observed['cpus'],memory_mb=observed['memory_mb'])
             actual=result['cpus']
+            actual_memory=result.get('memory_mb',old_memory)
             node.reserved+=actual-old
+            node.reserved_memory_mb+=actual_memory-old_memory
             job['task']['cpus']=job['result']['cpus']=actual
+            job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
             self._save(job)
+            self.pool.condition.notify_all()
             self.condition.notify_all()
             return dict(result,node=node.name,requested_cpus=cpus)
 

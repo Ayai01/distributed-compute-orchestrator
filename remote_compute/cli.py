@@ -211,7 +211,7 @@ def handoff_python(invocation):
 
 def main(argv=None):
     invocation = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(description="统一入口：总调度器、本机调度+算力、远程算力提供者")
+    parser = argparse.ArgumentParser(description="Distributed Compute Orchestrator (DCO)：调度器、本机调度+算力、独立worker")
     parser.add_argument("--mode", choices=("scheduler", "hybrid", "worker"), help="默认 hybrid；--url 连接现有服务时默认 scheduler")
     parser.add_argument("--config", help="本机工具链/共享目录配置 JSON")
     parser.add_argument("--nodes", help="调度器节点配置 JSON")

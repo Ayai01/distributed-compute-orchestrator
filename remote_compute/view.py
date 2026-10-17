@@ -7,6 +7,7 @@ import time
 import unicodedata
 from functools import lru_cache
 from urllib.parse import urlsplit
+from . import ABBREVIATION
 
 
 _ambiguous_width = None
@@ -154,7 +155,7 @@ class StatusRows(list):
     def _build(self):
         value,width=self.value,self.width
         center=value.get('role')=='scheduler'
-        self.title=f"Remote Compute | {value.get('node','')} | {'调度中心' if center else '算力提供者'}"
+        self.title=f"{ABBREVIATION} | {value.get('node','')} | {'调度中心' if center else '算力提供者'}"
         self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | 预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))

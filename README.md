@@ -1,6 +1,8 @@
-# Remote-Compute
+# Distributed Compute Orchestrator（DCO）
 
 面向简单局域网的远程计算、统一调度和工程操作工具，用于 ngspice、Verilator、原生模拟器批次与 Python 任务。服务、调度与终端只依赖标准库，源码兼容 Python 3.7–3.15；日常优先本机标准版 CPython 3.14，当前两机统一3.14.8。仿真工具和科学依赖按任务安装在设备本地。
+
+工程简称统一使用 **DCO**，仓库为 `distributed-compute-orchestrator`。现有部署目录、`remote_compute` Python 包、`REMOTE_COMPUTE_*` 环境变量和历史回执保持兼容；这些是同一工程的稳定接口，不另设第二套配置字段。
 
 ## 快速启动
 
@@ -57,4 +59,4 @@ restart --wait
 - [调度、任务接口与工程接入](docs/integration.md)：份额与提前排队、节点策略、AOP/RGCN/ARH/Bench 接入、Python API、任务变量、结果回收与验证。
 - [worker 配置示例](worker.example.json)、[节点配置示例](nodes.example.json)、[任务示例](examples/)。
 
-源码统一使用 [Ayai01/Remote-Compute](https://github.com/Ayai01/Remote-Compute) 的 main。设备配置、`.tools/`、`.projects/`、`.runtime/` 和结果留在本机。每台 Windows 设备复用同一块 8 GiB 共享 RAM 盘，工程各用自己的子目录。
+源码统一使用 [Ayai01/distributed-compute-orchestrator](https://github.com/Ayai01/distributed-compute-orchestrator) 的 main。设备配置、`.tools/`、`.projects/`、`.runtime/` 和结果留在本机。每台 Windows 设备复用同一块 8 GiB 共享 RAM 盘，工程各用自己的子目录。

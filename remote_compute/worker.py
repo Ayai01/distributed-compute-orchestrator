@@ -79,7 +79,7 @@ def file_hash(path):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
@@ -92,6 +92,8 @@ def validate_task(task, capacity, *, allow_auto=False):
         raise ValueError('resource_share must be positive and finite')
     if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
         raise ValueError(f"Task cpus must be in 1..{capacity}")
+    if 'max_cpus' in task and (type(task['max_cpus']) is not int or task['max_cpus']<1 or cpus>task['max_cpus']):
+        raise ValueError('max_cpus must be a positive integer no smaller than cpus')
     if type(task["memory_mb"]) is not int or task["memory_mb"] < 1:
         raise ValueError("memory_mb must be a positive integer in MiB")
     if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
@@ -217,7 +219,7 @@ class Worker:
                     "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
-                    "capabilities": ["machine", "resize"] + (["restart"] if self.restart_available else []),
+                    "capabilities": ["machine", "resize", "resize_memory", "max_cpus"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
                     "service": service_usage(),
@@ -286,23 +288,33 @@ class Worker:
             return Path(self.tools[name][0]).as_posix()
         return _VAR.sub(substitute, text)
 
-    def resize(self, identity, cpus):
+    def resize(self, identity, cpus, *, memory_mb=None):
         if type(cpus) is not int or cpus<1:
             raise ValueError('resize cpus must be a positive integer')
+        if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
+            raise ValueError('resize memory_mb must be a positive integer in MiB')
         with self.condition:
             job=self.jobs[identity];task,result=job['task'],job['result']
             if self.stopping or job['cancel'].is_set() or result['status']!='running':
                 raise Conflict('Only a running task can change its CPU grant')
             old=task['cpus']
+            old_memory=task['memory_mb']
+            memory=old_memory if memory_mb is None else memory_mb
+            extra=max(0,memory-old_memory)
+            if memory>self.memory_capacity or (extra and extra>self._memory_state()['memory_available_mb']):
+                raise Conflict('Insufficient memory for resource resize; existing grant retained')
+            requested_cpus=cpus
+            cpus=min(cpus,task.get('max_cpus',cpus))
             granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
-            if granted!=old:
+            if granted!=old or memory!=old_memory:
                 self.used+=granted-old
                 task['cpus']=result['cpus']=granted
+                task['memory_mb']=result['memory_mb']=memory
                 result['peak_cpus']=max(result.get('peak_cpus',old),granted)
                 result['resize_count']=result.get('resize_count',0)+1
                 self._save(job)
                 self.condition.notify_all()
-            return dict(id=identity,node=socket.gethostname(),cpus=granted,requested_cpus=cpus)
+            return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus)
 
     def submit(self, identity, payload, *, callback=None):
         if not _ID.fullmatch(identity):
@@ -751,7 +763,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif parts[2:] == ["cancel"] and self.command == "POST":
                     value = worker.cancel(identity)
                 elif parts[2:] == ['resize'] and self.command == 'POST':
-                    value = worker.resize(identity,json.loads(body)['cpus'])
+                    request = json.loads(body)
+                    value = worker.resize(identity, request['cpus'], memory_mb=request.get('memory_mb'))
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
                     value = worker.artifacts(identity)
                 elif parts[2:] == ["logs"] and self.command == "GET":

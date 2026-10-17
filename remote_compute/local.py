@@ -46,7 +46,7 @@ class LocalClient(Client):
                 if parts[2:] == ['cancel']:
                     return worker.cancel(identity)
                 if parts[2:] == ['resize']:
-                    return worker.resize(identity,data['cpus'])
+                    return worker.resize(identity,data['cpus'],memory_mb=data.get('memory_mb'))
                 if parts[2:] == ['logs']:
                     return worker.logs(identity)
                 if parts[2:] == ['artifacts']:

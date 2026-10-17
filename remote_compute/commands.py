@@ -70,6 +70,7 @@ def submission_parser(kind):
     parser.add_argument("--output", help="结果保存目录")
     parser.add_argument("--node", help="固定分配给指定节点")
     parser.add_argument("--cpus", type=int, dest="task_cpus")
+    parser.add_argument("--max-cpus", type=int, help="任务线程需求硬上界，包含后续借核")
     parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
     parser.add_argument("--priority", type=int)
     parser.add_argument("--requires", help="节点标签，以逗号分隔")
@@ -92,7 +93,7 @@ def prepare(kind, args):
     else:
         task = verilator(args.sources, args.top, flags=words(args.flags))
         inputs = inputs or source
-    for key in ("cpus", "priority", "node"):
+    for key in ("cpus", "max_cpus", "priority", "node"):
         value = getattr(args, "task_cpus" if key == "cpus" else key)
         if value is not None:
             task[key] = value

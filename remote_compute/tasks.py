@@ -3,12 +3,14 @@
 
 def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=256, cwd=None, stdin=None,
-            project='', resource_share=1.0):
+            project='', resource_share=1.0, max_cpus=None):
     task = {"steps": [list(argv)], "cpus": cpus, "timeout": timeout,
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
             "render": list(render), "label": label, "priority": priority,
             "requires": list(requires), "node": node, "memory_mb": memory_mb,
             "project": project, "resource_share": resource_share}
+    if max_cpus is not None:
+        task['max_cpus'] = max_cpus
     if cwd is not None:
         task["cwd"] = str(cwd)
     if stdin is not None:

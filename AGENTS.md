@@ -1,5 +1,6 @@
-# 工作规则
+# Distributed Compute Orchestrator（DCO）工作规则
 
+- 正式名称为 Distributed Compute Orchestrator，简称 DCO，仓库 distributed-compute-orchestrator；旧部署目录、remote_compute 包和 REMOTE_COMPUTE_* 协议变量保留兼容，新增说明统一用 DCO，不建立第二套重复字段。
 - 本工程提供远程任务执行与调度；电路测量、科学评分、实验预算和缓存归调用工程管理。
 - README保留快速入口；docs/operations.md维护启动、算力控制、远程操作与部署，docs/integration.md维护调度规则、API、任务与工程接入。参数变化同步对应文档和调用工程的现有说明，避免重复指南与临时审查报告。
 - 入口统一为 `main.py`，支持 scheduler / hybrid / worker；服务和终端保持 Python 标准库实现。
@@ -13,7 +14,7 @@
 - 调用工程连接 scheduler 的中心HTTP端口；统一队列按 CPU、任务内存预留、实际 RSS 与主机可用内存分配。同设备多 worker 只计一份物理内存，结果记录实际引擎和资源。
 - adaptive/balanced先满足线程与内存准入，再按CPU采样和当前账本选择较空闲设备；已采样任务占用不重复计入，未反映的派发/借还立即计入。负载相差不足一个逻辑线程时参考历史速度和节点权重；指定node和运行中任务保持原节点。
 - 中心模式忽略调用工程的并发上限。任务携带project与resource_share（默认1.0）；中心按活跃工程权重和最大余数分配整数线程，需求不足时借用空闲份额；整轮并行任务cpus=0由中心授予实际线程，通过${cpus}传给任务。
-- 提交端用Client.window的maximum建立线程池、current()刷新有限pending窗口；后者每秒至多查询一次。同步内核只在安全批次边界resize原任务，按回执cpus设置线程、finally归还；异步在途流水线维持原授予。中心和worker共同更新账本，结束释放最后授予值。
+- 提交端用Client.window的maximum建立线程池、current()刷新有限pending窗口；后者每秒至多查询一次。任务max_cpus限制需求，公平轮先固定就绪任务，auto最多等1秒凑份额后按可用线程启动；不跨工程预留空闲CPU。同步内核只在安全阶段边界resize原任务，按回执cpus/memory_mb设置资源、finally归还；异步在途流水线维持原授予。内存准入失败保留原授权，实际RSS继续参与准入。中心和worker共同更新账本，结束释放最后授予值。
 - 对外关键端口统一26133；hybrid本机worker由调度器进程内私有调用，不开HTTP监听；local://仅作为本机节点标记。设备cpu_limit是可配置硬上限；Aya1-PC为24，Aya1-TX默认预算30。queue_ratio默认1.0，中心admission给出有限预取窗口；只排已就绪工作，保留搜索批次/代际边界与独立运行策略。
 - 优先直接实现。新增机制须对应实际任务、调用者或失败；不加入服务发现、消息队列、容器编排或额外框架。
 - 节点短暂断连不结束已接受任务、不重复提交；保留ID、授予和最后已知能力，恢复后查询原任务。历史interrupted结果按原worker的实际产物恢复；网络错误返回明确HTTP状态，离线节点不影响中心健康接口。
@@ -24,7 +25,7 @@
 - 验证在本工程专属内存盘目录执行，核对绝对路径后清理。核心变更运行 `python main.py --test`；仿真链变化运行 `--test-native`。
 - 保留其他会话和用户的改动。交付说明实际入口、实测结果和当前接入状态，表达直接。
 
-- 设备始终使用系统主机名；两台设备源码统一从 Ayai01/Remote-Compute 的 main 快进更新。`.tools/`、`.projects/`、结果和设备本地配置不入库。
+- 设备始终使用系统主机名；两台设备源码统一从 Ayai01/distributed-compute-orchestrator 的 main 快进更新。`.tools/`、`.projects/`、结果和设备本地配置不入库。
 - 每台设备只创建/复用一块8GiB共享RAM盘；统一ramdisk.ensure_shared、全局mutex和标记，工程目录各自独立。
 
 - CLI启动与服务生命周期在cli.py，命令与参数在commands.py，框表与标签格式在view.py，看板与键盘交互在console.py。保持状态与输出变更时才重绘；耗时文件操作后台执行，完成的future与句柄及时释放。
