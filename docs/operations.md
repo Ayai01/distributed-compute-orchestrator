@@ -6,7 +6,9 @@
 
 在工程目录执行，唯一入口是 `main.py`：
 
-Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执行 `./start.sh`（也可 `sh start.sh`）。两个脚本都会切换到工程目录并调用同一个 `main.py`，默认读取 `worker.local.json`。本机配置让 Aya1-PC 启动 hybrid、Aya1-TX 启动 worker；新克隆的工程默认 hybrid，需要独立提供算力时显式指定 worker。参数原样传递，例如 `start.cmd --mode worker --host 0.0.0.0 --port 26133`。Windows 优先使用工程内的 `.tools/python/python.exe`，随后尝试 `py -3`、`python`；Linux 优先 `.tools/python/bin/python3`，随后尝试 `python3`、`python`。
+Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执行 `./start.sh`（也可 `sh start.sh`）。两个脚本都会切换到工程目录并调用同一个 `main.py`，默认读取 `worker.local.json`。本机配置让 Aya1-PC 启动 hybrid、Aya1-TX 启动 worker；新克隆的工程默认 hybrid，需要独立提供算力时显式指定 worker。参数原样传递，例如 `start.cmd --mode worker --host 0.0.0.0 --port 26133`。Windows 优先本机系统3.14，其次系统默认Python，最后使用已有工程环境；Linux优先`python3.14`，其次`python3`/`python`，最后已有工程环境。默认UTF-8，禁写字节码缓存。
+
+两台设备日常环境统一为标准GIL x64 CPython 3.14.8，`python`、`py`、`pip`、Codium与worker科学别名指向各机系统环境。包安装使用`python -m pip`绑定实际解释器。`setup`优先复用已装3.14并补齐所需科学包，原生ngspice/MSYS2继续位于忽略的`.tools/`；不会再下载一套3.12解释器。标准库控制与接入层保持Python3.7–3.15的语法/API兼容，科学依赖由所选Python安装对应可用版本；运行验收集中3.14。Linux仅保留实机验证提醒。
 
 启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:26133` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
 
@@ -87,7 +89,7 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 ## 终端操作
 
-耗时计算、命令和文件传输在后台执行，输入行持续可用。help 按资源、任务、机器、终端分组显示操作；完成后的后台操作及时释放结果引用。宽度达到120列时，看板左侧显示设备资源和工程份额，右侧逐任务显示4位ID、设备、工程、任务/线程、内存、状态与标签；设备摘要移除温度和常驻在线列，异常或暂停单独提示。工程汇总中的任务/线程如8/8，单任务行如1/2。长标签保留首尾，窄窗口切换为上下分区。`Tab` / `Shift+Tab` 翻任务页，`PgUp` / `PgDn` 翻命令输出；输入行固定在底部，状态与输出未变化时复用上一帧。
+耗时计算、命令和文件传输在后台执行，输入行持续可用。help 按资源、任务、机器、终端分组显示操作；完成后的后台操作及时释放结果引用。宽度达到120列时，看板左侧显示设备资源和工程份额，右侧逐任务显示4位ID、设备、工程、任务/线程、内存、状态与标签；两栏共享固定中线和完整边框，表头有水平分隔。设备摘要移除温度和常驻在线列，异常或暂停单独提示。工程汇总中的任务/线程如8/8，单任务行如1/2。长标签保留首尾，窄窗口切换为上下分区。结构符号使用ASCII；中文Windows控制台的歧义字符按实际显示宽度测量并缓存。`Tab` / `Shift+Tab` 翻任务页，`PgUp` / `PgDn` 翻命令输出；输入行固定在底部。刷新仅按绝对坐标重画变化行，避免清屏和换行滚动，状态未变时不写终端。
 
 Windows经典控制台启动看板时尝试扩展至160列×50行，按当前屏幕和字体允许的最大尺寸调整；已有更大的窗口保持原大小。Windows Terminal和编辑器内终端由宿主控制窗口尺寸，看板随可用宽高排版。
 

@@ -538,7 +538,9 @@ class SchedulerShell(Shell):
                 client.cancel(identity)
             except RemoteError:
                 pass  # completed tasks have already been collected and removed
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        for future in list(self.futures.values()):
+            future.cancel()
+        self.executor.shutdown(wait=True)
 
 
 class WorkerShell(Shell):

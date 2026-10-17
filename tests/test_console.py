@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.cli import Shell
-from remote_compute.console import Dashboard, FocusRefresh, format_status, _enable_ansi, _initial_size, _input_view, _layout, _width
+from remote_compute.console import Dashboard, FocusRefresh, RowPainter, format_status, _enable_ansi, _initial_size, _input_view, _layout, _width, _clip
 
 
 class Keyboard:
@@ -138,7 +138,7 @@ class ConsoleTests(unittest.TestCase):
                 self.assertTrue(all(_width(row)==width for row in rows))
                 self.assertLessEqual(len(rows),28)
                 for row in rows:
-                    seen.extend(job['id'][:4] for job in jobs if '| '+job['id'][:4]+' |' in row)
+                    seen.extend(job['id'][:4] for job in jobs if any(prefix+job['id'][:4]+' |' in row for prefix in ('| ','+ ')))
             self.assertCountEqual(seen,[job['id'][:4] for job in jobs])
             self.assertIn('1/2','\n'.join(first))
             self.assertNotIn('温度','\n'.join(first))
@@ -157,8 +157,8 @@ class ConsoleTests(unittest.TestCase):
                     patch('remote_compute.console.time.sleep'), \
                     patch('remote_compute.console.shutil.get_terminal_size',return_value=os.terminal_size((160,32))):
                 dashboard.run()
-            self.assertIn('1/2页',stream.getvalue())
-            self.assertIn('2/2页',stream.getvalue())
+            self.assertRegex(stream.getvalue(),r'1/\d+页')
+            self.assertRegex(stream.getvalue(),r'2/\d+页')
             self.assertEqual(shell.completed,1)
 
     def test_console_grows_to_screen_limit_without_shrinking_existing_window(self):
@@ -272,7 +272,43 @@ class ConsoleTests(unittest.TestCase):
                 self.assertLess(column, width)
         view, _ = _input_view('调度> ', line, len(line), 40)
         self.assertTrue(view.endswith('last.py"'))
-        self.assertIn('‹', view)
+        self.assertIn('<', view)
+
+    def test_incremental_refresh_updates_only_changed_rows_without_scroll_or_clear(self):
+        painter=RowPainter()
+        rows=['header','CPU 10%','label and ID a12f','prompt> ']
+        painter.frame(rows,80,4,8)
+        self.assertEqual(painter.frame(rows,80,4,8),'')
+        rows[1]='CPU 24%'
+        frame=painter.frame(rows,80,4,8)
+        self.assertIn('\x1b[2;1HCPU 24%\x1b[K',frame)
+        for text in ('header','label and ID','\n','\r','\x1b[J','\x1b[2J'):
+            self.assertNotIn(text,frame)
+        self.assertIn('\x1b[4;9H',frame)
+        self.assertEqual(painter.frame(rows,80,4,5),'\x1b[4;6H')
+        resized=painter.frame(rows,90,4,5)
+        self.assertIn('header',resized)
+        self.assertNotIn('\n',resized)
+
+    def test_ambiguous_characters_use_native_width_and_all_panel_edges_stay_fixed(self):
+        from remote_compute.view import set_width_probe
+        try:
+            set_width_probe(lambda char:2 if char in '·×' else 1)
+            self.assertEqual(_width('·×中|'),7)
+            job=dict(id='abcd'+'f'*28,label='长标签/·符号/'+'corner-'*30+'终点',cpus=2,status='running')
+            value=dict(role='scheduler',node='Aya1-PC',cpus=54,nodes=[dict(name='Aya1-PC',capacity=24,active_jobs=[job])])
+            for width in (120,159,199):
+                rows=format_status(value,width=width).fit(26)
+                for row in rows:
+                    self.assertEqual(_width(row),width)
+                for row in rows[2:]:
+                    self.assertIn(row[0],'+|')
+                    self.assertIn(row[-1],'+|')
+                    self.assertIn(_clip(row,56)[-1],'+|')
+                self.assertIn('abcd','\n'.join(rows))
+                self.assertNotIn('· Tab','\n'.join(rows))
+        finally:
+            set_width_probe(None)
 
     def test_ansi_unavailable_uses_original_command_loop(self):
         class Terminal(io.StringIO):

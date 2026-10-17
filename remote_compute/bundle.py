@@ -7,6 +7,8 @@ from pathlib import Path, PurePosixPath
 import stat
 import zipfile
 
+from .compat import is_relative_to
+
 PROTOCOL = 1
 TERMINAL = frozenset({"succeeded", "failed", "cancelled", "timed_out", "interrupted"})
 MAX_BODY = 512 * 1024 * 1024
@@ -29,7 +31,7 @@ def inside(root, name):
         raise ValueError("Expected a relative file path: " + name)
     root = Path(root).resolve()
     result = (root / name).resolve()
-    if not result.is_relative_to(root):
+    if not is_relative_to(result, root):
         raise ValueError("File path leaves its directory: " + name)
     return result
 
@@ -57,7 +59,7 @@ def tree(root, patterns=("**/*",)):
         inside(root, pattern)
         for path in sorted(root.glob(pattern)):
             if path.is_file():
-                if path.is_symlink() or not path.resolve().is_relative_to(root):
+                if path.is_symlink() or not is_relative_to(path.resolve(), root):
                     raise ValueError("Bundle requires regular files: " + str(path))
                 files[path.relative_to(root).as_posix()] = path
     return files

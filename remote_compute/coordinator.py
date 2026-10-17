@@ -14,6 +14,7 @@ from .client import RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .telemetry import Activity
 from .allocation import weighted_threads
+from .compat import unlink
 import socket
 import math
 import os
@@ -484,7 +485,7 @@ class Coordinator:
                     temporary.write_bytes(payload)
                     temporary.replace(path)
                 finally:
-                    temporary.unlink(missing_ok=True)
+                    unlink(temporary)
             return {"id": identity, "exists": path.is_file()}
 
     def close(self):

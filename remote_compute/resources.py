@@ -2,7 +2,7 @@
 
 import ctypes as c
 from concurrent.futures import ThreadPoolExecutor
-from functools import cache
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -21,7 +21,7 @@ _sensor_lock = threading.Lock()
 _sensor_started = False
 
 
-@cache
+@lru_cache(maxsize=None)
 def cpu_benchmark(cpus):
     """Measure total native throughput at the configured worker thread budget."""
     if type(cpus) is not int or cpus < 1:

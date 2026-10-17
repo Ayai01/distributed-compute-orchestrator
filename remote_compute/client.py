@@ -382,7 +382,7 @@ class Pool:
         memory_mb = task.get("memory_mb", 256)
         label = task.get("label", "")
         required_tools = {m[1] for argv in task.get("steps", ())
-                          if (m := re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0]))}
+                          for m in [re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0])] if m}
         texts = [*task.get("env", {}).values(), task.get("cwd", ""),
                  *(arg for argv in task["steps"] for arg in argv)]
         required_shared = {name for text in texts for name in re.findall(r"\$\{shared:([\w-]+)\}", text)}

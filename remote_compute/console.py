@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 
-from .view import _width, _clip, _layout, StatusRows, format_status
+from .view import _width, _clip, _layout, StatusRows, format_status, set_width_probe
 
 
 def _input_view(prompt, line, cursor, width):
@@ -20,7 +20,7 @@ def _input_view(prompt, line, cursor, width):
     while start < cursor and before >= room - int(start > 0 and room > 1):
         before -= _width(line[start])
         start += 1
-    marker = '‹' if start and room > 1 else ''
+    marker = '<' if start and room > 1 else ''
     visible = _clip(line[start:], room - len(marker))
     return prompt + marker + visible, _width(prompt + marker) + before
 
@@ -42,6 +42,61 @@ def _enable_ansi():
     if not kernel.SetConsoleMode(handle, mode.value | 4):
         return None
     return lambda: kernel.SetConsoleMode(handle, mode.value)
+
+
+def _console_width_probe():
+    """Measure ambiguous Unicode in an inactive buffer using the console font."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    class Coord(c.Structure):
+        _fields_=[('x',w.SHORT),('y',w.SHORT)]
+    class Rect(c.Structure):
+        _fields_=[(name,w.SHORT) for name in ('left','top','right','bottom')]
+    class Info(c.Structure):
+        _fields_=[('size',Coord),('cursor',Coord),('attributes',w.WORD),('window',Rect),('maximum',Coord)]
+    kernel=c.WinDLL('kernel32',use_last_error=True)
+    kernel.CreateConsoleScreenBuffer.argtypes=[w.DWORD,w.DWORD,c.c_void_p,w.DWORD,c.c_void_p]
+    kernel.CreateConsoleScreenBuffer.restype=w.HANDLE
+    kernel.SetConsoleCursorPosition.argtypes=[w.HANDLE,Coord]
+    kernel.WriteConsoleW.argtypes=[w.HANDLE,w.LPCWSTR,w.DWORD,c.POINTER(w.DWORD),c.c_void_p]
+    kernel.GetConsoleScreenBufferInfo.argtypes=[w.HANDLE,c.POINTER(Info)]
+    kernel.CloseHandle.argtypes=[w.HANDLE]
+    handle=kernel.CreateConsoleScreenBuffer(0xc0000000,3,None,1,None)
+    if not handle or handle==w.HANDLE(-1).value:
+        return None,lambda: None
+    def measure(char):
+        written,info=w.DWORD(),Info()
+        kernel.SetConsoleCursorPosition(handle,Coord(0,0))
+        if (kernel.WriteConsoleW(handle,char,len(char.encode('utf-16-le'))//2,c.byref(written),None)
+                and kernel.GetConsoleScreenBufferInfo(handle,c.byref(info))):
+            return max(1,info.cursor.x)
+        return 1
+    return measure,lambda: kernel.CloseHandle(handle)
+
+
+class RowPainter:
+    """Paint changed rows with absolute addresses, without scrolling the buffer."""
+    def __init__(self):
+        self.rows=()
+        self.size=None
+        self.cursor=None
+
+    def frame(self, rows, columns, height, cursor):
+        rows=tuple(_clip(row,max(0,columns-1)) for row in rows[:height])
+        rows+=('',)*max(0,height-len(rows))
+        previous=self.rows if self.size==(columns,height) else ()
+        changes=[f'\x1b[{i+1};1H'+row+'\x1b[K' for i,row in enumerate(rows)
+                 if i>=len(previous) or row!=previous[i]]
+        position=(height,min(max(0,cursor),max(0,columns-2))+1)
+        result=''
+        if changes:
+            result='\x1b[?25l'+''.join(changes)
+        if changes or position!=self.cursor:
+            result+=f'\x1b[{position[0]};{position[1]}H'
+        if changes:
+            result+='\x1b[?25h'
+        self.rows,self.size,self.cursor=rows,(columns,height),position
+        return result
 
 
 def _initial_size(columns=160, rows=50):
@@ -160,11 +215,14 @@ class Dashboard:
             return False
         if self.stream.isatty():
             _initial_size()
+        width_probe,close_probe=_console_width_probe() if self.stream.isatty() else (None,lambda: None)
+        set_width_probe(width_probe)
         focus, refresh = _focus_probe(), FocusRefresh()
         line, cursor, history, selected = '', 0, [], 0
-        last, offset, last_frame, page_size, task_page = 0, 0, '', 6, 0
+        last, offset, page_size, task_page = 0, 0, 6, 0
+        painter=RowPainter()
         rows, events = [], []
-        revision, cached_key, body = 0, None, ''
+        revision, cached_key, body = 0, None, []
         stdout, stderr, shell_stdout = sys.stdout, sys.stderr, self.shell.stdout
         try:
             sys.stdout = sys.stderr = self.shell.stdout = self
@@ -206,15 +264,13 @@ class Dashboard:
                                 if text.startswith('+ 命令输出'):
                                     page_size=max(1,len(visible)-index-2)
                             visible += [''] * max(0,height-2-len(visible))
-                            body = '\n'.join(_clip(row,columns-1)+'\x1b[K' for row in visible)
-                            body += '\n'+'─'*max(1,columns-1)
+                            body = visible+['-'*max(1,columns-1)]
                             cached_key = (revision,self.output_revision,offset,task_page,columns,height)
                     prompt, column = _input_view(self.shell.prompt, line, cursor, max(1, columns - 1))
-                    frame = '\x1b[H' + body + '\n\x1b[J' + prompt + f'\r\x1b[{column+1}G'
-                    if frame != last_frame:
+                    frame = painter.frame(body+[prompt],columns,height,column)
+                    if frame:
                         self.stream.write(frame)
                         self.stream.flush()
-                        last_frame = frame
                     while msvcrt.kbhit():
                         key = msvcrt.getwch()
                         if key in ('\x00', '\xe0'):
@@ -261,4 +317,6 @@ class Dashboard:
                 self.stream.write('\x1b[?1049l')
                 self.stream.flush()
             finally:
+                set_width_probe(None)
+                close_probe()
                 restore()

@@ -20,7 +20,10 @@ def replace_file(source, target):
         pending.chmod(mode)
         os.replace(pending, target)
     finally:
-        pending.unlink(missing_ok=True)
+        try:
+            pending.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def selected(root, patterns):
@@ -31,7 +34,11 @@ def selected(root, patterns):
             raise ValueError("File pattern must stay inside the selected directory")
         for path in root.glob(pattern):
             if path.is_file():
-                if path.is_symlink() or not path.resolve().is_relative_to(root):
+                try:
+                    path.resolve().relative_to(root)
+                except ValueError:
+                    raise ValueError("Select regular files: " + str(path)) from None
+                if path.is_symlink():
                     raise ValueError("Select regular files: " + str(path))
                 files[path.relative_to(root).as_posix()] = path
     return sorted(files.items())
@@ -58,7 +65,10 @@ def main():
     elif args.action == "write":
         replace_file(work / "data", path)
         with path.open("rb") as stream:
-            manifest.update(size=path.stat().st_size, sha256=hashlib.file_digest(stream, "sha256").hexdigest())
+            digest = hashlib.sha256()
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+            manifest.update(size=path.stat().st_size, sha256=digest.hexdigest())
     elif args.action == "upload":
         path.mkdir(parents=True, exist_ok=True)
         names = []

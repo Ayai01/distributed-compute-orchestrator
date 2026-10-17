@@ -1,4 +1,4 @@
-"""Install project-local scientific workers; the controller stays stdlib-only."""
+"""Reuse the machine Python for science; keep native tools inside the project."""
 
 import hashlib
 import json
@@ -7,27 +7,14 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from urllib.request import urlopen
-import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
-PYTHON_VERSION = '3.12.10'
-PYTHON_URL = f'https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-embed-amd64.zip'
-PACKAGES = ('numpy==2.3.5', 'scipy==1.18.1', 'numba==0.68.0', 'llvmlite==0.50.0',
-            'pymoo==0.6.2', 'moocore==0.3.2', 'threadpoolctl==3.7.0',
-            'platformdirs==4.13.0', 'cffi==2.1.1', 'pycparser==3.0',
-            'Deprecated==3.0.0', 'wrapt==2.5.0', 'alive-progress==3.3.0',
-            'graphemeu==0.7.2', 'about-time==4.2.1', 'matplotlib==3.11.2',
-            'python-dateutil==2.9.0.post0', 'six==1.17.0', 'pyparsing==3.3.3',
-            'pillow==12.3.0', 'packaging==26.3', 'kiwisolver==1.5.1',
-            'fonttools==4.66.1', 'cycler==0.12.1', 'contourpy==1.4.0',
-            'cma==4.5.0', 'autograd==1.9.1',
-            'opencv-python-headless==4.13.0.92', 'onnx==1.18.0', 'onnxruntime==1.22.1',
-            'protobuf==5.29.5', 'sympy==1.14.0', 'mpmath==1.3.0',
-            'flatbuffers==25.12.19', 'coloredlogs==15.0.1', 'humanfriendly==10.0',
-            'pyreadline3==3.5.6', 'typing-extensions==4.16.0')
+PACKAGES = ('numpy', 'scipy', 'numba', 'pymoo', 'moocore', 'threadpoolctl',
+            'opencv-python-headless', 'onnx', 'onnxruntime')
 NGSPICE_URL = 'https://downloads.sourceforge.net/project/ngspice/ng-spice-rework/47/ngspice-47_64.7z'
 SEVENZIP_URL = 'https://github.com/ip7z/7zip/releases/download/26.04/7zr.exe'
 
@@ -43,29 +30,30 @@ def _run(argv, **kwargs):
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), **kwargs)
 
 
-def _python(destination, temporary):
-    executable = destination/'python.exe'
-    if not executable.is_file():
-        archive = temporary/'python.zip'
-        _download(PYTHON_URL, archive)
-        destination.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(archive) as bundle:
-            bundle.extractall(destination)
-    # Normal module startup must honor the job's PYTHONPATH and cwd. In
-    # particular Bench runs -m bench.remote from a content-addressed asset.
-    (destination/'python312._pth').unlink(missing_ok=True)
+def preferred_python():
+    """Resolve an installed system 3.14, falling back to the current interpreter."""
+    if sys.version_info[:2] == (3,14):
+        return Path(sys.executable)
+    launcher=shutil.which('py')
+    if launcher:
+        installed=_run([launcher,'-0p'],capture_output=True,text=True).stdout
+        if '3.14' in installed:
+            selected=_run([launcher,'-3.14','-B','-c','import sys; print(sys.executable)'],
+                          capture_output=True,text=True).stdout.strip()
+            return Path(selected)
+    return Path(sys.executable)
+
+
+def _python(temporary):
+    executable = preferred_python()
     env = dict(os.environ, PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1',
                TEMP=str(temporary), TMP=str(temporary), TMPDIR=str(temporary))
     env.pop('PYTHONHOME', None)
     env.pop('PYTHONPATH', None)
-    if _run([executable, '-B', '-c', 'import importlib.util; print(bool(importlib.util.find_spec("pip")))'],
-            env=env, capture_output=True, text=True).stdout.strip() != 'True':
-        bootstrap = temporary/'get-pip.py'
-        _download('https://bootstrap.pypa.io/get-pip.py', bootstrap)
-        _run([executable, '-B', bootstrap, '--no-cache-dir', '--no-compile'], env=env)
+    _run([executable, '-B', '-m', 'ensurepip'], env=env, capture_output=True)
     _run([executable, '-B', '-m', 'pip', 'install', '--disable-pip-version-check',
           '--no-cache-dir', '--no-compile', '--only-binary=:all:', *PACKAGES], env=env)
-    probe = ('import json,sys,importlib.metadata as m; import numpy,scipy,numba,pymoo,moocore,cv2,onnx,onnxruntime as ort; '
+    probe = ('import json,sys; import numpy,scipy,numba,pymoo,moocore,cv2,onnx,onnxruntime as ort; '
              'f=numba.njit(lambda x: x*x); assert f(7)==49; '
              'assert cv2.resize(numpy.zeros((2,2),numpy.uint8),(4,4)).shape==(4,4); '
              'h=onnx.helper; t=onnx.TensorProto.FLOAT; '
@@ -76,8 +64,10 @@ def _python(destination, temporary):
              'session=ort.InferenceSession(model.SerializeToString(),providers=["CPUExecutionProvider"]); '
              'result=session.run(None,{"x":numpy.array([1,2],numpy.float32),"y":numpy.array([3,4],numpy.float32)})[0]; '
              'assert numpy.array_equal(result,[4,6]); '
-             'print(json.dumps({"python":sys.version.split()[0],"packages":'
-             '{n:m.version(n) for n in '+repr([p.split('==')[0] for p in PACKAGES])+'}}))')
+             'print(json.dumps({"python":sys.version.split()[0],"executable":sys.executable,"packages":'
+             '{n:getattr(m,"__version__","unknown") for n,m in '
+             '[("numpy",numpy),("scipy",scipy),("numba",numba),("pymoo",pymoo),'
+             '("moocore",moocore),("opencv-python-headless",cv2),("onnx",onnx),("onnxruntime",ort)]}}))')
     return executable, json.loads(_run([executable, '-B', '-c', probe], env=env,
                                       capture_output=True, text=True).stdout)
 
@@ -89,7 +79,7 @@ def _ngspice(destination, temporary, source=None):
         if not (source/'bin/ngspice.exe').is_file():
             raise ValueError('ngspice source must contain bin/ngspice.exe: '+str(source))
         if source != destination.resolve():
-            shutil.copytree(source, destination, dirs_exist_ok=True)
+            _merge_tree(source, destination)
     elif not executable.is_file():
         archive, extractor = temporary/'ngspice.7z', temporary/'7zr.exe'
         _download(NGSPICE_URL, archive)
@@ -97,7 +87,7 @@ def _ngspice(destination, temporary, source=None):
         unpacked = temporary/'ngspice-unpacked'
         _run([extractor, 'x', archive, '-o'+str(unpacked), '-y'], capture_output=True)
         found = next(unpacked.rglob('ngspice.exe'))
-        shutil.copytree(found.parent.parent, destination, dirs_exist_ok=True)
+        _merge_tree(found.parent.parent, destination)
     # The Windows distribution's spinit contains installation-specific paths.
     # Refresh just those paths so copied installations also work on another PC.
     spinit = destination/'share/ngspice/scripts/spinit'
@@ -112,8 +102,18 @@ def _ngspice(destination, temporary, source=None):
                         'sha256':hashlib.sha256(executable.read_bytes()).hexdigest()}
 
 
+def _merge_tree(source, destination):
+    destination.mkdir(parents=True,exist_ok=True)
+    for path in source.iterdir():
+        target=destination/path.name
+        if path.is_dir():
+            _merge_tree(path,target)
+        else:
+            shutil.copy2(path,target)
+
+
 def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
-    """Return tools/env for worker config; install no packages outside .tools."""
+    """Return tools/env using system Python and project-local native tools."""
     if os.name != 'nt':
         raise ValueError('This installer supplies Windows x64 workers; use native Python/ngspice on other systems')
     from .ramdisk import scratch
@@ -124,7 +124,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
     temporary_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='install-science-', dir=temporary_root) as directory:
         temporary = Path(directory)
-        python, runtime = _python(tools/'python', temporary)
+        python, runtime = _python(temporary)
         ngspice, simulator = _ngspice(tools/'ngspice', temporary, ngspice_source)
     result = {'tools':{name:python.as_posix() for name in ('aop_python','rgcn_python','bench_python','arh_python')},
               'env':{'PYTHONNOUSERSITE':'1', 'ARH_INFERENCE_PYTHON':python.as_posix()},
@@ -135,8 +135,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
         for name in ('tmp','dev/shm','dev/mqueue','home'):
             (msys/name).mkdir(parents=True, exist_ok=True)
         result['env']['MSYS2_ROOT'] = msys.as_posix()
-    result['installed_mib'] = {name:round(sum(p.stat().st_size for p in (tools/name).rglob('*') if p.is_file())/1024**2, 1)
-                               for name in ('python','ngspice')}
+    result['installed_mib'] = {'ngspice':round(sum(p.stat().st_size for p in (tools/'ngspice').rglob('*') if p.is_file())/1024**2, 1)}
     (tools/'science.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     return result
 

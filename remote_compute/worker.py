@@ -26,6 +26,7 @@ from .process import Process, low_integrity_directory
 from .resources import Host, process_usage, cpu_benchmark
 from .telemetry import Activity
 from .client import RemoteError
+from .compat import sha256
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -68,7 +69,7 @@ def cpu_budget(value=0):
 def file_hash(path):
     try:
         with open(path, "rb") as stream:
-            return hashlib.file_digest(stream, "sha256").hexdigest()
+            return sha256(stream)
     except OSError:
         # Windows execution aliases can launch a tool without exposing readable file bytes.
         return None

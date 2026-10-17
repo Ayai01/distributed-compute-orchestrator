@@ -51,7 +51,7 @@ def main(arguments=None):
     ucrt = Path(bash).resolve().parents[2] / "ucrt64/bin"
     environment["PATH"] = str(ucrt) + os.pathsep + environment.get("PATH", "")
     def run(argv):
-        return subprocess.call([bash, "-lc", shlex.join(argv)], env=environment)
+        return subprocess.call([bash, "-lc", ' '.join(shlex.quote(arg) for arg in argv)], env=environment)
     binary = "--binary" in arguments
     build = "--build" in arguments and ("--cc" in arguments or "--sc" in arguments)
     if not binary and not build:
@@ -60,8 +60,10 @@ def main(arguments=None):
     owned = os.environ.get("REMOTE_COMPUTE_JOB_DIR")
     if owned:
         directory_root = Path(owned).resolve()
-        if not Path.cwd().resolve().is_relative_to(directory_root):
-            raise ValueError("RTL workspace must be inside its job directory")
+        try:
+            Path.cwd().resolve().relative_to(directory_root)
+        except ValueError:
+            raise ValueError("RTL workspace must be inside its job directory") from None
         msys_workspace(directory_root)
     def option(name, default):
         return arguments[arguments.index(name) + 1] if name in arguments else default

@@ -123,8 +123,8 @@ class Process:
             if self.kernel.QueryInformationJobObject(self.job,3,buffer,len(buffer),None):
                 found=c.c_uint32.from_buffer(buffer,4).value
                 identities=(c.c_size_t*found).from_buffer(buffer,8)
-                return [handle for identity in identities
-                        if (handle:=self.kernel.OpenProcess(0x100000,False,identity))]
+                handles = [self.kernel.OpenProcess(0x100000,False,identity) for identity in identities]
+                return [handle for handle in handles if handle]
             if c.get_last_error()!=234:  # ERROR_MORE_DATA
                 raise c.WinError(c.get_last_error())
             count=max(count*2,c.c_uint32.from_buffer(buffer).value)

@@ -38,7 +38,7 @@ class BenchmarkTests(unittest.TestCase):
                     text='\n'.join(format_status(client.health(),width=width))
                     self.assertIn('kiter/s',text)
                     if width>=120:
-                        self.assertIn(f'{budget}线程',text)
+                        self.assertRegex(text,r'\|\s+'+str(budget)+r' \|')
                     elif width>=100:
                         self.assertIn(f'({budget})',text)
 
