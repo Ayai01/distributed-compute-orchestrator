@@ -1,24 +1,22 @@
-"""Startup throughput measurement and its resource/UI contract."""
-
-import io
+"""Approximate native load, resource calibration and compact UI contracts."""
+import itertools
 import json
-import math
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute import Pool
-from remote_compute.benchmark import BLOCK, NAME, MixedLoad, _lane, measure
+from remote_compute.benchmark import BATCH, NAME, _sample, measure
 from remote_compute.client import Node
 from remote_compute.resources import cpu_benchmark
-from remote_compute.view import format_status
+from remote_compute.view import _capabilities, format_status, _width
 from test_compute import provider, scratch
 
 
 class BenchmarkTests(unittest.TestCase):
-    def test_startup_calls_mixed_measurement_once_per_budget(self):
+    def test_startup_calls_native_measurement_once_per_budget(self):
         cpu_benchmark.cache_clear()
-        result=dict(name=NAME,score=2.5,unit='Miter/s',threads=24,seconds=1.7,total_seconds=2.0)
+        result=dict(name=NAME,score=2.5,unit='Miter/s',threads=24,seconds=1.9,total_seconds=2.0)
         try:
             with patch('remote_compute.benchmark.measure',return_value=result) as kernel:
                 self.assertIs(cpu_benchmark(24),result)
@@ -27,70 +25,66 @@ class BenchmarkTests(unittest.TestCase):
         finally:
             cpu_benchmark.cache_clear()
 
-    def test_mixed_iteration_has_nonlinear_circuit_rtl_and_scientific_state(self):
-        load=MixedLoad()
-        expected_dot=math.fsum(a*b for a,b in zip(load.matrix[0],load.vector))
-        load.block(1)
-        v=load.volts[0]
-        self.assertAlmostEqual(4*v+0.001*math.expm1(v/0.026),0.25,places=8)
-        self.assertAlmostEqual(load.vector[0],0.995*0.01+0.005*expected_dot+0.0001*v)
-        self.assertNotEqual(load.word,0x12345678)
-        self.assertTrue(0<=load.word<=0xffffffff)
-        for _ in range(4):load.block()
-        other=MixedLoad(); other.block(1)
-        for _ in range(4):other.block()
-        self.assertEqual((load.word,load.volts,load.vector,load.ram),
-                         (other.word,other.volts,other.vector,other.ram))
-        self.assertTrue(all(math.isfinite(x) for x in load.volts+load.vector))
-
-    def test_lane_warms_then_only_counts_work_before_the_shared_deadline(self):
-        output=io.StringIO()
-        with patch('remote_compute.benchmark.sys.stdin',io.StringIO('1.05\n')), \
-                patch('remote_compute.benchmark.sys.stdout',output), \
-                patch('remote_compute.benchmark.time.monotonic',side_effect=[1,1.1,1.1]):
-            _lane()
-        ready,result=output.getvalue().splitlines()
-        self.assertEqual(ready,'ready')
-        self.assertEqual(json.loads(result)['iterations'],BLOCK)
-
-    def test_all_lanes_start_together_with_bootstrap_inside_the_two_second_budget(self):
-        lanes, starts=[], []
-        def spawn(*args,**kwargs):
-            lane=Mock(stdin=io.StringIO(),stdout=io.StringIO('ready\n'),stderr=io.StringIO(),returncode=0)
-            lane.poll.return_value=0
-            def communicate(**options):
-                starts.append(lane.stdin.getvalue())
-                return json.dumps(dict(iterations=64000,finished=102.001,checksum=[1,2,3])),''
-            lane.communicate.side_effect=communicate
-            lanes.append(lane)
-            return lane
-        with patch('remote_compute.benchmark.subprocess.Popen',side_effect=spawn) as popen, \
-                patch('remote_compute.benchmark.time.monotonic',side_effect=[100,100.4,100.41,100.42,102.02]):
-            result=measure(2)
-        self.assertEqual(popen.call_count,2)
-        self.assertTrue(all('-I' in call.args[0] and '-B' in call.args[0] for call in popen.call_args_list))
-        self.assertEqual(result['threads'],2)
-        self.assertEqual(result['iterations'],128000)
-        self.assertAlmostEqual(result['score'],128000/1.601/1000000,places=6)
-        self.assertEqual(result['total_seconds'],2.02)
+    def test_native_lanes_share_deadline_with_import_inside_two_second_budget(self):
+        states=[]
+        def create(np):
+            state=Mock()
+            state.checksum.return_value=[1,2,3]
+            states.append(state)
+            return state
+        clock=itertools.count(10000)
+        np=SimpleNamespace(__version__='test',lib=SimpleNamespace())
+        with patch('remote_compute.benchmark.MixedLoad',side_effect=create), \
+                patch('remote_compute.benchmark.time.monotonic',side_effect=lambda:next(clock)/100):
+            result=_sample(np,2,100)
         self.assertEqual(result['name'],NAME)
-        self.assertEqual(starts,['102.0\n','102.0\n'])
-        self.assertEqual(result['components'],['circuit-newton','rtl-state-ram','scientific-dot'])
-        for lane in lanes:
-            lane.wait.assert_called_once()
-            self.assertTrue(all(s.closed for s in (lane.stdin,lane.stdout,lane.stderr)))
+        self.assertEqual(result['threads'],2)
+        self.assertTrue(1.9<=result['total_seconds']<2.2)
+        self.assertEqual(result['iterations'],sum(s.block.call_count-1 for s in states)*BATCH)
+        self.assertAlmostEqual(result['score'],result['iterations']/result['seconds']/1000000,places=4)
 
-    def test_bootstrap_interruption_reaps_only_its_own_lanes(self):
-        lane=Mock(stdin=io.StringIO(),stdout=io.StringIO(),stderr=io.StringIO())
-        lane.stdout.readline=Mock(side_effect=KeyboardInterrupt)
-        lane.poll.return_value=None
-        with patch('remote_compute.benchmark.subprocess.Popen',return_value=lane),self.assertRaises(KeyboardInterrupt):
-            measure(1)
-        lane.kill.assert_called_once()
-        lane.wait.assert_called_once()
-        self.assertTrue(all(s.closed for s in (lane.stdin,lane.stdout,lane.stderr)))
+    def test_helper_limits_blas_threads_without_changing_service_environment(self):
+        from os import environ
+        before=dict(environ)
+        helper=Mock()
+        helper.returncode=0
+        helper.communicate.return_value=(json.dumps(dict(name=NAME,available=False)),'')
+        factory=Mock()
+        factory.return_value.__enter__=Mock(return_value=helper)
+        factory.return_value.__exit__=Mock(return_value=False)
+        with patch('remote_compute.benchmark.subprocess.Popen',factory):
+            self.assertFalse(measure(24)['available'])
+        child_env=factory.call_args.kwargs['env']
+        for name in ('OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','OMP_NUM_THREADS','BLIS_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
+            self.assertEqual(child_env[name],'1')
+        self.assertEqual(dict(environ),before)
+        self.assertIn('-I',factory.call_args.args[0])
+        self.assertIn('-B',factory.call_args.args[0])
 
-    def test_device_budget_propagates_to_health_nodes_and_dashboard(self):
+    def test_timeout_reaps_the_single_helper_and_leaves_worker_available(self):
+        import subprocess
+        helper=Mock()
+        helper.communicate.side_effect=[subprocess.TimeoutExpired('estimate',5),('','')]
+        factory=Mock()
+        factory.return_value.__enter__=Mock(return_value=helper)
+        factory.return_value.__exit__=Mock(return_value=False)
+        with patch('remote_compute.benchmark.subprocess.Popen',factory):
+            result=measure(24)
+        self.assertFalse(result['available'])
+        self.assertNotIn('score',result)
+        helper.kill.assert_called_once()
+        self.assertEqual(helper.communicate.call_count,2)
+
+    def test_warmup_failure_breaks_barrier_and_leaves_no_benchmark_threads(self):
+        import threading
+        load=Mock()
+        load.block.side_effect=RuntimeError('warmup failed')
+        with patch('remote_compute.benchmark.MixedLoad',return_value=load), \
+                self.assertRaises((RuntimeError,threading.BrokenBarrierError)):
+            _sample(Mock(),2,100)
+        self.assertFalse(any(t.name.startswith('native-benchmark') for t in threading.enumerate()))
+
+    def test_device_budget_stays_in_health_but_is_not_repeated_in_score(self):
         for logical,budget in ((28,24),(32,30)):
             with self.subTest(budget=budget),scratch() as directory, \
                     patch('remote_compute.worker.os.cpu_count',return_value=logical), \
@@ -102,17 +96,30 @@ class BenchmarkTests(unittest.TestCase):
                 for width in (80,110,160):
                     text='\n'.join(format_status(client.health(),width=width))
                     self.assertIn('Miter/s',text)
-                    if width>=100:
-                        self.assertIn(f'({budget})',text)
+                    self.assertNotIn('Miter/s(T)',text)
+                    self.assertNotIn('1.000('+str(budget)+')',text)
 
-    def test_dashboard_distinguishes_the_new_mix_from_a_legacy_hash_snapshot(self):
+    def test_dashboard_distinguishes_native_python_and_hash_kernel_versions(self):
         value=dict(role='worker',node='Aya1-PC',cpus=24,
                    benchmark=dict(name=NAME,unit='Miter/s',score=1.234567,threads=24))
-        self.assertIn('1.235(24)','\n'.join(format_status(value,width=160)))
-        value['benchmark'].update(name='pbkdf2-sha256-v1',unit='kiter/s',score=140000)
-        text='\n'.join(format_status(value,width=160))
-        self.assertIn('旧哈希(24)',text)
-        self.assertNotIn('140.000',text)
+        self.assertIn('1.235','\n'.join(format_status(value,width=160)))
+        for name,label in (('mixed-cpu-v1','旧解释器'),('pbkdf2-sha256-v1','旧哈希')):
+            value['benchmark'].update(name=name,unit='Miter/s',score=140)
+            text='\n'.join(format_status(value,width=160))
+            self.assertIn(label,text)
+            self.assertNotIn('140.000',text)
+
+    def test_capabilities_group_aliases_without_folding_or_changing_protocol_tags(self):
+        tags=['aop_python','arh_python','bench_python','rgcn_python','rgcn_train',
+              'cpu','win32','ngspice','python','rtl','verilator']
+        self.assertEqual(_capabilities(tags),'SPICE RTL Python ML')
+        self.assertEqual(len(tags),11)
+        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'SPICE RTL Python ML +1')
+        value=dict(role='worker',node='Aya1-TX',cpus=30,tags=tags)
+        for width in (56,80,110,160):
+            lines=format_status(value,width=width)
+            self.assertTrue(all(_width(line)<=width for line in lines))
+            self.assertIn('SPICE RTL Python ML','\n'.join(lines))
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):
         with patch('remote_compute.benchmark.measure') as kernel:

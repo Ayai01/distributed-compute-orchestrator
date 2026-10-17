@@ -440,7 +440,7 @@ class Pool:
                         # Real same-label timings anchor and then replace it.
                         benchmarks = [n.health.get('benchmark') or {} for n in matching]
                         rates = [b['score']/b['threads'] for b in benchmarks
-                                 if b.get('name') == 'mixed-cpu-v1' and b.get('unit') == 'Miter/s'
+                                 if b.get('name') == 'numpy-mixed-v2' and b.get('unit') == 'Miter/s'
                                  and b.get('score',0)>0 and b.get('threads',0)>0]
                         priors = {n.name:1.0 for n in matching}
                         if len(rates)==len(matching):

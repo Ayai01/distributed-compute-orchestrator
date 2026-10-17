@@ -1,108 +1,138 @@
-"""Fixed scalar mix, run in short-lived stdlib-only processes at worker startup."""
+"""Approximate native mixed throughput using the installed NumPy/BLAS runtime."""
+from concurrent.futures import ThreadPoolExecutor
 import json
-import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
-NAME = 'mixed-cpu-v1'
-BLOCK = 64
+NAME = 'numpy-mixed-v2'
+BATCH = 32768
 
 
 class MixedLoad:
-    def __init__(self):
-        self.volts = [0.0] * 8
-        self.vector = [(i+1)/100 for i in range(16)]
-        self.matrix = [[((i*7+j*11) % 17-8)/128 for j in range(16)] for i in range(16)]
-        self.ram = [(i*2654435761) & 0xffffffff for i in range(1024)]
-        self.word, self.ticks = 0x12345678, 0
+    def __init__(self, np):
+        self.np = np
+        self.volts = np.full(BATCH,0.05)
+        self.rhs = np.linspace(0.2,0.3,BATCH)
+        self.exponent, self.delta = np.empty(BATCH),np.empty(BATCH)
+        self.words = np.arange(BATCH,dtype=np.uint32)+np.uint32(0x12345678)
+        self.ram = np.arange(BATCH,dtype=np.uint32)*np.uint32(2654435761)
+        self.indices, self.data, self.rotate = (np.empty(BATCH,dtype=np.uint32) for _ in range(3))
+        self.matrix = np.linspace(-0.2,0.2,128*128).reshape(128,128)
+        self.weight = np.full((128,128),0.0001)+np.eye(128)*0.98
+        self.product = np.empty_like(self.matrix)
 
-    def block(self, count=BLOCK):
-        volts, vector, matrix, ram = self.volts, self.vector, self.matrix, self.ram
-        word = self.word
-        drive = 0.25 + 0.02*math.sin(self.ticks/128)
-        for tick in range(self.ticks, self.ticks+count):
-            # RC ladder with a diode: three Newton updates of one sparse row.
-            i = tick & 7
-            rhs = 2*volts[i]+volts[(i-1) & 7]+volts[(i+1) & 7]+drive
-            v = volts[i]
-            for _ in range(3):
-                diode = 0.001*math.exp(v/0.026)
-                v -= (4*v+diode-0.001-rhs)/(4+diode/0.026)
-            volts[i] = v
-            # Fixed-width RTL-style state, conditional datapath and indexed RAM.
-            data = ram[(word >> 9) & 1023]
-            word = (((word << 5) | (word >> 27))+data+tick+3) & 0xffffffff
-            word = ((word ^ (data >> 1)) if word & 1 else word*1664525+1013904223) & 0xffffffff
-            ram[(word >> 15) & 1023] = word
-            # Double-precision matrix row product, reduction and state update.
-            i = tick & 15
-            total = 0.0
-            for a, b in zip(matrix[i], vector):
-                total += a*b
-            vector[i] = 0.995*vector[i]+0.005*total+0.0001*v
-        self.word, self.ticks = word, self.ticks+count
+    def block(self):
+        np = self.np
+        # Bulk nonlinear FP64 updates: no Python loop over circuit nodes.
+        for _ in range(3):
+            np.divide(self.volts,0.026,out=self.exponent)
+            np.exp(self.exponent,out=self.exponent)
+            self.exponent *= 0.001
+            np.multiply(self.volts,4,out=self.delta)
+            self.delta += self.exponent
+            self.delta -= 0.001
+            self.delta -= self.rhs
+            self.exponent /= 0.026
+            self.exponent += 4
+            self.delta /= self.exponent
+            self.volts -= self.delta
+        # Fixed-width datapath plus indexed gather/scatter, in native ufuncs.
+        np.right_shift(self.words,9,out=self.indices)
+        self.indices &= BATCH-1
+        np.take(self.ram,self.indices,out=self.data)
+        np.left_shift(self.words,5,out=self.rotate)
+        self.words >>= 27
+        self.words |= self.rotate
+        self.words += self.data
+        self.words *= np.uint32(1664525)
+        self.words += np.uint32(1013904223)
+        self.data >>= 1
+        self.words ^= self.data
+        self.ram[self.indices] = self.words
+        # The actual installed BLAS supplies scientific FP64/FMA performance.
+        np.matmul(self.matrix,self.weight,out=self.product)
+        self.product += 0.0001
+        self.matrix,self.product = self.product,self.matrix
+
+    def checksum(self):
+        return [int(self.words[0]),float(self.np.sum(self.volts)),float(self.np.sum(self.matrix))]
 
 
-def _lane():
-    load = MixedLoad()
-    load.block()  # Warm every lane before the common start.
-    print('ready', flush=True)
-    start = sys.stdin.readline()
-    if not start:
-        return
-    deadline = float(start)
-    iterations = 0
-    while time.monotonic() < deadline:
-        load.block()
-        iterations += BLOCK
-    print(json.dumps(dict(iterations=iterations, finished=time.monotonic(),
-                          checksum=[load.word, sum(load.volts), sum(load.vector)])), flush=True)
+def _sample(np, cpus, began):
+    started = deadline = 0.0
+    def start():
+        nonlocal started,deadline
+        started = time.monotonic()
+        deadline = started+max(0.25,2.0-(started-began))
+    ready = threading.Barrier(cpus+1,action=start)
+    def lane():
+        try:
+            load = MixedLoad(np)
+            load.block()
+            ready.wait()
+            iterations = 0
+            while time.monotonic()<deadline:
+                load.block()
+                iterations += BATCH
+            return iterations,time.monotonic(),load.checksum()
+        except BaseException:
+            ready.abort()
+            raise
+    with ThreadPoolExecutor(max_workers=cpus,thread_name_prefix='native-benchmark') as executor:
+        try:
+            futures = [executor.submit(lane) for _ in range(cpus)]
+            ready.wait()
+            samples = [future.result() for future in futures]
+        finally:
+            ready.abort()
+    elapsed = max(finished for _,finished,_ in samples)-started
+    iterations = sum(count for count,_,_ in samples)
+    introspect = getattr(getattr(np.lib,'introspect',None),'opt_func_info',None)
+    return dict(name=NAME,available=True,score=round(iterations/elapsed/1000000,6),unit='Miter/s',
+                threads=cpus,seconds=round(elapsed,3),total_seconds=round(time.monotonic()-began,3),
+                iterations=iterations,numpy=np.__version__,
+                dispatch=introspect(func_name='^exp$') if introspect else {},
+                components=['native-fp64-newton','native-u32-ram','native-blas-matmul'],
+                checksums=[checksum for _,_,checksum in samples])
+
+
+def _unavailable(reason):
+    return dict(name=NAME,available=False,reason=reason,unit='Miter/s',threads=0)
 
 
 def measure(cpus):
-    """Budget about two seconds including bootstrap; all lanes share a deadline."""
-    # monotonic has a process-shared epoch on supported Windows/Linux versions,
-    # including Python 3.7 where Windows perf_counter still had per-process epochs.
+    """One disposable native helper; the service itself stays stdlib-only."""
     began = time.monotonic()
-    lanes = []
+    env = dict(os.environ)
+    for name in ('OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','OMP_NUM_THREADS',
+                 'BLIS_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
+        env[name] = '1'  # Outer lanes share the worker budget; no nested BLAS pool.
+    with subprocess.Popen([sys.executable,'-I','-B','-u',str(Path(__file__).resolve()),
+                           '--sample',str(cpus),str(began)],
+            env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',
+            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)) as helper:
+        try:
+            stdout,stderr = helper.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            helper.kill(); helper.communicate()
+            return _unavailable('Native estimate exceeded startup budget')
+        except BaseException:
+            helper.kill(); helper.communicate()
+            raise
+        if helper.returncode:
+            return _unavailable(stderr.strip()[-240:] or 'Native helper exit '+str(helper.returncode))
+        return json.loads(stdout)
+
+
+if __name__ == '__main__' and sys.argv[1:2] == ['--sample']:
     try:
-        for _ in range(cpus):
-            lanes.append(subprocess.Popen([sys.executable, '-I', '-B', '-u', str(Path(__file__).resolve()), '--lane'],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0))
-        for lane in lanes:
-            if lane.stdout.readline().strip() != 'ready':
-                raise RuntimeError('CPU benchmark lane failed: '+lane.stderr.read())
-        started = time.monotonic()
-        deadline = started+max(0.25, 2.0-(started-began))
-        for lane in lanes:
-            lane.stdin.write(str(deadline)+'\n')
-            lane.stdin.flush()
-        samples = []
-        for lane in lanes:
-            stdout, stderr = lane.communicate(timeout=max(1, deadline-time.monotonic()+1))
-            if lane.returncode:
-                raise RuntimeError('CPU benchmark lane failed: '+stderr)
-            samples.append(json.loads(stdout))
-        elapsed = max(sample['finished'] for sample in samples)-started
-        iterations = sum(sample['iterations'] for sample in samples)
-        return dict(name=NAME, score=round(iterations/elapsed/1000000, 6), unit='Miter/s',
-                    threads=cpus, seconds=round(elapsed, 3), total_seconds=round(time.monotonic()-began, 3),
-                    iterations=iterations, python=sys.version.split()[0],
-                    components=['circuit-newton', 'rtl-state-ram', 'scientific-dot'],
-                    checksums=[sample['checksum'] for sample in samples])
-    finally:
-        for lane in lanes:
-            if lane.poll() is None:
-                lane.kill()
-            lane.wait()
-            for stream in (lane.stdin, lane.stdout, lane.stderr):
-                if stream is not None:
-                    stream.close()
-
-
-if __name__ == '__main__' and sys.argv[1:] == ['--lane']:
-    _lane()
+        import numpy as np
+    except ImportError:
+        result = _unavailable('Install NumPy with setup; real task timing remains available')
+    else:
+        result = _sample(np,int(sys.argv[2]),float(sys.argv[3]))
+    print(json.dumps(result))

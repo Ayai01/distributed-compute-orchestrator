@@ -100,14 +100,18 @@ def _gb(value):
 
 
 def _capabilities(tags):
+    tags=set(tags or [])
+    groups=[('SPICE',{'ngspice','spice'}),('RTL',{'rtl','verilator'}),
+            ('Python',{'python'}|{t for t in tags if t.endswith('_python')}),
+            ('ML',{'rgcn_train'}),('GPU',{'gpu','cuda','rocm'})]
+    known={'cpu','win32','linux','darwin'}
     result=[]
-    for tag in tags or []:
-        if tag in {'cpu','win32','linux','darwin'}:
-            continue
-        name = 'py' if tag=='python' else 'rtl' if tag=='verilator' else (tag[:-7] if tag.endswith('_python') else tag)
-        if name not in result:
-            result.append(name)
-    return '/'.join(result) or '-'
+    for name,members in groups:
+        known.update(members)
+        if tags & members:result.append(name)
+    other=len(tags-known)
+    if other:result.append('+'+str(other))
+    return ' '.join(result) or '-'
 
 
 def _project(name):
@@ -176,7 +180,9 @@ class StatusRows(list):
             if measured is not None and benchmark.get('unit','kiter/s')=='kiter/s':
                 measured/=1000
             score=('旧哈希' if benchmark.get('name')=='pbkdf2-sha256-v1' else
-                   f"{measured:.3f}" if measured is not None else '待测')
+                   '旧解释器' if benchmark.get('name')=='mixed-cpu-v1' else
+                   (f"{measured:.3f}" if measured<1000 else f"{measured:.1f}") if measured is not None else
+                   '待依赖' if benchmark.get('available') is False else '待测')
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
@@ -196,9 +202,9 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','线程(总)','CPU','Miter/s(T)','RAM','可配','RSS/预留','设备IP'],
-                         [[*r[:3],f'{r[7]}({r[8]})' if r[8]!='-' else r[7],*r[3:6],r[9]] for r in records],
-                         [7,10,6,11,10,5,9,None],width,right=(1,2,3,4,5,6))
+            table=_table(['设备','线程(总)','CPU','Miter/s','RAM','可配','RSS/预留','设备IP'],
+                         [[*r[:3],r[7],*r[3:6],r[9]] for r in records],
+                         [7,10,6,8,10,5,9,None],width,right=(1,2,3,4,5,6))
         elif width>=54:
             table=_table(['设备','线程(总)','CPU','RAM','可配'],[r[:5] for r in records],
                          [7,10,6,None,5],width,right=(1,2,3,4))
@@ -212,11 +218,11 @@ class StatusRows(list):
         sections=[('设备资源 | RAM GiB',table,0)]
         if width<100:
             if width>=54:
-                details=_table(['设备','Miter/s(T)','RSS/预留','设备IP'],
-                               [[r[0],f'{r[7]}({r[8]})',r[5],r[9]] for r in records],
-                               [7,12,9,None],width,right=(1,2))
+                details=_table(['设备','Miter/s','RSS/预留','设备IP'],
+                               [[r[0],r[7],r[5],r[9]] for r in records],
+                               [7,8,9,None],width,right=(1,2))
             else:
-                details=[_line(f'{r[0]} {r[7]} Miter/s ({r[8]})',width) for r in records]
+                details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
                 details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
             sections.append(('启动基准 Miter/s | RSS/预留 GiB',details,1))
         if self.value.get('role')=='scheduler':
