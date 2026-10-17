@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.cli import Shell
-from remote_compute.console import Dashboard, FocusRefresh, format_status, _enable_ansi, _input_view, _layout, _width
+from remote_compute.console import Dashboard, FocusRefresh, format_status, _enable_ansi, _initial_size, _input_view, _layout, _width
 
 
 class Keyboard:
@@ -54,6 +54,26 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_jobs_prefix_selects_one_record_and_lists_colliding_ids(self):
+        from remote_compute.commands import SchedulerShell
+        identities=['1234'+'a'*28,'1234'+'b'*28]
+        records=[dict(id=identity,status='running',label='test-label',cpus=1) for identity in identities]
+        client=Mock()
+        client.status.side_effect=lambda identity=None,**_kwargs: (next(r for r in records if r['id']==identity) if identity else records)
+        shell=SchedulerShell(Mock(),client)
+        try:
+            with redirect_stdout(io.StringIO()) as output:
+                shell.do_jobs('1234a')
+            self.assertIn(identities[0],output.getvalue())
+            self.assertNotIn(identities[1],output.getvalue())
+            with redirect_stdout(io.StringIO()) as output:
+                shell.do_jobs('1234')
+            for identity in identities:
+                self.assertIn(identity,output.getvalue())
+            self.assertIn('匹配多个任务',output.getvalue())
+        finally:
+            shell.close()
+
     def test_plain_posix_console_exits_on_reload_without_waiting_for_input(self):
         import select
         shell=OperatorShell();alive=threading.Event();alive.set()
@@ -94,8 +114,74 @@ class ConsoleTests(unittest.TestCase):
                 self.assertEqual(_width(row),width)
             text='\n'.join(rows)
             self.assertIn('BGR/ss27',text)
-            self.assertIn('24 个 / 1 组',text)
+            self.assertIn('当前任务 24 个',text)
+            self.assertIn('aaaa',text)
+            self.assertNotIn('aaaaaaaa',text)
             self.assertNotIn('m40_p125',text)
+
+    def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):
+        jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label='very-long-circuit-name/'*6+f'seed-{i}',
+                   cpus=2,memory_mb=512,status='running') for i in range(43)]
+        value=dict(role='scheduler',node='Aya1-PC',cpus=54,used_cpus=24,
+                   nodes=[dict(name='Aya1-PC',capacity=24,logical_cpus=28,active_jobs=jobs[:20]),
+                          dict(name='Aya1-TX',capacity=30,logical_cpus=32,active_jobs=jobs[20:])],
+                   projects={'Bench':dict(resource_share=1,used=24,target=54,queued=3)})
+        for width in (44,80,110,120,160,200):
+            status=format_status(value,width=width)
+            first=status.fit(28)
+            pages=status.page_count
+            self.assertGreater(pages,1)
+            seen=[]
+            for page in range(pages):
+                status.task_page=page
+                rows=status.fit(28)
+                self.assertTrue(all(_width(row)==width for row in rows))
+                self.assertLessEqual(len(rows),28)
+                for row in rows:
+                    seen.extend(job['id'][:4] for job in jobs if '| '+job['id'][:4]+' |' in row)
+            self.assertCountEqual(seen,[job['id'][:4] for job in jobs])
+            self.assertIn('1/2','\n'.join(first))
+            self.assertNotIn('温度','\n'.join(first))
+            self.assertNotIn('在线','\n'.join(first))
+            if width>=120:
+                self.assertTrue(any('设备资源' in row and '当前任务' in row for row in first))
+
+    def test_tab_changes_task_pages_while_preserving_input_and_output_history(self):
+        keyboard=Keyboard(['\t','\x00','\x0f',*'ping\rquit\r'])
+        jobs=[dict(id=f'{i:04x}'+'b'*28,label=f'unique-task-{i}',cpus=1,status='running') for i in range(50)]
+        with redirect_stdout(io.StringIO()) as stream:
+            shell=OperatorShell()
+            dashboard=Dashboard(shell,lambda: dict(node='Aya1-PC',role='worker',cpus=24,active_jobs=jobs))
+            with patch.dict(sys.modules,msvcrt=keyboard), \
+                    patch('remote_compute.console._enable_ansi',return_value=lambda: None), \
+                    patch('remote_compute.console.time.sleep'), \
+                    patch('remote_compute.console.shutil.get_terminal_size',return_value=os.terminal_size((160,32))):
+                dashboard.run()
+            self.assertIn('1/2页',stream.getvalue())
+            self.assertIn('2/2页',stream.getvalue())
+            self.assertEqual(shell.completed,1)
+
+    def test_console_grows_to_screen_limit_without_shrinking_existing_window(self):
+        kernel,user=Mock(),Mock()
+        user.IsWindowVisible.return_value=True
+        def information(_handle,pointer):
+            value=pointer._obj
+            value.size.x,value.size.y=120,300
+            value.window.right,value.window.bottom=119,29
+            return True
+        kernel.GetConsoleScreenBufferInfo.side_effect=information
+        kernel.GetLargestConsoleWindowSize.side_effect=lambda _handle: kernel.GetLargestConsoleWindowSize.restype(150,44)
+        with patch.object(ctypes,'WinDLL',side_effect=lambda name:kernel if name=='kernel32' else user):
+            self.assertTrue(_initial_size())
+        size=kernel.SetConsoleScreenBufferSize.call_args.args[1]
+        window=kernel.SetConsoleWindowInfo.call_args.args[2]._obj
+        self.assertEqual((size.x,size.y),(150,300))
+        self.assertEqual((window.right,window.bottom),(149,43))
+        user.IsWindowVisible.return_value=False
+        kernel.SetConsoleScreenBufferSize.reset_mock()
+        with patch.object(ctypes,'WinDLL',side_effect=lambda name:kernel if name=='kernel32' else user):
+            self.assertFalse(_initial_size())
+        kernel.SetConsoleScreenBufferSize.assert_not_called()
 
     def test_small_dashboard_keeps_both_devices_and_tasks_visible(self):
         nodes=[]

@@ -23,7 +23,7 @@ from urllib.parse import unquote
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
 from . import __version__
 from .process import Process, low_integrity_directory
-from .resources import Host, process_usage
+from .resources import Host, process_usage, cpu_benchmark
 from .telemetry import Activity
 from .client import RemoteError
 
@@ -187,6 +187,7 @@ class Worker:
             self.tags = sorted(set(self.tags) | {'rtl'})
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
+        self.benchmark = dict(cpu_benchmark(self.capacity))
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
@@ -208,7 +209,7 @@ class Worker:
         with self.condition:
             resources = self._memory_state()
             return {"protocol": PROTOCOL, "node": socket.gethostname(), "platform": sys.platform,
-                    "role": "worker", **resources,
+                    "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "capabilities": ["machine", "resize"] + (["restart"] if self.restart_available else []),
@@ -442,6 +443,7 @@ class Worker:
         except Exception as exc:
             state, error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
+            self._clean_temp(job)
             with self.condition:
                 if job["cancel"].is_set() and state == "succeeded":
                     state = "cancelled"
@@ -460,6 +462,23 @@ class Worker:
                 self.used -= task["cpus"]
                 self.threads.discard(threading.current_thread())
                 self.condition.notify_all()
+
+    def _clean_temp(self, job):
+        """Process TEMP is scratch; keep result inputs/outputs until collection."""
+        temporary=job['directory']/'tmp'
+        issue=None
+        try:
+            shutil.rmtree(temporary)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            issue=str(error)
+        with self.condition:
+            if issue:
+                job['result']['cleanup_error']=issue
+                self.activity.notify('临时目录待清理 '+str(temporary), 'local')
+            else:
+                job['result'].pop('cleanup_error',None)
 
     def get(self, identity):
         with self.condition:
@@ -552,6 +571,8 @@ class Worker:
         self.scheduler.join()
         for thread in list(self.threads):
             thread.join()
+        for job in self.jobs.values():
+            self._clean_temp(job)
         self.root_lock.close()
 
 

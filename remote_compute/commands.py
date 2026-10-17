@@ -309,11 +309,20 @@ class SchedulerShell(Shell):
         print('\n'.join(format_status(self.center.health(), self.center.url)))
 
     def do_jobs(self, line):
-        """jobs [节点|任务ID]：查看任务；指定完整任务ID查看完整标签和记录。"""
+        """jobs [节点|任务ID]：支持4位以上ID前缀，唯一匹配时查看完整记录。"""
         rows = []
         if self.center:
             identity=line.strip()
-            if len(identity)==32 and all(c in '0123456789abcdef' for c in identity):
+            if 4<=len(identity)<=32 and all(c in '0123456789abcdef' for c in identity):
+                if len(identity)<32:
+                    matches=[j for j in self.center.status(brief=True) if j['id'].startswith(identity)]
+                    if len(matches)!=1:
+                        if not matches:
+                            raise ValueError('未找到任务ID: '+identity)
+                        table(matches,['id','status','label','cpus'])
+                        print('ID前缀匹配多个任务，请增加位数。')
+                        return
+                    identity=matches[0]['id']
                 from .view import wrap_lines
                 width=max(20,shutil.get_terminal_size((110,32)).columns-5)
                 for row in json.dumps(self.center.status(identity),ensure_ascii=False,indent=2).splitlines():
@@ -552,10 +561,19 @@ class WorkerShell(Shell):
         self.worker.control({"memory_mb": int(line)})
         self.do_status("")
 
-    def do_jobs(self, _line):
-        """列出本节点任务。"""
+    def do_jobs(self, line):
+        """jobs [任务ID前缀]：列出本节点任务或查看完整记录。"""
         with self.worker.condition:
-            table([j["result"] for j in self.worker.jobs.values()], ["id", "status", "label", "cpus"])
+            rows=[j['result'].copy() for j in self.worker.jobs.values()
+                  if not line.strip() or j['result']['id'].startswith(line.strip())]
+        if line.strip() and len(rows)==1:
+            from .view import wrap_lines
+            width=max(20,shutil.get_terminal_size((110,32)).columns-5)
+            for row in json.dumps(rows[0],ensure_ascii=False,indent=2).splitlines():
+                for part in wrap_lines(row,width):
+                    print(part)
+        else:
+            table(rows,["id", "status", "label", "cpus"])
 
     def do_cpus(self, line):
         """cpus N：调整总CPU预算。"""

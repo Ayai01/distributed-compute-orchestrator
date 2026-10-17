@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import os
+import re
 import subprocess
 
 from .view import _width, _clip, _layout, StatusRows, format_status
@@ -41,6 +42,43 @@ def _enable_ansi():
     if not kernel.SetConsoleMode(handle, mode.value | 4):
         return None
     return lambda: kernel.SetConsoleMode(handle, mode.value)
+
+
+def _initial_size(columns=160, rows=50):
+    """Grow a classic Windows console once, within its current screen/font limit."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    class Coord(c.Structure):
+        _fields_=[('x',w.SHORT),('y',w.SHORT)]
+    class Rect(c.Structure):
+        _fields_=[(name,w.SHORT) for name in ('left','top','right','bottom')]
+    class Info(c.Structure):
+        _fields_=[('size',Coord),('cursor',Coord),('attributes',w.WORD),('window',Rect),('maximum',Coord)]
+    kernel=c.WinDLL('kernel32')
+    user=c.WinDLL('user32')
+    kernel.GetConsoleWindow.restype=w.HWND
+    user.IsWindowVisible.argtypes=[w.HWND]
+    if not user.IsWindowVisible(kernel.GetConsoleWindow()):
+        return False  # ConPTY/editor panes are sized by their host.
+    kernel.GetStdHandle.argtypes=[w.DWORD]
+    kernel.GetStdHandle.restype=w.HANDLE
+    kernel.GetConsoleScreenBufferInfo.argtypes=[w.HANDLE,c.POINTER(Info)]
+    kernel.GetLargestConsoleWindowSize.argtypes=[w.HANDLE]
+    kernel.GetLargestConsoleWindowSize.restype=Coord
+    kernel.SetConsoleScreenBufferSize.argtypes=[w.HANDLE,Coord]
+    kernel.SetConsoleWindowInfo.argtypes=[w.HANDLE,w.BOOL,c.POINTER(Rect)]
+    handle=kernel.GetStdHandle(-11 & 0xffffffff)
+    info=Info()
+    if not kernel.GetConsoleScreenBufferInfo(handle,c.byref(info)):
+        return False
+    maximum=kernel.GetLargestConsoleWindowSize(handle)
+    width=max(info.window.right-info.window.left+1,min(columns,maximum.x))
+    height=max(info.window.bottom-info.window.top+1,min(rows,maximum.y))
+    if (width,height)==(info.window.right-info.window.left+1,info.window.bottom-info.window.top+1):
+        return True
+    if not kernel.SetConsoleScreenBufferSize(handle,Coord(max(info.size.x,width),max(info.size.y,height))):
+        return False
+    return bool(kernel.SetConsoleWindowInfo(handle,True,c.byref(Rect(0,0,width-1,height-1))))
 
 
 def _focus_probe():
@@ -120,9 +158,11 @@ class Dashboard:
         restore = _enable_ansi()
         if restore is None:
             return False
+        if self.stream.isatty():
+            _initial_size()
         focus, refresh = _focus_probe(), FocusRefresh()
         line, cursor, history, selected = '', 0, [], 0
-        last, offset, last_frame, page_size = 0, 0, '', 6
+        last, offset, last_frame, page_size, task_page = 0, 0, '', 6, 0
         rows, events = [], []
         revision, cached_key, body = 0, None, ''
         stdout, stderr, shell_stdout = sys.stdout, sys.stderr, self.shell.stdout
@@ -141,7 +181,8 @@ class Dashboard:
                             notices = list(value.get('events', []))
                             for node in value.get('nodes', []):
                                 notices.extend(node.get('events') or [])
-                            events = [time.strftime('%H:%M:%S', time.localtime(e['time'])) + ' ' + e['ip'] + ' ' + e['message']
+                            events = [time.strftime('%H:%M:%S', time.localtime(e['time'])) + ' ' + e['ip'] + ' ' +
+                                      re.sub(r'\[([0-9a-f]{8,32})\]',lambda m:'['+m[1][:4]+']',e['message'])
                                       for e in sorted(notices, key=lambda x: x['time'])[-6:]]
                         except (OSError, RuntimeError, ValueError) as error:
                             rows = ['连接状态: ' + str(error)]
@@ -149,7 +190,7 @@ class Dashboard:
                         last = now
                     columns, height = shutil.get_terminal_size((110, 32))
                     with self.output_lock:
-                        key = (revision,self.output_revision,offset,columns,height)
+                        key = (revision,self.output_revision,offset,task_page,columns,height)
                         if key != cached_key:
                             output = list(self.output) + ([self.pending] if self.pending else [])
                             offset = min(offset,max(0,len(output)-1))
@@ -157,14 +198,17 @@ class Dashboard:
                                 output = output[:-offset]
                             if isinstance(rows,StatusRows):
                                 rows.resize(columns-1)
+                                rows.task_page=task_page
                             visible = _layout(rows,events,output,height)
+                            if isinstance(rows,StatusRows):
+                                task_page=rows.task_page
                             for index,text in enumerate(visible):
                                 if text.startswith('+ 命令输出'):
                                     page_size=max(1,len(visible)-index-2)
                             visible += [''] * max(0,height-2-len(visible))
                             body = '\n'.join(_clip(row,columns-1)+'\x1b[K' for row in visible)
                             body += '\n'+'─'*max(1,columns-1)
-                            cached_key = (revision,self.output_revision,offset,columns,height)
+                            cached_key = (revision,self.output_revision,offset,task_page,columns,height)
                     prompt, column = _input_view(self.shell.prompt, line, cursor, max(1, columns - 1))
                     frame = '\x1b[H' + body + '\n\x1b[J' + prompt + f'\r\x1b[{column+1}G'
                     if frame != last_frame:
@@ -182,10 +226,13 @@ class Dashboard:
                             elif key == 'S': line = line[:cursor] + line[cursor + 1:]
                             elif key == 'I': offset += page_size
                             elif key == 'Q': offset = max(0, offset - page_size)
+                            elif key == '\x0f': task_page -= 1
                             elif key in ('H', 'P') and history:
                                 selected = max(0, min(len(history), selected + (-1 if key == 'H' else 1)))
                                 line = history[selected] if selected < len(history) else ''
                                 cursor = len(line)
+                        elif key == '\t':
+                            task_page += 1
                         elif key == '\r':
                             if line.strip():
                                 self.write(self.shell.prompt + line + '\n')

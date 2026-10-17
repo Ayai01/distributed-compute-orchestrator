@@ -1,9 +1,13 @@
 """CPU and physical-memory observations without third-party dependencies."""
 
 import ctypes as c
+from concurrent.futures import ThreadPoolExecutor
+from functools import cache
+import hashlib
 import os
 from pathlib import Path
 import socket
+import ssl
 import threading
 import uuid
 import json
@@ -15,6 +19,34 @@ MACHINE_ID = socket.gethostname() + ":" + f"{uuid.getnode():012x}"
 _temperature = None
 _sensor_lock = threading.Lock()
 _sensor_started = False
+
+
+@cache
+def cpu_benchmark(cpus):
+    """Measure total native throughput at the configured worker thread budget."""
+    if type(cpus) is not int or cpus < 1:
+        raise ValueError('Benchmark cpus must be a positive integer')
+    password,salt=b'Remote Compute CPU benchmark v1',b'fixed benchmark input'
+    chunk=16000
+    started=0.0
+    def start():
+        nonlocal started
+        started=time.perf_counter()
+    ready=threading.Barrier(cpus,action=start)
+    def measure(_index):
+        hashlib.pbkdf2_hmac('sha256',password,salt,chunk,dklen=32)
+        ready.wait()
+        iterations=0
+        while time.perf_counter()-started<2.0:
+            hashlib.pbkdf2_hmac('sha256',password,salt,chunk,dklen=32)
+            iterations+=chunk
+        return iterations,time.perf_counter()
+    with ThreadPoolExecutor(max_workers=cpus,thread_name_prefix='cpu-benchmark') as executor:
+        samples=list(executor.map(measure,range(cpus)))
+    iterations=sum(count for count,_ in samples)
+    elapsed=max(finished for _,finished in samples)-started
+    return dict(name='pbkdf2-sha256-v1',score=round(iterations/elapsed/1000,1),unit='kiter/s',
+                threads=cpus,seconds=round(elapsed,3),iterations=iterations,openssl=ssl.OPENSSL_VERSION)
 
 
 def _sensors():

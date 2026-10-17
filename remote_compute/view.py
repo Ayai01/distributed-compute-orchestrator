@@ -1,6 +1,6 @@
 """Cell-aligned terminal tables; one snapshot in, bounded visible rows out."""
 
-from collections import OrderedDict
+import math
 import shutil
 import unicodedata
 
@@ -106,14 +106,13 @@ def _label(job):
 class StatusRows(list):
     def __init__(self, value, url='', width=110):
         self.value,self.url,self.width = value,url,max(20,width)
-        self.sections=[]
+        self.task_page,self.page_count = 0,1
         self._build()
         super().__init__(self._render(None))
 
     def resize(self, width):
         if self.width != max(20,width):
             self.width=max(20,width)
-            self.sections=[]
             self._build()
             self[:]=self._render(None)
 
@@ -125,74 +124,123 @@ class StatusRows(list):
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
-        device_records,details=[],[]
-        jobs=[]
+        self.devices,self.jobs=[],[]
         for node in nodes:
             name=node.get('node') or node.get('name') or '-'
-            state='离线' if node.get('error') else '暂停' if node.get('paused') or not node.get('enabled',True) else '在线'
             allocated=(node.get('reserved',0)+node.get('external_cpus',0) if 'reserved' in node else node.get('used_cpus',0))
             threads=f"{allocated}/{node.get('capacity',0)}({node.get('logical_cpus','?')})"
-            if width<100:
-                threads=f"{allocated}/{node.get('capacity',0)}"
             total=node.get('memory_total_mb') or 0
             available=node.get('host_memory_available_mb') or 0
             memory=f'{_gb(total-available)}/{_gb(total)}'
-            temp=node.get('temperature_c')
-            temperature=f'{temp}°C' if temp is not None else '-'
             peers=', '.join('本机' if item['ip']=='local' else item['ip'] for item in node.get('peers') or []) or '-'
-            record=[name,state,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,_gb(node.get('memory_available_mb')),temperature,peers,
-                    _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb'))]
-            device_records.append(record)
-            location='进程内' if node.get('url','').startswith('local://') else node.get('url',self.url)
-            if width>=100:
-                details.append((3,f"{name}: {location} | 能力 {_capabilities(node.get('tags'))}"))
-            else:
-                details.append((3,f"{name}: 设备 {node.get('logical_cpus','?')} 线程 | RSS {_gb(node.get('rss_mb'))} GiB | 预留 {_gb(node.get('memory_reserved_mb'))} GiB"))
-                details.append((3,f"{name}: 能力 {_capabilities(node.get('tags'))} | 访问IP {peers}"))
-            if node.get('error'):
-                details.append((1,name+': '+node['error']))
-            jobs.extend((name,job) for job in node.get('active_jobs') or [])
-        if width>=100:
-            device_table=_table(['设备','状态','线程(总)','CPU','内存GiB','可配','RSS/预留','温度','访问IP'],
-                                [[r[i] for i in (0,1,2,3,4,5,8,6,7)] for r in device_records],
-                                [10,4,10,6,11,5,8,5,None],width,right=(2,3,4,5,6,7))
-        elif width>=80:
-            device_table=_table(['设备','线程','CPU','内存 GiB','可分配','温度'],[[r[i] for i in (0,2,3,4,5,6)] for r in device_records],[10,7,6,12,7,None],width,right=(1,2,3,4,5))
-        else:
-            device_table=['设备 / 线程 / CPU / 内存 GiB']+[f'{r[0]}  {r[2]}  {r[3]}  {r[4]}' for r in device_records]
-        self.sections.append(('设备资源',[(0,row) for row in device_table]+details))
+            benchmark=node.get('benchmark') or {}
+            score=f"{benchmark['score']:.1f}" if benchmark.get('score') is not None else '待测'
+            self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
+                                       _gb(node.get('memory_available_mb')),
+                                       _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
+                                       benchmark.get('threads','-')]))
+            self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
+        self.projects=[]
         if center:
-            records=[[_project(name),f"{a['resource_share']:g}",f"{a['used']}/{a['target']}",a['queued']] for name,a in value.get('projects',{}).items()]
-            table=_table(['工程','权重','使用/目标','排队'],records,[None,6,11,6],width,right=(1,2,3)) if width>=50 else ['工程 / 权重 / 使用/目标 / 排队']+['  '.join(map(str,r)) for r in records]
-            self.sections.append(('工程份额',[(0,table[0])]+[(1,row) for row in table[1:]] if records else [(1,'等待工程任务')]))
-        groups=OrderedDict()
-        for name,job in jobs:
-            key=(name,_project(job.get('project')),_label(job),job.get('status','running'))
-            group=groups.setdefault(key,dict(count=0,cpus=0,memory=0,identity=job.get('id','')[:8]))
-            group['count']+=1;group['cpus']+=job.get('cpus',0);group['memory']+=job.get('memory_mb',0)
-        records=[]
-        for (name,project,label,state),group in groups.items():
-            records.append([name,project,group['count'],group['cpus'],_gb(group['memory']),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),label,group['identity'] if group['count']==1 else '-'])
-        if width>=100:
-            table=_table(['设备','工程','任务','线程','内存GiB','状态','标签','ID'],records,[10,9,4,5,7,4,None,8],width,right=(2,3,4))
-        elif width>=64:
-            table=_table(['设备','工程','任务','线程','标签'],[[r[i] for i in (0,1,2,3,6)] for r in records],[10,7,4,5,None],width,right=(2,3))
+            for name,a in value.get('projects',{}).items():
+                count=sum(job.get('project')==name for _,job in self.jobs)
+                self.projects.append([_project(name),f"{a['resource_share']:g}",f"{count}/{a['used']}",a['target'],a['queued']])
+        self.records=[]
+        for name,job in self.jobs:
+            state=job.get('status','running')
+            self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"1/{job.get('cpus',0)}",
+                                 _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),_label(job)])
+
+    def _resources(self, width, *, compact=False):
+        rows,details=[],[]
+        if compact:
+            for node,r in self.devices:
+                baseline=f'{r[7]} kiter/s · {r[8]}线程' if r[8]!='-' else '待测'
+                rows.extend([(0,f'{r[0]}  线程 {r[1]}  CPU {r[2]}'),
+                             (1,'算力 '+baseline),
+                             (0,f'内存 {r[3]} GiB | 可配 {r[4]}'),
+                             (2,f'RSS/预留 {r[5]} GiB'),
+                             (3,f'访问IP {r[6]}'),
+                             (3,f'能力 {_capabilities(node.get("tags"))}')])
         else:
-            table=['设备 / 工程 / 数量 / 标签']+[f'{r[0]} {r[1]} x{r[2]} {r[6]}' for r in records]
-        first=set();task_rows=[(0,table[0])]
-        for record,row in zip(records,table[1:]):
-            task_rows.append((0 if record[0] not in first else 2,row));first.add(record[0])
-        self.sections.append((f'当前任务 {len(jobs)} 个 / {len(groups)} 组 · jobs 查看明细',task_rows if records else [(1,'空闲')]))
+            records=[r for _,r in self.devices]
+            if width>=100:
+                table=_table(['设备','线程(总)','CPU','kiter/s(T)','内存GiB','可配','RSS/预留','访问IP'],
+                             [[*r[:3],f'{r[7]}({r[8]})' if r[8]!='-' else r[7],*r[3:7]] for r in records],
+                             [10,10,6,11,11,5,9,None],width,right=(1,2,3,4,5,6))
+            elif width>=70:
+                table=_table(['设备','线程','CPU','内存GiB','可配'],[r[:5] for r in records],
+                             [10,10,6,11,None],width,right=(1,2,3,4))
+            else:
+                table=['设备 / 线程 / CPU / 内存 GiB']+[f'{r[0]} {r[1]} {r[2]} {r[3]}' for r in records]
+            rows.extend((0,row) for row in table)
+            for node,r in self.devices:
+                details.append((3,f'{r[0]}: RSS/预留 {r[5]} GiB | 访问IP {r[6]} | 能力 {_capabilities(node.get("tags"))}'))
+                if width<100:
+                    baseline=f'{r[7]} kiter/s · {r[8]}线程' if r[8]!='-' else '待测'
+                    details.append((1,f'{r[0]}: 算力 '+baseline))
+        for node,r in self.devices:
+            if node.get('error'):
+                details.append((0,r[0]+': '+node['error']))
+            elif node.get('paused') or not node.get('enabled',True):
+                details.append((0,r[0]+': 暂停分配'))
+        sections=[('设备资源',rows+details)]
+        if self.value.get('role')=='scheduler':
+            if width>=42:
+                table=_table(['工程','权重','任务/线程','目标','排队'],self.projects,[None,4,9,4,4],width,right=(1,2,3,4))
+            else:
+                table=['工程 / 权重 / 任务/线程 / 目标 / 排队']+[' '.join(map(str,r)) for r in self.projects]
+            sections.append(('工程份额',[(0,table[0])]+[(1,row) for row in table[1:]] if self.projects else [(1,'等待工程任务')]))
+        return sections
+
+    @staticmethod
+    def _resource_rows(sections, width, limit=None, *, bottom=False):
+        fixed=len(sections)+int(bottom)
+        flat=[(priority,s,i) for s,(_,rows) in enumerate(sections) for i,(priority,_) in enumerate(rows)]
+        selected={(s,i) for _,s,i in sorted(flat)[:max(0,limit-fixed)]} if limit is not None else None
+        result=[]
+        for s,(title,rows) in enumerate(sections):
+            result.append(_rule(title,width))
+            result.extend(_line(text,width) for i,(_,text) in enumerate(rows) if selected is None or (s,i) in selected)
+        if bottom:
+            result.append(_rule('',width))
+        return result[:limit] if limit is not None else result
+
+    def _tasks(self, width, size=None):
+        size=max(1,size or len(self.records))
+        self.page_count=max(1,math.ceil(len(self.records)/size))
+        self.task_page%=self.page_count
+        records=self.records[self.task_page*size:(self.task_page+1)*size]
+        if width>=70:
+            table=_table(['ID','设备','工程','任务/线程','GiB','状态','标签'],records,
+                         [4,7,6,9,4,4,None],width,right=(3,4))
+        elif width>=42:
+            table=_table(['ID','设备','任务/线程','标签'],[[r[i] for i in (0,1,3,6)] for r in records],
+                         [4,7,9,None],width,right=(2,))
+        else:
+            table=['ID 设备 任务/线程 标签']+[f'{r[0]} {r[1]} {r[3]} {r[6]}' for r in records]
+        title=f'当前任务 {len(self.records)} 个 · {self.task_page+1}/{self.page_count}页 · Tab/ShiftTab'
+        return _panel(title,table if self.records else ['空闲'],width)
 
     def _render(self, limit):
-        fixed=3+len(self.sections)
-        flat=[(priority,section,index) for section,(_,rows) in enumerate(self.sections) for index,(priority,_) in enumerate(rows)]
-        selected={(section,index) for _,section,index in sorted(flat)[:max(0,limit-fixed)]} if limit is not None else None
-        result=[_rule(self.title,self.width),_line(self.summary,self.width)]
-        for section,(title,rows) in enumerate(self.sections):
-            result.append(_rule(title,self.width))
-            result.extend(_line(text,self.width) for index,(_,text) in enumerate(rows) if selected is None or (section,index) in selected)
-        result.append(_rule('',self.width))
+        width=self.width
+        result=[_rule(self.title,width),_line(self.summary,width)]
+        if width>=120:
+            left_width=46
+            right_width=width-left_width-1
+            sections=self._resources(left_width,compact=True)
+            count=(max(len(self._resource_rows(sections,left_width,bottom=True)),len(self.records)+3)
+                   if limit is None else max(0,limit-2))
+            left=self._resource_rows(sections,left_width,count,bottom=True)
+            right=self._tasks(right_width,max(1,count-3))
+            for i in range(min(count,max(len(left),len(right)))):
+                result.append(_cell(left[i] if i<len(left) else '',left_width)+' '+
+                              _cell(right[i] if i<len(right) else '',right_width))
+        else:
+            sections=self._resources(width)
+            non_limit=None if limit is None else max(len(sections),limit-5-min(2,len(self.records)))
+            result.extend(self._resource_rows(sections,width,non_limit))
+            result.extend(self._tasks(width,None if limit is None else max(1,limit-len(result)-3)))
         return result[:limit] if limit is not None else result
 
     def fit(self, count):

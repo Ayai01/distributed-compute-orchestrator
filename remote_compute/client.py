@@ -356,6 +356,7 @@ class Pool:
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),
+                 "benchmark": n.health.get("benchmark"),
                  "memory_capacity_mb": n.memory_capacity, "memory_available_mb": max(0, int(n.memory_free)),
                  "memory_reserved_mb": n.health.get("memory_reserved_mb", 0),
                  "reserved_memory_mb": n.reserved_memory_mb, "memory_limit_mb": n.memory_limit_mb,

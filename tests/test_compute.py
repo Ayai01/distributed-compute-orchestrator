@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError, command, ngspice, verilator
 from remote_compute.bundle import pack, task_bundle
@@ -30,7 +31,11 @@ def scratch():
 
 @contextmanager
 def provider(root, cpus=1, **options):
-    worker = Worker(root, cpus, **options)
+    # Transport/accounting tests should not benchmark every fixture or consume
+    # a production-sized CPU budget; the actual kernel has its own regression.
+    with patch('remote_compute.worker.cpu_benchmark',side_effect=lambda n:
+               dict(name='test-kernel',score=1000.0,unit='kiter/s',threads=n,seconds=2.0)):
+        worker = Worker(root, cpus, **options)
     server = Server(("127.0.0.1", 0), worker)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
     thread.start()
@@ -57,6 +62,27 @@ def until(check, seconds=5):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_task_temp_is_reclaimed_before_results_are_collected(self):
+        for code,expected in ((0,'succeeded'),(3,'failed')):
+            with self.subTest(status=expected):
+                task=python("from pathlib import Path;import os,sys\n"
+                            "Path(os.environ['TEMP'],'unused-raw.bin').write_bytes(b'x'*1024*1024)\n"
+                            "Path('answer.txt').write_text('retained result')\n"
+                            f"sys.exit({code})",outputs=['answer.txt'])
+                identity=self.client.submit(task)['id']
+                self.assertEqual(self.client.wait(identity)['status'],expected)
+                self.assertFalse((self.worker.root/'jobs'/identity/'tmp').exists())
+                self.assertEqual(self.client.fetch(identity)['files']['answer.txt'],b'retained result')
+
+    def test_timeout_reclaims_temp_and_retains_diagnostic_logs(self):
+        task=python("from pathlib import Path;import os,time\n"
+                    "Path(os.environ['TEMP'],'unfinished.bin').write_bytes(b'x'*1024*1024)\n"
+                    "print('ready',flush=True)\ntime.sleep(10)",timeout=.3)
+        identity=self.client.submit(task)['id']
+        self.assertEqual(self.client.wait(identity)['status'],'timed_out')
+        self.assertFalse((self.worker.root/'jobs'/identity/'tmp').exists())
+        self.assertIn('ready',self.client.fetch(identity)['stdout'])
+
     @unittest.skipUnless(os.name=='nt','Windows mandatory labels')
     def test_low_integrity_tool_writes_job_outputs_and_temp_without_changing_parent_acl(self):
         from remote_compute.process import low_integrity_directory

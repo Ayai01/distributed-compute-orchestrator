@@ -480,8 +480,11 @@ class Coordinator:
                 if hashlib.sha256(payload).hexdigest() != identity:
                     raise ValueError("Asset digest does not match bundle")
                 temporary = path.with_suffix(".upload")
-                temporary.write_bytes(payload)
-                temporary.replace(path)
+                try:
+                    temporary.write_bytes(payload)
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
             return {"id": identity, "exists": path.is_file()}
 
     def close(self):

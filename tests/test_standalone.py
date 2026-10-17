@@ -83,9 +83,9 @@ class StandaloneTests(unittest.TestCase):
                         self.assertEqual(hub.wait(job['id'])['status'], 'succeeded')
                         hub.fetch(job['id'])
                         source = machine.read_text('remote_compute/worker.py')
-                        updated = source.replace('"role": "worker", **resources,',
-                                                 '"role": "worker", "revision": "updated", **resources,')
-                        self.assertNotEqual(source, updated)
+                        self.assertIn('"role": "worker",',source)
+                        updated = source.replace('"role": "worker",',
+                                                 '"role": "worker", "revision": "updated",',1)
                         machine.write_text('remote_compute/worker.py', updated)
                         self.assertNotIn('revision', client.health())
                         self.assertTrue(machine.restart()['restarting'])

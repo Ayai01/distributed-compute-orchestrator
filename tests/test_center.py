@@ -105,6 +105,7 @@ class CenterTests(unittest.TestCase):
                                 ids=[client.submit(python(code,project='CPU-placement',label='cpu-placement'))['id'] for _ in range(16)]
                                 client.control(paused=False)
                                 until(lambda:client.health()['used_cpus']==16)
+                                until(lambda:all(client.status(i)['status']=='running' for i in ids))
                                 assigned=[client.status(i)['assigned_node'] for i in ids]
                                 self.assertEqual(assigned[:6],['idle']*6)
                                 self.assertEqual((assigned.count('busy'),assigned.count('idle')),(8,8))
