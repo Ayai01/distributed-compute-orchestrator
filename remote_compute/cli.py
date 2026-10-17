@@ -304,7 +304,9 @@ def main(argv=None):
                 if path.exists():
                     os.environ["REMOTE_COMPUTE_TEST_CONFIG"] = str(path.resolve())
             suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
-            return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+            from test_compute import calibration_environment
+            with calibration_environment():
+                return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         if args.check:
             return check_tools(config)
         if not args.url and args.action is None:

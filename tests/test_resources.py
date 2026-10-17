@@ -18,10 +18,10 @@ class BenchmarkTests(unittest.TestCase):
         cpu_benchmark.cache_clear()
         result=dict(name=NAME,score=2.5,unit='Miter/s',threads=24,seconds=1.9,total_seconds=2.0)
         try:
-            with patch('remote_compute.benchmark.measure',return_value=result) as kernel:
+            with patch('remote_compute.benchmark.calibrated',return_value=result) as kernel:
                 self.assertIs(cpu_benchmark(24),result)
                 self.assertIs(cpu_benchmark(24),result)
-            kernel.assert_called_once_with(24)
+            kernel.assert_called_once_with(24,executable=None,environment=())
         finally:
             cpu_benchmark.cache_clear()
 
@@ -36,10 +36,10 @@ class BenchmarkTests(unittest.TestCase):
         np=SimpleNamespace(__version__='test',lib=SimpleNamespace())
         with patch('remote_compute.benchmark.MixedLoad',side_effect=create), \
                 patch('remote_compute.benchmark.time.monotonic',side_effect=lambda:next(clock)/100):
-            result=_sample(np,2,100)
+            result=_sample(np,2,100,duration=2)
         self.assertEqual(result['name'],NAME)
         self.assertEqual(result['threads'],2)
-        self.assertTrue(1.9<=result['total_seconds']<2.2)
+        self.assertTrue(2<=result['total_seconds']<2.6)
         self.assertEqual(result['iterations'],sum(s.block.call_count-1 for s in states[1:])*BATCH)
         self.assertAlmostEqual(result['score'],result['iterations']/result['seconds']/1000000,places=4)
         self.assertEqual(result['single']['threads'],1)
@@ -116,8 +116,8 @@ class BenchmarkTests(unittest.TestCase):
     def test_dashboard_distinguishes_native_python_and_hash_kernel_versions(self):
         value=dict(role='worker',node='Aya1-PC',cpus=24,
                    benchmark=dict(name=NAME,unit='Miter/s',score=1.234567,threads=24))
-        self.assertIn('1.235','\n'.join(format_status(value,width=160)))
-        for name,label in (('mixed-cpu-v1','旧解释器'),('pbkdf2-sha256-v1','旧哈希')):
+        self.assertIn('1.23','\n'.join(format_status(value,width=160)))
+        for name,label in (('mixed-cpu-v1','待校准'),('pbkdf2-sha256-v1','待校准')):
             value['benchmark'].update(name=name,unit='Miter/s',score=140)
             text='\n'.join(format_status(value,width=160))
             self.assertIn(label,text)
@@ -137,6 +137,7 @@ class BenchmarkTests(unittest.TestCase):
               'cpu','win32','ngspice','python','rtl','verilator']
         self.assertEqual(_capabilities(tags),'ngspice RTL Python ML')
         self.assertEqual(len(tags),11)
+        self.assertEqual(_capabilities([*tags,'ngspice47','java','scala-cli','firtool','shared:arh']),'ngspice47 RTL Chisel Python ML')
         self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'ngspice RTL Python ML '+'long-custom-tag'*8)
         self.assertIn('HSPICE',_capabilities([*tags,'hspice','aop_hspice_python']))
         value=dict(role='worker',node='Aya1-TX',cpus=30,tags=tags)

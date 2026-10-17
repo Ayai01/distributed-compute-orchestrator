@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-NAME = 'numpy-mixed-v3'
+NAME = 'native-mixed-v4'
 BATCH = 32768
 
 
@@ -59,65 +59,48 @@ class MixedLoad:
         self.product += 0.0001
         self.matrix,self.product = self.product,self.matrix
 
-    def checksum(self):
-        return [int(self.words[0]),float(self.np.sum(self.volts)),float(self.np.sum(self.matrix))]
 
-
-def _sample(np, cpus, began):
-    serial = MixedLoad(np)
-    serial.block()
-    serial_started = time.monotonic()
-    serial_deadline = serial_started + max(0.1,min(0.4,(began+2.0-serial_started)/4))
-    serial_iterations = 0
-    while time.monotonic()<serial_deadline:
-        serial.block()
-        serial_iterations += BATCH
-    serial_elapsed = time.monotonic()-serial_started
-    single = dict(name=NAME,available=True,score=round(serial_iterations/serial_elapsed/1000000,6),
-                  unit='Miter/s',threads=1,seconds=round(serial_elapsed,3),iterations=serial_iterations)
-    started = deadline = 0.0
+def _sample(np, cpus, began, duration=60):
+    # Import, allocation and thread warmup are outside the measured intervals.
+    serial=MixedLoad(np);serial.block()
+    started=time.monotonic();deadline=started+duration/6
+    count=0
+    while time.monotonic()<deadline:
+        serial.block();count+=BATCH
+    seconds=time.monotonic()-started
+    single=dict(name=NAME,available=True,score=round(count/seconds/1000000,6),
+                unit='Miter/s',threads=1,seconds=round(seconds,3),iterations=count)
+    bulk_started=deadline=0.0
     def start():
-        nonlocal started,deadline
-        started = time.monotonic()
-        deadline = started+max(0.25,2.0-(started-began))
-    ready = threading.Barrier(cpus+1,action=start)
+        nonlocal bulk_started,deadline
+        bulk_started=time.monotonic();deadline=bulk_started+duration*5/6
+    ready=threading.Barrier(cpus+1,action=start)
     def lane():
         try:
-            load = MixedLoad(np)
-            load.block()
-            ready.wait()
-            iterations = 0
+            load=MixedLoad(np);load.block();ready.wait();count=0
             while time.monotonic()<deadline:
-                load.block()
-                iterations += BATCH
-            return iterations,time.monotonic(),load.checksum()
+                load.block();count+=BATCH
+            return count,time.monotonic()
         except BaseException:
-            ready.abort()
-            raise
+            ready.abort();raise
     with ThreadPoolExecutor(max_workers=cpus,thread_name_prefix='native-benchmark') as executor:
         try:
-            futures = [executor.submit(lane) for _ in range(cpus)]
-            ready.wait()
-            samples = [future.result() for future in futures]
-        finally:
-            ready.abort()
-    elapsed = max(finished for _,finished,_ in samples)-started
-    iterations = sum(count for count,_,_ in samples)
-    introspect = getattr(getattr(np.lib,'introspect',None),'opt_func_info',None)
-    return dict(name=NAME,available=True,score=round(iterations/elapsed/1000000,6),unit='Miter/s',
-                threads=cpus,seconds=round(elapsed,3),total_seconds=round(time.monotonic()-began,3),
-                iterations=iterations,numpy=np.__version__,
-                single=single,
-                dispatch=introspect(func_name='^exp$') if introspect else {},
-                components=['native-fp64-newton','native-u32-ram','native-blas-matmul'],
-                checksums=[checksum for _,_,checksum in samples])
+            futures=[executor.submit(lane) for _ in range(cpus)]
+            ready.wait();samples=[future.result() for future in futures]
+        finally:ready.abort()
+    seconds=max(finished for _,finished in samples)-bulk_started
+    count=sum(count for count,_ in samples)
+    return dict(name=NAME,available=True,score=round(count/seconds/1000000,6),unit='Miter/s',
+                threads=cpus,seconds=round(seconds,3),total_seconds=round(time.monotonic()-began,3),
+                iterations=count,numpy=np.__version__,single=single,measured_at=time.time(),
+                components=['native-fp64-newton','native-u32-ram','native-blas-matmul'])
 
 
 def _unavailable(reason):
     return dict(name=NAME,available=False,reason=reason,unit='Miter/s',threads=0)
 
 
-def measure(cpus, *, executable=None, environment=()):
+def measure(cpus, *, executable=None, environment=(), duration=60):
     """One disposable native helper; the service itself stays stdlib-only."""
     began = time.monotonic()
     env = dict(os.environ, **dict(environment))
@@ -125,11 +108,11 @@ def measure(cpus, *, executable=None, environment=()):
                  'BLIS_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
         env[name] = '1'  # Outer lanes share the worker budget; no nested BLAS pool.
     with subprocess.Popen([executable or sys.executable,'-I','-B','-u',str(Path(__file__).resolve()),
-                           '--sample',str(cpus),str(began)],
+                           '--sample',str(cpus),str(began),str(duration)],
             env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',
             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)) as helper:
         try:
-            stdout,stderr = helper.communicate(timeout=5)
+            stdout,stderr = helper.communicate(timeout=duration+15)
         except subprocess.TimeoutExpired:
             helper.kill(); helper.communicate()
             return _unavailable('Native estimate exceeded startup budget')
@@ -143,11 +126,45 @@ def measure(cpus, *, executable=None, environment=()):
         return result
 
 
+def cpu_identity(cpus):
+    import platform
+    if os.name=='nt':
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as key:
+            model=winreg.QueryValueEx(key,'ProcessorNameString')[0].strip()
+    else:
+        model=sorted({line.split(':',1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')})
+    return dict(kernel=NAME,model=model,architecture=platform.machine(),logical_cpus=os.cpu_count(),
+                affinity=sorted(os.sched_getaffinity(0)) if hasattr(os,'sched_getaffinity') else None,threads=cpus)
+
+
+def calibrated(cpus, *, executable=None, environment=(), cache_file=None):
+    from .bundle import atomic_json
+    from .resources import cpu_ticks
+    cache=Path(cache_file) if cache_file else Path(os.environ.get('DCO_BENCHMARK_DIR',str(Path(__file__).resolve().parents[1]/'.local/benchmarks')))/(str(cpus)+'.json')
+    identity=cpu_identity(cpus)
+    try:
+        saved=json.loads(cache.read_text(encoding='utf-8'))
+        if saved.get('identity')==identity and saved.get('benchmark',{}).get('available'):
+            return saved['benchmark']
+    except (FileNotFoundError,ValueError):pass
+    before=cpu_ticks();time.sleep(.6);after=cpu_ticks()
+    total=after[0]-before[0]
+    load=100*(1-(after[1]-before[1])/total) if total else 100
+    if load>20:return _unavailable('CPU busy; calibration deferred until an idle startup')
+    print('DCO: CPU '+str(round(load,1))+'%, calibrating 1/'+str(cpus)+' threads (~60s)...',flush=True)
+    result=measure(cpus,executable=executable,environment=environment)
+    if result.get('available'):
+        cache.parent.mkdir(parents=True,exist_ok=True)
+        atomic_json(cache,dict(identity=identity,benchmark=result))
+    return result
+
+
 if __name__ == '__main__' and sys.argv[1:2] == ['--sample']:
     try:
         import numpy as np
     except ImportError:
         result = _unavailable('Install NumPy with setup; real task timing remains available')
     else:
-        result = _sample(np,int(sys.argv[2]),float(sys.argv[3]))
+        result = _sample(np,int(sys.argv[2]),float(sys.argv[3]),float(sys.argv[4]))
     print(json.dumps(result))

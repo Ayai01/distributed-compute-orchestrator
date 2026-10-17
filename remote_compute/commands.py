@@ -213,7 +213,7 @@ class Shell(cmd.Cmd):
         elif command == 'policy' and index == 1:
             choices = ['adaptive', 'balanced', 'round_robin']
         elif command == 'set' and index >= 2:
-            choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false', 'callback_url=']
+            choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
         elif scheduler and index == 1 and command in {'cpus','memory','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
             choices = names + ([j.get('id') for _, j in jobs] if command == 'jobs' else [])
         elif command in {'jobs','logs','cancel','delete','fetch'} and index == (2 if scheduler else 1):
@@ -472,7 +472,7 @@ class SchedulerShell(Shell):
                 if value.lower() not in {"true", "false"}:
                     raise ValueError("enabled=true|false")
                 value = value.lower() == "true"
-            elif key != 'callback_url':
+            elif key not in ('url','ca_file','host_ip'):
                 value = int(value) if key in {"limit", "memory_limit_mb"} else float(value)
             changes[key] = value
         if self.center:
@@ -504,8 +504,6 @@ class SchedulerShell(Shell):
         value = {"policy": snapshot["policy"], "nodes": []}
         for row in snapshot["nodes"]:
             node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
-            if row.get('callback_url'):
-                node['callback_url'] = row['callback_url']
             if addresses.get(row['name']):
                 node['host_ip'] = addresses[row['name']]
             if row.get('timeout',10)!=10:

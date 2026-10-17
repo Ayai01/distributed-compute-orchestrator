@@ -101,14 +101,16 @@ def _gb(value):
 
 def _capabilities(tags):
     tags=set(tags or [])
-    groups=[('ngspice',{'ngspice','spice'}),('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
+    groups=[('ngspice47' if 'ngspice47' in tags else 'ngspice',{'ngspice','ngspice47','spice'}),
+            ('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
+            ('Chisel',{'java','scala-cli','firtool'}),
             ('Python',{'python'}|{t for t in tags if '_python' in t}),
             ('ML',{'rgcn_train'}),('GPU',{'gpu','cuda','rocm'})]
-    known={'cpu','win32','linux','darwin'}
+    known={'cpu','win32','linux','darwin'}|{t for t in tags if t.startswith('shared:')}
     result=[]
     for name,members in groups:
         known.update(members)
-        if tags & members:result.append(name)
+        if (members<=tags if name=='Chisel' else tags & members):result.append(name)
     result.extend(sorted(tags-known))
     return ' '.join(result) or '-'
 
@@ -126,7 +128,7 @@ def _device_address(node, url=''):
         return node['host_ip']
     host=urlsplit(address).hostname if address else None
     if host in ('127.0.0.1','localhost','::1'):
-        return '隧道' if node.get('callback_url') else '本机'
+        return '本机'
     return node.get('host_ip') or (host if host and host not in ('0.0.0.0','::') else '等待连接')
 
 
@@ -198,21 +200,16 @@ class StatusRows(list):
             memory=f'{_gb(total-available)}/{_gb(total)}'
             peers=list(dict.fromkeys(item['ip'] for item in node.get('peers') or []))
             external=[ip for ip in peers if ip not in ('local','127.0.0.1','::1')]
-            loopback='中心/隧道' if node.get('callback_url') else '本机'
+            loopback='本机'
             peers=', '.join(external or [loopback if ip in ('local','127.0.0.1','::1') else ip for ip in peers]) or '-'
             benchmark=node.get('benchmark') or {}
-            measured=benchmark.get('score')
-            if measured is not None and benchmark.get('unit','kiter/s')=='kiter/s':
-                measured/=1000
-            score=('旧哈希' if benchmark.get('name')=='pbkdf2-sha256-v1' else
-                   '旧解释器' if benchmark.get('name')=='mixed-cpu-v1' else
-                   (f"{measured:.3f}" if measured<1000 else f"{measured:.1f}") if measured is not None else
-                   '超时' if 'exceeded' in benchmark.get('reason','') else
-                   '待依赖' if 'Install NumPy' in benchmark.get('reason','') else
-                   '未完成' if benchmark.get('available') is False else '待测')
-            single=(benchmark.get('single') or {}).get('score')
-            score=(f'{single:.3g}/'+(f'{measured:.3g}' if measured is not None and benchmark.get('name') in {'numpy-mixed-v2','numpy-mixed-v3'} else score)
-                   if single is not None else '-/'+score)
+            measured=benchmark.get('score');single=(benchmark.get('single') or {}).get('score')
+            if benchmark.get('name')!='native-mixed-v4' and measured is not None:
+                score='-/待校准'
+            elif measured is not None:
+                score=(f'{single:.3g}/' if single is not None else '-/')+f'{measured:.3g}'
+            else:
+                score='-/待依赖' if 'Install NumPy' in benchmark.get('reason','') else '-/待校准'
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,

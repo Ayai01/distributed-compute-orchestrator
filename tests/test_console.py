@@ -219,16 +219,14 @@ class ConsoleTests(unittest.TestCase):
         for i in range(14,20):
             self.assertIn(f'log {i}','\n'.join(rows))
 
-    def test_tunnel_device_shows_public_ip_instead_of_localhost(self):
+    def test_direct_device_shows_public_ip(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
-            dict(name='Server',url='http://127.0.0.1:26134',callback_url='http://127.0.0.1:26134',
-                 host_ip='203.0.113.42',capacity=96,peers=[dict(ip='127.0.0.1')])])
+            dict(name='Server',url='https://203.0.113.42:26133',
+                 capacity=96,peers=[dict(ip='192.0.2.10')])])
         text='\n'.join(format_status(value,width=159).fit(38))
         self.assertIn('203.0.113.42',text)
         self.assertNotIn('本机',text)
-        self.assertIn('Server: 中心/隧道',text)
-        value['nodes'][0]['host_ip']=None
-        self.assertIn('隧道','\n'.join(format_status(value,width=159).fit(38)))
+        self.assertIn('Server: 192.0.2.10',text)
 
     def test_device_ip_is_distinct_from_visitors_and_keeps_complete_ipv4(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[

@@ -444,3 +444,17 @@ class NativeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@contextmanager
+def calibration_environment():
+    # CLI lifecycle tests reuse a fixture cache; native calibration has its own tests.
+    from remote_compute.benchmark import cpu_identity,NAME
+    with scratch() as directory:
+        cache=Path(directory)
+        for cpus in (1,2):
+            value=dict(name=NAME,available=True,score=1,unit='Miter/s',threads=cpus,
+                       single=dict(name=NAME,available=True,score=1,unit='Miter/s',threads=1))
+            (cache/(str(cpus)+'.json')).write_text(json.dumps(dict(identity=cpu_identity(cpus),benchmark=value)))
+        with patch.dict(os.environ,DCO_BENCHMARK_DIR=str(cache)):
+            yield

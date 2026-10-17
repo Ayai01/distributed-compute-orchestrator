@@ -11,7 +11,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import RemoteError
-from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
+from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, validate_tool_constraints
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
@@ -71,6 +71,7 @@ class Coordinator:
         cpus = request.get('cpus', 1)
         maximum_cpus = request.get('max_cpus')
         requires = request.get('requires', [])
+        constraints=validate_tool_constraints(request.get('tool_sha256',{}))
         node_name=request.get('node')
         if (not isinstance(project, str) or isinstance(share, bool) or not isinstance(share, (int,float))
                 or not math.isfinite(share) or share <= 0 or isinstance(ratio, bool)
@@ -83,7 +84,8 @@ class Coordinator:
         shares = {name: row['resource_share'] for name,row in resources.items()}
         demands = {name: min(row['demand'],row['capacity']) for name,row in resources.items()}
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled
-                  and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))]
+                  and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))
+                  and all(n.health.get('tools',{}).get(tool,{}).get('sha256') in allowed for tool,allowed in constraints.items())]
         capable=sum(n.capacity for n in eligible)
         tool_sha256={name:sorted({info['sha256'] for n in eligible
                                  for info in [n.health.get('tools',{}).get(name,{})]
@@ -135,7 +137,10 @@ class Coordinator:
         except RemoteError as error:
             raise Conflict(str(error)) from None
 
-    def health(self):
+    def health(self, *, brief=False, sample=False):
+        if brief:
+            return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -175,7 +180,7 @@ class Coordinator:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','retry_jobs','admission_job']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -500,23 +505,11 @@ class Coordinator:
             self._save(job)
 
     def _callback(self, node):
-        if getattr(node, 'callback_url', ''):
-            return dict(url=node.callback_url.rstrip('/'), token=self.token,timeout=node.client.timeout)
-        if 'lease_polling' in node.health.get('capabilities',[]) and not node.client.url.startswith('local://'):
+        if not node.client.url.startswith('local://'):
             return {'mode':'poll','timeout':node.client.timeout}
-        if not self.callback_address:
-            return None
+        if not self.callback_address:return None
         host,port=self.callback_address[:2]
-        endpoint=urlsplit(node.client.url)
-        local=endpoint.scheme=='local' or endpoint.hostname in ('localhost','127.0.0.1','::1')
-        if local:
-            host='127.0.0.1' if host in ('0.0.0.0','127.0.0.1','localhost') else host
-        elif host in ('127.0.0.1','localhost','::1'):
-            return None
-        elif host=='0.0.0.0':
-            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as route:
-                route.connect((endpoint.hostname,endpoint.port or 80))
-                host=route.getsockname()[0]
+        host='127.0.0.1' if host=='0.0.0.0' else host
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
     def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
@@ -638,6 +631,14 @@ class Coordinator:
             if getattr(error, 'status_code', None) == 404:
                 raise FileNotFoundError(name) from None
             raise Conflict(str(error)) from None
+
+    def job_file_version(self, identity, name, version=None):
+        with self.condition:
+            job=self.jobs[identity];client=self._client(job);worker_id=job.get('worker_id',identity)
+        if not client:raise Conflict('Job has not been assigned yet')
+        from .local import LocalClient
+        if isinstance(client,LocalClient):return client.worker.job_file_version(worker_id,name,version)
+        return client.read_job_file_changed(worker_id,name,version)
 
     def cancel(self, identity):
         with self.condition:

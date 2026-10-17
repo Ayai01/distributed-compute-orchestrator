@@ -42,7 +42,7 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 ## 分配策略
 
-- `adaptive`：先满足线程、内存、工具与工程份额，优先选择预计CPU负载较低的设备。候选负载相差不足一个逻辑线程时，用相同版本启动基准的单线程/总吞吐组合先验，再以同类任务真实耗时校准和替代，结合节点权重与未采样节点。基准组成与约2秒预算见[启动基准](operations.md#终端操作)。
+- `adaptive`：先满足线程、内存、工具与工程份额，优先选择预计CPU负载较低的设备。候选负载相差不足一个逻辑线程时，用相同版本启动基准的单线程/总吞吐组合先验，再以同类任务真实耗时校准和替代，结合节点权重与未采样节点。基准组成与持久化的一分钟校准见[启动基准](operations.md#终端操作)。
 - `balanced`：使用相同的 CPU 负载优先规则，接近时使用单线程/总吞吐组合先验及节点权重，不采用同标签的历史耗时。
 - `round_robin`：在满足资源条件的节点之间轮询，便于固定分配实验。
 
@@ -59,7 +59,7 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 中心 `/health.capabilities` 包含 `single_thread_weight` 时，适配器可传此字段；旧中心省略它。普通默认1任务保持原请求格式；中心保留偏好元数据，并在派发时移除该中心提示，已有worker无需重启即可执行。启动原生估算的单线程结果位于 `benchmark.single`，使用同一混合工作单位；CLI以“单/总 Miter/s”展示。
 
-中心直接连接设备IP的26133端口；HTTPS节点同时配置`ca_file`。worker通过本地lease接口提交CPU/RAM请求，由中心现有连接取回并授权，无需worker反向访问中心。可用`center.control(add={"name":"compute-linux","url":"https://203.0.113.42:26133","token":worker_token,"ca_file":"worker.crt"})`加入。节点配置和令牌保存在本机`nodes.local.json`，不放入聊天或Git；`callback_url`仅保留旧客户端兼容。
+中心直接连接设备IP的26133端口；HTTPS节点同时配置`ca_file`。worker通过本地lease接口提交CPU/RAM请求，由中心现有连接取回并授权，无需worker反向访问中心。可用`center.control(add={"name":"compute-linux","url":"https://203.0.113.42:26133","token":worker_token,"ca_file":"worker.crt"})`加入。节点配置和令牌保存在本机`nodes.local.json`，不放入聊天或Git。旧反向回调入口已退役。
 
 节点`timeout`默认10秒，跨网慢连接可通过`control(node=名字,routing={"timeout":120})`在线调整。任务SDK通过`REMOTE_COMPUTE_TIMEOUT`继承连接时限，显式指定超时的客户端保持原设置；计算执行时限仍由`task.timeout`控制。
 
@@ -100,7 +100,7 @@ Windows新建作业目录设置可继承的Low完整性标签，允许现有带L
 | --- | --- | --- |
 | AOP_v2 | `--compute-center URL` 或 `compute.center`；网页选本地调度器 / 本地工程 | 每角点任务；源码、模型按内容同步，沿用原测量与解析。 |
 | RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | PRE/POST使用`rgcn_python`；神经训练使用已验证Torch/PyG及检查点续跑的`rgcn_train`。源码和模型闭包同步，保留后仿恢复与原任务ID。 |
-| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；`run_remote`提交冻结源码资产，执行与源码校验使用同一资产。需要`arh_python`与`shared.arh`复用预部署工具、模型和持久统计缓存。Aya1-TX部署见[工具部署](operations.md#工程内工具安装)；自动候选节点以`shared_paths`为准。 |
+| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；`run_remote`提交冻结源码资产，执行与源码校验使用同一资产。需要`arh_python`与`shared.arh`复用预部署工具、模型和持久统计缓存。Aya1-TX部署见[工具部署](operations.md#工程内工具安装)；声明`shared:arh`及相应编译器能力，由中心自动匹配。 |
 | Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码同步，需要 bench_python 科学环境。 |
 
 仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告；本次验证使用该隔离方式，正式结果与已有报告保持原样。日常正式运行仍按各工程规则更新当前成功报告。
@@ -127,7 +127,7 @@ print(result["status"], result["assigned_node"])
 print(result["files"]["ngspice.log"].decode(errors="replace"))
 ```
 
-指定 `output_dir` 时产物保存到该目录；省略时以 bytes 返回在 `result["files"]` 中。高级脚本可使用 `Pool` 直接连接独立 worker（例如 Aya1-TX 的 `192.168.1.10:26133`）；hybrid 本机 worker 仅供所属中心进程使用。接入统一调度使用 `Client(中心地址)`，让中心管理多工程份额。
+指定 `output_dir` 时产物保存到该目录；省略时以 bytes 返回在 `result["files"]` 中。科研入口统一使用`Client(中心地址)`。`Pool`是中心内部调度实现；hybrid本机worker仅供所属中心进程使用。指定设备仅用于`machine()`运维操作和明确的设备验收，不用于生产科研选点。
 
 其他工程可把此工程目录加入 Python 的模块搜索路径，再导入 `remote_compute`。工程本身没有 pip 安装步骤。
 
@@ -256,3 +256,17 @@ python main.py --test-native
 工具参数：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。
 
 原生HTTPS worker支持单向资源协商：任务访问本机lease接口，中心按节点合并轮询待处理请求。存在此类在途任务时约每0.2秒检查一次，空闲节点沿用常规采样周期，避免每任务各建高频轮询连接。网络短暂中断保留原授权。
+
+## 接入与传输约定
+
+- `requires`声明实际工具及`shared:<别名>`数据位置能力，步骤以`${shared:别名}`引用；同名工程目录不代表数据已同步。冻结数据与模型作为内容资产，结果取回后由工程发布到持久目录。
+- 固定引擎数据集可在`command`、`admission`、`window`传`tool_sha256={"ngspice":["允许的SHA256"]}`，中心按实际工具筛选。新请求无需绑定设备或OS；实际引擎回执决定缓存分区，允许集合不等于数值等价证明。
+- 科研工程不另建节点池、反向代理或隧道。来源设备保留在结果回执，用于追溯；调度不依赖特定主机名称。
+- 只提交已就绪、能消费结果的工作；源码/模型每内容版本同步一次，重复候选复用工程现有科学缓存。连续小内核合并阶段授权，阶段结束及时归还；等待/借还耗时与CPU计算分开统计。
+- `read_job_file_changed(id,path,version=None)`返回`version/data/changed`；后续传回版本，未更新返回304且data为None，中心与worker两跳都不重传文件。需要恢复状态时按原子发布批次更新，不反复下载未改变的检查点。
+- 节点动态资源独立采样，慢节点不阻塞其他设备；首次连接/worker换PID取完整工具元数据，日常采样只取动态资源、活动任务和有界通知。简要健康查询直接返回身份与协议能力。
+
+静态大输入已有内容摘要时，复用同一个 SDK Client，调用
+`client.sync_files(files_or_factory, content_id=摘要)`。摘要覆盖包内相对路径、内容和执行权限；
+SDK 先确认已有资产，命中时不生成文件、不压缩，缺失时才调用零参数工厂并重新上传。
+索引只存最近128个摘要与资产ID，不保留ZIP副本；不改变中心资产引用/回收规则。

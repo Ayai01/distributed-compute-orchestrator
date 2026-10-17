@@ -212,11 +212,11 @@ class CenterTests(unittest.TestCase):
         from types import SimpleNamespace
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
             address='203.0.113.42'
-            with Pool([dict(name='tunnel',client=worker,host_ip=address,callback_url='http://127.0.0.1:26134')]) as pool:
+            with Pool([dict(name='remote',client=worker,host_ip=address)]) as pool:
                 self.assertEqual(pool.snapshot()['nodes'][0]['host_ip'],address)
                 for invalid in (None,'http://server','not-an-ip'):
-                    with self.assertRaises(ValueError):pool.configure('tunnel',host_ip=invalid)
-                pool.configure('tunnel',host_ip='203.0.113.43')
+                    with self.assertRaises(ValueError):pool.configure('remote',host_ip=invalid)
+                pool.configure('remote',host_ip='203.0.113.43')
                 shell=SimpleNamespace(pool=pool,center=None)
                 with patch('remote_compute.commands.ROOT',Path(root)):
                     SchedulerShell.do_save(shell,'')
@@ -340,63 +340,21 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(result['single_thread_weight'],2)
                 self.assertIn('single_thread_weight',client.health()['capabilities'])
 
-    def test_explicit_node_callback_reaches_center_and_resizes_original_task(self):
-        with scratch() as root, provider(Path(root)/'worker',cpus=2,token='worker-token') as (_,worker):
-            with Pool([dict(name='tunnel',client=worker)]) as pool, center(pool,Path(root)/'center') as (state,client):
-                # A second loopback listener models the reverse end of a tunnel.
-                reverse=Server(('127.0.0.1',0),state)
-                thread=threading.Thread(target=reverse.serve_forever,kwargs={'poll_interval':.05},daemon=True)
-                thread.start()
-                try:
-                    callback=f'http://127.0.0.1:{reverse.server_port}'
-                    client.control(node='tunnel',routing={'callback_url':callback,'timeout':120})
-                    state.callback_address=('127.0.0.1',1)  # Automatic LAN routing would be wrong.
-                    code=("import os,json,sys\nfrom pathlib import Path\n"
-                          "sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\nfrom remote_compute import Client\n"
-                          "c=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'])\n"
-                          "grant=c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],2,memory_mb=128)\n"
-                          "grant['callback_timeout']=c.timeout\n"
-                          "Path('grant.json').write_text(json.dumps(grant))\n")
-                    result=client.run(python(code,node='tunnel',outputs=['grant.json']))
-                    self.assertEqual(result['status'],'succeeded',result.get('stderr'))
-                    grant=json.loads(result['files']['grant.json'])
-                    self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb']),(result['id'],2,128))
-                    self.assertEqual(grant['callback_timeout'],120)
-                    self.assertEqual(client.nodes()['nodes'][0]['callback_url'],callback)
-                    client.control(node='tunnel',routing={'callback_url':''})
-                    self.assertEqual(state._callback(pool.nodes[0])['mode'],'poll')
-                finally:
-                    reverse.shutdown();thread.join();reverse.server_close()
 
-    def test_node_callback_load_add_and_validation(self):
-        with scratch() as root, provider(Path(root)/'one') as (_,one), provider(Path(root)/'two') as (_,two):
-            callback='http://127.0.0.1:26134'
-            with Pool([dict(name='one',client=one,callback_url=callback)]) as pool:
-                self.assertEqual(pool.nodes[0].callback_url,callback)
-                pool.add('two',two.url,callback_url=callback)
-                self.assertEqual(pool.snapshot()['nodes'][1]['callback_url'],callback)
-                pool.configure('two',timeout=120)
-                self.assertEqual(pool.nodes[1].client.timeout,120)
-                self.assertEqual(pool.snapshot()['nodes'][1]['timeout'],120)
-                for invalid in (None,'file:///tmp/center','http://','http://127.0.0.1/?token=secret'):
-                    with self.subTest(value=invalid),self.assertRaises(ValueError):
-                        pool.configure('one',callback_url=invalid)
-                    self.assertEqual(pool.nodes[0].callback_url,callback)
 
-    def test_saved_tunnel_node_keeps_local_token_when_console_only_has_center_client(self):
+    def test_saved_remote_node_keeps_local_token_when_console_only_has_center_client(self):
         from contextlib import redirect_stdout
         from types import SimpleNamespace
         with scratch() as directory:
             root=Path(directory)
-            remote=dict(name='tunnel',url='http://127.0.0.1:26134',weight=1.0,limit=0,
-                        memory_limit_mb=0,enabled=True,callback_url='http://127.0.0.1:26134')
+            remote=dict(name='remote',url='https://203.0.113.42:26133',weight=1.0,limit=0,
+                        memory_limit_mb=0,enabled=True)
             (root/'nodes.local.json').write_text(json.dumps({'nodes':[dict(remote,token='private-worker-token')]}))
             shell=SimpleNamespace(pool=SimpleNamespace(nodes=[]),
                                   center=SimpleNamespace(nodes=lambda:dict(policy='adaptive',nodes=[remote]),token=''))
             with patch('remote_compute.commands.ROOT',root),io.StringIO() as output,redirect_stdout(output):
                 SchedulerShell.do_save(shell,'')
             saved=json.loads((root/'nodes.local.json').read_text())['nodes'][0]
-            self.assertEqual(saved['callback_url'],remote['callback_url'])
             self.assertEqual(saved['token'],'private-worker-token')
 
     def test_offline_worker_keeps_health_and_local_submission_available(self):
@@ -581,8 +539,8 @@ class CenterTests(unittest.TestCase):
                 until(lambda:worker.status(external)['status']=='running')
                 self.assertEqual(client.resize(identity,3)['cpus'],3)
                 entered,release=threading.Event(),threading.Event();original=pool.nodes[0].client.health
-                def delayed_health():
-                    result=original();entered.set();release.wait(5);return result
+                def delayed_health(**options):
+                    result=original(**options);entered.set();release.wait(5);return result
                 with patch.object(pool.nodes[0].client,'health',side_effect=delayed_health):
                     probe=threading.Thread(target=pool.refresh);probe.start()
                     try:

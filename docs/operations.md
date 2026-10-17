@@ -47,7 +47,6 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 
 日常配置统一使用 26133；调整中心端口后，调用工程的显式 URL 也要相应调整。`--port 0` 用于临时验证，由系统分配端口。
 
-0.7.11的资源接口可用CPython3.14的`sys.remote_exec`执行工程内`live_patch.apply()`，在原PID中安装已验证的方法，保留任务、连接、类和资源账本；该专项迁移用于不中断长仿真地修正内存借还。普通版本升级仍等待空闲后重载。迁移前核对目标PID、工作目录和版本，先在旧版夹具验证；不对科研子进程做代码更新。
 
 独立worker支持原生HTTPS：设备配置`certfile`、`keyfile`，中心节点配置对应`ca_file`并直接访问设备IP的26133端口。资源借还通过worker本地接口和中心已有连接转交，无需反向端口或隧道。Linux桌面可以运行`python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json`附着现有服务；关闭看板保留后台计算。
 
@@ -110,9 +109,7 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 Windows经典控制台启动看板时尝试扩展至160列×50行，按当前屏幕和字体允许的最大尺寸调整；已有更大的窗口保持原大小。Windows Terminal和编辑器内终端由宿主控制窗口尺寸，看板随可用宽高排版。
 
-启动估算`numpy-mixed-v3`优先复用已登记的科研Python及其NumPy/BLAS（bench/aop/arh/rgcn别名，最后使用默认Python），包含批量FP64二极管Newton更新、uint32逻辑与索引RAM读写、512×512双精度矩阵乘法，减少大线程数下Python调度占比。每批32768个混合工作单位，数组内层计算由原生库完成；Python负责发起整批运算。使用库自身的[CPU/SIMD分派](https://numpy.org/doc/stable/reference/simd/index.html)，不自行编译内核或建立ISA评分体系。BLAS内层固定1线程，外层按设备CPU预算并行，单个临时子进程在结束或取消时回收。NumPy缺席时worker照常服务，使用真实任务耗时学习，不退回解释器循环计分。
-
-总时间目标约2秒，导入、分配和预热计入预算：先约0.4秒测单线程，再用余下时间测目标线程总量，后者至少保留0.25秒；记录采样`seconds`和总耗时`total_seconds`，单线程结果在`benchmark.single`。`Miter/s`为每秒百万个固定版本混合工作单位；CLI显示“单/总 Miter/s”，API保留测量槽数、NumPy版本和实际分派信息。不同版本的混合分数不交叉比较；旧哈希/解释器分数单独标记。在线调整CPU预算保留原测量，下次自然启动重测；看板刷新与源码同步不触发测试。现有进程可通过计入1CPU的短测补单线程结果，保留原总分与其版本标签，不重跑全预算测试。
+启动校准使用固定`native-mixed-v4`负载：批量FP64 Newton、uint32逻辑/访存与512×512矩阵乘法。启动采样CPU占用≤20%时，未有匹配结果的设备先测约10秒单线程，再测约50秒目标线程总量；导入、分配和线程预热不计入分母。BLAS内层固定1，外层遵守设备预算。CPU型号、可见CPU和线程预算未变时直接读取`.local/benchmarks/<线程数>.json`，持续显示同一已测数据；负载较高时不抢占计算，待下次空闲启动。`DCO_BENCHMARK_DIR`可指定本设备的持久校准目录。不同负载版本不比较，旧分数显示待校准。单位Miter/s表示该固定混合工作单位，不是FLOPS；设备间的真实同类任务耗时继续参与调度校准。
 
 启动混合分数用于缺少任务历史时的初始估计。调度优先满足CPU、RAM和工程份额，负载相近时按混合分数/实际测量槽数估计单槽速度；必须是相同版本的混合基准才参与比较。同类任务已有真实耗时时，以该耗时替代初始估计，未采样设备的估计则用已采样设备的耗时校准；持续使用指数移动平均。调用方以label区分电路、保真度和相近工作量。AVX2/AVX512不套倍率，科研内核、向量库和内存访问的实际影响由任务耗时反映。
 
@@ -221,7 +218,7 @@ machine.download("./results", "./results/Aya1-TX")
 
 ## 同一仓库、设备独立配置
 
-源码统一来自 https://github.com/Ayai01/distributed-compute-orchestrator.git。两台设备保持同一个 main 提交；设备始终以操作系统主机名显示。首次 `git clone`，后续运行 `python main.py update`（快进更新）；`update --check` 查看远端版本。更新仅修改磁盘源码；运行版本以 `health.version` 和 `pid` 为准。科研任务运行期间可先同步源码，留待自然重启生效；需要立即生效时，先确认空闲，再从中心执行 `restart Aya1-TX` 和 `restart --wait`。
+源码统一来自 https://github.com/Ayai01/distributed-compute-orchestrator.git。所有设备保持同一个 main 提交；设备始终以操作系统主机名显示。首次 `git clone`，后续运行 `python main.py update`（快进更新）；`update --check` 查看远端版本。更新仅修改磁盘源码；运行版本以 `health.version` 和 `pid` 为准。科研任务运行期间可先同步源码，留待自然重启生效；需要立即生效时，先确认空闲，再从中心执行 `restart Aya1-TX` 和 `restart --wait`。
 
 `worker.local.json`、`nodes.local.json`、`worker.standalone.json`、`.tools/`、`.projects/`、`.runtime/` 和 `results/` 都不上传仓库。`.tools/` 放实际Python科学环境、ngspice、RTL编译链和内存盘驱动；任务源码与小模型按内容资产同步。只有确需常驻的大工程才放 `.projects/` 并写本机shared配置。
 
@@ -261,17 +258,17 @@ python main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source "D
 
 Windows 的 `setup` 优先复用本机系统Python3.14科学环境，验证Numba JIT、OpenCV与ONNX Runtime CPU推理后写入本机工具配置；ngspice可下载或复用已有安装。`--rtl-source` 提取现有MSYS2中GCC/Verilator的实际依赖，排除编译链无关组件与下载缓存。
 
-AOP/RGCN SPICE、Bench优化、ARH CPU推理在两台设备均优先使用本机系统CPython 3.14.8，通过`aop_python`、`rgcn_python`、`bench_python`和`arh_python`登记到tools。RGCN神经训练单独使用`rgcn_train`能力；两端已通过Torch/PyG加载和检查点续跑验证，沿用同一系统解释器。`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB；ARH的GSIM另用公共MSYS中的Clang/Flex/Bison。需要GPU的独立训练保留调用工程的指定环境。跨机复制后用`setup`校验版本和本机路径，配置随worker自然启动或空闲重载加载。
+AOP/RGCN SPICE、Bench优化、ARH CPU推理在各设备均优先使用本机系统CPython 3.14.8，通过`aop_python`、`rgcn_python`、`bench_python`和`arh_python`登记到tools。RGCN神经训练单独使用`rgcn_train`能力；两端已通过Torch/PyG加载和检查点续跑验证，沿用同一系统解释器。`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB；ARH的GSIM另用公共MSYS中的Clang/Flex/Bison。需要GPU的独立训练保留调用工程的指定环境。跨机复制后用`setup`校验版本和本机路径，配置随worker自然启动或空闲重载加载。
 
 Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/Remote-Compute/.projects/arh`，Python复用 `arh_python`。该目录的 `.tools` 保存Java、Scala CLI、firtool/circt-translate、模型、Coursier缓存和Rocket/GSIM必要资产；`.tools/msys64`是指向DCO公共MSYS的目录联接，GCC、Verilator与Clang共用一份。`run_remote`提交时冻结小型源码资产，入口、执行和摘要校验均使用该版本；新旧源码任务可同时存在。工具与模型继续共享，已有原生小产物经过原编译指纹决定能否复用，科研统计缓存留在shared.arh。重连使用原ID及原源码资产，取消取回中的结果时保留最近成功报告。
 
-`worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过 `Client().machine('Aya1-TX', cwd=上述目录)` 或指定 `node='Aya1-TX'` 的普通任务按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。实际自动候选节点以中心返回的 `shared_paths` 为准。
+`worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过 `Client().machine('Aya1-TX', cwd=上述目录)` 或指定 `node='Aya1-TX'` 的普通任务按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。生产任务声明`shared:arh`及编译器能力，由中心筛选；工程不查询`shared_paths`选择设备。
 
 ## 部署到其他设备
 
 Linux 使用普通磁盘时，在设备配置中显式指定 `root` 为用户可写的磁盘绝对路径，例如 `~` 展开后的 `/home/user/.local/state/dco/worker`，并将进程 `TMPDIR` 指向普通磁盘；不运行 `ramdisk`。例如 `mode=worker`、`cpus=96`、`cpu_limit=96`、`memory_mb=98304`、`memory_reserve_mb=4096`，然后执行 `python3 -B main.py --config worker.local.json --headless`。节点使用系统 hostname，跨平台任务按实际工具和 `requires` 标签匹配；Linux 节点不会声明 `win32`。
 
-设备统一按 IP:26133 直连。公网 worker 在本机配置设置 host="0.0.0.0"、certfile、keyfile，中心节点使用 https://设备IP:26133 及 ca_file 信任该设备证书，私钥只留提供者；不修改全局证书信任、不依赖 SSH 或转发端口。计算进程在 worker 本地提出 CPU/RAM 请求，中心通过已有状态轮询处理并返回实际授权，提供者无需反向访问中心。旧版显式 callback_url 保留协议兼容，新部署不设置。令牌与设备配置放在忽略目录。
+设备统一按 IP:26133 直连。公网 worker 在本机配置设置 host="0.0.0.0"、certfile、keyfile，中心节点使用 https://设备IP:26133 及 ca_file 信任该设备证书，私钥只留提供者；不修改全局证书信任、不依赖 SSH 或转发端口。计算进程在 worker 本地提出 CPU/RAM 请求，中心通过已有状态轮询处理并返回实际授权，提供者无需反向访问中心。旧反向callback_url入口已退役，配置只保存实际直连URL。令牌与设备配置放在忽略目录。
 
 已有服务的桌面终端使用 python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json 连接，证书从本机配置读取。它只显示和控制同一 worker；退出终端保留服务和任务。Windows、Linux 均使用标准库实时看板，Tab/翻页/输入区保持一致。
 

@@ -82,7 +82,7 @@ def file_hash(path):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "tool_sha256"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
@@ -131,6 +131,7 @@ def validate_task(task, capacity, *, allow_auto=False):
         raise ValueError("priority must be an integer; larger values run first")
     if not isinstance(task["requires"], list) or any(not isinstance(x, str) for x in task["requires"]):
         raise ValueError("requires must be a list of node tags")
+    validate_tool_constraints(task.get('tool_sha256',{}))
     if task["node"] is not None and not isinstance(task["node"], str):
         raise ValueError("node must be a configured node name")
     if "cwd" in task and (not isinstance(task["cwd"], str) or not task["cwd"] or "\0" in task["cwd"]):
@@ -140,6 +141,14 @@ def validate_task(task, capacity, *, allow_auto=False):
             raise ValueError("stdin must name an input file")
         inside(Path.cwd(), task["stdin"])
     return task
+
+
+def validate_tool_constraints(value):
+    if (not isinstance(value,dict) or any(not isinstance(name,str) or not _NAME.fullmatch(name)
+            or not isinstance(hashes,list) or not hashes or any(not isinstance(h,str) or not _ASSET.fullmatch(h) for h in hashes)
+            for name,hashes in value.items())):
+        raise ValueError('tool_sha256 maps tool names to nonempty SHA256 lists')
+    return value
 
 
 class Worker:
@@ -159,6 +168,7 @@ class Worker:
             raise ValueError(f'CPU budget exceeds configured cpu_limit={self.cpu_limit}')
         self.activity = Activity()
         self.save_settings = None
+        self.configuration_revision = 0
         self.token = token
         self.tags = list(tags)
         self.paused = False
@@ -179,7 +189,8 @@ class Worker:
         for name, value in (tools or {}).items():
             self.tools[name] = [value] if isinstance(value, str) else list(value)
         self.tools,self.tool_info=self._probe_tools(self.tools)
-        self.tags = sorted(set(self.tags) | {sys.platform} | {k for k, v in self.tool_info.items() if v["available"]})
+        self.tags = sorted(set(self.tags) | {sys.platform} | {'shared:'+name for name in self.shared}
+                           | {k for k, v in self.tool_info.items() if v["available"]})
         if self.tool_info['verilator']['available']:
             self.tags = sorted(set(self.tags) | {'rtl'})
         # The lock is released by the OS on exit; no stale PID files to repair.
@@ -209,16 +220,19 @@ class Worker:
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
         self.scheduler.start()
 
-    def health(self):
+    def health(self, *, brief=False, sample=False):
+        identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version']+(['restart'] if self.restart_available else []))
+        if brief:return identity
         with self.condition:
             resources = self._memory_state()
             disk = shutil.disk_usage(self.root)
-            return {"protocol": PROTOCOL, "node": socket.gethostname(), "platform": sys.platform,
+            value = {**identity, "platform": sys.platform,
                     "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
-                    "capabilities": ["machine", "resize", "resize_memory", "resize_auto", "resize_memory_model", "max_cpus", "lease_polling", "job_identity"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
+                    "configuration_revision": self.configuration_revision,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
                     "service": service_usage(),
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
@@ -228,6 +242,10 @@ class Worker:
                                      'rss_mb':round(j.get('rss_mb',0),2),**({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
+            if sample:
+                for name in ('benchmark','tools','shared','tags','home','tool_root','shared_paths','unavailable_shared','root'):
+                    value.pop(name,None)
+            return value
 
     def _probe_tools(self, tools):
         resolved,info={},{}
@@ -278,6 +296,7 @@ class Worker:
                     if self.tool_info.get('verilator',{}).get('available'):tags.add('rtl')
                     else:tags.discard('rtl')
                 self.tags=sorted(tags)
+                self.configuration_revision += 1
             if "cpus" in value:
                 self.capacity = value["cpus"]
             if "paused" in value:
@@ -398,6 +417,9 @@ class Worker:
                 return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), self.capacity)
+                for name,allowed in task.get('tool_sha256',{}).items():
+                    if self.tool_info.get(name,{}).get('sha256') not in allowed:
+                        raise ValueError('Tool SHA256 constraint no longer matches: '+name)
                 if task["memory_mb"] > self.memory_capacity:
                     raise ValueError("Task memory_mb exceeds worker memory budget")
                 for item in archive.infolist():
@@ -633,6 +655,14 @@ class Worker:
             temporary.replace(path)
             return {'written': name, 'bytes': len(data)}
 
+    def job_file_version(self, identity, name, version=None):
+        with self.condition:
+            path=inside(self.jobs[identity]['directory']/'input',name)
+        with path.open('rb') as stream:
+            stat=os.fstat(stream.fileno())
+            current='"'+str(stat.st_ino)+'-'+str(stat.st_mtime_ns)+'-'+str(stat.st_size)+'"'
+            return dict(version=current,changed=current!=version,data=stream.read() if current!=version else None)
+
     def logs(self, identity):
         with self.condition:
             directory = self.jobs[identity]["directory"]
@@ -790,12 +820,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-    def _reply(self, value, status=200):
+    def _reply(self, value, status=200, *, etag=None):
         binary = isinstance(value, bytes)
         body = value if binary else json_bytes(value)
-        total, offset, etag = len(body), 0, None
+        total, offset = len(body), 0
         if binary and self.command == 'GET' and status == 200:
-            etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+            etag = etag or '"' + hashlib.sha256(body).hexdigest() + '"'
             match = re.fullmatch(r'bytes=(\d+)-', self.headers.get('Range', ''))
             if match and self.headers.get('If-Range') == etag:
                 offset = int(match[1])
@@ -845,7 +875,8 @@ class Handler(BaseHTTPRequestHandler):
                 if len(body) != length:
                     raise ValueError("Incomplete request body")
             if parts == ["health"] and self.command == "GET":
-                value = worker.health()
+                value = worker.health(brief=self.headers.get("X-Remote-Compute-Brief")=="1",
+                                      sample=self.headers.get("X-DCO-Sample")=="1")
             elif parts == ["nodes"] and self.command == "GET" and hasattr(worker, "nodes"):
                 value = worker.nodes()
             elif parts == ['admission'] and self.command == 'POST' and hasattr(worker, 'admission'):
@@ -895,6 +926,9 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.logs(identity)
                 elif len(parts) >= 4 and parts[2] == 'files' and self.command in {'GET', 'POST'}:
                     name = unquote('/'.join(parts[3:]))
+                    if self.command=='GET' and self.headers.get('X-DCO-File-Version')=='1':
+                        version=worker.job_file_version(identity,name,self.headers.get('If-None-Match'))
+                        return self._reply(version['data'] or b'',200 if version['changed'] else 304,etag=version['version'])
                     value = worker.job_file(identity, name, body if self.command == 'POST' else None)
                     if self.command == 'POST':
                         worker.activity.notify('Job file ' + name + ' [' + identity[:8] + ']', self.client_address[0])

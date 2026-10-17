@@ -21,8 +21,7 @@ class LocalClient(Client):
         worker.activity.access('local')
         try:
             if parts == ['health']:
-                value=worker.health()
-                return {k:value[k] for k in ('protocol','node','role','version','capabilities') if k in value} if brief else value
+                return worker.health(brief=brief,sample=(extra_headers or {}).get("X-DCO-Sample")=="1")
             if parts == ['control']:
                 result = worker.control(data)
                 worker.activity.notify('Control ' + str(data), 'local')
