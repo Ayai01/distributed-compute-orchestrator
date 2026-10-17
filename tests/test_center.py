@@ -39,6 +39,20 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_project_shares_and_prefetch_exclude_unusable_server_capacity(self):
+        with scratch() as root, provider(Path(root)/'native',cpus=2,cpu_limit=2,tags=['native_only']) as (_,native), \
+                provider(Path(root)/'bulk',cpus=8,cpu_limit=8,tags=['bulk_only']) as (_,bulk):
+            with Pool([native,bulk]) as pool, center(pool,Path(root)/'center') as (_,client):
+                client.control(paused=True)
+                identities=[client.submit(python('pass',project=project,requires=['native_only']))['id']
+                            for project in ('A','B') for _ in range(4)]
+                resources=client.health()['projects']
+                self.assertEqual([resources[p]['target'] for p in ('A','B')],[1,1])
+                self.assertEqual([resources[p]['capacity'] for p in ('A','B')],[2,2])
+                window=client.admission('B',requires=['native_only'],queue_ratio=1)
+                self.assertEqual((window['target_cpus'],window['in_flight']),(1,2))
+                for identity in identities:client.cancel(identity);client.delete(identity)
+
     def test_window_tracks_new_worker_capabilities_and_budget_reductions(self):
         import sys
         with scratch() as root, provider(Path(root)/'one',cpus=2,cpu_limit=2,tools={'bench_python':sys.executable}) as (_,one), \
@@ -785,6 +799,30 @@ class CenterTests(unittest.TestCase):
                     self.assertEqual(local.status(),[])
             finally:
                 worker.close()
+
+    def test_slow_asset_does_not_block_other_assets_or_control_jobs(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with scratch() as root, provider(Path(root)/'worker') as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (state,client):
+                large=client.sync_files({'large':b'large model'})
+                small=client.sync_files({'small':b'controller source'})
+                node=pool.nodes[0]
+                original=node.client.request
+                entered,release=threading.Event(),threading.Event()
+                def delayed(path,data=None,**options):
+                    if path=='/assets/'+large and data is not None:
+                        entered.set();release.wait(3)
+                    return original(path,data,**options)
+                with patch.object(node.client,'request',side_effect=delayed),ThreadPoolExecutor(max_workers=3) as transfers:
+                    blocked=transfers.submit(state._ensure_assets,node,[large])
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        transfers.submit(state._ensure_assets,node,[small]).result(timeout=1)
+                        transfers.submit(state._ensure_assets,node,[]).result(timeout=1)
+                        self.assertFalse(blocked.done())
+                    finally:
+                        release.set();blocked.result(timeout=3)
+                self.assertTrue({large,small}.issubset(node.known_assets))
 
     def test_concurrent_jobs_check_and_upload_an_asset_once(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,node):

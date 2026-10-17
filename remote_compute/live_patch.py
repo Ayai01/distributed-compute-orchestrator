@@ -31,10 +31,12 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
         raise RuntimeError('Expected one service and its optional private worker')
     plan={
         'allocation':{'':('plan_resize',)},
-        'client':{'Client':('__init__','health','resize','admission'),'Pool':('__init__','_validate_node','configure','add','snapshot','_acquire','_speed_priors')},
+        'client':{'Client':('__init__','health','resize','admission'),'Pool':('__init__','_validate_node','configure','add','snapshot','_matching','_acquire','_speed_priors')},
         'worker':{'Worker':('_probe_tools','control','health','resize','_execute'),'Handler':('_handle',),'':('validate_task',)},
-        'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_callback','_update','_execute','_schedule')},
+        'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_callback','_update','_execute','_ensure_assets','_schedule')},
         'local':{'LocalClient':('request',)},
+        'admission':{'AdmissionWindow':('current',)},
+        'console':{'FocusRefresh':('due',)},
         'tasks':{'':('command',)},
         'commands':{'':('table','prepare','submission_parser'),'SchedulerShell':('do_save',)},
         'view':{'':('_device_address',),'StatusRows':('_build','_resources','_resource_rows','_tasks')},

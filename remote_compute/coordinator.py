@@ -64,14 +64,15 @@ class Coordinator:
                 or (maximum_cpus is not None and (type(maximum_cpus) is not int or maximum_cpus<max(1,cpus)))):
             raise ValueError('project, positive resource_share, nonnegative queue_ratio and cpus required')
         resources = self.project_resources()
-        capacity = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled)
         shares = {name: row['resource_share'] for name,row in resources.items()}
-        demands = {name: row['demand'] for name,row in resources.items()}
-        shares[project], demands[project] = share, capacity
-        target = weighted_threads(capacity, shares, demands)[project]
+        demands = {name: min(row['demand'],row['capacity']) for name,row in resources.items()}
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled
                   and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))]
         capable=sum(n.capacity for n in eligible)
+        names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
+        capacity=sum(n.capacity for n in self.pool.nodes if n.name in names and not n.error and n.enabled)
+        shares[project], demands[project] = share, capable
+        target = weighted_threads(capacity, shares, demands)[project]
         maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
         target = min(target, capable)
         unit = cpus or maximum_cpus
@@ -163,10 +164,10 @@ class Coordinator:
                     'projects': self.project_resources(), **self.activity.snapshot()}
 
     def project_resources(self):
-        shares, demands, used, queued = {}, {}, {}, {}
-        capacity = sum(n.capacity for n in self.pool.nodes if not n.error and n.enabled)
+        shares, demands, used, queued, rooms = {}, {}, {}, {}, {}
+        online={n.name:n for n in self.pool.nodes if not n.error and n.enabled}
         largest = max((n.capacity for n in self.pool.nodes if not n.error and n.enabled), default=1)
-        with self.condition:
+        with self.condition,self.pool.condition:
             for job in self.jobs.values():
                 if job['result']['status'] in TERMINAL:
                     continue
@@ -174,11 +175,21 @@ class Coordinator:
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
                 demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
-                demands[name] = demands.get(name, 0) + min(demand,task.get('max_cpus',demand))
+                demand=min(demand,task.get('max_cpus',demand))
+                demands[name] = demands.get(name, 0) + demand
+                available=rooms.setdefault(name,{})
+                wanted={**task,'cpus':0} if job.get('auto_cpus') else task
+                for node in self.pool._matching(wanted):
+                    if node.name in online and (not job.get('node') or node is job['node']):
+                        available[node.name]=available.get(node.name,0)+min(demand,node.capacity)
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
-        quotas = weighted_threads(capacity, shares, demands)
-        return {name: dict(resource_share=shares[name], target=quotas[name], demand=demands[name], used=used[name], queued=queued[name]) for name in shares}
+        names={node for available in rooms.values() for node in available}
+        capacity=sum(online[name].capacity for name in names)
+        ceilings={name:sum(min(online[node].capacity,demand) for node,demand in rooms[name].items()) for name in shares}
+        quotas = weighted_threads(capacity, shares, {name:min(demands[name],ceilings[name]) for name in shares})
+        return {name: dict(resource_share=shares[name], target=quotas[name], demand=demands[name], used=used[name], queued=queued[name],
+                           capacity=ceilings[name],eligible_nodes=sorted(rooms[name])) for name in shares}
 
     def control(self, changes):
         if isinstance(changes, dict) and "node" in changes:
@@ -348,15 +359,25 @@ class Coordinator:
 
     def _ensure_assets(self, node, assets, *, force=False):
         # One upload per content id and worker session, including concurrent jobs.
+        assets=set(assets)
+        if not assets:return
         with node.asset_lock:
             session = (node.health.get('pid'), node.health.get('root'), node.health.get('asset_revision'))
-            if force or node.asset_session != session:
+            if node.asset_session != session:
                 node.known_assets.clear()
                 node.asset_session = session
-            for asset in set(assets) - node.known_assets:
+                node._asset_upload_locks={}
+            if force:node.known_assets.difference_update(assets)
+            locks=node.__dict__.setdefault('_asset_upload_locks',{})
+            pending=[(asset,locks.setdefault(asset,threading.Lock())) for asset in assets-node.known_assets]
+        for asset,transfer in pending:
+            with transfer:
+                with node.asset_lock:
+                    if node.asset_session==session and asset in node.known_assets:continue
                 if not node.client.request('/assets/' + asset)['exists']:
                     node.client.request('/assets/' + asset, (self.root/'assets'/(asset+'.zip')).read_bytes())
-                node.known_assets.add(asset)
+                with node.asset_lock:
+                    if node.asset_session==session:node.known_assets.add(asset)
 
     def _update(self, job, remote):
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])

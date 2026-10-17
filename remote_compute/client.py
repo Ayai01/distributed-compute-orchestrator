@@ -425,6 +425,19 @@ class Pool:
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
+    def _matching(self, task):
+        cpus=task.get('cpus',1) or 1
+        required_tools={m[1] for argv in task.get('steps',())
+                        for m in [re.fullmatch(r'\$\{tool:([\w-]+)\}',argv[0])] if m}
+        texts=[*task.get('env',{}).values(),task.get('cwd',''),
+               *(arg for argv in task.get('steps',()) for arg in argv)]
+        required_shared={name for text in texts for name in re.findall(r'\$\{shared:([\w-]+)\}',text)}
+        return [n for n in self.nodes if (not task.get('node') or n.name==task['node'])
+                and set(task.get('requires',())).issubset(n.health.get('tags',()))
+                and all(n.health.get('tools',{}).get(tool,{}).get('available') for tool in required_tools)
+                and required_shared.issubset(n.health.get('shared',()))
+                and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)]
+
     def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, reservations=None):
         # A dispatcher already running older bytecode may still pass reservations.
         # They no longer reserve CPUs across projects.
@@ -435,22 +448,13 @@ class Pool:
         cpus = task.get("cpus", 1) or 1
         memory_mb = task.get("memory_mb", 256)
         label = task.get("label", "")
-        required_tools = {m[1] for argv in task.get("steps", ())
-                          for m in [re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0])] if m}
-        texts = [*task.get("env", {}).values(), task.get("cwd", ""),
-                 *(arg for argv in task["steps"] for arg in argv)]
-        required_shared = {name for text in texts for name in re.findall(r"\$\{shared:([\w-]+)\}", text)}
         with self.condition:
             while True:
                 if self.closed:
                     raise RemoteError("Pool has closed")
                 if cancel_event is not None and cancel_event.is_set():
                     return None
-                matching = [n for n in self.nodes if (not task.get("node") or n.name == task["node"])
-                            and set(task.get("requires", ())).issubset(n.health.get("tags", ()))
-                            and all(n.health.get("tools", {}).get(tool, {}).get("available") for tool in required_tools)
-                            and required_shared.issubset(n.health.get("shared", ()))
-                            and n.capacity >= cpus and n.memory_capacity >= memory_mb]
+                matching = self._matching(task)
                 if not matching:
                     raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
                 def needed(node):

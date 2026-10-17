@@ -170,7 +170,7 @@ class FocusRefresh:
         self.focused = False
 
     def due(self, now, focused, *, force=False):
-        refresh = force or self.last is None or (focused and not self.focused) or now-self.last >= (1 if focused else 30)
+        refresh = force or self.last is None or (focused and not self.focused) or now-self.last >= (1 if focused else 5)
         self.focused = focused
         if refresh:
             self.last = now
