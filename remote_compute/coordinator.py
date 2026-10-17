@@ -268,7 +268,15 @@ class Coordinator:
                 files['task.json'] = json_bytes(task)
                 payload = pack(files)
             callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
-            node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
+            try:
+                node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
+            except RemoteError as error:
+                if getattr(error,'status_code',None) != 400 or 'Synchronize missing asset first:' not in str(error):
+                    raise
+                # A worker may have reclaimed an idle cached asset after its last
+                # health sample. No job was accepted: restore it and reuse this ID.
+                self._ensure_assets(node, task['assets'].values(), force=True)
+                node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
             cancel_sent=False
             while True:
                 try:
@@ -306,11 +314,11 @@ class Coordinator:
                 self.threads.discard(threading.current_thread())
                 self.condition.notify_all()
 
-    def _ensure_assets(self, node, assets):
+    def _ensure_assets(self, node, assets, *, force=False):
         # One upload per content id and worker session, including concurrent jobs.
         with node.asset_lock:
-            session = (node.health.get('pid'), node.health.get('root'))
-            if node.asset_session != session:
+            session = (node.health.get('pid'), node.health.get('root'), node.health.get('asset_revision'))
+            if force or node.asset_session != session:
                 node.known_assets.clear()
                 node.asset_session = session
             for asset in set(assets) - node.known_assets:

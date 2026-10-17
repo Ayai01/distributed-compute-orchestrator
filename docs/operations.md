@@ -91,6 +91,8 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 `memory_mb` / `--memory-mb` 单位为 MiB；0 使用物理内存减去预留量。中心同时核对任务内存预留、实际进程树 RSS 和系统可用内存。同一设备的多个 worker 共用一份物理内存统计。任务默认预留 256 MiB；大任务由调用者声明所需内存。
 
+健康接口同时提供`service`的常驻内存、私有提交量、线程及句柄数，和`scratch_disk`、`asset_cache`占用；用于区分计算子进程、服务自身及缓存盘的增长。详情与自动清理边界见[工程接入](integration.md#传输与本地执行)。
+
 ## 终端操作
 
 耗时计算、命令和文件传输在后台执行，输入行持续可用。help 按资源、任务、机器、终端分组显示操作；完成后的后台操作及时释放结果引用。宽度达到120列时，看板左侧显示设备资源和工程份额，右侧逐任务显示4位ID、设备、工程、任务/线程、内存、状态与标签；两栏共享固定中线和完整边框，表头有水平分隔。设备摘要移除温度和常驻在线列，异常或暂停单独提示。工程汇总中的任务/线程如8/8，单任务行如1/2。长标签保留首尾，窄窗口切换为上下分区。结构符号使用ASCII；中文Windows控制台的歧义字符按实际显示宽度测量并缓存。`Tab` / `Shift+Tab` 翻任务页，`PgUp` / `PgDn` 翻命令输出；输入行固定在底部。刷新仅按绝对坐标重画变化行，避免清屏和换行滚动，状态未变时不写终端。
@@ -238,7 +240,7 @@ Linux 复用已有 `/dev/shm`；该入口不修改系统 tmpfs 容量。当前 W
 python main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source "D:/Projects/#4-Arclight/ARH-DSE-v2/.tools/msys64"
 ```
 
-Windows 的 `setup` 安装固定版本的可移动Python3.12科学环境，验证Numba JIT、OpenCV与ONNX Runtime CPU推理后写入本机工具配置；首次可直接下载Python/ngspice，也可复用已有ngspice。`--rtl-source` 提取现有MSYS2中GCC/Verilator的实际依赖，排除编译链无关组件与下载缓存。
+Windows 的 `setup` 优先复用本机系统Python3.14科学环境，验证Numba JIT、OpenCV与ONNX Runtime CPU推理后写入本机工具配置；ngspice可下载或复用已有安装。`--rtl-source` 提取现有MSYS2中GCC/Verilator的实际依赖，排除编译链无关组件与下载缓存。
 
 AOP/RGCN SPICE、Bench优化、ARH CPU推理共用 `.tools/python`（约565MiB）；`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB。ARH的GSIM另外使用Clang/Flex/Bison及其依赖，继续装在公共MSYS中。原工程模型训练仍使用各工程环境。跨机复制运行时后，用`setup`校验版本并重定位路径，待worker自然启动或空闲重载时加载配置。
 

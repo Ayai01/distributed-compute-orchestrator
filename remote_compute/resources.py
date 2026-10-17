@@ -93,6 +93,40 @@ def memory():
     return values["MemTotal"], values["MemAvailable"]
 
 
+@lru_cache(maxsize=1)
+def _service_api():
+    from ctypes import wintypes as w
+    class Counters(c.Structure):
+        _fields_ = [('size', w.DWORD), ('faults', w.DWORD),
+                    *[(name, c.c_size_t) for name in ('peak_rss', 'rss', 'peak_paged', 'paged',
+                       'peak_nonpaged', 'nonpaged', 'pagefile', 'peak_pagefile', 'private')]]
+    kernel = c.WinDLL('kernel32', use_last_error=True)
+    psapi = c.WinDLL('psapi', use_last_error=True)
+    psapi.GetProcessMemoryInfo.argtypes = [w.HANDLE, c.POINTER(Counters), w.DWORD]
+    kernel.GetProcessHandleCount.argtypes = [w.HANDLE, c.POINTER(w.DWORD)]
+    return Counters, psapi.GetProcessMemoryInfo, kernel.GetProcessHandleCount
+
+
+def service_usage():
+    """Current service footprint, separate from the admitted child processes."""
+    value = dict(pid=os.getpid(), threads=threading.active_count())
+    if os.name == 'nt':
+        from ctypes import wintypes as w
+        Counters, memory_info, handle_count = _service_api()
+        info = Counters(); info.size = c.sizeof(info)
+        handles = w.DWORD()
+        if memory_info(w.HANDLE(-1), c.byref(info), info.size):
+            value.update(rss_mb=round(info.rss/MIB, 2), private_mb=round(info.private/MIB, 2))
+        if handle_count(w.HANDLE(-1), c.byref(handles)):
+            value['handles'] = handles.value
+    else:
+        entries = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
+        value.update(rss_mb=int(entries['VmRSS'].split()[0])/1024,
+                     private_mb=int(entries['VmData'].split()[0])/1024,
+                     handles=len(list(Path('/proc/self/fd').iterdir())))
+    return value
+
+
 def cpu_ticks():
     if os.name == "nt":
         idle, kernel, user = c.c_uint64(), c.c_uint64(), c.c_uint64()

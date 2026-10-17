@@ -23,10 +23,11 @@ from urllib.parse import unquote
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
 from . import __version__
 from .process import Process, low_integrity_directory
-from .resources import Host, process_usage, cpu_benchmark
+from .resources import Host, process_usage, cpu_benchmark, service_usage
 from .telemetry import Activity
 from .client import RemoteError
 from .compat import sha256
+from .cleanup import AssetCache, remove_owned
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -203,18 +204,24 @@ class Worker:
                 saved.update(status="interrupted", finished=time.time(), error="Worker stopped before completion")
                 atomic_json(path, saved)
             self.jobs[saved["id"]] = {"result": saved, "cancel": threading.Event(), "directory": path.parent}
+        self.asset_cache = AssetCache(self.root / 'assets')
+        self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
         self.scheduler.start()
 
     def health(self):
         with self.condition:
             resources = self._memory_state()
+            disk = shutil.disk_usage(self.root)
             return {"protocol": PROTOCOL, "node": socket.gethostname(), "platform": sys.platform,
                     "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "capabilities": ["machine", "resize"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
+                    "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
+                    "service": service_usage(),
+                    "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb')},
@@ -320,6 +327,7 @@ class Worker:
             for asset in task["assets"].values():
                 if not (self.root / "assets" / asset).is_dir():
                     raise ValueError("Synchronize missing asset first: " + asset)
+                self.asset_cache.touch(asset)
             # Resolve commands and references before admission, so typos do not occupy slots.
             work = self.root / "jobs" / identity / "input"
             cwd = Path(self._expand(task["cwd"], task, work)).expanduser() if "cwd" in task else work
@@ -445,6 +453,7 @@ class Worker:
             state, error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
             self._clean_temp(job)
+            self._clean_work(job)
             with self.condition:
                 if job["cancel"].is_set() and state == "succeeded":
                     state = "cancelled"
@@ -463,6 +472,40 @@ class Worker:
                 self.used -= task["cpus"]
                 self.threads.discard(threading.current_thread())
                 self.condition.notify_all()
+
+    def _clean_work(self, job, *, discard=False):
+        """Keep declared results; consumed input decks/builds are no longer artifacts."""
+        work = job['directory']/'input'
+        try:
+            if work.resolve() != work:
+                raise ValueError('Job input directory became a link')
+            task = job.get('task') or json.loads((job['directory']/'task.json').read_text(encoding='utf-8'))
+            if not task['outputs'] and not discard:
+                return  # Generic job-file callers collect arbitrary files by name.
+            keep = set(tree(work, task['outputs']).values())
+            parents = {parent for path in keep for parent in path.parents if work in parent.parents or parent == work}
+            def reclaim(directory):
+                for path in directory.iterdir():
+                    if path in keep:
+                        continue
+                    if path in parents:
+                        reclaim(path)
+                    else:
+                        remove_owned(path)
+            if work.is_dir():
+                reclaim(work)
+        except (OSError, ValueError) as error:
+            job['result']['input_cleanup_error'] = str(error)
+            self.activity.notify('输入临时物待清理 '+str(work), 'local')
+        else:
+            job['result'].pop('input_cleanup_error', None)
+
+    def _prune_assets(self):
+        protected = set()
+        for job in self.jobs.values():
+            protected.update(job['result'].get('assets', {}).values())
+        for error in self.asset_cache.prune(protected):
+            self.activity.notify('资产缓存待清理 '+error, 'local')
 
     def _clean_temp(self, job):
         """Process TEMP is scratch; keep result inputs/outputs until collection."""
@@ -517,6 +560,7 @@ class Worker:
                 job["cancel"].set()
                 if job["result"]["status"] == "queued":
                     self.queue.remove(identity)
+                    self._clean_work(job, discard=True)
                     job["result"].update(status="cancelled", finished=time.time())
                     self._save(job)
                 self.condition.notify_all()
@@ -543,6 +587,7 @@ class Worker:
                 raise Conflict("Cancel and wait for the job before deleting it")
             shutil.rmtree(job["directory"])
             del self.jobs[identity]
+            self._prune_assets()
             return {"deleted": identity}
 
     def asset(self, identity, payload=None):
@@ -561,6 +606,8 @@ class Worker:
                 finally:
                     if temporary.exists():
                         shutil.rmtree(temporary)
+            if directory.is_dir():
+                self.asset_cache.touch(identity)
             return {"id": identity, "exists": directory.is_dir()}
 
     def close(self):
@@ -574,6 +621,8 @@ class Worker:
             thread.join()
         for job in self.jobs.values():
             self._clean_temp(job)
+            self._clean_work(job)
+        self._prune_assets()
         self.root_lock.close()
 
 
