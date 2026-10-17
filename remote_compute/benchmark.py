@@ -63,6 +63,17 @@ class MixedLoad:
 
 
 def _sample(np, cpus, began):
+    serial = MixedLoad(np)
+    serial.block()
+    serial_started = time.monotonic()
+    serial_deadline = serial_started + max(0.1,min(0.4,(began+2.0-serial_started)/4))
+    serial_iterations = 0
+    while time.monotonic()<serial_deadline:
+        serial.block()
+        serial_iterations += BATCH
+    serial_elapsed = time.monotonic()-serial_started
+    single = dict(name=NAME,available=True,score=round(serial_iterations/serial_elapsed/1000000,6),
+                  unit='Miter/s',threads=1,seconds=round(serial_elapsed,3),iterations=serial_iterations)
     started = deadline = 0.0
     def start():
         nonlocal started,deadline
@@ -95,6 +106,7 @@ def _sample(np, cpus, began):
     return dict(name=NAME,available=True,score=round(iterations/elapsed/1000000,6),unit='Miter/s',
                 threads=cpus,seconds=round(elapsed,3),total_seconds=round(time.monotonic()-began,3),
                 iterations=iterations,numpy=np.__version__,
+                single=single,
                 dispatch=introspect(func_name='^exp$') if introspect else {},
                 components=['native-fp64-newton','native-u32-ram','native-blas-matmul'],
                 checksums=[checksum for _,_,checksum in samples])

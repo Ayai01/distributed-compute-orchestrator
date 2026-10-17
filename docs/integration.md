@@ -51,7 +51,13 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 同设备的多个 worker 合并计算主机占用，避免重复计入 CPU。整轮 `cpus: 0` 比较节点时按一个启动线程计价，选定后仍按可用线程和工程份额授予。采样中的在途任务已包含在 CPU 使用率内，用当前账本替换其旧授予；连续提交不用等待下一次采样才更新负载。CPU 使用率参与节点选择，线程和内存预算决定准入；其余设备已满且该设备仍有可用额度时，可继续派发。指定 `node` 保持约束，已运行任务保持原节点。
 
+任务可设置 `single_thread_weight`（有限正数，默认1），也可用 `run/spice/rtl --single-thread-weight`。这项设置只决定负载接近时选哪台主机：1对单线程延迟和并行总吞吐无明显偏向；2适合串行仿真占主导的任务；0.5适合大量独立评价的搜索。它与工程份额 `resource_share`、排队顺序 `priority` 分开，不增加线程、不改变正在运行任务的节点。单线程占比为 `w/(1+w)`，按该占比组合归一化的单线程分数与配置线程下总分的几何均值；节点weight保持生效，adaptive的同标签实测耗时校准该先验。balanced使用相同负载和算力先验、不学习历史；round_robin保持轮转。缺少同版本原生总分时仅按可用配置槽数估计总量；单线程分数不全时该分量保持中性，旧哈希/解释器分数始终不参与比较。
+
+中心 `/health.capabilities` 包含 `single_thread_weight` 时，适配器可传此字段；旧中心省略它。普通默认1任务保持原请求格式；中心保留偏好元数据，并在派发时移除该中心提示，已有worker无需重启即可执行。启动原生估算的单线程结果位于 `benchmark.single`，使用同一混合工作单位；CLI以“单/总 Miter/s”展示。
+
 跨网络或 SSH 转发的节点可设置 `callback_url`，表示从该 worker 看见的中心地址，供任务通过原 ID 借还 CPU/RAM；空值保持局域网自动推导。节点 `url` 是中心访问 worker 的地址，两者按各自方向配置。可用 `center.control(add={"name": "compute-linux", "url": "http://127.0.0.1:26134", "token": worker_token, "callback_url": "http://127.0.0.1:26134"})` 动态加入，或用 `control(node=名字, routing={"callback_url": 地址})` 在线调整。节点配置保存在本机 `nodes.local.json`，令牌不放入聊天或 Git；保存节点时保留已有本机令牌。
+
+节点 `timeout` 默认10秒；带宽较低的跨网隧道传模型/PDK时，可在该节点配置中设置120，或通过 `control(node=名字,routing={"timeout":120})` 在线调整。它仅修改该节点连接的socket超时，不是计算任务的执行时限；后者仍由task.timeout控制。
 
 worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 

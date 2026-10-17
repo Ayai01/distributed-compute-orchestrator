@@ -284,7 +284,7 @@ class Pool:
                 node = Node(f"node{index + 1}", entry)
             else:
                 node = Node(entry.get("name", f"node{index + 1}"),
-                            entry.get('client') or Client(entry["url"], entry.get("token", "")),
+                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10)),
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
@@ -352,18 +352,23 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url"}:
-                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url", "timeout"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url, timeout")
+                timeout=changes.pop('timeout',None)
+                if timeout is not None and (isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not 0<timeout<float('inf')):
+                    raise ValueError('Node timeout must be positive and finite')
                 proposed = Node(node.name, node.client, **{
                     key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled", "memory_limit_mb")})
                 proposed.callback_url = changes.get('callback_url', getattr(node, 'callback_url', ''))
                 self._validate_node(proposed)
                 for key, value in changes.items():
                     setattr(node, key, value)
+                if timeout is not None:
+                    node.client.timeout=timeout
             self.condition.notify_all()
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url=""):
-        node = Node(name, Client(url, token), weight=weight, limit=limit)
+    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url="", timeout=10):
+        node = Node(name, Client(url, token,timeout=timeout), weight=weight, limit=limit)
         node.callback_url = callback_url
         self._validate_node(node)
         with self.condition:
@@ -377,6 +382,7 @@ class Pool:
             return {"policy": self.policy, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
                  "callback_url": getattr(n, 'callback_url', ''),
+                 "timeout": getattr(n.client,'timeout',10),
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),
@@ -446,21 +452,13 @@ class Pool:
                         # difference, retain speed learning and operator weights.
                         close = [n for n in ready if pressures[n.name] - pressures[least.name]
                                  < max(1 / logical(n), 1 / logical(least))]
-                        # Same-version mixed work is a prior, per measured CPU.
-                        # Real same-label timings anchor and then replace it.
-                        benchmarks = [n.health.get('benchmark') or {} for n in matching]
-                        rates = [b['score']/b['threads'] for b in benchmarks
-                                 if b.get('name') == 'numpy-mixed-v2' and b.get('unit') == 'Miter/s'
-                                 and b.get('score',0)>0 and b.get('threads',0)>0]
-                        priors = {n.name:1.0 for n in matching}
-                        if len(rates)==len(matching):
-                            priors = {n.name:1/r for n,r in zip(matching,rates)}
-                        observations = [n.durations[label]/priors[n.name] for n in matching if label in n.durations]
+                        priors = self._speed_priors(close,task.get('single_thread_weight',1.0))
+                        observations = [n.durations[label]/priors[n.name] for n in close if label in n.durations]
                         typical = sum(observations) / len(observations) if observations else 1.0
                         def score(n):
-                            speed = n.durations.get(label, typical * priors[n.name] * 0.8) / typical if self.policy == "adaptive" else 1.0
-                            load = n.reserved + n.external
-                            return ((load + cpus) * speed / (n.capacity * n.weight), pressures[n.name])
+                            speed = n.durations.get(label, typical * priors[n.name] * 0.8) / typical if self.policy == "adaptive" else priors[n.name]
+                            return (speed / n.weight, pressures[n.name],
+                                    (n.reserved+n.external+cpus)/n.capacity)
                         unexplored = [n for n in close if label not in n.durations] if self.policy == "adaptive" else []
                         node = min(unexplored or close, key=score)
                     if automatic:
@@ -478,6 +476,22 @@ class Pool:
                 if not block:
                     return None
                 self.condition.wait(0.2)
+
+    def _speed_priors(self, nodes, single_thread_weight):
+        """A neutral hint balances serial latency and aggregate throughput."""
+        benchmarks = [n.health.get('benchmark') or {} for n in nodes]
+        valid = lambda b: (b.get('name')=='numpy-mixed-v2' and b.get('unit')=='Miter/s'
+                           and b.get('score',0)>0 and b.get('threads',0)>0)
+        # Incomparable/missing aggregate measurements use configured slot counts.
+        # Hash/legacy scores are never treated as native mixed throughput.
+        bulk = ([b['score']*n.capacity/b['threads'] for n,b in zip(nodes,benchmarks)]
+                if all(valid(b) for b in benchmarks) else [n.capacity for n in nodes])
+        singles = [b.get('single') or {} for b in benchmarks]
+        serial = [b['score'] for b in singles] if all(valid(b) for b in singles) else [1.0]*len(nodes)
+        bulk_mean,serial_mean = sum(bulk)/len(nodes),sum(serial)/len(nodes)
+        serial_fraction = single_thread_weight/(1.0+single_thread_weight)
+        return {n.name:1/((total/bulk_mean)**(1-serial_fraction)*(single/serial_mean)**serial_fraction)
+                for n,total,single in zip(nodes,bulk,serial)}
 
     def _cpu_pressure(self, node, cpus):
         machine = node.health.get('machine_id', node.client.url)

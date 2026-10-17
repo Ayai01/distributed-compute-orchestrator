@@ -73,6 +73,7 @@ def submission_parser(kind):
     parser.add_argument("--max-cpus", type=int, help="任务线程需求硬上界，包含后续借核")
     parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
     parser.add_argument("--priority", type=int)
+    parser.add_argument("--single-thread-weight", type=float, help="单线程偏好，默认1；较高偏单线程、较低偏总吞吐")
     parser.add_argument("--requires", help="节点标签，以逗号分隔")
     parser.add_argument("--keep", action="store_true", help="回收后保留节点任务目录")
     if kind == "rtl":
@@ -93,7 +94,7 @@ def prepare(kind, args):
     else:
         task = verilator(args.sources, args.top, flags=words(args.flags))
         inputs = inputs or source
-    for key in ("cpus", "max_cpus", "priority", "node"):
+    for key in ("cpus", "max_cpus", "priority", "node", "single_thread_weight"):
         value = getattr(args, "task_cpus" if key == "cpus" else key)
         if value is not None:
             task[key] = value
@@ -456,6 +457,8 @@ class SchedulerShell(Shell):
             node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
             if row.get('callback_url'):
                 node['callback_url'] = row['callback_url']
+            if row.get('timeout',10)!=10:
+                node['timeout']=row['timeout']
             token = tokens.get(row["url"], self.center.token if self.center else "")
             if token:
                 node["token"] = token

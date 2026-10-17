@@ -206,6 +206,9 @@ class StatusRows(list):
                    '旧解释器' if benchmark.get('name')=='mixed-cpu-v1' else
                    (f"{measured:.3f}" if measured<1000 else f"{measured:.1f}") if measured is not None else
                    '待依赖' if benchmark.get('available') is False else '待测')
+            single=(benchmark.get('single') or {}).get('score')
+            score=(f'{single:.3g}/'+(f'{measured:.3g}' if measured is not None and benchmark.get('name')=='numpy-mixed-v2' else score)
+                   if single is not None else '-/'+score)
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
@@ -229,9 +232,9 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','线程(总)','CPU','Miter/s','RAM','可配','RSS/预留','设备IP'],
+            table=_table(['设备','线程(总)','CPU','单/总','RAM','可配','RSS/预留','设备IP'],
                          [[*r[:3],r[7],*r[3:6],r[9]] for r in records],
-                         [7,10,6,8,10,5,9,None],width,right=(1,2,3,4,5,6))
+                         [7,10,6,11,10,5,9,None],width,right=(1,2,3,4,5,6))
         elif width>=54:
             table=_table(['设备','线程(总)','CPU','RAM','可配'],[r[:5] for r in records],
                          [7,10,6,None,5],width,right=(1,2,3,4))
@@ -242,12 +245,12 @@ class StatusRows(list):
                 table.append(_line(r[0]+': '+node['error'],width))
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
-        sections=[('设备资源 | RAM GiB',table,0)]
+        sections=[('设备资源 | RAM GiB | 算力 Miter/s',table,0)]
         if width<100:
             if width>=54:
-                details=_table(['设备','Miter/s','RSS/预留','设备IP'],
+                details=_table(['设备','单/总','RSS/预留','设备IP'],
                                [[r[0],r[7],r[5],r[9]] for r in records],
-                               [7,8,9,None],width,right=(1,2))
+                               [7,11,9,None],width,right=(1,2))
             else:
                 details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
                 details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)

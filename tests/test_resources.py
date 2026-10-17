@@ -40,8 +40,12 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result['name'],NAME)
         self.assertEqual(result['threads'],2)
         self.assertTrue(1.9<=result['total_seconds']<2.2)
-        self.assertEqual(result['iterations'],sum(s.block.call_count-1 for s in states)*BATCH)
+        self.assertEqual(result['iterations'],sum(s.block.call_count-1 for s in states[1:])*BATCH)
         self.assertAlmostEqual(result['score'],result['iterations']/result['seconds']/1000000,places=4)
+        self.assertEqual(result['single']['threads'],1)
+        self.assertEqual(result['single']['iterations'],(states[0].block.call_count-1)*BATCH)
+        self.assertGreater(result['single']['score'],0)
+        self.assertLess(result['single']['seconds'],.5)
 
     def test_helper_limits_blas_threads_without_changing_service_environment(self):
         from os import environ
@@ -109,6 +113,15 @@ class BenchmarkTests(unittest.TestCase):
             self.assertIn(label,text)
             self.assertNotIn('140.000',text)
 
+    def test_dashboard_shows_single_and_total_without_exceeding_existing_width(self):
+        value=dict(role='worker',node='Aya1-PC',cpus=24,benchmark=dict(name=NAME,unit='Miter/s',
+                   score=56.78,threads=24,single=dict(name=NAME,score=1.234,unit='Miter/s',threads=1)))
+        for width in (48,56,80,110,160):
+            with self.subTest(width=width):
+                lines=format_status(value,width=width)
+                self.assertTrue(all(_width(line)<=width for line in lines))
+                self.assertIn('1.23/56.8','\n'.join(lines))
+
     def test_capabilities_group_aliases_without_folding_or_changing_protocol_tags(self):
         tags=['aop_python','arh_python','bench_python','rgcn_python','rgcn_train',
               'cpu','win32','ngspice','python','rtl','verilator']
@@ -142,8 +155,8 @@ class CalibrationTests(unittest.TestCase):
                 benchmark=dict(name=NAME,score=4,threads=4,unit='Miter/s'))
         return pool
 
-    def choose(self,pool):
-        return pool._acquire(dict(steps=[['echo']],cpus=1,memory_mb=64,label='same-work'),block=False).name
+    def choose(self,pool,weight=1.0):
+        return pool._acquire(dict(steps=[['echo']],cpus=1,memory_mb=64,label='same-work',single_thread_weight=weight),block=False).name
 
     def test_unmeasured_tasks_use_mixed_speed_per_measured_cpu(self):
         pool=self.pool()
@@ -168,7 +181,45 @@ class CalibrationTests(unittest.TestCase):
         pool.nodes[0].health['benchmark'].update(score=40)
         self.assertEqual(self.choose(pool),'two')
 
-    def test_balanced_policy_keeps_using_load_instead_of_benchmark_scores(self):
+    def test_balanced_policy_uses_speed_only_within_close_cpu_load(self):
         pool=self.pool('balanced')
         pool.nodes[1].health['benchmark'].update(score=40)
-        self.assertEqual(self.choose(pool),'one')
+        self.assertEqual(self.choose(pool),'two')
+
+    def test_serial_hint_changes_placement_without_changing_cpu_or_project_share(self):
+        for policy in ('adaptive','balanced'):
+            for weight,expected in ((.5,'two'),(1.0,'two'),(2.0,'one')):
+                with self.subTest(policy=policy,weight=weight):
+                    pool=self.pool(policy)
+                    one,two=pool.nodes
+                    two.health.update(cpus=16,logical_cpus=16)
+                    one.health['benchmark'].update(score=4,single=dict(name=NAME,score=8,unit='Miter/s',threads=1))
+                    two.health['benchmark'].update(score=16,threads=16,single=dict(name=NAME,score=2,unit='Miter/s',threads=1))
+                    if weight==1:
+                        priors=pool._speed_priors(pool.nodes,weight)
+                        self.assertAlmostEqual(priors['one'],priors['two'])
+                    self.assertEqual(self.choose(pool,weight),expected)
+                    self.assertEqual(sum(n.reserved for n in pool.nodes),1)
+
+    def test_lower_cpu_load_overrides_extreme_serial_hint(self):
+        pool=self.pool()
+        pool.nodes[0].health.update(cpu_percent=75)
+        for n,rate in zip(pool.nodes,(100,1)):
+            n.health['benchmark']['single']=dict(name=NAME,score=rate,unit='Miter/s',threads=1)
+        self.assertEqual(self.choose(pool,1000),'two')
+
+    def test_missing_single_measurement_is_neutral_and_hash_bulk_is_ignored(self):
+        pool=self.pool()
+        pool.nodes[0].health['benchmark'].update(name='pbkdf2-sha256-v1',score=1e12)
+        pool.nodes[1].health['benchmark']['single']=dict(name=NAME,score=100,unit='Miter/s',threads=1)
+        priors=pool._speed_priors(pool.nodes,2.0)
+        self.assertEqual(priors,{'one':1.0,'two':1.0})
+
+    def test_serial_weight_validation_and_default_packet_compatibility(self):
+        from remote_compute import command
+        from remote_compute.worker import validate_task
+        self.assertNotIn('single_thread_weight',command(['echo']))
+        self.assertEqual(validate_task(command(['echo'],single_thread_weight=2),4)['single_thread_weight'],2)
+        for value in (0,-1,True,False,None,'2',float('inf'),float('nan')):
+            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'single_thread_weight'):
+                validate_task(command(['echo'],single_thread_weight=value),4)

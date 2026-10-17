@@ -132,6 +132,7 @@ class Coordinator:
                 result = job['result']
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
                     item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb','started')}
+                    item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
                     item['project'] = job.get('task',{}).get('project','')
                     active.setdefault(result['assigned_node'],[]).append(item)
             for node in snapshot['nodes']:
@@ -148,7 +149,7 @@ class Coordinator:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
-                    'capabilities':['resize','resize_memory','max_cpus']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','max_cpus','single_thread_weight']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -232,6 +233,7 @@ class Coordinator:
             (directory / "request.zip").write_bytes(payload)
             job = {"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
                    "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
+                              "single_thread_weight": task.get('single_thread_weight',1.0),
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
                               "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}}
@@ -287,10 +289,12 @@ class Coordinator:
         try:
             self._ensure_assets(node, task['assets'].values())
             payload = (job['directory'] / 'request.zip').read_bytes()
-            if job['auto_cpus'] or 'max_cpus' in task:
+            if job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task:
                 with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                     files = {name: archive.read(name) for name in archive.namelist()}
                 worker_task = dict(task)
+                # Placement hints belong to the dispatcher, not the executable.
+                worker_task.pop('single_thread_weight',None)
                 if 'max_cpus' not in node.health.get('capabilities',[]):
                     worker_task.pop('max_cpus',None)
                 files['task.json'] = json_bytes(worker_task)

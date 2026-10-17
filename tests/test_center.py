@@ -39,6 +39,20 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_serial_hint_is_center_metadata_and_not_forwarded_to_older_worker(self):
+        import zipfile
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker):
+            original=worker.submit_bundle
+            def submit(identity,payload,**options):
+                with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                    self.assertNotIn('single_thread_weight',json.loads(archive.read('task.json')))
+                return original(identity,payload,**options)
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client),patch.object(worker,'submit_bundle',side_effect=submit):
+                result=client.run(python('print(42)',single_thread_weight=2))
+                self.assertEqual(result['status'],'succeeded',result)
+                self.assertEqual(result['single_thread_weight'],2)
+                self.assertIn('single_thread_weight',client.health()['capabilities'])
+
     def test_explicit_node_callback_reaches_center_and_resizes_original_task(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=2,token='worker-token') as (_,worker):
             with Pool([dict(name='tunnel',client=worker)]) as pool, center(pool,Path(root)/'center') as (state,client):
@@ -72,6 +86,9 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(pool.nodes[0].callback_url,callback)
                 pool.add('two',two.url,callback_url=callback)
                 self.assertEqual(pool.snapshot()['nodes'][1]['callback_url'],callback)
+                pool.configure('two',timeout=120)
+                self.assertEqual(pool.nodes[1].client.timeout,120)
+                self.assertEqual(pool.snapshot()['nodes'][1]['timeout'],120)
                 for invalid in (None,'file:///tmp/center','http://','http://127.0.0.1/?token=secret'):
                     with self.subTest(value=invalid),self.assertRaises(ValueError):
                         pool.configure('one',callback_url=invalid)

@@ -30,7 +30,7 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     if len(centers)>1 or len(workers)>1 or not states:
         raise RuntimeError('Expected one service and its optional private worker')
     plan={
-        'client':{'Client':('health','resize','admission'),'Pool':('_acquire',)},
+        'client':{'Client':('health','resize','admission'),'Pool':('_acquire','_speed_priors')},
         'worker':{'Worker':('health','resize'),'Handler':('_handle',),'':('validate_task',)},
         'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_update','_execute','_schedule')},
         'local':{'LocalClient':('request',)},
@@ -52,10 +52,10 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
                 fragment=ast.Module(body=[node],type_ignores=[])
                 scope={}
                 exec(compile(fragment,str(path),'exec'),module.__dict__,scope)
-                old,new=getattr(owner,method),scope[method]
-                if old.__code__.co_freevars or new.__code__.co_freevars:
+                old,new=getattr(owner,method,None),scope[method]
+                if (old is not None and old.__code__.co_freevars) or new.__code__.co_freevars:
                     raise RuntimeError('Resource patch methods must have no closures')
-                prepared.append((old,new))
+                prepared.append((owner,method,old,new))
     metadata=ast.parse((source/'remote_compute/__init__.py').read_text(encoding='utf-8'))
     constants={target.id:ast.literal_eval(node.value) for node in metadata.body if isinstance(node,ast.Assign)
                for target in node.targets if isinstance(target,ast.Name) and target.id in ('__version__','PROJECT_NAME','ABBREVIATION')}
@@ -66,8 +66,11 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
         for state in workers:
             locks.enter_context(state.condition)
         before={id(state):set(state.jobs) for state in states}
-        for old,new in prepared:
-            old.__code__,old.__defaults__,old.__kwdefaults__=new.__code__,new.__defaults__,new.__kwdefaults__
+        for owner,method,old,new in prepared:
+            if old is None:
+                setattr(owner,method,new)
+            else:
+                old.__code__,old.__defaults__,old.__kwdefaults__=new.__code__,new.__defaults__,new.__kwdefaults__
         for name,value in constants.items():setattr(package,name,value)
         worker.__version__=coordinator.__version__=constants['__version__']
         sys.modules['remote_compute.view'].ABBREVIATION=constants['ABBREVIATION']
