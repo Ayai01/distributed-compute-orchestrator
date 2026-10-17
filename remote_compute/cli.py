@@ -38,7 +38,7 @@ def load_nodes(path=None, url=None, local_client=None):
             node.update(url=local_client.url, client=local_client)
             continue
         try:
-            node['name'] = Client(node['url'], node['token'], timeout=2).health()['node']
+            node['name'] = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file')).health()['node']
         except RemoteError:
             pass
     return value
@@ -340,12 +340,18 @@ def main(argv=None):
                 existing_worker = resolve(args.host or config.get('host', '127.0.0.1'),
                                           args.port if args.port is not None else config.get('port', 26133),
                                           policy=args.on_port_conflict, token=args.local_token,
-                                          reuse_role='worker' if args.mode == 'hybrid' else None)
+                                          reuse_role='worker',ca_file=config.get('ca_file') or config.get('certfile'),
+                                          tls=bool(config.get('certfile')))
+                if existing_worker:
+                    from .commands import RemoteWorker
+                    client=Client(existing_worker,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'))
+                    WorkerShell(RemoteWorker(client)).loop(client.health,client.url)
+                    return 0
         if args.mode != "scheduler" and not existing_worker:
             port = args.port if args.port is not None else config.get("port", 26133)
             from .ramdisk import scratch
             root = args.root or config.get("root") or scratch('Remote-Compute') / ('local' if args.mode == 'hybrid' else str(port))
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root") if key in config}
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
@@ -378,7 +384,8 @@ def main(argv=None):
                 worker.restart_available = args.service_child
                 server = Server((host, port), worker, restart=restart_worker if args.service_child else None,
                                 certfile=config.get('certfile'),keyfile=config.get('keyfile'))
-                print(f"算力提供者 http://{host}:{server.server_port}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
+                worker_url=f'{"https" if config.get("certfile") else "http"}://{host}:{server.server_port}'
+                print(f"算力提供者 {worker_url}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
                 thread.start()
             else:
@@ -391,7 +398,7 @@ def main(argv=None):
                 except KeyboardInterrupt:
                     pass
             else:
-                WorkerShell(worker).loop(worker.health, f'http://{host}:{server.server_port}', thread.is_alive)
+                WorkerShell(worker).loop(worker.health, worker_url, thread.is_alive)
             return 75 if restarting.is_set() else 0
         if worker:
             from .local import LocalClient

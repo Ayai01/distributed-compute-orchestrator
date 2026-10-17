@@ -34,6 +34,7 @@ class DirectTests(unittest.TestCase):
                     code=("import sys,os,json;sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME']);"
                           "from remote_compute import Client;"
                           "c=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN']);"
+                          "a=c.admission('default',job_id=os.environ['REMOTE_COMPUTE_JOB_ID']);assert a['recommended_cpus']==2;"
                           "print(json.dumps(c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=64)))")
                     result=client.run(python(code,cpus=2,memory_mb=128))
                     self.assertEqual(result['status'],'succeeded',result.get('stderr'))

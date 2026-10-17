@@ -22,7 +22,7 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
         raise RuntimeError('The service belongs to another checkout')
     package=importlib.import_module('remote_compute')
     legacy=package.__version__ in ('0.7.11','0.7.12','0.7.13')
-    if not legacy and package.__version__ not in ('0.7.28','0.7.29','0.7.30'):
+    if not legacy and package.__version__ not in ('0.7.28','0.7.29','0.7.30','0.7.31'):
         raise RuntimeError('Use an idle restart for this service version')
     coordinator=importlib.import_module('remote_compute.coordinator')
     states=[obj for obj in gc.get_objects() if type(obj) in (worker.Worker,coordinator.Coordinator)]
@@ -33,7 +33,7 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     plan={
         'allocation':{'':('plan_resize','weighted_node_threads')},
         'client':{'Client':('__init__','health','resize','admission'),'Pool':('__init__','_validate_node','configure','add','snapshot','_matching','_acquire','_speed_priors')},
-        'worker':{'Worker':('_probe_tools','control','health','resize','_execute'),'Handler':('_connected','_handle'),'':('validate_task',)},
+        'worker':{'Worker':('_probe_tools','control','health','resize','lease','_execute','_temporary','_clean_temp'),'Handler':('_connected','_handle'),'':('validate_task',)},
         'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_callback','_update','_execute','_ensure_assets','_schedule','_recover_running','artifacts','delete')},
         'local':{'LocalClient':('request',)},
         'admission':{'AdmissionWindow':('current',)},
@@ -45,10 +45,15 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     if not legacy:
         plan={
             'allocation':{'':('plan_resize','weighted_node_threads')},
-            'client':{'Client':('request','_request','health','status','fetch')},
-            'worker':{'Handler':('handle_one_request','_connected','_reply','_handle')},
-            'coordinator':{'Coordinator':('admission','project_resources','resize','artifacts','delete','_execute','_schedule','_recover_running')},
-            'view':{'':('_device_address',),'StatusRows':('_build',)},
+            'bundle':{'':('progress',)},
+            'client':{'Client':('__init__','request','_request','health','status','fetch','resize','admission'),
+                      'Pool':('_validate_node','configure','add','snapshot','refresh','_monitor','_speed_priors','_cpu_pressure')},
+            'worker':{'Handler':('handle_one_request','_connected','_reply','_handle'),
+                      'Worker':('health','lease','_execute','_temporary','_clean_temp'),'':('validate_task',)},
+            'coordinator':{'Coordinator':('admission','_health','project_resources','resize','artifacts','delete',
+                '_execute','_retry','_callback','_update','_client','logs','job_file','_schedule','_recover_running')},
+            'view':{'':('_device_address','_capabilities'),'StatusRows':('_build','_resources')},
+            'commands':{'SchedulerShell':('do_save',)},
         }
     prepared=[]
     for name,classes in plan.items():
@@ -56,6 +61,7 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
         if name=='client':
             module.__dict__.setdefault('os',os)
             module.__dict__.setdefault('ipaddress',importlib.import_module('ipaddress'))
+            module.__dict__.setdefault('ssl',importlib.import_module('ssl'))
         if name=='worker':
             module.__dict__.setdefault('select',importlib.import_module('select'))
         path=source/'remote_compute'/(name+'.py')
@@ -87,6 +93,8 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
         for state in centers:
             locks.enter_context(state.condition)
             locks.enter_context(state.pool.condition)
+            if not hasattr(state.pool,'sample_seconds'):state.pool.sample_seconds=state.pool.refresh_seconds
+            state.pool.refresh_seconds=min(state.pool.sample_seconds,.2)
         for state in workers:
             locks.enter_context(state.condition)
         def snapshot(state):

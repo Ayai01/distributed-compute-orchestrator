@@ -50,6 +50,22 @@ class Coordinator:
 
     def admission(self, request):
         project = request.get('project') or 'default'
+        job_id=request.get('job_id')
+        advice={}
+        if job_id is not None:
+            with self.condition,self.pool.condition:
+                job=self.jobs.get(job_id)
+                if job is None or job.get('node') is None or job['result']['status'] in TERMINAL:
+                    raise Conflict('admission job_id must identify a running task')
+                if (job['task'].get('project') or 'default')!=project:
+                    raise ValueError('admission project differs from the running task')
+                node=job['node'];old=job['task']['cpus'];old_memory=job['task']['memory_mb']
+                resource=self.project_resources()[project]
+                advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
+                                  resource['target']-resource['used']+old,node.capacity-node.reserved-node.external+old))
+                advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
+                            current_cpus=old,current_memory_mb=old_memory,
+                            available_memory_mb=old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
         share = request.get('resource_share', 1.0)
         ratio = request.get('queue_ratio', 1.0)
         cpus = request.get('cpus', 1)
@@ -69,6 +85,10 @@ class Coordinator:
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled
                   and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))]
         capable=sum(n.capacity for n in eligible)
+        tool_sha256={name:sorted({info['sha256'] for n in eligible
+                                 for info in [n.health.get('tools',{}).get(name,{})]
+                                 if info.get('available') and info.get('sha256')})
+                     for name in requires if any(name in n.health.get('tools',{}) for n in eligible)}
         names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
         shares[project], demands[project] = share, capable
         rooms={name:row['node_demands'] for name,row in resources.items()}
@@ -100,7 +120,9 @@ class Coordinator:
                            if room else 0)
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
-        return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,
+        return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
+                    tool_sha256=tool_sha256,
+                    **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
 
@@ -153,7 +175,7 @@ class Coordinator:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','retry_jobs']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','retry_jobs','admission_job']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -376,7 +398,8 @@ class Coordinator:
                     if request and job.get('lease_answered')!=request['request_id']:
                         options={k:v for k,v in request.items() if k!='request_id'}
                         try:
-                            reply={'grant':self.resize(job['result']['id'],**options)}
+                            operation=options.pop('_operation','resize')
+                            reply={'grant':self.admission(options) if operation=='admission' else self.resize(job['result']['id'],**options)}
                         except (Conflict,RemoteError,ValueError) as error:
                             reply={'error':str(error)}
                         node.client.request('/jobs/'+identity+'/lease',{'request_id':request['request_id'],**reply})
@@ -426,7 +449,7 @@ class Coordinator:
         job['result'].update(status='interrupted',error=outcome.get('error','Worker stopped'),finished=outcome.get('finished',time.time()))
         self._save(job)
         attempts=job['result'].setdefault('attempts',[])
-        if len(attempts)>=job['task'].get('retries',2):return
+        if len(attempts)>=job['result'].get('max_retries',0):return
         attempts.append(dict(node=job['node'].name,worker_id=job.get('worker_id',job['result']['id']),
                              status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished')))
         identity=job['result']['id']

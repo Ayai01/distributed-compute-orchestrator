@@ -207,9 +207,11 @@ class StatusRows(list):
             score=('旧哈希' if benchmark.get('name')=='pbkdf2-sha256-v1' else
                    '旧解释器' if benchmark.get('name')=='mixed-cpu-v1' else
                    (f"{measured:.3f}" if measured<1000 else f"{measured:.1f}") if measured is not None else
-                   '待依赖' if benchmark.get('available') is False else '待测')
+                   '超时' if 'exceeded' in benchmark.get('reason','') else
+                   '待依赖' if 'Install NumPy' in benchmark.get('reason','') else
+                   '未完成' if benchmark.get('available') is False else '待测')
             single=(benchmark.get('single') or {}).get('score')
-            score=(f'{single:.3g}/'+(f'{measured:.3g}' if measured is not None and benchmark.get('name')=='numpy-mixed-v2' else score)
+            score=(f'{single:.3g}/'+(f'{measured:.3g}' if measured is not None and benchmark.get('name') in {'numpy-mixed-v2','numpy-mixed-v3'} else score)
                    if single is not None else '-/'+score)
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),

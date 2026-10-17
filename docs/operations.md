@@ -14,11 +14,11 @@ Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执�
 
 从旧Python加载新版本时，空闲重载后的服务子进程会把同一终端交给本机首选3.14，旧托管器正常退出；配置和任务目录保持原路径。中心合并转发通知时按完整操作标识去重，显示执行设备与访问IP，不把同一操作重复计为两条通知。
 
-设备IP来自该设备实际接受连接的地址，完整显示IPv4，不按网卡枚举顺序猜测。worker监听`0.0.0.0`时，首次外部连接前显示“等待连接”，之后显示实际连接使用的本机地址；回环探测不覆盖它。访问来源单独显示，有外部访问时省略内部回环探测，多个来源各占一行。启动算力使用`Miter/s`，测量槽数留在API，不在数值后重复显示。能力按SPICE、RTL、Python、ML、GPU合并，同类工程解释器只占一项；额外自定义标签以`+N`表示，完整标签仍可通过nodes/API查看。
+设备IP来自该设备实际接受连接的地址，完整显示IPv4，不按网卡枚举顺序猜测。worker监听`0.0.0.0`时，首次外部连接前显示“等待连接”，之后显示实际连接使用的本机地址；回环探测不覆盖它。访问来源单独显示，有外部访问时省略内部回环探测，多个来源各占一行。启动算力使用`Miter/s`，测量槽数留在API，不在数值后重复显示。能力明确区分ngspice和HSPICE，再按RTL、Python、ML、GPU合并；自定义标签完整显示并在本区域内换行，不使用`+N`。
 
 Windows 下 scheduler / hybrid / worker 从启动到退出持续阻止自动休眠，空闲排队、终端失焦、headless 和服务重载期间均生效；屏幕可以正常关闭。退出后自动释放，恢复原有电源策略，无需管理员权限，也不修改系统电源计划。显式休眠、关机和合盖仍按用户操作执行。仅连接已有中心的 CLI 命令不申请防休眠。Linux 的电源管理接入保留待实机验证。
 
-端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心，hybrid 复用中心内置的本机算力）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
+端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心或worker，hybrid复用中心内置的本机算力；worker复用时只打开终端界面，退出界面保留后台服务）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
 
 ```text
 python main.py
@@ -49,6 +49,8 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 
 0.7.11的资源接口可用CPython3.14的`sys.remote_exec`执行工程内`live_patch.apply()`，在原PID中安装已验证的方法，保留任务、连接、类和资源账本；该专项迁移用于不中断长仿真地修正内存借还。普通版本升级仍等待空闲后重载。迁移前核对目标PID、工作目录和版本，先在旧版夹具验证；不对科研子进程做代码更新。
 
+独立worker支持原生HTTPS：设备配置`certfile`、`keyfile`，中心节点配置对应`ca_file`并直接访问设备IP的26133端口。资源借还通过worker本地接口和中心已有连接转交，无需反向端口或隧道。Linux桌面可以运行`python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json`附着现有服务；关闭看板保留后台计算。
+
 ## 实时终端与运行中控制
 
 Windows交互终端在窗口获得焦点时每秒刷新、失焦时每5秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签与访问IP。设备区显示启动算力测量结果，移除温度和常驻在线列，异常或暂停单独提示。最近6条指令/文件操作滚动显示，普通计算提交放在任务表中，避免刷掉重要操作通知；命令输入同时保持可用。`--headless` 保留无界面服务；设备配置 `console: true` 可在原headless启动终端打开看板。
@@ -69,8 +71,9 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 | 设备 | 模式 | 地址 | 默认预算 | 硬上限 |
 | --- | --- | --- | --- | --- |
-| Aya1-PC | hybrid | 中心 `127.0.0.1:26133`；本机 worker 进程内调用 | 24 | 24 |
+| Aya1-PC | hybrid | 中心 `127.0.0.1:26133`；本机 worker 进程内调用 | 16 | 24 |
 | Aya1-TX | worker | `192.168.1.10:26133` | 30 | 31 |
+| ku26s | worker | `https://1.191.212.42:26133` | 96 | 96 |
 
 新设备的通用默认预算和硬上限为 `max(1, CPU_COUNT-1)`。`cpu_limit` 在设备配置中设置硬上限，`cpus` 设置当前预算。在线 `cpus` 控制会写回当前使用的配置文件；调低预算后，在途任务自然结束，后续派发按新预算执行。改硬上限需要更新配置并重启。
 
@@ -93,6 +96,8 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 `--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听 `0.0.0.0:26133`，以便远端任务回调中心申请/归还线程，CLI 仍用本机127.0.0.1地址。`--host 127.0.0.1` 可限定回环；此时远端任务保持静态授予。本机 worker 始终为进程内私有调用。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
 
+`temp_root`可将任务TMP与持久root分开：例如Linux使用现有`/run/user/1000/dco`，资产与回执继续保存在普通磁盘。DCO按worker目录身份和任务ID隔离TMP，成功、失败、取消和下次启动均回收已结束任务的临时物；调用工程只使用任务的TMPDIR，不另建无主内存目录。Linux进程统计与取消按子进程关系追踪，包括另建会话的原生仿真器。
+
 `memory_mb` / `--memory-mb` 单位为 MiB；0 使用物理内存减去预留量。中心同时核对任务内存预留、实际进程树 RSS 和系统可用内存。同一设备的多个 worker 共用一份物理内存统计。任务默认预留 256 MiB；大任务由调用者声明所需内存。
 
 健康接口同时提供`service`的常驻内存、私有提交量、线程及句柄数，和`scratch_disk`、`asset_cache`占用；用于区分计算子进程、服务自身及缓存盘的增长。详情与自动清理边界见[工程接入](integration.md#传输与本地执行)。
@@ -105,9 +110,9 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 Windows经典控制台启动看板时尝试扩展至160列×50行，按当前屏幕和字体允许的最大尺寸调整；已有更大的窗口保持原大小。Windows Terminal和编辑器内终端由宿主控制窗口尺寸，看板随可用宽高排版。
 
-启动估算`numpy-mixed-v2`复用设备已有NumPy/BLAS，包含批量FP64二极管Newton更新、uint32逻辑与索引RAM读写、128×128双精度矩阵乘法。每批32768个混合工作单位，数组内层计算由原生库完成；Python负责发起整批运算。使用库自身的[CPU/SIMD分派](https://numpy.org/doc/stable/reference/simd/index.html)，不自行编译内核或建立ISA评分体系。BLAS内层固定1线程，外层按设备CPU预算并行，单个临时子进程在结束或取消时回收。NumPy缺席时worker照常服务，使用真实任务耗时学习，不退回解释器循环计分。
+启动估算`numpy-mixed-v3`优先复用已登记的科研Python及其NumPy/BLAS（bench/aop/arh/rgcn别名，最后使用默认Python），包含批量FP64二极管Newton更新、uint32逻辑与索引RAM读写、512×512双精度矩阵乘法，减少大线程数下Python调度占比。每批32768个混合工作单位，数组内层计算由原生库完成；Python负责发起整批运算。使用库自身的[CPU/SIMD分派](https://numpy.org/doc/stable/reference/simd/index.html)，不自行编译内核或建立ISA评分体系。BLAS内层固定1线程，外层按设备CPU预算并行，单个临时子进程在结束或取消时回收。NumPy缺席时worker照常服务，使用真实任务耗时学习，不退回解释器循环计分。
 
-总时间目标约2秒，导入、分配和预热计入预算：先约0.4秒测单线程，再用余下时间测目标线程总量，后者至少保留0.25秒；记录采样`seconds`和总耗时`total_seconds`，单线程结果在`benchmark.single`。`Miter/s`为每秒百万个固定版本混合工作单位；CLI显示“单/总 Miter/s”，API保留测量槽数、NumPy版本和实际分派信息。旧哈希/解释器分数单独标记，不和新分数比较。在线调整CPU预算保留原测量，下次自然启动重测；看板刷新与源码同步不触发测试。现有进程可通过计入1CPU的短测补单线程结果，保留原总分与其版本标签，不重跑全预算测试。
+总时间目标约2秒，导入、分配和预热计入预算：先约0.4秒测单线程，再用余下时间测目标线程总量，后者至少保留0.25秒；记录采样`seconds`和总耗时`total_seconds`，单线程结果在`benchmark.single`。`Miter/s`为每秒百万个固定版本混合工作单位；CLI显示“单/总 Miter/s”，API保留测量槽数、NumPy版本和实际分派信息。不同版本的混合分数不交叉比较；旧哈希/解释器分数单独标记。在线调整CPU预算保留原测量，下次自然启动重测；看板刷新与源码同步不触发测试。现有进程可通过计入1CPU的短测补单线程结果，保留原总分与其版本标签，不重跑全预算测试。
 
 启动混合分数用于缺少任务历史时的初始估计。调度优先满足CPU、RAM和工程份额，负载相近时按混合分数/实际测量槽数估计单槽速度；必须是相同版本的混合基准才参与比较。同类任务已有真实耗时时，以该耗时替代初始估计，未采样设备的估计则用已采样设备的耗时校准；持续使用指数移动平均。调用方以label区分电路、保真度和相近工作量。AVX2/AVX512不套倍率，科研内核、向量库和内存访问的实际影响由任务耗时反映。
 

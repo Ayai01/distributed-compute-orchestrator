@@ -33,7 +33,7 @@ def scratch():
 def provider(root, cpus=1, **options):
     # Transport/accounting tests should not benchmark every fixture or consume
     # a production-sized CPU budget; the actual kernel has its own regression.
-    with patch('remote_compute.worker.cpu_benchmark',side_effect=lambda n:
+    with patch('remote_compute.worker.cpu_benchmark',side_effect=lambda n,*args:
                dict(name='test-kernel',score=1000.0,unit='kiter/s',threads=n,seconds=2.0)):
         worker = Worker(root, cpus, **options)
     server = Server(("127.0.0.1", 0), worker)
@@ -62,6 +62,18 @@ def until(check, seconds=5):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_configured_temp_root_is_owned_and_reclaimed_after_exit(self):
+        with scratch() as directory:
+            root=Path(directory)
+            with provider(root/'disk',temp_root=root/'scratch') as (worker,client):
+                for exit_code in (0,3):
+                    task=python("import os,sys;from pathlib import Path\nPath(os.environ['TMPDIR'],'raw.dat').write_bytes(b'raw')\nprint(os.environ['TMPDIR'],flush=True)\nsys.exit("+str(exit_code)+")")
+                    result=client.run(task)
+                    temporary=Path(result['stdout'].strip())
+                    self.assertEqual(temporary.parent,worker.temp_root)
+                    self.assertFalse(temporary.exists())
+                    self.assertEqual(result['status'],'succeeded' if exit_code==0 else 'failed')
+
     def test_task_temp_is_reclaimed_before_results_are_collected(self):
         for code,expected in ((0,'succeeded'),(3,'failed')):
             with self.subTest(status=expected):

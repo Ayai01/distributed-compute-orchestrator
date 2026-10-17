@@ -79,6 +79,16 @@ class BenchmarkTests(unittest.TestCase):
         helper.kill.assert_called_once()
         self.assertEqual(helper.communicate.call_count,2)
 
+    def test_estimate_uses_existing_scientific_runtime_and_library_settings(self):
+        helper=Mock(returncode=0)
+        helper.communicate.return_value=(json.dumps(dict(name=NAME,available=True)),'')
+        with patch('remote_compute.benchmark.subprocess.Popen') as factory:
+            factory.return_value.__enter__.return_value=helper
+            result=measure(96,executable='/science/bin/python',environment=(('OPENBLAS_CORETYPE','Haswell'),))
+        self.assertEqual(factory.call_args.args[0][0],'/science/bin/python')
+        self.assertEqual(factory.call_args.kwargs['env']['OPENBLAS_CORETYPE'],'Haswell')
+        self.assertEqual(result['python'],'/science/bin/python')
+
     def test_warmup_failure_breaks_barrier_and_leaves_no_benchmark_threads(self):
         import threading
         load=Mock()
@@ -125,14 +135,15 @@ class BenchmarkTests(unittest.TestCase):
     def test_capabilities_group_aliases_without_folding_or_changing_protocol_tags(self):
         tags=['aop_python','arh_python','bench_python','rgcn_python','rgcn_train',
               'cpu','win32','ngspice','python','rtl','verilator']
-        self.assertEqual(_capabilities(tags),'SPICE RTL Python ML')
+        self.assertEqual(_capabilities(tags),'ngspice RTL Python ML')
         self.assertEqual(len(tags),11)
-        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'SPICE RTL Python ML +1')
+        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'ngspice RTL Python ML '+'long-custom-tag'*8)
+        self.assertIn('HSPICE',_capabilities([*tags,'hspice','aop_hspice_python']))
         value=dict(role='worker',node='Aya1-TX',cpus=30,tags=tags)
         for width in (56,80,110,160):
             lines=format_status(value,width=width)
             self.assertTrue(all(_width(line)<=width for line in lines))
-            self.assertIn('SPICE RTL Python ML','\n'.join(lines))
+            self.assertIn('ngspice RTL Python ML','\n'.join(lines))
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):
         with patch('remote_compute.benchmark.measure') as kernel:
@@ -180,6 +191,20 @@ class CalibrationTests(unittest.TestCase):
         pool.nodes[0].health.update(cpu_percent=75)
         pool.nodes[0].health['benchmark'].update(score=40)
         self.assertEqual(self.choose(pool),'two')
+
+    def test_underused_grants_do_not_replace_measured_cpu_load(self):
+        pool=self.pool()
+        first,second=pool.nodes
+        for node in pool.nodes:node.health.update(cpus=16,logical_cpus=16)
+        first.reserved=8;first.health.update(used_cpus=8,cpu_percent=10)
+        second.health.update(cpu_percent=40)
+        self.assertEqual(self.choose(pool),'one')
+
+    def test_different_native_workloads_are_not_compared(self):
+        pool=self.pool()
+        pool.nodes[0].health['benchmark'].update(name='numpy-mixed-v2',score=1000)
+        pool.nodes[1].health['benchmark'].update(name='numpy-mixed-v3',score=1)
+        self.assertEqual(pool._speed_priors(pool.nodes,1),{'one':1.0,'two':1.0})
 
     def test_balanced_policy_uses_speed_only_within_close_cpu_load(self):
         pool=self.pool('balanced')

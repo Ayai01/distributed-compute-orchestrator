@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-NAME = 'numpy-mixed-v2'
+NAME = 'numpy-mixed-v3'
 BATCH = 32768
 
 
@@ -21,8 +21,9 @@ class MixedLoad:
         self.words = np.arange(BATCH,dtype=np.uint32)+np.uint32(0x12345678)
         self.ram = np.arange(BATCH,dtype=np.uint32)*np.uint32(2654435761)
         self.indices, self.data, self.rotate = (np.empty(BATCH,dtype=np.uint32) for _ in range(3))
-        self.matrix = np.linspace(-0.2,0.2,128*128).reshape(128,128)
-        self.weight = np.full((128,128),0.0001)+np.eye(128)*0.98
+        # A native block must outlast Python dispatch even on large CPU budgets.
+        self.matrix = np.linspace(-0.2,0.2,512*512).reshape(512,512)
+        self.weight = np.full((512,512),0.0001)+np.eye(512)*0.98
         self.product = np.empty_like(self.matrix)
 
     def block(self):
@@ -116,14 +117,14 @@ def _unavailable(reason):
     return dict(name=NAME,available=False,reason=reason,unit='Miter/s',threads=0)
 
 
-def measure(cpus):
+def measure(cpus, *, executable=None, environment=()):
     """One disposable native helper; the service itself stays stdlib-only."""
     began = time.monotonic()
-    env = dict(os.environ)
+    env = dict(os.environ, **dict(environment))
     for name in ('OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','OMP_NUM_THREADS',
                  'BLIS_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
         env[name] = '1'  # Outer lanes share the worker budget; no nested BLAS pool.
-    with subprocess.Popen([sys.executable,'-I','-B','-u',str(Path(__file__).resolve()),
+    with subprocess.Popen([executable or sys.executable,'-I','-B','-u',str(Path(__file__).resolve()),
                            '--sample',str(cpus),str(began)],
             env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',
             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)) as helper:
@@ -137,7 +138,9 @@ def measure(cpus):
             raise
         if helper.returncode:
             return _unavailable(stderr.strip()[-240:] or 'Native helper exit '+str(helper.returncode))
-        return json.loads(stdout)
+        result=json.loads(stdout)
+        result['python']=executable or sys.executable
+        return result
 
 
 if __name__ == '__main__' and sys.argv[1:2] == ['--sample']:

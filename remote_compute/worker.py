@@ -143,8 +143,12 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None, temp_root=None):
         self.root = Path(root).expanduser().resolve()
+        self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
+        if self.temp_root:
+            self.temp_root/=hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
+            self.temp_root.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.callback = {}
         physical_limit = max(1, (os.cpu_count() or 1) - 1)
         if cpu_limit is not None and (type(cpu_limit) is not int or not 1 <= cpu_limit <= physical_limit):
@@ -180,7 +184,11 @@ class Worker:
             self.tags = sorted(set(self.tags) | {'rtl'})
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
-        self.benchmark = dict(cpu_benchmark(self.capacity))
+        benchmark_python=next((self.tools[name][0] for name in ('bench_python','aop_python','arh_python','rgcn_python','python')
+                               if self.tool_info.get(name,{}).get('available')),sys.executable)
+        benchmark_env=tuple((name,self.env[name]) for name in ('PATH','LD_LIBRARY_PATH','OPENBLAS_CORETYPE','MKL_ENABLE_INSTRUCTIONS')
+                            if name in self.env)
+        self.benchmark = dict(cpu_benchmark(self.capacity,benchmark_python,benchmark_env))
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
@@ -195,6 +203,7 @@ class Worker:
                 saved.update(status="interrupted", finished=time.time(), error="Worker stopped before completion")
                 atomic_json(path, saved)
             self.jobs[saved["id"]] = {"result": saved, "cancel": threading.Event(), "directory": path.parent}
+            self._clean_temp(self.jobs[saved['id']])
         self.asset_cache = AssetCache(self.root / 'assets')
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
@@ -475,7 +484,7 @@ class Worker:
             for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
                 if key not in task['env']:
                     environment[key] = str(task["cpus"])
-            temporary = directory / "tmp"
+            temporary = self._temporary(job)
             temporary.mkdir()
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
@@ -485,6 +494,7 @@ class Worker:
             if polling:callback={**self.callback,**callback}
             environment.update(REMOTE_COMPUTE_URL=callback.get('url',''),
                                REMOTE_COMPUTE_JOB_ID=callback.get('job_id',result['id']),
+                               REMOTE_COMPUTE_WORKER_JOB_ID=result['id'],
                                REMOTE_COMPUTE_TOKEN=callback.get('token',''),
                                REMOTE_COMPUTE_TIMEOUT=str(callback.get('timeout',10)),
                                REMOTE_COMPUTE_RESIZE='1' if callback.get('url') else '0',
@@ -587,16 +597,20 @@ class Worker:
         for error in self.asset_cache.prune(protected):
             self.activity.notify('资产缓存待清理 '+error, 'local')
 
+    def _temporary(self, job):
+        base=getattr(self,'temp_root',None)
+        return base/job['result']['id'] if base else job['directory']/'tmp'
+
     def _clean_temp(self, job):
         """Process TEMP is scratch; keep result inputs/outputs until collection."""
-        temporary=job['directory']/'tmp'
         issue=None
-        try:
-            shutil.rmtree(temporary)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            issue=str(error)
+        for temporary in {self._temporary(job),job['directory']/'tmp'}:
+            try:
+                shutil.rmtree(temporary)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                issue=str(error)
         with self.condition:
             if issue:
                 job['result']['cleanup_error']=issue

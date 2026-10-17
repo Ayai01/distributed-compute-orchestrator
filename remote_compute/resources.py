@@ -19,12 +19,12 @@ _sensor_started = False
 
 
 @lru_cache(maxsize=None)
-def cpu_benchmark(cpus):
+def cpu_benchmark(cpus, executable=None, environment=()):
     """Measure a fixed circuit/RTL/scientific mix at the worker CPU budget."""
     if type(cpus) is not int or cpus < 1:
         raise ValueError('Benchmark cpus must be a positive integer')
     from .benchmark import measure
-    return measure(cpus)
+    return measure(cpus,executable=executable,environment=environment) if executable or environment else measure(cpus)
 
 
 def _sensors():
@@ -145,16 +145,11 @@ def process_usage(process):
     """Sum the owned job/process group; CPU time includes completed Windows children."""
     if os.name != "nt":
         rss, seconds = 0, 0.0
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                parts = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if int(parts[2]) == process.child.pid:  # pgrp, after removing pid/comm
-                    seconds += (int(parts[11]) + int(parts[12])) / os.sysconf("SC_CLK_TCK")
-                    rss += int(parts[21]) * os.sysconf("SC_PAGE_SIZE")
-            except (OSError, ValueError, IndexError):
-                continue  # a child exited between enumeration and observation
+        totals=process.__dict__.setdefault('_posix_cpu',{})
+        for pid,parts in process._posix_members().items():
+            totals[(pid,parts[19])]=(int(parts[11])+int(parts[12]))/os.sysconf('SC_CLK_TCK')
+            rss+=int(parts[21])*os.sysconf('SC_PAGE_SIZE')
+        seconds=sum(totals.values())
         return {"rss_mb": rss / MIB, "cpu_seconds": seconds}
 
     from ctypes import wintypes as w

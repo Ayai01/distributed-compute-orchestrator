@@ -12,6 +12,10 @@
 
 自动线程任务按每台候选节点的实际容量计算所需线程；较大节点忙碌时，可在空闲的小节点取得相应授予，不为等待较大节点留下整台机器空闲。
 
+调用工程仅连接中心，以`health(brief=True)`识别中心和协议能力，通过`admission`/`window`按requires声明工具及实验环境。`capable_cpus`是匹配能力的在线预算（0表示暂无供给），`target_cpus`是当前工程份额；查询不登记活跃需求。`tool_sha256`给出同时匹配requires的工具SHA集合，不含路径或设备拓扑，供原有数值缓存识别引擎。工程不枚举nodes或绑定设备名，设备配置与选择由中心管理，完成回执保留执行来源用于溯源。
+
+中心声明`admission_job`时，`admission(project, job_id=原任务ID)`返回该任务的`recommended_cpus`、`current_cpus`、`current_memory_mb`和`available_memory_mb`，供阶段边界先判断是否值得调整工作池。此查询不改变授权；需要调整时排空当前池，再调用`resize`并按实际回执建池。运行中的worker任务通过同一lease通路查询。
+
 `queue_ratio`（默认 1.0）控制提前排队比例。`Client.admission()` 返回当前窗口及 `max_in_flight` 安全上界；`Client.window()` 每秒至多刷新一次当前份额和上界，节点新增、能力登记和预算变化都会反映到窗口：
 
 ```text
@@ -55,9 +59,9 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 中心 `/health.capabilities` 包含 `single_thread_weight` 时，适配器可传此字段；旧中心省略它。普通默认1任务保持原请求格式；中心保留偏好元数据，并在派发时移除该中心提示，已有worker无需重启即可执行。启动原生估算的单线程结果位于 `benchmark.single`，使用同一混合工作单位；CLI以“单/总 Miter/s”展示。
 
-跨网络或 SSH 转发的节点可设置 `callback_url`，表示从该 worker 看见的中心地址，供任务通过原 ID 借还 CPU/RAM；空值保持局域网自动推导。节点 `url` 是中心访问 worker 的地址，两者按各自方向配置。可用 `center.control(add={"name": "compute-linux", "url": "http://127.0.0.1:26134", "token": worker_token, "callback_url": "http://127.0.0.1:26134"})` 动态加入，或用 `control(node=名字, routing={"callback_url": 地址})` 在线调整。节点配置保存在本机 `nodes.local.json`，令牌不放入聊天或 Git；保存节点时保留已有本机令牌。
+中心直接连接设备IP的26133端口；HTTPS节点同时配置`ca_file`。worker通过本地lease接口提交CPU/RAM请求，由中心现有连接取回并授权，无需worker反向访问中心。可用`center.control(add={"name":"compute-linux","url":"https://203.0.113.42:26133","token":worker_token,"ca_file":"worker.crt"})`加入。节点配置和令牌保存在本机`nodes.local.json`，不放入聊天或Git；`callback_url`仅保留旧客户端兼容。
 
-节点 `timeout` 默认10秒；带宽较低的跨网隧道传模型/PDK时，可在该节点配置中设置120，或通过 `control(node=名字,routing={"timeout":120})` 在线调整。该值用于节点连接和任务返回中心的控制回调；任务中的 SDK 默认客户端通过 `REMOTE_COMPUTE_TIMEOUT` 继承它，显式指定超时的客户端与其他地址保持原设置。计算任务的执行时限仍由task.timeout控制。
+节点`timeout`默认10秒，跨网慢连接可通过`control(node=名字,routing={"timeout":120})`在线调整。任务SDK通过`REMOTE_COMPUTE_TIMEOUT`继承连接时限，显式指定超时的客户端保持原设置；计算执行时限仍由`task.timeout`控制。
 
 同一任务的资源调整串行处理，网络调用不持有中心或资源池的全局锁。增加的CPU/RAM先占额度，缩减的额度等worker确认后归还；实际授权未变化时直接返回。回执丢失后查询原任务，暂时无法确认的增加额度继续保留，直到下次确认或任务正常结束，避免重复分配和退出泄漏。
 
@@ -65,7 +69,7 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 RAM随并发线性增长时，使用 `client.resize(id, 0, base_memory_mb=1024, memory_per_cpu_mb=512, memory_limit_mb=8192)`；这表示下一阶段的基座+每CPU需求，中心结合当前CPU/RAM和可选RAM上限，一次返回匹配的授权。系数模式与固定总量`memory_mb`互斥；`resize_memory_model`能力表示支持。SDK面对缺少能力的旧中心保留当前授权并返回`supported=False`，调用工程按旧路径运行。同步内核完成后可归还资源，异步在途工作继续使用已有授权，只在自然收齐边界更新，不强制排空来改变算法执行次序。
 
-隧道节点可在`nodes.local.json`或`control(node=名字,routing={"host_ip":"203.0.113.42"})`设置实际展示IP；它不修改连接URL和回调URL。未配置IP的显式回环隧道显示“隧道”，避免把外网设备显示为本机。
+设备地址显示实际节点URL的IP，`local://`私有worker显示本机。可通过`control(node=名字,routing={"host_ip":"203.0.113.42"})`补充展示IP；它不改变连接地址。
 
 worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 
@@ -250,3 +254,5 @@ python main.py --test-native
 随后使用正式 Class-AB 模型核对两台实际设备：ZDT1 全字段逐位一致；Class-AB 的制造设计、前沿索引、128 次预算、可行性与完整性掩码一致。Aya1-TX 的 float64 目标、约束、物理指标最大绝对差分别为 2.29e-10、3.29e-8、5.92e-7，原始浮点值保留。24+30 预算下的另一次 90 秒提交检查完成 AOP 256 个角点、RGCN 216 个候选、ARH 6 轮，峰值 54/54；18,764 个原结果/报告文件未变。CLI 实时帧在两端各检查 90 帧，覆盖 44–140 列和 24–48 行，92 字符原始标签通过缩写与明细完整保留。
 
 工具参数：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。
+
+原生HTTPS worker支持单向资源协商：任务访问本机lease接口，中心按节点合并轮询待处理请求。存在此类在途任务时约每0.2秒检查一次，空闲节点沿用常规采样周期，避免每任务各建高频轮询连接。网络短暂中断保留原授权。

@@ -364,7 +364,7 @@ class CenterTests(unittest.TestCase):
                     self.assertEqual(grant['callback_timeout'],120)
                     self.assertEqual(client.nodes()['nodes'][0]['callback_url'],callback)
                     client.control(node='tunnel',routing={'callback_url':''})
-                    self.assertEqual(state._callback(pool.nodes[0])['url'],'http://127.0.0.1:1')
+                    self.assertEqual(state._callback(pool.nodes[0])['mode'],'poll')
                 finally:
                     reverse.shutdown();thread.join();reverse.server_close()
 

@@ -97,16 +97,16 @@ def terminate(pids, *, admin=False):
     print((result.stdout or '已结束端口占用进程。').strip())
 
 
-def resolve(host, port, *, policy='ask', token='', reuse_role=None):
+def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None, tls=False):
     """Return a reusable local service URL, or None when the port is free."""
     if available(host, port):
         return None
     local_host = '127.0.0.1' if host in {'0.0.0.0', ''} else '::1' if host == '::' else host
-    url = f"http://{'[' + local_host + ']' if ':' in local_host else local_host}:{port}"
+    url = f"{'https' if tls else 'http'}://{'[' + local_host + ']' if ':' in local_host else local_host}:{port}"
     reusable = False
     if reuse_role:
         try:
-            reusable = Client(url, token, timeout=1).health().get('role') == reuse_role
+            reusable = Client(url, token, timeout=1,ca_file=ca_file).health().get('role') == reuse_role
         except RemoteError:
             pass
     print(f'端口冲突：{host}:{port}')

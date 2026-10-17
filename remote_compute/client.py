@@ -204,18 +204,23 @@ class Client:
             request.update(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
         action='lease' if (os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
                            and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/')) else 'resize'
-        return self.request('/jobs/'+identity+'/'+action, request)
+        target=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',identity) if action=='lease' else identity
+        return self.request('/jobs/'+target+'/'+action, request)
 
     def nodes(self):
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,cpus=cpus,requires=list(requires))
         if node:
             request['node']=node
         if max_cpus is not None:
             request['max_cpus'] = max_cpus
+        if job_id is not None:request['job_id']=job_id
+        if os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'):
+            identity=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',os.environ['REMOTE_COMPUTE_JOB_ID'])
+            return self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission'))
         return self.request('/admission',request)
 
     def window(self, project, **options):
@@ -332,6 +337,7 @@ class Node:
     live_jobs: set = field(default_factory=set)
     callback_url: str = ""
     host_ip: str = ""
+    aliases: list = field(default_factory=list)
 
     @property
     def capacity(self):
@@ -363,7 +369,8 @@ class Pool:
         self.refresh_lock = threading.Lock()
         self.nodes = []
         self.policy = policy
-        self.refresh_seconds = refresh
+        self.sample_seconds = refresh
+        self.refresh_seconds = min(refresh,.2)
         self.closed = False
         self.rotation = 0
         self.active = {}
@@ -399,6 +406,9 @@ class Pool:
             raise ValueError('Node host_ip must be an IP address or empty')
         if address:
             ipaddress.ip_address(address)
+        aliases=getattr(node,'aliases',[])
+        if not isinstance(aliases,list) or any(not isinstance(alias,str) or not alias for alias in aliases):
+            raise ValueError('Node aliases must be a list of previous node names')
         if (not isinstance(node.weight, (int, float)) or not 0 < node.weight < float("inf")
                 or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)
                 or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
@@ -409,13 +419,17 @@ class Pool:
                 or urlsplit(callback).query or urlsplit(callback).fragment)):
             raise ValueError('Node callback_url must be an HTTP(S) base URL or empty for automatic routing')
 
-    def refresh(self):
+    def refresh(self, *, monitor=False):
+        monitor=monitor or threading.current_thread() is getattr(self,'monitor',None)
         def probe(node):
+            interval=min(self.sample_seconds,.2) if node.live_jobs and 'lease_polling' in node.health.get('capabilities',[]) else self.sample_seconds
+            if monitor and time.monotonic()-getattr(node,'sampled_at',0)<interval:return
             try:
                 value, error = node.client.health(), ""
             except RemoteError as exc:
                 value, error = {}, str(exc)
             with self.condition:
+                node.sampled_at=time.monotonic()
                 node.error = error
                 if error:
                     self.condition.notify_all()
@@ -440,7 +454,7 @@ class Pool:
 
     def _monitor(self):
         while not self.stop_event.wait(self.refresh_seconds):
-            self.refresh()
+            self.refresh(monitor=True)
 
     def configure(self, name=None, *, policy=None, **changes):
         with self.condition:
@@ -450,8 +464,8 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url", "timeout", "host_ip"}:
-                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url, timeout, host_ip")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url", "timeout", "host_ip", "url", "ca_file", "aliases"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url, timeout, host_ip, url, ca_file, aliases")
                 timeout=changes.pop('timeout',None)
                 if timeout is not None and (isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not 0<timeout<float('inf')):
                     raise ValueError('Node timeout must be positive and finite')
@@ -459,17 +473,28 @@ class Pool:
                     key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled", "memory_limit_mb")})
                 proposed.callback_url = changes.get('callback_url', getattr(node, 'callback_url', ''))
                 proposed.host_ip = changes.get('host_ip', getattr(node, 'host_ip', ''))
+                proposed.aliases = changes.get('aliases',getattr(node,'aliases',[]))
                 self._validate_node(proposed)
+                address=changes.pop('url',node.client.url)
+                ca_file=changes.pop('ca_file',getattr(node.client,'ca_file',None))
+                if not isinstance(address,str) or urlsplit(address).scheme not in {'http','https','local'}:
+                    raise ValueError('Node URL must use HTTP(S) or the private local endpoint')
+                if any(other is not node and other.client.url==address.rstrip('/') for other in self.nodes):
+                    raise ValueError('Configure each worker URL once')
+                if address.rstrip('/')!=node.client.url or ca_file!=getattr(node.client,'ca_file',None):
+                    node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file)
+                    node.error='Node address changed; checking worker'
                 for key, value in changes.items():
                     setattr(node, key, value)
                 if timeout is not None:
                     node.client.timeout=timeout
             self.condition.notify_all()
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url="", timeout=10, host_ip=""):
-        node = Node(name, Client(url, token,timeout=timeout), weight=weight, limit=limit)
+    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url="", timeout=10, host_ip="", ca_file=None, aliases=None):
+        node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file), weight=weight, limit=limit)
         node.callback_url = callback_url
         node.host_ip = host_ip
+        node.aliases=[] if aliases is None else aliases
         self._validate_node(node)
         with self.condition:
             if any(n.name == name or n.client.url == node.client.url for n in self.nodes):
@@ -586,14 +611,14 @@ class Pool:
     def _speed_priors(self, nodes, single_thread_weight):
         """A neutral hint balances serial latency and aggregate throughput."""
         benchmarks = [n.health.get('benchmark') or {} for n in nodes]
-        valid = lambda b: (b.get('name')=='numpy-mixed-v2' and b.get('unit')=='Miter/s'
+        valid = lambda b: (b.get('name') in {'numpy-mixed-v2','numpy-mixed-v3'} and b.get('unit')=='Miter/s'
                            and b.get('score',0)>0 and b.get('threads',0)>0)
         # Incomparable/missing aggregate measurements use configured slot counts.
         # Hash/legacy scores are never treated as native mixed throughput.
         bulk = ([b['score']*n.capacity/b['threads'] for n,b in zip(nodes,benchmarks)]
-                if all(valid(b) for b in benchmarks) else [n.capacity for n in nodes])
+                if all(valid(b) for b in benchmarks) and len({b.get('name') for b in benchmarks})==1 else [n.capacity for n in nodes])
         singles = [b.get('single') or {} for b in benchmarks]
-        serial = [b['score'] for b in singles] if all(valid(b) for b in singles) else [1.0]*len(nodes)
+        serial = [b['score'] for b in singles] if all(valid(b) for b in singles) and len({b.get('name') for b in singles})==1 else [1.0]*len(nodes)
         bulk_mean,serial_mean = sum(bulk)/len(nodes),sum(serial)/len(nodes)
         serial_fraction = single_thread_weight/(1.0+single_thread_weight)
         return {n.name:1/((total/bulk_mean)**(1-serial_fraction)*(single/serial_mean)**serial_fraction)
@@ -609,7 +634,7 @@ class Pool:
         committed = sum(n.reserved + n.external for n in siblings)
         # The sample already includes running work. Replace its reported grants
         # with today's ledger, including dispatches and resizes not sampled yet.
-        return (max(0, sampled - reported) + committed + cpus) / logical
+        return (max(0, sampled + committed - reported) + cpus) / logical
 
     def _host_memory_free(self, node):
         machine = node.health.get("machine_id", node.client.url)

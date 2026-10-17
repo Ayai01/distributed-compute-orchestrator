@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import os
+from pathlib import Path
 import signal
 import subprocess
 import time
@@ -131,6 +132,33 @@ class Process:
                 raise c.WinError(c.get_last_error())
             count=max(count*2,c.c_uint32.from_buffer(buffer).value)
 
+    def _posix_members(self):
+        """Keep ancestry and birth times, including children that call setsid."""
+        rows={}
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():continue
+            try:rows[int(entry.name)]=(entry/'stat').read_text().rsplit(')',1)[1].split()
+            except (OSError,ValueError):continue
+        known=self.__dict__.setdefault('_posix_known',{})
+        owned={pid for pid,born in known.items() if pid in rows and rows[pid][19]==born}
+        if self.child.pid in rows and (self.child.pid not in known or self.child.pid in owned):owned.add(self.child.pid)
+        while True:
+            children={pid for pid,parts in rows.items() if int(parts[1]) in owned or int(parts[2])==self.child.pid}
+            if children<=owned:break
+            owned.update(children)
+        for pid in owned:known[pid]=rows[pid][19]
+        return {pid:rows[pid] for pid in owned}
+
+    def _stop_posix(self):
+        members=self._posix_members()
+        for pid in members:
+            try:os.kill(pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+        deadline=time.monotonic()+5
+        while any(parts[0]!='Z' for parts in self._posix_members().values()):
+            if time.monotonic()>=deadline:raise RuntimeError('Cancelled child process did not finish exiting')
+            time.sleep(.01)
+
     def stop(self):
         handles=self._process_handles() if os.name=='nt' and self.job else []
         try:
@@ -144,10 +172,7 @@ class Process:
             if self.job:
                 self.kernel.TerminateJobObject(self.job, 1)
         else:
-            try:
-                os.killpg(self.child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self._stop_posix()
         self.child.wait()
         if os.name == 'nt' and self.job:
             # TerminateJobObject starts termination of the whole tree. Wait for
@@ -174,7 +199,4 @@ class Process:
             self.kernel.CloseHandle(self.job)
             self.job = None
         elif os.name != "nt":
-            try:
-                os.killpg(self.child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self._stop_posix()
