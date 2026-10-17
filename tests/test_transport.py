@@ -60,9 +60,35 @@ class TransportTests(unittest.TestCase):
                     time.sleep(.02)
             client.timeout=.1
             started=time.monotonic()
-            with patch.object(Handler,'_reply',reply):result=client.fetch(identity)
+            with patch.object(Handler,'_reply',reply):
+                raw=client.request('/jobs/'+identity+'/artifacts',binary=True)
             self.assertGreater(time.monotonic()-started,client.timeout)
-            self.assertEqual(len(result['files']['out.bin']),100000)
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                self.assertEqual(len(archive.read('files/out.bin')),100000)
+            client.delete(identity)
+
+    def test_fetch_waits_for_remote_headers_without_delaying_status(self):
+        with scratch() as root,provider(Path(root)/'worker') as (_,client):
+            identity=client.submit(python('pass'))['id'];client.wait(identity)
+            entered,release=threading.Event(),threading.Event()
+            original=Handler._reply;downloads=[]
+            def delayed(handler,value,status=200):
+                if isinstance(value,bytes):
+                    downloads.append(handler.path);entered.set();release.wait(2)
+                return original(handler,value,status)
+            client.timeout=.05
+            with patch.object(Handler,'_reply',delayed),ThreadPoolExecutor(max_workers=1) as executor:
+                result=executor.submit(client.fetch,identity)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    time.sleep(.1)  # Header wait exceeds the status timeout.
+                    self.assertEqual(client.health(brief=True)['role'],'worker')
+                    self.assertFalse(result.done())
+                finally:
+                    release.set()
+                self.assertEqual(result.result(timeout=2)['status'],'succeeded')
+            self.assertEqual(len(downloads),1)
 
     def test_idle_keep_alive_is_reclaimed_and_the_same_client_reconnects(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client),patch.object(Handler,'idle_timeout',.05):

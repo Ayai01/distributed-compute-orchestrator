@@ -45,9 +45,10 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     if not legacy:
         plan={
             'allocation':{'':('plan_resize','weighted_node_threads')},
-            'client':{'Client':('request','_request','health','status')},
+            'client':{'Client':('request','_request','health','status','fetch')},
             'worker':{'Handler':('handle_one_request','_connected','_reply','_handle')},
             'coordinator':{'Coordinator':('admission','project_resources','resize','artifacts','delete')},
+            'view':{'':('_device_address',)},
         }
     prepared=[]
     for name,classes in plan.items():

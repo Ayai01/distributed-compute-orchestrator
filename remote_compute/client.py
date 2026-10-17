@@ -256,7 +256,15 @@ class Client:
             time.sleep(poll)
 
     def fetch(self, identity, output_dir=None, *, delete=True):
-        raw = self.request("/jobs/" + identity + "/artifacts", binary=True)
+        # A center may first need to retrieve the complete remote ZIP. Keep
+        # that header wait and its connections separate from status/control.
+        backend=self
+        if self.endpoint.scheme in {'http','https'}:
+            backend=self.__dict__.get('_result_client')
+            if backend is None:
+                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout)))
+            backend.timeout=max(120,self.timeout)
+        raw = backend.request("/jobs/" + identity + "/artifacts", binary=True)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             result = json.loads(archive.read("result.json"))
             result["files"] = {name[6:]: archive.read(name) for name in archive.namelist() if name.startswith("files/")}
