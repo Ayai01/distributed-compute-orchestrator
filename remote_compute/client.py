@@ -117,7 +117,7 @@ class Client:
     def resize(self, identity, cpus, *, memory_mb=None):
         """Borrow/return resources at a safe boundary; use the actual returned grant."""
         if memory_mb is not None:
-            if self._capabilities is None:
+            if getattr(self, '_capabilities', None) is None:
                 self.health()
             if 'resize_memory' not in self._capabilities:
                 state=self.status(identity,brief=True)

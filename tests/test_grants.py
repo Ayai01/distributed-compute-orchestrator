@@ -53,6 +53,7 @@ class GrantTests(unittest.TestCase):
                 with patch.object(pool.nodes[0].client,'resize',side_effect=rejected_by_worker):
                     with self.assertRaises(RemoteError):client.resize(first,4,memory_mb=192)
                 self.assertEqual(client.health()['projects']['default']['demand'],before)
+                del client._capabilities  # A client created before the in-process update.
                 grant=client.resize(first,1,memory_mb=96)
                 self.assertEqual((grant['cpus'],grant['memory_mb']),(1,96))
                 pool.refresh()
