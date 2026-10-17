@@ -39,7 +39,7 @@ def display(value):
 def table(rows, columns):
     from .view import _width, _cell, wrap_lines
     names=dict(name='设备',node='设备',capacity='预算',used_cpus='分配',cpu_percent='CPU%',
-               memory_available_mb='可用MiB',memory_reserved_mb='预留MiB',memory_mb='内存MiB',
+               memory_available_mb='可用RAM',memory_reserved_mb='预留RAM',memory_mb='RAM',
                weight='权重',enabled='启用',paused='暂停',status='状态',cpus='线程',label='标签',id='ID')
     headers=[names.get(key,key) for key in columns]
     rows = [[str(row.get(key, "")) for key in columns] for row in rows]

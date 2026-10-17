@@ -156,7 +156,7 @@ class StatusRows(list):
         value,width=self.value,self.width
         center=value.get('role')=='scheduler'
         self.title=f"{ABBREVIATION} | {value.get('node','')} | {'调度中心' if center else '算力提供者'}"
-        self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | 预留 {_gb(value.get('memory_reserved_mb'))} GiB"
+        self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
@@ -172,7 +172,10 @@ class StatusRows(list):
             external=[ip for ip in peers if ip not in ('local','127.0.0.1','::1')]
             peers=', '.join(external or ['本机' if ip in ('local','127.0.0.1','::1') else ip for ip in peers]) or '-'
             benchmark=node.get('benchmark') or {}
-            score=f"{benchmark['score']:.1f}" if benchmark.get('score') is not None else '待测'
+            measured=benchmark.get('score')
+            if measured is not None and benchmark.get('unit','kiter/s')=='kiter/s':
+                measured/=1000
+            score=f"{measured:.1f}" if measured is not None else '待测'
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
@@ -192,11 +195,11 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','线程(总)','CPU','kiter/s(T)','内存GiB','可配','RSS/预留','设备IP'],
+            table=_table(['设备','线程(总)','CPU','Miter/s(T)','RAM','可配','RSS/预留','设备IP'],
                          [[*r[:3],f'{r[7]}({r[8]})' if r[8]!='-' else r[7],*r[3:6],r[9]] for r in records],
                          [7,10,6,11,10,5,9,None],width,right=(1,2,3,4,5,6))
         elif width>=54:
-            table=_table(['设备','线程(总)','CPU','内存GiB','可配'],[r[:5] for r in records],
+            table=_table(['设备','线程(总)','CPU','RAM','可配'],[r[:5] for r in records],
                          [7,10,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
@@ -205,16 +208,16 @@ class StatusRows(list):
                 table.append(_line(r[0]+': '+node['error'],width))
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
-        sections=[('设备资源',table,0)]
+        sections=[('设备资源 | RAM GiB',table,0)]
         if width<100:
             if width>=54:
-                details=_table(['设备','kiter/s(T)','RSS/预留','设备IP'],
+                details=_table(['设备','Miter/s(T)','RSS/预留','设备IP'],
                                [[r[0],f'{r[7]}({r[8]})',r[5],r[9]] for r in records],
                                [7,12,9,None],width,right=(1,2))
             else:
-                details=[_line(f'{r[0]} {r[7]} kiter/s ({r[8]})',width) for r in records]
+                details=[_line(f'{r[0]} {r[7]} Miter/s ({r[8]})',width) for r in records]
                 details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
-            sections.append(('启动算力 kiter/s | RSS/预留 GiB',details,1))
+            sections.append(('启动基准 Miter/s | RSS/预留 GiB',details,1))
         if self.value.get('role')=='scheduler':
             if width>=42:
                 table=_table(['工程','权重','任务/线程','目标','排队'],self.projects,
@@ -236,7 +239,7 @@ class StatusRows(list):
         if limit is not None and sum(1+len(s[1]) for s in selected)+int(bottom)>limit:
             # Short windows keep every device and a compact quota summary.
             result=[_rule('设备资源',width)]
-            result.extend(_line(f'{r[0]} {r[1]} CPU {r[2]} 内存{r[3]}',width) for _,r in self.devices)
+            result.extend(_line(f'{r[0]} {r[1]} CPU {r[2]} RAM {r[3]}',width) for _,r in self.devices)
             if self.value.get('role')=='scheduler':
                 result.extend([_rule('工程份额',width),_line(' | '.join(f'{r[0]} {r[2]}/{r[3]}'
                                for r in self.projects) or '等待工程任务',width)])
@@ -256,7 +259,7 @@ class StatusRows(list):
         self.task_page%=self.page_count
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         if width>=70:
-            table=_table(['ID','设备','工程','任务/线程','GiB','状态','标签'],records,
+            table=_table(['ID','设备','工程','任务/线程','RAM','状态','标签'],records,
                          [4,7,6,9,4,4,None],width,right=(3,4))
         elif width>=42:
             table=_table(['ID','设备','任务/线程','标签'],[[r[i] for i in (0,1,3,6)] for r in records],

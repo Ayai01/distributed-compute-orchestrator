@@ -45,7 +45,7 @@ def cpu_benchmark(cpus):
         samples=list(executor.map(measure,range(cpus)))
     iterations=sum(count for count,_ in samples)
     elapsed=max(finished for _,finished in samples)-started
-    return dict(name='pbkdf2-sha256-v1',score=round(iterations/elapsed/1000,1),unit='kiter/s',
+    return dict(name='pbkdf2-sha256-v1',score=round(iterations/elapsed/1000000,3),unit='Miter/s',
                 threads=cpus,seconds=round(elapsed,3),iterations=iterations,openssl=ssl.OPENSSL_VERSION)
 
 

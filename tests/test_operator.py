@@ -81,7 +81,7 @@ print(Path('control.json').read_text(),flush=True)
         text = '\n'.join(format_status(dict(node='Aya1-TX', role='worker', cpus=31, used_cpus=3,
                     logical_cpus=32, cpu_percent=40, memory_total_mb=32768, host_memory_available_mb=16000,
                     memory_available_mb=15000, temperature_c=52, tags=['ngspice'], **snapshot)))
-        for expected in ('Aya1-TX', '3/31', '32', '192.168.1.6', 'ngspice', '内存'):
+        for expected in ('Aya1-TX', '3/31', '32', '192.168.1.6', 'ngspice', 'RAM'):
             self.assertIn(expected, text)
         self.assertNotIn('温度',text)
 

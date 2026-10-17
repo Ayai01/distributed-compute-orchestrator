@@ -388,7 +388,9 @@ class Pool:
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 
-    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=False, job_id=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, reservations=None):
+        # A dispatcher already running older bytecode may still pass reservations.
+        # They no longer reserve CPUs across projects.
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")

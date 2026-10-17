@@ -18,9 +18,9 @@ class BenchmarkTests(unittest.TestCase):
         self.assertGreaterEqual(result['seconds'],2.0)
         self.assertLess(time.perf_counter()-started,6.0)
         self.assertEqual(result['threads'],2)
-        self.assertEqual(result['unit'],'kiter/s')
+        self.assertEqual(result['unit'],'Miter/s')
         self.assertGreater(result['iterations'],0)
-        self.assertAlmostEqual(result['score'],result['iterations']/result['seconds']/1000,delta=result['score']*.001)
+        self.assertAlmostEqual(result['score'],result['iterations']/result['seconds']/1000000,delta=result['score']*.001)
         with patch('remote_compute.resources.hashlib.pbkdf2_hmac') as kernel:
             self.assertIs(cpu_benchmark(2),result)
         kernel.assert_not_called()
@@ -36,7 +36,7 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertEqual(pool.snapshot()['nodes'][0]['benchmark'],baseline)
                 for width in (80,110,160):
                     text='\n'.join(format_status(client.health(),width=width))
-                    self.assertIn('kiter/s',text)
+                    self.assertIn('Miter/s',text)
                     if width>=100:
                         self.assertIn(f'({budget})',text)
 
