@@ -513,7 +513,10 @@ class Worker:
             job['result'].pop('input_cleanup_error', None)
 
     def _prune_assets(self):
-        protected = set()
+        # A check/upload and the following submit are separate LAN requests.
+        # Keep their short handoff intact even if active assets exceed the LRU target.
+        now = time.time()
+        protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if now-used<5}
         for job in self.jobs.values():
             protected.update(job['result'].get('assets', {}).values())
         for error in self.asset_cache.prune(protected):

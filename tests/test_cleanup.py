@@ -2,7 +2,9 @@
 
 from pathlib import Path
 import os
+import time
 import unittest
+from unittest.mock import patch
 
 from remote_compute import Pool
 from test_center import center
@@ -58,7 +60,8 @@ class CleanupTests(unittest.TestCase):
                 two=client.submit(task(second))['id'];client.wait(two)
                 self.assertTrue((worker.root/'assets'/first).exists())
                 self.assertTrue((worker.root/'assets'/second).exists())
-                client.fetch(two)
+                with patch('remote_compute.worker.time.time',return_value=time.time()+6):
+                    client.fetch(two)
                 self.assertTrue((worker.root/'assets'/first).exists())
                 self.assertFalse((worker.root/'assets'/second).exists())
                 client.fetch(one)
@@ -70,7 +73,26 @@ class CleanupTests(unittest.TestCase):
                 restored=client.run(task(second))
                 self.assertEqual(restored['status'],'succeeded',restored)
                 self.assertEqual(restored['stdout'].strip(),'b'*80)
+                with patch('remote_compute.worker.time.time',return_value=time.time()+6),worker.condition:
+                    worker._prune_assets()
                 self.assertLessEqual(worker.asset_cache.snapshot()['bytes'],100)
+
+    def test_recent_asset_survives_collection_between_upload_and_submit(self):
+        with scratch() as directory, provider(Path(directory)/'worker',cpus=2) as (worker,client):
+            worker.asset_cache.limit=100
+            active=client.sync_files({'data':b'a'*160})
+            first=client.submit(python("import time;time.sleep(20)",assets={'data':active}))['id']
+            until(lambda:client.status(first)['status']=='running')
+            incoming=client.sync_files({'data':b'b'*80})
+            with worker.condition:worker._prune_assets()
+            self.assertTrue((worker.root/'assets'/incoming).exists())
+            result=client.run(python("from pathlib import Path;print(Path(r'${asset:data}/data').read_text())",assets={'data':incoming}))
+            self.assertEqual(result['stdout'].strip(),'b'*80)
+            with patch('remote_compute.worker.time.time',return_value=time.time()+6),worker.condition:
+                worker._prune_assets()
+            self.assertFalse((worker.root/'assets'/incoming).exists())
+            self.assertTrue((worker.root/'assets'/active).exists())
+            client.cancel(first);client.wait(first);client.fetch(first)
 
 
 if __name__=='__main__':
