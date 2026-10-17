@@ -5,7 +5,27 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import threading
 import time
+
+
+_proc_lock = threading.Lock()
+_proc_sample = (0.0, {})
+
+
+def _proc_rows(fresh=False):
+    """Share monitoring scans; termination always takes a fresh snapshot."""
+    global _proc_sample
+    with _proc_lock:
+        if not fresh and time.monotonic()-_proc_sample[0]<.25:
+            return _proc_sample[1]
+        rows={}
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():continue
+            try:rows[int(entry.name)]=(entry/'stat').read_text().rsplit(')',1)[1].split()
+            except (OSError,ValueError):continue
+        _proc_sample=(time.monotonic(),rows)
+        return rows
 
 
 @contextmanager
@@ -132,13 +152,9 @@ class Process:
                 raise c.WinError(c.get_last_error())
             count=max(count*2,c.c_uint32.from_buffer(buffer).value)
 
-    def _posix_members(self):
+    def _posix_members(self, *, fresh=True):
         """Keep ancestry and birth times, including children that call setsid."""
-        rows={}
-        for entry in Path('/proc').iterdir():
-            if not entry.name.isdigit():continue
-            try:rows[int(entry.name)]=(entry/'stat').read_text().rsplit(')',1)[1].split()
-            except (OSError,ValueError):continue
+        rows=_proc_rows(fresh)
         known=self.__dict__.setdefault('_posix_known',{})
         owned={pid for pid,born in known.items() if pid in rows and rows[pid][19]==born}
         if self.child.pid in rows and (self.child.pid not in known or self.child.pid in owned):owned.add(self.child.pid)

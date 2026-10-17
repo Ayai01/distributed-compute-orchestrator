@@ -95,9 +95,20 @@ def _ngspice(destination, temporary, source=None):
     spinit = destination/'share/ngspice/scripts/spinit'
     if spinit.is_file():
         text = spinit.read_text(encoding='utf-8-sig')
+        library = (destination/'lib/ngspice').resolve()
+        # ngspice 47 treats quotes in codemodel arguments as filename bytes.
+        # Use Windows' existing short path for installations containing spaces.
+        if os.name == 'nt' and any(c.isspace() for c in str(library)):
+            import ctypes
+            short = ctypes.create_unicode_buffer(32768)
+            size = ctypes.windll.kernel32.GetShortPathNameW(str(library), short, len(short))
+            if not size or any(c.isspace() for c in short.value):
+                raise ValueError('Install ngspice in a path without spaces; this volume has no usable short path')
+            library = Path(short.value)
         def relocate(match):
             name = match[2].strip().strip('"').replace('\\', '/').rsplit('/', 1)[-1]
-            return match[1]+'"'+(destination/'lib/ngspice'/name).as_posix()+'"'
+            return match[1]+(library/name).as_posix()
+        text = re.sub(r'(?m)^set num_threads\s*=.*$', 'set num_threads=1', text)
         spinit.write_text(re.sub(r'(?m)^(\s*(?:codemodel|osdi)\s+)([^\r\n]+)', relocate, text), encoding='utf8')
     version = _run([executable, '--version'], capture_output=True, text=True).stdout
     return executable, {'version':next((line.strip(' *') for line in version.splitlines() if 'ngspice-' in line), version.strip()),

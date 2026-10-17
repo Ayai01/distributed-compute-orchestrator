@@ -10,7 +10,7 @@ import time
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
-from .client import RemoteError
+from .client import PoolBusy, RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, validate_tool_constraints
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
@@ -368,7 +368,6 @@ class Coordinator:
         result = None;retry=False
         try:
             if not job.pop('reattach',False):
-                self._ensure_assets(node, task['assets'].values())
                 payload = (job['directory'] / 'request.zip').read_bytes()
                 if job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task or 'retries' in task:
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
@@ -383,15 +382,10 @@ class Coordinator:
                     payload = pack(files)
                 callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
                 if callback:callback={**callback,'job_id':job['result']['id']}
-                try:
-                    node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
-                except RemoteError as error:
-                    if getattr(error,'status_code',None) != 400 or 'Synchronize missing asset first:' not in str(error):
-                        raise
-                    # A worker may have reclaimed an idle cached asset after its last
-                    # health sample. No job was accepted: restore it and reuse this ID.
-                    self._ensure_assets(node, task['assets'].values(), force=True)
-                    node.client.submit_bundle(identity,payload,callback=callback) if callback else node.client.submit_bundle(identity,payload)
+                if not self._submit(job, identity, payload, callback):
+                    result=dict(status='cancelled',finished=time.time())
+                    with self.condition:self._update(job,result)
+                    return
             cancel_sent=False
             while True:
                 try:
@@ -449,6 +443,24 @@ class Coordinator:
                 self.threads.discard(threading.current_thread())
                 if retry and not self.stopping and not job['cancel'].is_set():self._retry(job,result)
                 self.condition.notify_all()
+
+    def _submit(self, job, identity, payload, callback):
+        node, force = job['node'], False
+        while True:
+            try:
+                self._ensure_assets(node, job['task']['assets'].values(), force=force)
+                node.client.submit_bundle(identity,payload,**({'callback':callback} if callback else {}))
+                return True
+            except PoolBusy as error:
+                # Nothing was sent. Keep the same reservation and ID while the
+                # local transport queue drains, rather than ending the task.
+                if self.stopping:raise
+                with self.condition:job['result']['connection_error']=str(error)
+                if job['cancel'].wait(.1):return False
+            except RemoteError as error:
+                if force or getattr(error,'status_code',None)!=400 or 'Synchronize missing asset first:' not in str(error):
+                    raise
+                force=True
 
     def _retry(self, job, outcome):
         job['result'].update(status='interrupted',error=outcome.get('error','Worker stopped'),finished=outcome.get('finished',time.time()))

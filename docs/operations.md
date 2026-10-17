@@ -93,9 +93,11 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 }
 ```
 
-`--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听 `0.0.0.0:26133`，以便远端任务回调中心申请/归还线程，CLI 仍用本机127.0.0.1地址。`--host 127.0.0.1` 可限定回环；此时远端任务保持静态授予。本机 worker 始终为进程内私有调用。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
+`--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听 `0.0.0.0:26133`，CLI 使用本机127.0.0.1地址。`--host 127.0.0.1` 可限定中心为本机入口；远端任务仍通过中心到worker的已有连接申请/归还线程。本机 worker 始终为进程内私有调用。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
 
 `temp_root`可将任务TMP与持久root分开：例如Linux使用现有`/run/user/1000/dco`，资产与回执继续保存在普通磁盘。DCO按worker目录身份和任务ID隔离TMP，成功、失败、取消和下次启动均回收已结束任务的临时物；调用工程只使用任务的TMPDIR，不另建无主内存目录。Linux进程统计与取消按子进程关系追踪，包括另建会话的原生仿真器。
+
+Linux监控在所有任务间共享250毫秒的进程表快照，取消操作始终重新读取。每个节点的8个HTTP连接按请求进入顺序分配；连接槽等待超时属于本地背压，首次派发保留原任务ID和资源授权继续等待，用户可取消，不标成计算中断。
 
 `memory_mb` / `--memory-mb` 单位为 MiB；0 使用物理内存减去预留量。中心同时核对任务内存预留、实际进程树 RSS 和系统可用内存。同一设备的多个 worker 共用一份物理内存统计。任务默认预留 256 MiB；大任务由调用者声明所需内存。
 

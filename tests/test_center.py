@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
+from remote_compute.client import PoolBusy
 from remote_compute.coordinator import Coordinator
 from remote_compute.cli import SchedulerShell
 from remote_compute.worker import Conflict, Server
@@ -39,6 +40,32 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_submission_pool_backpressure_keeps_id_and_can_be_cancelled(self):
+        for cancel in (False,True):
+            with self.subTest(cancel=cancel),scratch() as root,provider(Path(root)/'worker') as (worker,remote):
+                original=remote.submit_bundle;calls=[];blocked=threading.Event()
+                def submit(identity,payload,**options):
+                    calls.append(identity)
+                    if cancel or len(calls)<=2:
+                        blocked.set()
+                        raise PoolBusy('local queue busy; nothing sent')
+                    return original(identity,payload,**options)
+                with Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client),patch.object(remote,'submit_bundle',side_effect=submit):
+                    identity=client.submit(python('print(42)'))['id']
+                    self.assertTrue(blocked.wait(2))
+                    self.assertNotIn(client.status(identity)['status'],('interrupted','failed'))
+                    self.assertEqual(pool.nodes[0].reserved,1)
+                    if cancel:client.cancel(identity)
+                    result=client.wait(identity)
+                    self.assertEqual(result['status'],'cancelled' if cancel else 'succeeded',result)
+                    self.assertEqual(set(calls),{identity})
+                    if cancel:
+                        self.assertNotIn(identity,worker.jobs)
+                        client.delete(identity)
+                    else:
+                        self.assertEqual(client.fetch(identity)['stdout'].strip(),'42')
+                    until(lambda:pool.nodes[0].reserved==0)
+
     def test_overlapping_node_sets_have_feasible_project_targets_and_admission(self):
         with scratch() as root,provider(Path(root)/'pc',cpus=2,tags=['windows_only']) as (_,pc), \
                 provider(Path(root)/'tx',cpus=6,tags=['windows_only']) as (_,tx), \

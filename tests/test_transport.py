@@ -9,12 +9,38 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool
+from remote_compute.client import PoolBusy, _ConnectionPool
 from remote_compute.worker import Handler
 from test_center import center
-from test_compute import provider, python, scratch
+from test_compute import provider, python, scratch, until
 
 
 class TransportTests(unittest.TestCase):
+    def test_connection_slots_are_fifo_and_timeout_never_sends_a_request(self):
+        pool=_ConnectionPool()
+        for _ in range(8):self.assertTrue(pool.acquire(0))
+        order=[]
+        def waiter(index):
+            self.assertTrue(pool.acquire(2))
+            order.append(index)
+            pool.release()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures=[]
+            for index in range(3):
+                futures.append(executor.submit(waiter,index))
+                until(lambda:len(pool.waiting)==index+1)
+            client=Client(timeout=.01);client._transport=pool
+            with patch.object(client,'_request') as request:
+                with self.assertRaises(PoolBusy):client.health()
+                request.assert_not_called()
+            pool.release()
+            for future in futures:future.result()
+        self.assertEqual(order,[0,1,2])
+        self.assertEqual(pool.available,1)
+        self.assertFalse(pool.waiting)
+        for _ in range(7):pool.release()
+        self.assertEqual(pool.available,8)
+
     def test_interrupted_binary_get_resumes_and_changed_or_legacy_payload_restarts(self):
         original=Handler._reply
         for mode in ('resume','changed','legacy'):

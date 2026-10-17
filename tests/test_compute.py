@@ -414,7 +414,9 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual({x["assigned_node"] for x in results}, {"node1", "node2"})
                 for result in results:
                     self.assertEqual(result["status"], "succeeded", result.get("stderr"))
+                    self.assertNotIn('Error opening code model', result.get('stderr',''))
                     log = result["files"]["ngspice.log"].decode()
+                    self.assertNotIn('Error opening code model', log)
                     value = float(re.search(r"vout_at\s*=\s*([\d.eE+-]+)", log)[1])
                     self.assertAlmostEqual(value, 1.2, places=6)
                 rtl = pool.run(verilator(["tb.sv"], "tb"), inputs=ROOT / "examples/rtl")

@@ -109,7 +109,7 @@ def process_usage(process):
     if os.name != "nt":
         rss, seconds = 0, 0.0
         totals=process.__dict__.setdefault('_posix_cpu',{})
-        for pid,parts in process._posix_members().items():
+        for pid,parts in process._posix_members(fresh=False).items():
             totals[(pid,parts[19])]=(int(parts[11])+int(parts[12]))/os.sysconf('SC_CLK_TCK')
             rss+=int(parts[21])*os.sysconf('SC_PAGE_SIZE')
         seconds=sum(totals.values())

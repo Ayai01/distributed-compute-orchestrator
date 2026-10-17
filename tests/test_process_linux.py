@@ -6,9 +6,28 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
+from remote_compute import process as process_module
 from remote_compute.process import Process
 from remote_compute.resources import process_usage
+from test_compute import scratch
+
+
+class ProcessSamplingTests(unittest.TestCase):
+    def test_monitoring_reuses_scan_but_termination_reads_fresh(self):
+        with scratch() as temporary:
+            root=Path(temporary);(root/'12').mkdir();stat=root/'12'/'stat'
+            stat.write_text('12 (example process) S 1 12')
+            with patch.object(process_module,'_proc_sample',(0.0,{})),patch.object(process_module,'Path',return_value=root),patch.object(process_module.time,'monotonic',return_value=100):
+                first=process_module._proc_rows()
+                stat.write_text('12 (example process) Z 1 12')
+                self.assertIs(process_module._proc_rows(),first)
+                self.assertEqual(first[12][0],'S')
+                self.assertEqual(process_module._proc_rows(fresh=True)[12][0],'Z')
+                stat.write_text('12 (example process) S 1 12')
+                with patch.object(process_module.time,'monotonic',return_value=100.3):
+                    self.assertEqual(process_module._proc_rows()[12][0],'S')
 
 
 @unittest.skipUnless(sys.platform=='linux','Linux process ancestry')

@@ -1,6 +1,6 @@
 """HTTP client and weighted, adaptive dispatch across independent workers."""
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
@@ -28,11 +28,39 @@ class RemoteError(RuntimeError):
     pass
 
 
+class PoolBusy(RemoteError):
+    """The local connection queue timed out before any request was sent."""
+
+
 class _ConnectionPool:
     def __init__(self):
         self.idle = []
         self.lock = threading.Lock()
-        self.slots = threading.BoundedSemaphore(8)
+        self.condition = threading.Condition()
+        self.available = 8
+        self.waiting = deque()
+
+    def acquire(self, timeout):
+        ticket = object()
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            self.waiting.append(ticket)
+            try:
+                while not self.available or self.waiting[0] is not ticket:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self.condition.wait(remaining)
+                self.available -= 1
+                return True
+            finally:
+                self.waiting.remove(ticket)
+                self.condition.notify_all()
+
+    def release(self):
+        with self.condition:
+            self.available += 1
+            self.condition.notify_all()
 
     def __del__(self):
         for connection in self.idle:
@@ -58,8 +86,8 @@ class Client:
         pool=self.__dict__.get('_transport')
         if pool is None:
             pool=self.__dict__.setdefault('_transport',_ConnectionPool())
-        if not pool.slots.acquire(timeout=self.timeout):
-            raise RemoteError(f'{self.url}{path}: connection pool is busy')
+        if not pool.acquire(self.timeout):
+            raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         # Old live instances may still own a per-thread cached connection.
         previous=getattr(self.connections,'connection',None)
         if previous is not None:previous.close()
@@ -78,7 +106,7 @@ class Client:
             self.connections.connection=None
             if connection is not None:
                 with pool.lock:pool.idle.append(connection)
-            pool.slots.release()
+            pool.release()
 
     def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
