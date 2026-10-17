@@ -117,11 +117,15 @@ class Coordinator:
                     active.setdefault(result['assigned_node'],[]).append(item)
             for node in snapshot['nodes']:
                 external, remaining = [], node['external_cpus']
+                sampled={item['id']:item for item in node.get('active_jobs',[])}
+                owned=active.get(node['name'],[])
+                for item in owned:
+                    item['rss_mb']=sampled.get(item['id'],{}).get('rss_mb')
                 for item in node.get('active_jobs',[]):
                     if item['id'] not in self.jobs and 0 < item.get('cpus',0) <= remaining:
                         external.append(item)
                         remaining -= item['cpus']
-                node['active_jobs'] = active.get(node['name'],[]) + external
+                node['active_jobs'] = owned + external
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),

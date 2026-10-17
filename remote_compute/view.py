@@ -115,7 +115,8 @@ def _capabilities(tags):
 
 
 def _project(name):
-    return {'Analog-Opt-Bench':'Bench','ARH-DSE':'ARH'}.get(name,name or '-')
+    return {'Analog-Opt-Bench':'Bench','ARH-DSE':'ARH','rocket-nn-host':'NCNN',
+            'yolov8-quant-lab':'YOLO'}.get(name,name or '-')
 
 
 def _device_address(node, url=''):
@@ -134,12 +135,32 @@ def _label(job):
     positions = [i for i,part in enumerate(parts) if project and part.casefold()==project]
     if positions:
         parts = parts[positions[-1]+1:]
+    if not parts:
+        return '-'
     if project == 'aop' and len(parts)>=2:
         circuit=parts[-2].split('_',1)[0]
         if circuit.upper() in {'BGR','TSA','FSA','LDO','CLASSAB'}:
             return circuit+'/'+parts[-1]
-    if parts and parts[0]=='Analog' and len(parts)>=3:
-        return '/'.join(parts[1:3])+(' '+parts[3] if len(parts)>3 else '')
+    if project=='rocket-nn-host':
+        names={'rocket':'Rocket','boom':'BOOM','shufflenet_v2_x0_5':'ShuffleV2-0.5',
+               'mobilenet_v2':'MobileV2','yolov8n':'YOLOv8n','resnet18':'ResNet18'}
+        parts=[names.get(part,part) for part in parts if not re.fullmatch(r'[0-9a-f]{12,64}',part)]
+        return ' '.join(parts[-3:]) or '-'
+    if project=='rgcn':
+        text=re.sub(r'^rgcn-', '', parts[-1], flags=re.IGNORECASE)
+        for before,after in (('-frozen-model',''),('-fresh',''),('analytic_previous_control','ana-prev'),
+                             ('neural_previous_control','nn-prev'),('neural_shared_gate_control','nn-gate'),
+                             ('analytic','ana'),('neural','nn'),('-seed','-s')):
+            text=text.replace(before,after)
+        head,sep,tail=text.partition('-')
+        head={'ldo':'LDO','tsa':'TSA','fsa':'FSA','bgr':'BGR','classab':'ClassAB'}.get(head,head)
+        return head+(' '+tail if sep else '')
+    if project in ('analog-opt-bench','bench') or parts and parts[0]=='Analog':
+        if parts[0]=='Analog':parts=parts[1:]
+        text='/'.join(parts[-3:])
+        return re.sub(r'\bb(\d{4,})\b',lambda m:'b'+format(int(m[1])/1000,'g')+'k',text)
+    if project=='yolov8-quant-lab' and parts[-1]=='integer-range-and-cost':
+        return 'INT4 range/cost'
     return '/'.join(parts[-2:]) or job.get('label','-')
 
 

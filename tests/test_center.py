@@ -359,6 +359,9 @@ class CenterTests(unittest.TestCase):
                 started=worker.status(identity)['started']
                 self.assertEqual(pool.nodes[0].health['active_jobs'][0]['started'],started)
                 until(lambda:client.health()['nodes'][0]['active_jobs'][0]['started']==started)
+                with pool.condition:
+                    pool.nodes[0].health['active_jobs'][0]['rss_mb']=123.5
+                self.assertEqual(client.health()['nodes'][0]['active_jobs'][0]['rss_mb'],123.5)
                 client.wait(identity)
                 client.fetch(identity)
                 until(lambda: pool.nodes[0].reserved==0)

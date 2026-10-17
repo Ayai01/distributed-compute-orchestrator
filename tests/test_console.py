@@ -148,6 +148,23 @@ class ConsoleTests(unittest.TestCase):
             self.assertNotIn('aaaaaaaa',text)
             self.assertNotIn('m40_p125',text)
 
+    def test_project_and_task_descriptions_are_compact_without_changing_request_labels(self):
+        from remote_compute.view import _label, _project
+        cases=[('rocket-nn-host','rocket-nn-host/boom/shufflenet_v2_x0_5/kitten/f4d61bbf5462da2d','NCNN','BOOM ShuffleV2-0.5 kitten'),
+               ('RGCN','RGCN/fsa-online-frozen-model-seed42','RGCN','FSA online-s42'),
+               ('RGCN','RGCN/tsa-neural_previous_control-fresh','RGCN','TSA nn-prev'),
+               ('RGCN','rgcn-tsa-pre','RGCN','TSA pre'),
+               ('Analog-Opt-Bench','Analog/class_ab/FACE-MO/b96000','Bench','class_ab/FACE-MO/b96k'),
+               ('AOP','aop/ngspice/LDO_SKY130_SSFF_m40_p125_4corners/ss125','AOP','LDO/ss125'),
+               ('ARH-DSE','ARH-DSE/mac','ARH','mac'),
+               ('yolov8-quant-lab','YOLO/integer-range-and-cost','YOLO','INT4 range/cost'),
+               ('RGCN','RGCN','RGCN','-')]
+        for project,label,source,description in cases:
+            job=dict(project=project,label=label)
+            self.assertEqual((_project(project),_label(job)),(source,description))
+            self.assertEqual(job['label'],label)
+            self.assertLessEqual(_width(description),26)
+
     def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):
         jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label='very-long-circuit-name/'*6+f'seed-{i}',
                    cpus=2,memory_mb=512,status='running') for i in range(43)]

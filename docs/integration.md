@@ -59,6 +59,8 @@ worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`�
 
 用 `label` 区分电路、保真度或相近工作量的批次，使同类耗时具有可比性。执行中的任务保留原节点。短暂断连时保留原任务ID和资源预留，状态中的 `connection_error` 显示连接问题；重连后继续查询该任务，不重新执行。已知节点暂时离线时，匹配该节点的待执行工作继续排队，其余在线节点照常服务。
 
+`project`承担来源工程，`label`只描述工作，如`TSA/nn-prev/s42`、`class_ab/FACE-MO/b96k`、`BOOM/YOLOv8n/kitten`。目录、长哈希、运行批次和模型身份留在请求/回执；同类任务使用稳定标签以便耗时校准。看板将已有长标签格式化为简短描述，不修改已接受任务的原标签、缓存身份或输入摘要；完整内容通过任务API查看。
+
 健康接口在节点离线时仍返回有效响应；上游通信失败返回HTTP 502。历史版本或中心重启留下的 `interrupted` 任务可直接按原ID `fetch`：worker仍在运行时暂缓领取，完成后以worker的实际结果恢复中心记录。调用工程保留已接受的ID，避免因超时改在本机重复启动。
 
 Windows新建作业目录设置可继承的Low完整性标签，允许现有带Low标签的firtool、GSIM等工具写入本作业的输出和TEMP。处理发生在解包和创建子目录之前，使用Windows原生API；原DACL及继承标记保持不变，现有作业、父目录、共享盘根和工具文件保持原样。Linux沿用普通目录逻辑。
@@ -130,16 +132,18 @@ from remote_compute import Client
 
 center = Client(os.environ['REMOTE_COMPUTE_URL'], os.environ['REMOTE_COMPUTE_TOKEN'])
 identity = os.environ['REMOTE_COMPUTE_JOB_ID']
-grant = center.resize(identity, desired_threads)
+grant = center.resize(identity, desired_threads, memory_mb=phase_ram_mb)
 try:
     compute_batch(threads=grant['cpus'])
 finally:
-    center.resize(identity, 1)
+    center.resize(identity, 1, memory_mb=resident_ram_mb)
 ```
 
 `resize` 保留原任务ID、节点和输入摘要，返回 `id/cpus/memory_mb/requested_cpus/node`。增长受工程权重、任务 `max_cpus`、节点预算和当前空闲线程约束；调用方始终使用实际 `cpus`。可选 `memory_mb` 在同一请求中调整内存预留，例如编译结束、子进程退出后 `center.resize(identity, 1, memory_mb=512)`。内存准入失败返回409并保留原CPU/内存授予；实际RSS仍参与准入，降低申报不隐藏真实占用。两端声明 `resize_memory` 能力后使用联合调整，旧节点返回 `supported=False` 并保留原授予。同步批次结束后才归还，异步 pending 期间维持固定授予。BLAS 内层保持1，避免与外层并行相乘。worker 与中心同步计账，取消、异常和完成均按最后授予释放；回执保留 `initial_cpus/peak_cpus/resize_count`。旧节点未声明 resize 能力时继续原授予。
 
 DCO负责跨工程份额、CPU/内存准入、实际授予和原ID资源账本；调用工程负责判断是否有可伸缩内核，并在并行池/子进程已收齐的安全边界借还。YOLO包审计默认每包1CPU；对约50毫秒的串行尾段增加线程会增加通信和调度开销，较大通道块才按实测启用多核。Rocket/BOOM可在编译结束后按实际仿真并发和DDR规模同时收缩CPU/内存，ARH常驻池保持初始授予直到池关闭。工程资源配置不参与科学结果缓存身份。
+
+RAM预留对应当前阶段仍需承载的对象和并发子进程。编译器/并行池退出且其对象释放后，联合归还CPU和RAM；下一阶段增加峰值前先申请并检查实际授予。付费账本、模型和数据仍常驻时保留其需求，DCO不按瞬时低RSS自动下调任务申报。`/health`的节点`active_jobs`同时提供`memory_mb`与worker最近采样的`rss_mb`（尚未采样为null），可用于检查阶段预留；真实RSS始终参与设备内存准入。
 
 ## 任务文件与结果
 
