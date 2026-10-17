@@ -75,11 +75,30 @@ class Coordinator:
         maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
         target = min(target, capable)
         unit = cpus or maximum_cpus
-        ready = max(1, math.ceil(target / unit)) if unit else max(1,min(len(eligible),target))
-        ceiling=max(1,math.ceil(maximum/unit)) if unit else max(1,len(eligible))
+        wave = max(1, math.ceil(target / unit)) if unit else max(1,min(len(eligible),target))
+        ready = wave
+        ceiling_wave=max(1,math.ceil(maximum/unit)) if unit else max(1,len(eligible))
+        ceiling=ceiling_wave
+        if cpus==0:
+            # An automatic task can return most of its CPUs after compilation.
+            # Keep those running tasks and admit another wave into the freed
+            # credits; prefetch still covers only a full-width wave.
+            with self.condition,self.pool.condition:
+                names={node.name for node in eligible}
+                running=sum(job.get('auto_cpus',False) and (job.get('task',{}).get('project') or 'default')==project
+                            and job['result'].get('assigned_node') in names
+                            and job['result']['status'] not in TERMINAL for job in self.jobs.values())
+                if running:
+                    room=max(0,target-resources.get(project,{}).get('used',0))
+                    free=[max(0,node.capacity-node.reserved-node.external) for node in eligible]
+                    slots=sum(math.ceil(value/unit) if unit else bool(value) for value in free)
+                    extra=(min(math.ceil(room/unit) if unit else min(len(eligible),room),slots or 1)
+                           if room else 0)
+                    ready=max(1,running+extra)
+            ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,
-                    running_tasks=ready,queued_tasks=math.ceil(ready*ratio),
-                    in_flight=ready+math.ceil(ready*ratio),max_in_flight=ceiling+math.ceil(ceiling*ratio))
+                    running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
+                    in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
 
     def restart_node(self, name):
         node = next((n for n in self.pool.nodes if n.name == name), None)

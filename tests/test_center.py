@@ -145,6 +145,55 @@ class CenterTests(unittest.TestCase):
                 for identity in ids:
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
 
+    def test_auto_window_refills_after_running_tasks_return_cpu_credits(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as root, provider(Path(root)/'one',cpus=4,cpu_limit=4) as (_,one), provider(Path(root)/'two',cpus=4,cpu_limit=4) as (_,two):
+            with Pool([one,two]) as pool, center(pool,Path(root)/'center') as (_,client):
+                window=client.window('phased',cpus=0,queue_ratio=0)
+                self.assertEqual((window.maximum,window.current()),(8,2))
+                ids=[client.submit(python(hold,cpus=0,project='phased'))['id'] for _ in range(2)]
+                until(lambda:client.health()['used_cpus']==8)
+                until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
+                for identity in ids:client.resize(identity,1)
+                window.updated=0
+                self.assertEqual(window.current(),4)
+                queued=client.admission('phased',cpus=0,queue_ratio=1)
+                self.assertEqual((queued['running_tasks'],queued['queued_tasks'],queued['in_flight'],queued['max_in_flight']),
+                                 (4,2,6,10))
+                first=list(ids)
+                ids += [client.submit(python(hold,cpus=0,project='phased'))['id'] for _ in range(2)]
+                until(lambda:client.health()['used_cpus']==8)
+                self.assertTrue(all(client.status(identity)['cpus']==1 for identity in first))
+                window.updated=0
+                self.assertEqual(window.current(),4)
+                for identity in ids:
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
+    def test_capped_auto_window_counts_partial_grants_and_keeps_prefetch_bounded(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as root, provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                ids=[client.submit(python(hold,cpus=0,max_cpus=2,project='capped'))['id'] for _ in range(2)]
+                until(lambda:client.health()['used_cpus']==4)
+                until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
+                client.resize(ids[0],1)
+                window=client.admission('capped',cpus=0,max_cpus=2,queue_ratio=1)
+                self.assertEqual((window['running_tasks'],window['queued_tasks'],window['max_in_flight']),(3,2,6))
+                ids.append(client.submit(python(hold,cpus=0,max_cpus=2,project='capped'))['id'])
+                until(lambda:client.health()['used_cpus']==4)
+                self.assertEqual(client.status(ids[-1])['cpus'],1)
+                for identity in ids:
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
+    def test_auto_window_counts_only_its_own_projects_running_tasks(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                identity=client.submit(python('import time;time.sleep(30)',cpus=0,project='other'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                window=client.admission('newcomer',cpus=0,queue_ratio=0)
+                self.assertEqual((window['running_tasks'],window['in_flight']),(1,1))
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+
     def test_cancellation_is_sent_once_and_terminal_polling_stays_bounded(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
