@@ -1,7 +1,9 @@
 """Cell-aligned terminal tables; one snapshot in, bounded visible rows out."""
 
 import math
+import re
 import shutil
+import time
 import unicodedata
 from functools import lru_cache
 
@@ -280,6 +282,21 @@ class StatusRows(list):
 
 def format_status(value, url='', *, width=None):
     return StatusRows(value,url,width or shutil.get_terminal_size((110,32)).columns-1)
+
+
+def format_notices(value):
+    """Merge forwarded operation notices; the executing worker supplies the peer."""
+    notices={}
+    sources=[value]+list(value.get('nodes') or [])
+    for source in sources:
+        name=source.get('node') or source.get('name') or '-'
+        for event in source.get('events') or []:
+            message=event['message']
+            key=message if re.search(r'\[[0-9a-f]{8,32}\]',message) else (event['time'],event['ip'],message)
+            notices[key]=dict(event,node=name)
+    return [time.strftime('%H:%M:%S',time.localtime(e['time']))+' '+e['node']+' '+e['ip']+' '+
+            re.sub(r'\[([0-9a-f]{8,32})\]',lambda m:'['+m[1][:4]+']',e['message'])
+            for e in sorted(notices.values(),key=lambda e:e['time'])[-6:]]
 
 
 def _layout(status, events, output, height):

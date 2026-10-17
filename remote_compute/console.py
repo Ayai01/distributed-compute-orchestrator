@@ -5,10 +5,9 @@ import sys
 import threading
 import time
 import os
-import re
 import subprocess
 
-from .view import _width, _clip, _layout, StatusRows, format_status, set_width_probe
+from .view import _width, _clip, _layout, StatusRows, format_status, format_notices, set_width_probe
 
 
 def _input_view(prompt, line, cursor, width):
@@ -236,12 +235,7 @@ class Dashboard:
                         try:
                             value = self.health()
                             rows = format_status(value, self.url)
-                            notices = list(value.get('events', []))
-                            for node in value.get('nodes', []):
-                                notices.extend(node.get('events') or [])
-                            events = [time.strftime('%H:%M:%S', time.localtime(e['time'])) + ' ' + e['ip'] + ' ' +
-                                      re.sub(r'\[([0-9a-f]{8,32})\]',lambda m:'['+m[1][:4]+']',e['message'])
-                                      for e in sorted(notices, key=lambda x: x['time'])[-6:]]
+                            events = format_notices(value)
                         except (OSError, RuntimeError, ValueError) as error:
                             rows = ['连接状态: ' + str(error)]
                         revision += 1

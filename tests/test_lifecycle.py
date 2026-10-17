@@ -25,6 +25,18 @@ from test_compute import provider, python, until, scratch
 
 
 class ServicePowerTests(unittest.TestCase):
+    def test_reloaded_child_hands_old_supervisor_to_preferred_runtime_by_normal_exit(self):
+        with patch('remote_compute.setup_tools.preferred_python',return_value=Path('C:/preferred314/python.exe')), \
+                patch('remote_compute.cli.subprocess.Popen') as launch, \
+                patch('remote_compute.cli.Worker') as worker:
+            self.assertEqual(main(['--service-child','--mode','worker','--config','device.json','--root','owned-root']),0)
+        command=launch.call_args.args[0]
+        self.assertEqual(command[0],'C:\\preferred314\\python.exe' if os.name=='nt' else 'C:/preferred314/python.exe')
+        self.assertNotIn('--service-child',command)
+        self.assertEqual(command[-6:],['--mode','worker','--config','device.json','--root','owned-root'])
+        self.assertEqual(launch.call_args.kwargs['env']['PYTHONUTF8'],'1')
+        worker.assert_not_called()
+
     def test_all_service_modes_hold_request_until_cleanup_and_supervisor_exit(self):
         for mode in ('scheduler', 'hybrid', 'worker'):
             for child in (False, True):

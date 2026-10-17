@@ -195,6 +195,20 @@ def supervise(argv):
         print("正在重新加载服务源码和配置。", flush=True)
 
 
+def handoff_python(invocation):
+    """Let a reloaded child replace its old supervisor through a normal exit."""
+    from .setup_tools import preferred_python
+    executable=preferred_python()
+    if executable.resolve()==Path(sys.executable).resolve():
+        return False
+    environment=dict(os.environ,PYTHONUTF8='1',PYTHONDONTWRITEBYTECODE='1')
+    environment.pop('PYTHONHOME',None)
+    environment['PATH']=str(executable.parent)+os.pathsep+str(executable.parent/'Scripts')+os.pathsep+environment.get('PATH','')
+    args=[arg for arg in invocation if arg!='--service-child']
+    subprocess.Popen([str(executable),'-B',str(ROOT/'main.py'),*args],cwd=ROOT,env=environment)
+    return True
+
+
 def main(argv=None):
     invocation = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="统一入口：总调度器、本机调度+算力、远程算力提供者")
@@ -223,7 +237,7 @@ def main(argv=None):
     item.add_argument('--install', action='store_true', help='管理员安装已放入.tools/imdisk的签名驱动')
     item = sub.add_parser('update', help='从统一GitHub仓库快进更新当前工程')
     item.add_argument('--check', action='store_true', dest='update_check')
-    item = sub.add_parser('setup', help='安装本工程内的科学运行时；工具存放于.tools，不上传仓库')
+    item = sub.add_parser('setup', help='复用系统Python安装科学包；原生工具存放于.tools')
     item.add_argument('--ngspice-source', help='复用已有ngspice目录，省去下载')
     item.add_argument('--rtl-source', help='提取已有MSYS2的GCC/Verilator闭包')
     item = sub.add_parser('control', help='在线调整设备资源，保存到设备配置')
@@ -254,6 +268,9 @@ def main(argv=None):
     lifetime = ExitStack()
     restarting = threading.Event()
     try:
+        if (args.service_child and not args.url and args.action is None and
+                not (args.test or args.test_native or args.check) and handoff_python(invocation)):
+            return 0
         path = Path(args.config) if args.config else ROOT / "worker.local.json"
         if args.config and not path.exists():
             raise ValueError("Missing worker config: " + str(path))

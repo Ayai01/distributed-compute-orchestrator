@@ -54,6 +54,20 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_center_and_worker_notices_merge_by_operation_and_keep_executing_device(self):
+        from remote_compute.view import format_notices
+        center=[dict(time=10,ip='127.0.0.1',message='upload main.py [aafe1122]'),
+                dict(time=12,ip='127.0.0.1',message='upload main.py [aafe3344]')]
+        worker=[dict(time=10.2,ip='192.168.1.6',message='upload main.py [aafe1122]'),
+                dict(time=12.2,ip='192.168.1.6',message='upload main.py [aafe3344]'),
+                dict(time=13,ip='terminal',message='CPU budget 30'),
+                dict(time=14,ip='terminal',message='CPU budget 30')]
+        rows=format_notices(dict(node='Aya1-PC',events=center,nodes=[dict(name='Aya1-TX',events=worker)]))
+        self.assertEqual(len(rows),4)
+        self.assertEqual(sum('upload main.py' in row for row in rows),2)
+        self.assertTrue(all('Aya1-TX 192.168.1.6' in row for row in rows[:2]))
+        self.assertTrue(all('[aafe]' in row for row in rows[:2]))
+
     def test_jobs_prefix_selects_one_record_and_lists_colliding_ids(self):
         from remote_compute.commands import SchedulerShell
         identities=['1234'+'a'*28,'1234'+'b'*28]
