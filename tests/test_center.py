@@ -39,6 +39,111 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_modeled_resize_fits_cpu_and_ram_and_rechecks_later_budget(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=768,memory_reserve_mb=0) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time;time.sleep(30)',memory_mb=64))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256)
+                self.assertEqual((grant['cpus'],grant['memory_mb']),(2,640))
+                self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(2,640))
+                grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256,memory_limit_mb=384)
+                self.assertEqual((grant['cpus'],grant['memory_mb']),(1,384))
+                client.control(node='node1',worker={'memory_mb':1536})
+                grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256,memory_limit_mb=1152)
+                self.assertEqual((grant['cpus'],grant['memory_mb']),(4,1152))
+                self.assertEqual(worker.status(identity)['cpus'],4)
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_modeled_resize_rejection_preserves_existing_grant_and_demand(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=512,memory_reserve_mb=0) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time;time.sleep(30)',memory_mb=64))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                with self.assertRaises(RemoteError):client.resize(identity,0,base_memory_mb=1024,memory_per_cpu_mb=64)
+                self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(1,64))
+                self.assertNotIn('desired_cpus',state.jobs[identity])
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+
+    def test_memory_model_legacy_fallback_and_validation(self):
+        from unittest.mock import Mock
+        from remote_compute.allocation import plan_resize
+        client=Client('http://old-center');client._capabilities=['resize','resize_auto','resize_memory']
+        client.request=Mock(return_value=dict(cpus=1,memory_mb=64))
+        self.assertFalse(client.resize('original',0,base_memory_mb=128,memory_per_cpu_mb=64)['supported'])
+        self.assertEqual(client.request.call_count,1)
+        self.assertNotIn('resize',client.request.call_args.args[0])
+        with self.assertRaises(ValueError):plan_resize(4,64,128,64,None,1024)
+        for base,per in ((None,64),(64,None),(-1,64),(64,True),(0,0)):
+            with self.assertRaises(ValueError):plan_resize(4,None,base,per,None,1024)
+
+    def test_live_tool_alias_keeps_accepted_tool_provenance(self):
+        import sys
+        with scratch() as root,provider(Path(root)/'worker',cpus=2,tools={'g++':[sys.executable]}) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                self.assertIn('g++',worker.health()['tags'])
+                identity=client.submit(python('import time;time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                before=worker.status(identity)['tools']
+                client.control(node='node1',worker={'tools':{'verified_python':[sys.executable]}})
+                self.assertIn('verified_python',worker.health()['tags'])
+                result=client.run(dict(python('print(42)'),requires=['verified_python'],steps=[['${tool:verified_python}','-c','print(42)']]))
+                self.assertEqual(result['status'],'succeeded',result)
+                self.assertNotIn('verified_python',worker.status(identity)['tools'])
+                self.assertEqual(worker.status(identity)['tools'],before)
+                client.control(node='node1',worker={'tools':{'verified_python':None}})
+                self.assertNotIn('verified_python',worker.health()['tags'])
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+
+    def test_auto_resize_rechecks_budget_after_a_partial_initial_grant(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                blocker=client.submit(python('import time;time.sleep(30)',cpus=3,project='other'))['id']
+                until(lambda:client.status(blocker)['status']=='running')
+                identity=client.submit(python('import time;time.sleep(30)',cpus=0,max_cpus=3,project='A'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                self.assertEqual(client.status(identity)['cpus'],1)
+                client.cancel(blocker);client.wait(blocker);client.fetch(blocker)
+                grant=client.resize(identity,0,memory_mb=384)
+                self.assertEqual((grant['cpus'],grant['memory_mb']),(3,384))
+                self.assertEqual(grant['requested_cpus'],0)
+                self.assertEqual(worker.status(identity)['cpus'],3)
+                self.assertIn('resize_auto',client.health()['capabilities'])
+                client.resize(identity,1,memory_mb=128)
+                client.control(node='node1',worker={'cpus':2})
+                self.assertEqual(client.resize(identity,0,memory_mb=256)['cpus'],2)
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_auto_resize_keeps_existing_grant_on_older_center(self):
+        from unittest.mock import Mock
+        client=Client('http://old-center')
+        client._capabilities=['resize','resize_memory']
+        client.request=Mock(return_value=dict(id='original',cpus=1,memory_mb=256,assigned_node='same'))
+        grant=client.resize('original',0,memory_mb=512)
+        self.assertFalse(grant['supported'])
+        self.assertEqual((grant['cpus'],grant['memory_mb']),(1,256))
+        self.assertEqual(client.request.call_count,1)
+        self.assertNotIn('resize',client.request.call_args.args[0])
+
+    def test_node_public_ip_override_survives_load_configure_snapshot_and_save(self):
+        from types import SimpleNamespace
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker):
+            address='203.0.113.42'
+            with Pool([dict(name='tunnel',client=worker,host_ip=address,callback_url='http://127.0.0.1:26134')]) as pool:
+                self.assertEqual(pool.snapshot()['nodes'][0]['host_ip'],address)
+                for invalid in (None,'http://server','not-an-ip'):
+                    with self.assertRaises(ValueError):pool.configure('tunnel',host_ip=invalid)
+                pool.configure('tunnel',host_ip='203.0.113.43')
+                shell=SimpleNamespace(pool=pool,center=None)
+                with patch('remote_compute.commands.ROOT',Path(root)):
+                    SchedulerShell.do_save(shell,'')
+                saved=json.loads((Path(root)/'nodes.local.json').read_text())
+                self.assertEqual(saved['nodes'][0]['host_ip'],'203.0.113.43')
+
     def test_callback_timeout_applies_only_to_callback_default_clients(self):
         with patch.dict('os.environ',{'REMOTE_COMPUTE_URL':'http://center:1234','REMOTE_COMPUTE_TIMEOUT':'120'}):
             self.assertEqual(Client('http://center:1234/').timeout,120)

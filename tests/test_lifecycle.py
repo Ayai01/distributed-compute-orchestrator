@@ -95,6 +95,13 @@ class ServicePowerTests(unittest.TestCase):
             state(continuous | previous)
 
 
+class LinuxWorkerScratchTests(unittest.TestCase):
+    def test_worker_uses_job_tmpdir_instead_of_implicit_dev_shm(self):
+        with patch.object(ramdisk.os, 'name', 'posix'), \
+                patch.dict(os.environ, {'REMOTE_COMPUTE_WORKER': '1'}):
+            self.assertIsNone(ramdisk.ensure_shared())
+
+
 @unittest.skipUnless(os.name == 'nt', 'Windows shared ImDisk lifecycle')
 class SharedRamdiskTests(unittest.TestCase):
     def test_concurrent_starts_create_one_marked_eight_gib_volume(self):

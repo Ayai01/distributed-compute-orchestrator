@@ -452,11 +452,15 @@ class SchedulerShell(Shell):
         previous = read_json(path) if path.exists() else {}
         tokens = {n['url']: n.get('token', '') for n in previous.get('nodes', [])}
         tokens.update({n.client.url: n.client.token for n in self.pool.nodes})
+        addresses = {n['name']: n.get('host_ip','') for n in previous.get('nodes', [])}
+        addresses.update({n.name:getattr(n,'host_ip','') for n in self.pool.nodes})
         value = {"policy": snapshot["policy"], "nodes": []}
         for row in snapshot["nodes"]:
             node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
             if row.get('callback_url'):
                 node['callback_url'] = row['callback_url']
+            if addresses.get(row['name']):
+                node['host_ip'] = addresses[row['name']]
             if row.get('timeout',10)!=10:
                 node['timeout']=row['timeout']
             token = tokens.get(row["url"], self.center.token if self.center else "")

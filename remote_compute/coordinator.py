@@ -13,7 +13,7 @@ from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .telemetry import Activity
-from .allocation import weighted_threads
+from .allocation import weighted_threads, plan_resize
 from .compat import unlink
 import socket
 import math
@@ -149,7 +149,7 @@ class Coordinator:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
-                    'capabilities':['resize','resize_memory','max_cpus','single_thread_weight']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -387,9 +387,9 @@ class Coordinator:
                 host=route.getsockname()[0]
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
-    def resize(self, identity, cpus, *, memory_mb=None):
-        if type(cpus) is not int or cpus<1:
-            raise ValueError('resize cpus must be a positive integer')
+    def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+        if type(cpus) is not int or cpus<0:
+            raise ValueError('resize cpus must be nonnegative; 0 uses the current node budget')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
         with self.condition:
@@ -402,14 +402,13 @@ class Coordinator:
                     raise Conflict('Only a running task can change its CPU grant')
                 old=job['task']['cpus']
                 old_memory=job['task']['memory_mb']
-                memory=old_memory if memory_mb is None else memory_mb
+                modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
                 capabilities=node.health.get('capabilities',[])
-                if 'resize' not in capabilities or (memory_mb is not None and 'resize_memory' not in capabilities):
+                if 'resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities):
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus,supported=False)
-                extra=max(0,memory-old_memory)
-                if memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
-                    raise Conflict('Insufficient memory for resource resize; existing grant retained')
-                desired=min(cpus,job['task'].get('max_cpus',cpus))
+                desired=min(cpus or node.capacity,job['task'].get('max_cpus',node.capacity))
+                desired,_=plan_resize(desired,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,node.memory_capacity)
+                if desired<1:raise Conflict('Insufficient RAM for one phase worker; existing grant retained')
                 previous_desired=job.get('desired_cpus')
                 job['desired_cpus']=desired
                 granted=desired
@@ -422,6 +421,14 @@ class Coordinator:
                     room=target-resources[group]['used']+old
                     available=node.capacity-node.reserved-node.external+old
                     granted=max(old,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
+                granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
+                    old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
+                memory=old_memory if memory is None else memory
+                extra=max(0,memory-old_memory)
+                if granted<1 or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
+                    if previous_desired is None:job.pop('desired_cpus',None)
+                    else:job['desired_cpus']=previous_desired
+                    raise Conflict('Insufficient memory for resource resize; existing grant retained')
                 if granted==old and memory==old_memory and not job.get('resize_uncertain'):
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
                 # Reserve increases before the RPC; return decreases after its ack.
@@ -444,7 +451,7 @@ class Coordinator:
                     self.condition.notify_all()
 
             try:
-                result=(node.client.resize(identity,granted,memory_mb=memory) if memory_mb is not None
+                result=(node.client.resize(identity,granted,memory_mb=memory) if memory_mb is not None or modeled
                         else node.client.resize(identity,granted))
             except RemoteError as error:
                 if getattr(error,'status_code',None) is not None:

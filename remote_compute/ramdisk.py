@@ -92,6 +92,8 @@ def ensure_shared(size_gib=8):
     if size_gib != 8:
         raise ValueError('Shared RAM disk capacity is fixed at 8 GiB')
     if os.name != 'nt':
+        if os.environ.get('REMOTE_COMPUTE_WORKER')=='1':
+            return None  # Linux jobs follow their configured ordinary-disk TMPDIR.
         root = Path('/dev/shm')
         return root if root.is_dir() else None
     with creation_lock():

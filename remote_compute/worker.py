@@ -28,6 +28,7 @@ from .telemetry import Activity
 from .client import RemoteError
 from .compat import sha256
 from .cleanup import AssetCache, remove_owned
+from .allocation import plan_resize
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -169,26 +170,7 @@ class Worker:
                       "verilator": [sys.executable, str(Path(__file__).with_name("rtl.py"))]}
         for name, value in (tools or {}).items():
             self.tools[name] = [value] if isinstance(value, str) else list(value)
-        self.tool_info = {}
-        search_path = self.env.get("PATH", os.environ.get("PATH", ""))
-        for name, argv in self.tools.items():
-            if not argv or any(not isinstance(x, str) for x in argv):
-                raise ValueError("Tool requires an executable or argv prefix: " + name)
-            executable = shutil.which(argv[0], path=search_path)
-            if executable:
-                argv[0] = str(Path(executable).resolve())
-            self.tool_info[name] = {"argv": argv, "available": executable is not None,
-                                    "sha256": file_hash(executable) if executable else None}
-            supporting = {str(Path(x).resolve()): file_hash(x) for x in argv[1:] if Path(x).is_file()}
-            if supporting:
-                self.tool_info[name]["supporting_sha256"] = supporting
-        if self.tools["verilator"][1:] == [str(Path(__file__).with_name("rtl.py"))]:
-            msys = self.env.get("MSYS2_ROOT", os.environ.get("MSYS2_ROOT"))
-            engine = (str(Path(msys) / "ucrt64/bin/verilator_bin.exe") if os.name == "nt" and msys
-                      else shutil.which("verilator", path=search_path))
-            ready = bool(engine and Path(engine).is_file())
-            self.tool_info["verilator"].update(available=ready, engine=engine,
-                                               engine_sha256=file_hash(engine) if ready else None)
+        self.tools,self.tool_info=self._probe_tools(self.tools)
         self.tags = sorted(set(self.tags) | {sys.platform} | {k for k, v in self.tool_info.items() if v["available"]})
         if self.tool_info['verilator']['available']:
             self.tags = sorted(set(self.tags) | {'rtl'})
@@ -222,7 +204,7 @@ class Worker:
                     "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
-                    "capabilities": ["machine", "resize", "resize_memory", "max_cpus"] + (["restart"] if self.restart_available else []),
+                    "capabilities": ["machine", "resize", "resize_memory", "resize_auto", "resize_memory_model", "max_cpus"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
                     "service": service_usage(),
@@ -234,16 +216,55 @@ class Worker:
                                     for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
 
+    def _probe_tools(self, tools):
+        resolved,info={},{}
+        search_path=self.env.get('PATH',os.environ.get('PATH',''))
+        for name,argv in tools.items():
+            if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_+.-]*',name):raise ValueError('Invalid tool name')
+            if not isinstance(argv,(str,list,tuple)):raise ValueError('Tool requires an argv prefix')
+            argv=[argv] if isinstance(argv,str) else list(argv)
+            if not argv or any(not isinstance(x,str) for x in argv):raise ValueError('Tool requires an argv prefix: '+name)
+            executable=shutil.which(argv[0],path=search_path)
+            # Resolving a venv's Python symlink would select the base interpreter.
+            if executable:argv[0]=str(Path(executable).absolute())
+            resolved[name]=argv
+            info[name]=dict(argv=argv,available=executable is not None,sha256=file_hash(executable) if executable else None)
+            supporting={str(Path(x).resolve()):file_hash(x) for x in argv[1:] if Path(x).is_file()}
+            if supporting:info[name]['supporting_sha256']=supporting
+            if name=='verilator' and argv[1:]==[str(Path(__file__).with_name('rtl.py'))]:
+                msys=self.env.get('MSYS2_ROOT',os.environ.get('MSYS2_ROOT'))
+                engine=(str(Path(msys)/'ucrt64/bin/verilator_bin.exe') if os.name=='nt' and msys else shutil.which('verilator',path=search_path))
+                ready=bool(engine and Path(engine).is_file())
+                info[name].update(available=ready,engine=engine,engine_sha256=file_hash(engine) if ready else None)
+        return resolved,info
+
     def control(self, value):
-        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb"}:
-            raise ValueError("Control accepts cpus, memory_mb and paused")
+        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "tools"}:
+            raise ValueError("Control accepts cpus, memory_mb, paused and tools")
         if "cpus" in value and (type(value["cpus"]) is not int or not 1 <= value["cpus"] <= self.cpu_limit):
             raise ValueError(f"cpus must be in 1..{self.cpu_limit}")
         if "paused" in value and not isinstance(value["paused"], bool):
             raise ValueError("paused must be true or false")
         if "memory_mb" in value and (type(value["memory_mb"]) is not int or value["memory_mb"] < 1):
             raise ValueError("memory_mb must be a positive integer")
+        tools=value.get('tools',{})
+        if not isinstance(tools,dict):raise ValueError('tools must map names to argv or null')
+        removed={name for name,argv in tools.items() if argv is None}
+        if any(not isinstance(name,str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_+.-]*',name) for name in removed):raise ValueError('Invalid tool name')
+        additions,info=self._probe_tools({name:argv for name,argv in tools.items() if argv is not None})
+        if any(not item['available'] for item in info.values()):raise ValueError('Tool executable or engine not found')
         with self.condition:
+            if tools:
+                # Accepted commands and their recorded tool dictionaries retain
+                # their identities while future jobs see the new aliases.
+                self.tools={k:v for k,v in self.tools.items() if k not in removed}
+                self.tool_info={k:v for k,v in self.tool_info.items() if k not in removed}
+                self.tools.update(additions);self.tool_info.update(info)
+                tags=(set(self.tags)-removed)|set(additions)
+                if 'verilator' in tools:
+                    if self.tool_info.get('verilator',{}).get('available'):tags.add('rtl')
+                    else:tags.discard('rtl')
+                self.tags=sorted(tags)
             if "cpus" in value:
                 self.capacity = value["cpus"]
             if "paused" in value:
@@ -291,9 +312,9 @@ class Worker:
             return Path(self.tools[name][0]).as_posix()
         return _VAR.sub(substitute, text)
 
-    def resize(self, identity, cpus, *, memory_mb=None):
-        if type(cpus) is not int or cpus<1:
-            raise ValueError('resize cpus must be a positive integer')
+    def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+        if type(cpus) is not int or cpus<0:
+            raise ValueError('resize cpus must be nonnegative; 0 uses the current worker budget')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
         with self.condition:
@@ -302,13 +323,16 @@ class Worker:
                 raise Conflict('Only a running task can change its CPU grant')
             old=task['cpus']
             old_memory=task['memory_mb']
-            memory=old_memory if memory_mb is None else memory_mb
+            requested_cpus=cpus
+            cpus=min(cpus or self.capacity,task.get('max_cpus',self.capacity))
+            granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
+            granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
+                                      min(self.memory_capacity,old_memory+max(0,self._memory_state()['memory_available_mb'])))
+            if granted<1:raise Conflict('Insufficient RAM for one phase worker; existing grant retained')
+            memory=old_memory if memory is None else memory
             extra=max(0,memory-old_memory)
             if memory>self.memory_capacity or (extra and extra>self._memory_state()['memory_available_mb']):
                 raise Conflict('Insufficient memory for resource resize; existing grant retained')
-            requested_cpus=cpus
-            cpus=min(cpus,task.get('max_cpus',cpus))
-            granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
             if granted!=old or memory!=old_memory:
                 self.used+=granted-old
                 task['cpus']=result['cpus']=granted
@@ -771,7 +795,8 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.cancel(identity)
                 elif parts[2:] == ['resize'] and self.command == 'POST':
                     request = json.loads(body)
-                    value = worker.resize(identity, request['cpus'], memory_mb=request.get('memory_mb'))
+                    options={k:request[k] for k in ('memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
+                    value = worker.resize(identity, request['cpus'], **options)
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
                     value = worker.artifacts(identity)
                 elif parts[2:] == ["logs"] and self.command == "GET":

@@ -61,6 +61,12 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 
 同一任务的资源调整串行处理，网络调用不持有中心或资源池的全局锁。增加的CPU/RAM先占额度，缩减的额度等worker确认后归还；实际授权未变化时直接返回。回执丢失后查询原任务，暂时无法确认的增加额度继续保留，直到下次确认或任务正常结束，避免重复分配和退出泄漏。
 
+自动任务的初始授权不是后续并发上限。池/原生进程已收齐的阶段或自然批次边界可调用 `client.resize(id, 0, memory_mb=下一阶段总MiB)`，重新按当前所选节点预算和工程份额申请，实际CPU仍受`max_cpus`限制；以返回的`cpus`、`memory_mb`重建或调整池，再启动下一批。`resize_auto`能力表示支持0；显式正数仍表示有用CPU需求。缩减到1后也保留自动需求意图在调用工程内，下次边界再次申请，中心不在后台改动运行中的池。
+
+RAM随并发线性增长时，使用 `client.resize(id, 0, base_memory_mb=1024, memory_per_cpu_mb=512, memory_limit_mb=8192)`；这表示下一阶段的基座+每CPU需求，中心结合当前CPU/RAM和可选RAM上限，一次返回匹配的授权。系数模式与固定总量`memory_mb`互斥；`resize_memory_model`能力表示支持。SDK面对缺少能力的旧中心保留当前授权并返回`supported=False`，调用工程按旧路径运行。同步内核完成后可归还资源，异步在途工作继续使用已有授权，只在自然收齐边界更新，不强制排空来改变算法执行次序。
+
+隧道节点可在`nodes.local.json`或`control(node=名字,routing={"host_ip":"203.0.113.42"})`设置实际展示IP；它不修改连接URL和回调URL。未配置IP的显式回环隧道显示“隧道”，避免把外网设备显示为本机。
+
 worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 
 任务还可设置 `priority`、`node`、`requires`。较大的 `priority` 先启动；`node` 固定节点名称；`requires` 要求节点标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选节点。多个批次共享同一调度器的资源账本，节点再按自身预算统一准入。

@@ -30,18 +30,21 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     if len(centers)>1 or len(workers)>1 or not states:
         raise RuntimeError('Expected one service and its optional private worker')
     plan={
-        'client':{'Client':('__init__','health','resize','admission'),'Pool':('_acquire','_speed_priors')},
-        'worker':{'Worker':('health','resize','_execute'),'Handler':('_handle',),'':('validate_task',)},
+        'allocation':{'':('plan_resize',)},
+        'client':{'Client':('__init__','health','resize','admission'),'Pool':('__init__','_validate_node','configure','add','snapshot','_acquire','_speed_priors')},
+        'worker':{'Worker':('_probe_tools','control','health','resize','_execute'),'Handler':('_handle',),'':('validate_task',)},
         'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_callback','_update','_execute','_schedule')},
         'local':{'LocalClient':('request',)},
         'tasks':{'':('command',)},
-        'commands':{'':('table','prepare','submission_parser')},
-        'view':{'StatusRows':('_build','_resources','_resource_rows','_tasks')},
+        'commands':{'':('table','prepare','submission_parser'),'SchedulerShell':('do_save',)},
+        'view':{'':('_device_address',),'StatusRows':('_build','_resources','_resource_rows','_tasks')},
     }
     prepared=[]
     for name,classes in plan.items():
         module=importlib.import_module('remote_compute.'+name)
-        if name=='client':module.__dict__.setdefault('os',os)
+        if name=='client':
+            module.__dict__.setdefault('os',os)
+            module.__dict__.setdefault('ipaddress',importlib.import_module('ipaddress'))
         path=source/'remote_compute'/(name+'.py')
         tree=ast.parse(path.read_text(encoding='utf-8'),filename=str(path))
         for class_name,methods in classes.items():
@@ -57,6 +60,8 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
                 if (old is not None and old.__code__.co_freevars) or new.__code__.co_freevars:
                     raise RuntimeError('Resource patch methods must have no closures')
                 prepared.append((owner,method,old,new))
+    resize_plan=next(new for owner,method,old,new in prepared if method=='plan_resize')
+    worker.plan_resize=coordinator.plan_resize=resize_plan
     metadata=ast.parse((source/'remote_compute/__init__.py').read_text(encoding='utf-8'))
     constants={target.id:ast.literal_eval(node.value) for node in metadata.body if isinstance(node,ast.Assign)
                for target in node.targets if isinstance(target,ast.Name) and target.id in ('__version__','PROJECT_NAME','ABBREVIATION')}

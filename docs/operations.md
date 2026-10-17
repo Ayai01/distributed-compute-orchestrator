@@ -244,6 +244,8 @@ Linux 复用已有 `/dev/shm`；该入口不修改系统 tmpfs 容量。当前 W
 
 ## 工程内工具安装
 
+已核对可执行环境后，可用 `client.control(node=节点名, worker={"tools":{"bench_python":[解释器路径]}})` 在运行中登记工具别名；值为`None`时移除。已接受任务的命令和工具身份保留，后续任务使用新别名。该操作修改当前进程；部署时同步更新设备自己的`worker.local.json`中`tools`，以便下次启动复用。能力测试先用临时别名，验证通过后登记正式别名并移除临时项，保持在途任务运行。
+
 ```text
 python main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source "D:/Projects/#4-Arclight/ARH-DSE-v2/.tools/msys64"
 ```

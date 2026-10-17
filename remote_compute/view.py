@@ -123,9 +123,11 @@ def _device_address(node, url=''):
     address=node.get('url') or url
     if address.startswith('local://'):
         return '本机'
+    if node.get('host_ip'):
+        return node['host_ip']
     host=urlsplit(address).hostname if address else None
     if host in ('127.0.0.1','localhost','::1'):
-        return '本机'
+        return '隧道' if node.get('callback_url') else '本机'
     return node.get('host_ip') or (host if host and host not in ('0.0.0.0','::') else '等待连接')
 
 

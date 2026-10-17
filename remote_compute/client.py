@@ -6,6 +6,7 @@ import hashlib
 import gzip
 import http.client
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -119,18 +120,23 @@ class Client:
                                 extra_headers={'X-Remote-Compute-Callback':json.dumps(callback)})
         return self.request("/jobs/" + identity, payload)
 
-    def resize(self, identity, cpus, *, memory_mb=None):
+    def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         """Borrow/return resources at a safe boundary; use the actual returned grant."""
-        if memory_mb is not None:
+        modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
+        if memory_mb is not None or cpus==0 or modeled:
             if getattr(self, '_capabilities', None) is None:
                 self.health()
-            if 'resize_memory' not in self._capabilities:
+            if (memory_mb is not None and 'resize_memory' not in self._capabilities
+                    or cpus==0 and 'resize_auto' not in self._capabilities
+                    or modeled and 'resize_memory_model' not in self._capabilities):
                 state=self.status(identity,brief=True)
                 return dict(id=identity,node=state.get('assigned_node',state.get('node')),
                             cpus=state['cpus'],memory_mb=state['memory_mb'],requested_cpus=cpus,supported=False)
         request = dict(cpus=cpus)
         if memory_mb is not None:
             request['memory_mb'] = memory_mb
+        if modeled:
+            request.update(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
         return self.request('/jobs/'+identity+'/resize', request)
 
     def nodes(self):
@@ -246,6 +252,7 @@ class Node:
     known_jobs: set = field(default_factory=set)
     live_jobs: set = field(default_factory=set)
     callback_url: str = ""
+    host_ip: str = ""
 
     @property
     def capacity(self):
@@ -294,6 +301,7 @@ class Pool:
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
                 node.callback_url = entry.get("callback_url", "")
+                node.host_ip = entry.get("host_ip", "")
             self._validate_node(node)
             self.nodes.append(node)
         if not self.nodes or len({x.name for x in self.nodes}) != len(self.nodes):
@@ -306,6 +314,11 @@ class Pool:
 
     @staticmethod
     def _validate_node(node):
+        address=getattr(node,'host_ip','')
+        if not isinstance(address,str):
+            raise ValueError('Node host_ip must be an IP address or empty')
+        if address:
+            ipaddress.ip_address(address)
         if (not isinstance(node.weight, (int, float)) or not 0 < node.weight < float("inf")
                 or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)
                 or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
@@ -357,14 +370,15 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url", "timeout"}:
-                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url, timeout")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "callback_url", "timeout", "host_ip"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, callback_url, timeout, host_ip")
                 timeout=changes.pop('timeout',None)
                 if timeout is not None and (isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not 0<timeout<float('inf')):
                     raise ValueError('Node timeout must be positive and finite')
                 proposed = Node(node.name, node.client, **{
                     key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled", "memory_limit_mb")})
                 proposed.callback_url = changes.get('callback_url', getattr(node, 'callback_url', ''))
+                proposed.host_ip = changes.get('host_ip', getattr(node, 'host_ip', ''))
                 self._validate_node(proposed)
                 for key, value in changes.items():
                     setattr(node, key, value)
@@ -372,9 +386,10 @@ class Pool:
                     node.client.timeout=timeout
             self.condition.notify_all()
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url="", timeout=10):
+    def add(self, name, url, *, token="", weight=1.0, limit=0, callback_url="", timeout=10, host_ip=""):
         node = Node(name, Client(url, token,timeout=timeout), weight=weight, limit=limit)
         node.callback_url = callback_url
+        node.host_ip = host_ip
         self._validate_node(node)
         with self.condition:
             if any(n.name == name or n.client.url == node.client.url for n in self.nodes):
@@ -387,6 +402,7 @@ class Pool:
             return {"policy": self.policy, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
                  "callback_url": getattr(n, 'callback_url', ''),
+                 "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
                  "timeout": getattr(n.client,'timeout',10),
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
@@ -405,7 +421,7 @@ class Pool:
                  "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
-                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'host_ip', 'peers', 'events', 'root', 'version')},
+                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 

@@ -54,6 +54,16 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_tunnel_device_shows_public_ip_instead_of_localhost(self):
+        value=dict(role='scheduler',node='Aya1-PC',nodes=[
+            dict(name='Server',url='http://127.0.0.1:26134',callback_url='http://127.0.0.1:26134',
+                 host_ip='203.0.113.42',capacity=96)])
+        text='\n'.join(format_status(value,width=159).fit(38))
+        self.assertIn('203.0.113.42',text)
+        self.assertNotIn('本机',text)
+        value['nodes'][0]['host_ip']=None
+        self.assertIn('隧道','\n'.join(format_status(value,width=159).fit(38)))
+
     def test_device_ip_is_distinct_from_visitors_and_keeps_complete_ipv4(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
             dict(name='Aya1-PC',url='local://Aya1-PC',capacity=24,peers=[dict(ip='local')]),
