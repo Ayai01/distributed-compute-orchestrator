@@ -147,14 +147,16 @@ def _label(job):
         parts=[names.get(part,part) for part in parts if not re.fullmatch(r'[0-9a-f]{12,64}',part)]
         return ' '.join(parts[-3:]) or '-'
     if project=='rgcn':
-        text=re.sub(r'^rgcn-', '', parts[-1], flags=re.IGNORECASE)
+        text=re.sub(r'^rgcn-', '', '/'.join(parts[-3:]), flags=re.IGNORECASE)
         for before,after in (('-frozen-model',''),('-fresh',''),('analytic_previous_control','ana-prev'),
                              ('neural_previous_control','nn-prev'),('neural_shared_gate_control','nn-gate'),
                              ('analytic','ana'),('neural','nn'),('-seed','-s')):
             text=text.replace(before,after)
-        head,sep,tail=text.partition('-')
+        tokens=text.split('/',1)
+        head,sep,tail=tokens[0].partition('-')
         head={'ldo':'LDO','tsa':'TSA','fsa':'FSA','bgr':'BGR','classab':'ClassAB'}.get(head,head)
-        return head+(' '+tail if sep else '')
+        tokens[0]=head+(' '+tail if sep else '')
+        return '/'.join(tokens)
     if project in ('analog-opt-bench','bench') or parts and parts[0]=='Analog':
         if parts[0]=='Analog':parts=parts[1:]
         text='/'.join(parts[-3:])

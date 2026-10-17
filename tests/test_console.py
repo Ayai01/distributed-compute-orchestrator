@@ -154,6 +154,7 @@ class ConsoleTests(unittest.TestCase):
                ('RGCN','RGCN/fsa-online-frozen-model-seed42','RGCN','FSA online-s42'),
                ('RGCN','RGCN/tsa-neural_previous_control-fresh','RGCN','TSA nn-prev'),
                ('RGCN','rgcn-tsa-pre','RGCN','TSA pre'),
+               ('RGCN','RGCN/tsa/nn-prev/s42','RGCN','TSA/nn-prev/s42'),
                ('Analog-Opt-Bench','Analog/class_ab/FACE-MO/b96000','Bench','class_ab/FACE-MO/b96k'),
                ('AOP','aop/ngspice/LDO_SKY130_SSFF_m40_p125_4corners/ss125','AOP','LDO/ss125'),
                ('ARH-DSE','ARH-DSE/mac','ARH','mac'),
