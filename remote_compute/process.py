@@ -51,7 +51,9 @@ def low_integrity_directory(path):
         # Label only a new, empty directory. This preserves DACL inheritance;
         # files and subdirectories created later inherit the Low label.
         if not security.SetFileSecurityW(str(path),0x10,descriptor):
-            raise c.WinError(c.get_last_error())
+            error=c.get_last_error()
+            if error in (5,1314):return False
+            raise c.WinError(error)
     finally:
         kernel.LocalFree(descriptor)
 
