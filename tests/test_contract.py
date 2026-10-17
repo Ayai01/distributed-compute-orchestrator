@@ -59,8 +59,17 @@ class ContractTests(unittest.TestCase):
     def test_conditional_file_reads_cross_center_without_retransmitting(self):
         with scratch() as directory,provider(Path(directory)/'worker') as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(directory)/'center') as (_,client):
-                identity=client.submit(python('import time;time.sleep(1)'))['id']
+                identity=client.submit(python('import time;time.sleep(2)'))['id']
                 until(lambda:client.status(identity)['status']=='running')
+                from remote_compute.client import RemoteError
+                with self.assertRaises(RemoteError) as missing:
+                    client.read_job_file_changed(identity,'missing.json')
+                self.assertEqual(missing.exception.status_code,404)
+                conflict=RemoteError('not ready');conflict.status_code=409
+                with patch.object(pool.nodes[0].client,'read_job_file_changed',side_effect=conflict):
+                    with self.assertRaises(RemoteError) as not_ready:
+                        client.read_job_file_changed(identity,'state.json')
+                    self.assertEqual(not_ready.exception.status_code,409)
                 client.write_job_file(identity,'state.json',b'first'*1000)
                 first=client.read_job_file_changed(identity,'state.json')
                 unchanged=client.read_job_file_changed(identity,'state.json',first['version'])

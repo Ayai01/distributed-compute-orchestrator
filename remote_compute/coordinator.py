@@ -638,7 +638,12 @@ class Coordinator:
         if not client:raise Conflict('Job has not been assigned yet')
         from .local import LocalClient
         if isinstance(client,LocalClient):return client.worker.job_file_version(worker_id,name,version)
-        return client.read_job_file_changed(worker_id,name,version)
+        try:
+            return client.read_job_file_changed(worker_id,name,version)
+        except RemoteError as error:
+            if getattr(error,'status_code',None)==404:raise FileNotFoundError(name) from None
+            if getattr(error,'status_code',None)==409:raise Conflict(str(error)) from None
+            raise
 
     def cancel(self, identity):
         with self.condition:
