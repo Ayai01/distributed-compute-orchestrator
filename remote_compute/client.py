@@ -7,6 +7,7 @@ import gzip
 import http.client
 import io
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -32,8 +33,12 @@ class _ConnectionOwner:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=10):
-        self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None):
+        self.url, self.token = url.rstrip("/"), token
+        if timeout is None:
+            timeout = (float(os.environ.get('REMOTE_COMPUTE_TIMEOUT',10))
+                       if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else 10)
+        self.timeout = timeout
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
         self._capabilities = None

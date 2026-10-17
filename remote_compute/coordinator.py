@@ -371,7 +371,7 @@ class Coordinator:
 
     def _callback(self, node):
         if getattr(node, 'callback_url', ''):
-            return dict(url=node.callback_url.rstrip('/'), token=self.token)
+            return dict(url=node.callback_url.rstrip('/'), token=self.token,timeout=node.client.timeout)
         if not self.callback_address:
             return None
         host,port=self.callback_address[:2]
@@ -385,60 +385,84 @@ class Coordinator:
             with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as route:
                 route.connect((endpoint.hostname,endpoint.port or 80))
                 host=route.getsockname()[0]
-        return dict(url=f'http://{host}:{port}',token=self.token)
+        return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
     def resize(self, identity, cpus, *, memory_mb=None):
         if type(cpus) is not int or cpus<1:
             raise ValueError('resize cpus must be a positive integer')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
-        with self.condition,self.pool.condition:
-            job=self.jobs[identity];node=job.get('node')
-            if self.stopping or job['cancel'].is_set() or node is None or job['result']['status'] in TERMINAL:
-                raise Conflict('Only a running task can change its CPU grant')
-            old=job['task']['cpus']
-            old_memory=job['task']['memory_mb']
-            memory=old_memory if memory_mb is None else memory_mb
-            capabilities=node.health.get('capabilities',[])
-            if 'resize' not in capabilities or (memory_mb is not None and 'resize_memory' not in capabilities):
-                return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus,supported=False)
-            extra=max(0,memory-old_memory)
-            if memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
-                raise Conflict('Insufficient memory for resource resize; existing grant retained')
-            desired=min(cpus,job['task'].get('max_cpus',cpus))
-            previous_desired=job.get('desired_cpus')
-            job['desired_cpus']=desired
-            granted=desired
-            if desired>old:
-                resources=self.project_resources();group=job['task'].get('project') or 'default'
-                shares={name:r['resource_share'] for name,r in resources.items()}
-                demands={name:r['demand'] for name,r in resources.items()}
-                capacity=sum(n.capacity for n in self.pool.nodes if n.enabled and not n.error)
-                target=weighted_threads(capacity,shares,demands)[group]
-                room=target-resources[group]['used']+old
-                available=node.capacity-node.reserved-node.external+old
-                granted=max(old,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
+        with self.condition:
+            resize_lock=self.jobs[identity].setdefault('resize_lock',threading.Lock())
+        # A slow worker must not hold up health, admission or other tasks.
+        with resize_lock:
+            with self.condition,self.pool.condition:
+                job=self.jobs[identity];node=job.get('node')
+                if self.stopping or job['cancel'].is_set() or node is None or job['result']['status'] in TERMINAL:
+                    raise Conflict('Only a running task can change its CPU grant')
+                old=job['task']['cpus']
+                old_memory=job['task']['memory_mb']
+                memory=old_memory if memory_mb is None else memory_mb
+                capabilities=node.health.get('capabilities',[])
+                if 'resize' not in capabilities or (memory_mb is not None and 'resize_memory' not in capabilities):
+                    return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus,supported=False)
+                extra=max(0,memory-old_memory)
+                if memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
+                    raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                desired=min(cpus,job['task'].get('max_cpus',cpus))
+                previous_desired=job.get('desired_cpus')
+                job['desired_cpus']=desired
+                granted=desired
+                if desired>old:
+                    resources=self.project_resources();group=job['task'].get('project') or 'default'
+                    shares={name:r['resource_share'] for name,r in resources.items()}
+                    demands={name:r['demand'] for name,r in resources.items()}
+                    capacity=sum(n.capacity for n in self.pool.nodes if n.enabled and not n.error)
+                    target=weighted_threads(capacity,shares,demands)[group]
+                    room=target-resources[group]['used']+old
+                    available=node.capacity-node.reserved-node.external+old
+                    granted=max(old,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
+                if granted==old and memory==old_memory and not job.get('resize_uncertain'):
+                    return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
+                # Reserve increases before the RPC; return decreases after its ack.
+                held,held_memory=max(old,granted),max(old_memory,memory)
+                node.reserved+=held-old
+                node.reserved_memory_mb+=held_memory-old_memory
+                job['task']['cpus']=job['result']['cpus']=held
+                job['task']['memory_mb']=job['result']['memory_mb']=held_memory
+
+            def commit(actual,actual_memory):
+                with self.condition,self.pool.condition:
+                    # Completion may have released this task while the RPC waited.
+                    if identity in node.live_jobs:
+                        node.reserved+=actual-job['task']['cpus']
+                        node.reserved_memory_mb+=actual_memory-job['task']['memory_mb']
+                    job['task']['cpus']=job['result']['cpus']=actual
+                    job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
+                    if self.jobs.get(identity) is job:self._save(job)
+                    self.pool.condition.notify_all()
+                    self.condition.notify_all()
+
             try:
                 result=(node.client.resize(identity,granted,memory_mb=memory) if memory_mb is not None
                         else node.client.resize(identity,granted))
             except RemoteError as error:
                 if getattr(error,'status_code',None) is not None:
-                    if previous_desired is None:
-                        job.pop('desired_cpus',None)
-                    else:
-                        job['desired_cpus']=previous_desired
+                    with self.condition:
+                        if previous_desired is None:job.pop('desired_cpus',None)
+                        else:job['desired_cpus']=previous_desired
+                    commit(old,old_memory)
                     raise
-                observed=node.client.status(identity)
+                try:
+                    observed=node.client.status(identity)
+                except RemoteError:
+                    # The worker may have accepted the increase. Keep its held
+                    # budget until an acknowledged resize or normal completion.
+                    with self.condition:job['resize_uncertain']=True
+                    raise
                 result=dict(id=identity,cpus=observed['cpus'],memory_mb=observed['memory_mb'])
-            actual=result['cpus']
-            actual_memory=result.get('memory_mb',old_memory)
-            node.reserved+=actual-old
-            node.reserved_memory_mb+=actual_memory-old_memory
-            job['task']['cpus']=job['result']['cpus']=actual
-            job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
-            self._save(job)
-            self.pool.condition.notify_all()
-            self.condition.notify_all()
+            with self.condition:job.pop('resize_uncertain',None)
+            commit(result['cpus'],result.get('memory_mb',old_memory))
             return dict(result,node=node.name,requested_cpus=cpus)
 
     def _client(self, job):

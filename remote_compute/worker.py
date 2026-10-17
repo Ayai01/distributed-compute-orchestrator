@@ -427,6 +427,7 @@ class Worker:
             callback=job.get('callback',{})
             environment.update(REMOTE_COMPUTE_URL=callback.get('url',''),
                                REMOTE_COMPUTE_TOKEN=callback.get('token',''),
+                               REMOTE_COMPUTE_TIMEOUT=str(callback.get('timeout',10)),
                                REMOTE_COMPUTE_RESIZE='1' if callback.get('url') else '0',
                                REMOTE_COMPUTE_HOME=str(Path(__file__).resolve().parent.parent))
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:

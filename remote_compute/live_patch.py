@@ -30,9 +30,9 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     if len(centers)>1 or len(workers)>1 or not states:
         raise RuntimeError('Expected one service and its optional private worker')
     plan={
-        'client':{'Client':('health','resize','admission'),'Pool':('_acquire','_speed_priors')},
-        'worker':{'Worker':('health','resize'),'Handler':('_handle',),'':('validate_task',)},
-        'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_update','_execute','_schedule')},
+        'client':{'Client':('__init__','health','resize','admission'),'Pool':('_acquire','_speed_priors')},
+        'worker':{'Worker':('health','resize','_execute'),'Handler':('_handle',),'':('validate_task',)},
+        'coordinator':{'Coordinator':('admission','_health','project_resources','resize','_callback','_update','_execute','_schedule')},
         'local':{'LocalClient':('request',)},
         'tasks':{'':('command',)},
         'commands':{'':('table','prepare','submission_parser')},
@@ -41,6 +41,7 @@ def apply(*, source_root=None, expected_root=None, expected_pid=None):
     prepared=[]
     for name,classes in plan.items():
         module=importlib.import_module('remote_compute.'+name)
+        if name=='client':module.__dict__.setdefault('os',os)
         path=source/'remote_compute'/(name+'.py')
         tree=ast.parse(path.read_text(encoding='utf-8'),filename=str(path))
         for class_name,methods in classes.items():

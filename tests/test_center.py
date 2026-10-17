@@ -39,6 +39,109 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_callback_timeout_applies_only_to_callback_default_clients(self):
+        with patch.dict('os.environ',{'REMOTE_COMPUTE_URL':'http://center:1234','REMOTE_COMPUTE_TIMEOUT':'120'}):
+            self.assertEqual(Client('http://center:1234/').timeout,120)
+            self.assertEqual(Client('http://center:1234',timeout=2).timeout,2)
+            self.assertEqual(Client('http://other:1234').timeout,10)
+
+    def test_unchanged_grant_does_not_contact_worker(self):
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                identity=client.submit(python('import time;time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                with patch.object(pool.nodes[0].client,'resize') as resize:
+                    grant=client.resize(identity,1,memory_mb=256)
+                    self.assertEqual((grant['cpus'],grant['memory_mb']),(1,256))
+                    resize.assert_not_called()
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+
+    def test_slow_resize_reserves_growth_without_blocking_admission(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time;time.sleep(30)',project='A'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                backend=pool.nodes[0].client;original=backend.resize
+                entered,release=threading.Event(),threading.Event();results=[]
+                def delayed(*args,**kwargs):
+                    entered.set();release.wait(5)
+                    return original(*args,**kwargs)
+                with patch.object(backend,'resize',side_effect=delayed):
+                    thread=threading.Thread(target=lambda:results.append(state.resize(identity,4,memory_mb=512)))
+                    thread.start()
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        quick=Client(client.url,timeout=.5)
+                        self.assertEqual(quick.health()['used_cpus'],4)
+                        self.assertEqual(quick.admission('B')['target_cpus'],2)
+                        self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
+                        self.assertEqual(worker.health()['used_cpus'],1)
+                        other=quick.submit(python('pass',project='B'))['id']
+                        self.assertEqual(quick.status(other)['status'],'queued')
+                    finally:
+                        release.set();thread.join(5)
+                self.assertEqual(results[0]['cpus'],4)
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+                client.wait(other);client.fetch(other)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_late_resize_ack_after_completion_does_not_release_twice(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time;time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                backend=pool.nodes[0].client;original=backend.resize
+                entered,release=threading.Event(),threading.Event();results=[]
+                def delayed(*args,**kwargs):
+                    value=original(*args,**kwargs);entered.set();release.wait(5)
+                    return value
+                with patch.object(backend,'resize',side_effect=delayed):
+                    thread=threading.Thread(target=lambda:results.append(state.resize(identity,4)))
+                    thread.start()
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        client.cancel(identity);client.wait(identity);client.fetch(identity)
+                        until(lambda:pool.nodes[0].reserved==0)
+                    finally:
+                        release.set();thread.join(5)
+                self.assertEqual(results[0]['cpus'],4)
+                self.assertEqual(pool.nodes[0].reserved,0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_rejected_resize_restores_cpu_and_ram_reservations(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time;time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                error=RemoteError('resize rejected');error.status_code=409
+                with patch.object(pool.nodes[0].client,'resize',side_effect=error):
+                    with self.assertRaises(RemoteError):client.resize(identity,4,memory_mb=512)
+                self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(1,256))
+                self.assertNotIn('desired_cpus',state.jobs[identity])
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+
+    def test_uncertain_resize_keeps_budget_and_reconfirms_same_grant(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time;time.sleep(30)'))['id']
+                until(lambda:client.status(identity)['status']=='running')
+                backend=pool.nodes[0].client;original=backend.resize
+                def lost_reply(*args,**kwargs):
+                    original(*args,**kwargs)
+                    raise RemoteError('lost resize acknowledgement')
+                with patch.object(backend,'resize',side_effect=lost_reply),patch.object(backend,'status',side_effect=RemoteError('status unavailable')):
+                    with self.assertRaises(RemoteError):state.resize(identity,4,memory_mb=512)
+                    self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(4,512))
+                    self.assertTrue(state.jobs[identity]['resize_uncertain'])
+                with patch.object(backend,'resize',wraps=original) as resize:
+                    self.assertEqual(client.resize(identity,4,memory_mb=512)['cpus'],4)
+                    self.assertEqual(resize.call_count,1)
+                self.assertNotIn('resize_uncertain',state.jobs[identity])
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
     def test_serial_hint_is_center_metadata_and_not_forwarded_to_older_worker(self):
         import zipfile
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
@@ -62,17 +165,19 @@ class CenterTests(unittest.TestCase):
                 thread.start()
                 try:
                     callback=f'http://127.0.0.1:{reverse.server_port}'
-                    client.control(node='tunnel',routing={'callback_url':callback})
+                    client.control(node='tunnel',routing={'callback_url':callback,'timeout':120})
                     state.callback_address=('127.0.0.1',1)  # Automatic LAN routing would be wrong.
                     code=("import os,json,sys\nfrom pathlib import Path\n"
                           "sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\nfrom remote_compute import Client\n"
                           "c=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'])\n"
                           "grant=c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],2,memory_mb=128)\n"
+                          "grant['callback_timeout']=c.timeout\n"
                           "Path('grant.json').write_text(json.dumps(grant))\n")
                     result=client.run(python(code,node='tunnel',outputs=['grant.json']))
                     self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                     grant=json.loads(result['files']['grant.json'])
                     self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb']),(result['id'],2,128))
+                    self.assertEqual(grant['callback_timeout'],120)
                     self.assertEqual(client.nodes()['nodes'][0]['callback_url'],callback)
                     client.control(node='tunnel',routing={'callback_url':''})
                     self.assertEqual(state._callback(pool.nodes[0])['url'],'http://127.0.0.1:1')
