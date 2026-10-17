@@ -13,7 +13,7 @@ from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .telemetry import Activity
-from .allocation import weighted_threads, plan_resize
+from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
 import socket
 import math
@@ -70,9 +70,12 @@ class Coordinator:
                   and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))]
         capable=sum(n.capacity for n in eligible)
         names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
-        capacity=sum(n.capacity for n in self.pool.nodes if n.name in names and not n.error and n.enabled)
         shares[project], demands[project] = share, capable
-        target = weighted_threads(capacity, shares, demands)[project]
+        rooms={name:row['node_demands'] for name,row in resources.items()}
+        rooms[project]={node.name:node.capacity for node in eligible}
+        grants=weighted_node_threads({n.name:n.capacity for n in self.pool.nodes if n.name in names
+                                     and not n.error and n.enabled},shares,demands,rooms)
+        target=sum(grants[project].values())
         maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
         target = min(target, capable)
         unit = cpus or maximum_cpus
@@ -185,11 +188,12 @@ class Coordinator:
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
         names={node for available in rooms.values() for node in available}
-        capacity=sum(online[name].capacity for name in names)
         ceilings={name:sum(min(online[node].capacity,demand) for node,demand in rooms[name].items()) for name in shares}
-        quotas = weighted_threads(capacity, shares, {name:min(demands[name],ceilings[name]) for name in shares})
+        grants=weighted_node_threads({name:online[name].capacity for name in names},shares,demands,rooms)
+        quotas={name:sum(grants[name].values()) for name in shares}
         return {name: dict(resource_share=shares[name], target=quotas[name], demand=demands[name], used=used[name], queued=queued[name],
-                           capacity=ceilings[name],eligible_nodes=sorted(rooms[name])) for name in shares}
+                           capacity=ceilings[name],eligible_nodes=sorted(rooms[name]),node_demands=rooms[name],
+                           node_targets=grants[name]) for name in shares}
 
     def control(self, changes):
         if isinstance(changes, dict) and "node" in changes:
@@ -433,15 +437,13 @@ class Coordinator:
                 previous_desired=job.get('desired_cpus')
                 job['desired_cpus']=desired
                 granted=desired
-                if desired>old:
+                if desired>old or cpus==0:
                     resources=self.project_resources();group=job['task'].get('project') or 'default'
-                    shares={name:r['resource_share'] for name,r in resources.items()}
-                    demands={name:r['demand'] for name,r in resources.items()}
-                    capacity=sum(n.capacity for n in self.pool.nodes if n.enabled and not n.error)
-                    target=weighted_threads(capacity,shares,demands)[group]
+                    target=resources[group]['target']
                     room=target-resources[group]['used']+old
                     available=node.capacity-node.reserved-node.external+old
-                    granted=max(old,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
+                    floor=1 if cpus==0 else old
+                    granted=max(floor,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
                 granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
                     old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
                 memory=old_memory if memory is None else memory
@@ -541,19 +543,46 @@ class Coordinator:
                 self.condition.notify_all()
             return self.get(identity)
 
-    def artifacts(self, identity):
+    def artifacts(self, identity, *, is_connected=None):
         with self.condition:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             result, client = self.get(identity), self._client(job)
+            result_lock=job.setdefault('artifact_lock',threading.RLock())
+            transfers=self.__dict__.setdefault('_artifact_transfers',{})
+            transfer_lock=transfers.setdefault(client.url,threading.Lock()) if client else None
         files = {}
         if client:
             from .local import LocalClient
             if isinstance(client, LocalClient) and result['status'] != 'interrupted':
                 return client.worker.artifacts(identity, result=result)
             try:
-                raw = client.request("/jobs/" + identity + "/artifacts", binary=True)
+                with result_lock:
+                    if is_connected and not is_connected():
+                        raise ConnectionAbortedError('Result download caller disconnected while queued')
+                    cached=job['directory']/'worker-artifacts.zip'
+                    if cached.is_file():
+                        raw=cached.read_bytes()
+                    else:
+                        while not transfer_lock.acquire(timeout=.2):
+                            if is_connected and not is_connected():
+                                raise ConnectionAbortedError('Result download caller disconnected while queued')
+                        try:
+                            if is_connected and not is_connected():
+                                raise ConnectionAbortedError('Result download caller disconnected while queued')
+                            raw=client.request("/jobs/" + identity + "/artifacts", binary=True)
+                        finally:
+                            transfer_lock.release()
+                        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                            if json.loads(archive.read('result.json'))['id']!=identity:
+                                raise ValueError('Artifact task identity mismatch')
+                        temporary=cached.with_suffix('.partial')
+                        try:
+                            temporary.write_bytes(raw)
+                            temporary.replace(cached)
+                        finally:
+                            unlink(temporary)
             except RemoteError as error:
                 if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
                     raise
@@ -576,6 +605,8 @@ class Coordinator:
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Cancel and wait before deleting the job")
             client = self._client(job)
+            result_lock=job.setdefault('artifact_lock',threading.RLock())
+        with result_lock:
             if client:
                 try:
                     client.delete(identity)
@@ -583,7 +614,8 @@ class Coordinator:
                     if getattr(error, 'status_code', None) != 404:
                         raise
             shutil.rmtree(job["directory"])
-            del self.jobs[identity]
+            with self.condition:
+                del self.jobs[identity]
             return {"deleted": identity}
 
     def asset(self, identity, payload=None):

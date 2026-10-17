@@ -238,6 +238,8 @@ if result["status"] == "succeeded":
 
 `update` 仅允许 main 快进更新；本地源码改动先提交再更新。更新后检查两端 `git rev-parse HEAD` 一致，`nodes` 中设备重新在线。先重载独立 worker，再 `Client().restart(wait=True)` 重载本机中心；两边均保持原终端，无需手动关闭再启动。
 
+跨网结果下载使用独立长超时Client（至少120秒），状态与提交继续短超时。中心每节点同时取回一份结果，同ID重复领取复用中心原ZIP缓存；缓存随作业领取清理。现代HTTP连接空闲10秒释放，单Client共享最多8条连接，避免SSH转发被线程各自保留的连接耗尽；二进制GET支持校验身份的断线续传。详情见[差网络处理](integration.md)。
+
 ## 每台设备唯一8 GiB共享内存盘
 
 所有工程使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1`。创建前持有同一个系统锁并重新检测；已存在小盘原地扩容，已有盘扩容失败时保留它并报告原因，不另建第二块。调用 `python main.py ramdisk` 可创建或检查。Windows需安装一次ImDisk驱动，首次安装/扩容使用管理员权限；驱动包存放在 `.tools/imdisk/` 后运行 `python main.py ramdisk --install`。安装时登记系统启动任务 `RemoteCompute Shared RAM`，重启后重新创建唯一共享盘；日常工程启动直接复用，每个工程使用自己的子目录。目标容量固定为8GiB，命令成功后可检查实际盘容量；扩容失败时先处理现有盘，再继续使用。

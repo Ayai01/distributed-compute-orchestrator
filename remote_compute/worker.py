@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import select
 import sys
 import threading
 import time
@@ -709,6 +710,12 @@ class Server(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+    idle_timeout = 10
+
+    def handle_one_request(self):
+        # Expire idle keep-alive waits, while active transfers may be slow.
+        self.connection.settimeout(self.idle_timeout)
+        return BaseHTTPRequestHandler.handle_one_request(self)
 
     def handle(self):
         try:
@@ -719,12 +726,29 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def _connected(self):
+        try:
+            return (not select.select([self.connection],[],[],0)[0]
+                    or bool(self.connection.recv(1,socket.MSG_PEEK)))
+        except OSError:
+            return False
     def log_message(self, *_args):
         pass
 
     def _reply(self, value, status=200):
         binary = isinstance(value, bytes)
         body = value if binary else json_bytes(value)
+        total, offset, etag = len(body), 0, None
+        if binary and self.command == 'GET' and status == 200:
+            etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+            match = re.fullmatch(r'bytes=(\d+)-', self.headers.get('Range', ''))
+            if match and self.headers.get('If-Range') == etag:
+                offset = int(match[1])
+                if 0 < offset < total:
+                    body, status = body[offset:], 206
+                else:
+                    offset = 0
         compressed = not binary and len(body) >= 1024 and 'gzip' in self.headers.get('Accept-Encoding', '')
         if compressed:
             body = gzip.compress(body, compresslevel=1)
@@ -732,15 +756,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/zip" if binary else "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            if etag:
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('ETag', etag)
+                if status == 206:
+                    self.send_header('Content-Range', f'bytes {offset}-{total-1}/{total}')
             if compressed:
                 self.send_header('Content-Encoding', 'gzip')
                 self.send_header('Vary', 'Accept-Encoding')
+            if self.headers.get('X-Remote-Compute-Keepalive') != '1':
+                # Older clients expect POST connections to stay live forever.
+                # Announce closure instead of surprising them on their next POST.
+                self.send_header('Connection','close')
+                self.close_connection=True
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
 
     def _handle(self):
+        self.connection.settimeout(None)
         worker = self.server.worker
         if worker.token and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + worker.token):
             return self._reply({"error": "Token required"}, 401)
@@ -798,7 +833,8 @@ class Handler(BaseHTTPRequestHandler):
                     options={k:request[k] for k in ('memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
                     value = worker.resize(identity, request['cpus'], **options)
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
-                    value = worker.artifacts(identity)
+                    value = (worker.artifacts(identity,is_connected=self._connected) if hasattr(worker,'pool')
+                             else worker.artifacts(identity))
                 elif parts[2:] == ["logs"] and self.command == "GET":
                     value = worker.logs(identity)
                 elif len(parts) >= 4 and parts[2] == 'files' and self.command in {'GET', 'POST'}:

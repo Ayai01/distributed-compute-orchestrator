@@ -39,6 +39,38 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_overlapping_node_sets_have_feasible_project_targets_and_admission(self):
+        with scratch() as root,provider(Path(root)/'pc',cpus=2,tags=['windows_only']) as (_,pc), \
+                provider(Path(root)/'tx',cpus=6,tags=['windows_only']) as (_,tx), \
+                provider(Path(root)/'server',cpus=12,tags=['linux_only']) as (_,server):
+            with Pool([pc,tx,server]) as pool,center(pool,Path(root)/'center') as (_,client):
+                client.control(paused=True)
+                tasks=[python('pass',project='ARH',node='node1'),
+                       python('pass',project='ARH',cpus=0,node='node2'),
+                       python('pass',project='Bench',cpus=0,max_cpus=2,node='node3')]
+                tasks += [python('pass',project='Bench',requires=['windows_only']) for _ in range(10)]
+                identities=[client.submit(task)['id'] for task in tasks]
+                resources=client.health()['projects']
+                self.assertEqual({p:r['target'] for p,r in resources.items()},{'ARH':5,'Bench':5})
+                self.assertEqual(client.admission('ARH',node='node2',cpus=0)['target_cpus'],5)
+                for identity in identities:client.cancel(identity);client.delete(identity)
+
+    def test_auto_reloan_returns_excess_only_when_the_running_task_requests_it(self):
+        hold="from pathlib import Path; import time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                first=client.submit(python(hold,project='A',cpus=0,memory_mb=64))['id']
+                until(lambda:client.status(first)['status']=='running')
+                second=client.submit(python(hold,project='B',cpus=0,memory_mb=64))['id']
+                self.assertEqual(client.status(first)['cpus'],4)
+                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],4)
+                grant=client.resize(first,0,memory_mb=64)
+                self.assertEqual(grant['cpus'],2)
+                until(lambda:client.status(second)['status']=='running')
+                self.assertEqual(client.status(second)['cpus'],2)
+                for identity in (first,second):
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
     def test_capability_handshake_omits_large_dashboard_and_keeps_full_health(self):
         from remote_compute.local import LocalClient
         with scratch() as root, provider(Path(root)/'worker') as (worker,node):
@@ -612,7 +644,7 @@ class CenterTests(unittest.TestCase):
             endpoint=urlsplit(client.url)
             with patch.object(Server,'handle_error') as errors,patch.object(Handler,'finish',finish):
                 connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port)
-                connection.request('GET','/health');connection.getresponse().read()
+                connection.request('GET','/health',headers={'X-Remote-Compute-Keepalive':'1'});connection.getresponse().read()
                 connection.sock.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('hh' if os.name=='nt' else 'ii',1,0))
                 connection.close()
                 self.assertTrue(finished.wait(3))
@@ -965,7 +997,7 @@ class CenterTests(unittest.TestCase):
             ports = set()
             for _ in range(300):
                 client.health()
-                ports.add(client.connections.connection.sock.getsockname()[1])
+                ports.add(client._transport.idle[-1].sock.getsockname()[1])
             self.assertEqual(len(ports), 1)
 
     def test_forward_result_provenance_and_two_sided_collection(self):

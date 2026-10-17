@@ -18,10 +18,16 @@ from test_compute import scratch, until
                      'Windows CPython 3.14 and the Git baseline are required')
 class LivePatchTests(unittest.TestCase):
     def test_existing_job_and_process_survive_the_resource_patch(self):
+        self._verify_patch('f3d2a0b','0.7.11')
+
+    def test_current_service_keeps_running_jobs_through_the_network_patch(self):
+        self._verify_patch('81b5a74','0.7.28')
+
+    def _verify_patch(self,revision,version):
         root=Path(__file__).resolve().parents[1]
-        archive=subprocess.run(['git','archive','--format=zip','f3d2a0b','remote_compute'],
+        archive=subprocess.run(['git','archive','--format=zip',revision,'remote_compute'],
                                cwd=root,capture_output=True)
-        if archive.returncode:self.skipTest('The 0.7.11 baseline is absent in this checkout')
+        if archive.returncode:self.skipTest('The '+version+' baseline is absent in this checkout')
         with scratch() as temporary:
             scope=Path(temporary);legacy=scope/'legacy';legacy.mkdir()
             with zipfile.ZipFile(io.BytesIO(archive.stdout)) as files:files.extractall(legacy)
@@ -49,7 +55,7 @@ finally:
             try:
                 address=json.loads(process.stdout.readline())
                 client=Client(address['url'])
-                self.assertEqual(client.health()['version'],'0.7.11')
+                self.assertEqual(client.health()['version'],version)
                 code="from pathlib import Path;import os,time\nPath('pid.txt').write_text(str(os.getpid()))\nwhile not Path('release').exists():time.sleep(.02)\nprint('completed once')"
                 accepted=client.submit(command(['${tool:python}','-u','-c',code],cpus=2,memory_mb=4096,outputs=['pid.txt']))
                 identity=accepted['id']
@@ -85,5 +91,7 @@ finally:
                 until(lambda:client.health()['used_cpus']==0)
             finally:
                 (scope/'stop').write_text('stop')
-                process.wait(15)
-                process.stdout.close()
+                try:
+                    process.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill();process.communicate()

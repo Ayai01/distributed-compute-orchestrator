@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import threading
 import time
 from urllib.parse import quote
@@ -25,12 +26,15 @@ class RemoteError(RuntimeError):
     pass
 
 
-class _ConnectionOwner:
-    def __init__(self, connection):
-        self.connection = connection
+class _ConnectionPool:
+    def __init__(self):
+        self.idle = []
+        self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(8)
 
     def __del__(self):
-        self.connection.close()
+        for connection in self.idle:
+            connection.close()
 
 
 class Client:
@@ -45,10 +49,36 @@ class Client:
         self._capabilities = None
 
     def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
+        pool=self.__dict__.get('_transport')
+        if pool is None:
+            pool=self.__dict__.setdefault('_transport',_ConnectionPool())
+        if not pool.slots.acquire(timeout=self.timeout):
+            raise RemoteError(f'{self.url}{path}: connection pool is busy')
+        # Old live instances may still own a per-thread cached connection.
+        previous=getattr(self.connections,'connection',None)
+        if previous is not None:previous.close()
+        self.connections.owner=None
+        with pool.lock:
+            connection=pool.idle.pop() if pool.idle else None
+        if connection is not None and connection.sock is not None:
+            try:
+                if select.select([connection.sock],[],[],0)[0]:connection.close()
+            except (OSError,ValueError):connection.close()
+        self.connections.connection=connection
+        try:
+            return self._request(path,data,method=method,binary=binary,brief=brief,extra_headers=extra_headers)
+        finally:
+            connection=getattr(self.connections,'connection',None)
+            self.connections.connection=None
+            if connection is not None:
+                with pool.lock:pool.idle.append(connection)
+            pool.slots.release()
+
+    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
-                   'Accept-Encoding': 'gzip'}
+                   'Accept-Encoding': 'gzip','X-Remote-Compute-Keepalive':'1'}
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         if brief:
@@ -57,20 +87,45 @@ class Client:
         if data is not None and not isinstance(data, bytes):
             data = json_bytes(data)
         method = method or ('POST' if data is not None else 'GET')
-        for attempt in range(2):
+        partial, etag = bytearray(), None
+        attempts = 4 if binary and method == 'GET' else 2
+        retryable=(method=='GET' or method=='POST' and (path=='/admission' or bool(re.fullmatch(
+            r'/(jobs/[0-9a-f]{32}(/(?:resize|cancel))?|assets/[0-9a-f]{64})',path))))
+        for attempt in range(attempts):
             connection = getattr(self.connections, 'connection', None)
             if connection is None:
                 factory = http.client.HTTPSConnection if self.endpoint.scheme == 'https' else http.client.HTTPConnection
                 connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=self.timeout)
                 self.connections.connection = connection
-                self.connections.owner = _ConnectionOwner(connection)
             connection.timeout = self.timeout
             if connection.sock is not None:
                 connection.sock.settimeout(self.timeout)
             try:
+                if partial and etag:
+                    headers.update(Range='bytes='+str(len(partial))+'-', **{'If-Range':etag})
+                else:
+                    headers.pop('Range',None);headers.pop('If-Range',None)
                 connection.request(method, self.endpoint.path.rstrip('/') + path, body=data, headers=headers)
                 response = connection.getresponse()
-                raw = response.read()
+                if binary and response.status < 400:
+                    continued=(partial and response.status==206 and response.getheader('ETag')==etag
+                               and response.getheader('Content-Range','').startswith('bytes '+str(len(partial))+'-'))
+                    if response.status==206 and not continued:
+                        partial.clear();etag=None
+                        raise http.client.HTTPException('Invalid artifact resume range')
+                    if not continued:
+                        partial.clear()
+                    etag=response.getheader('ETag') if response.getheader('Accept-Ranges')=='bytes' else None
+                    while True:
+                        chunk=response.read1(128*1024)
+                        if not chunk:
+                            if response.length not in (None,0):
+                                raise http.client.IncompleteRead(b'',response.length)
+                            break
+                        partial.extend(chunk)
+                    raw=bytes(partial)
+                else:
+                    raw = response.read()
                 if response.getheader('Content-Encoding') == 'gzip':
                     raw = gzip.decompress(raw)
                 if response.status >= 400:
@@ -82,9 +137,11 @@ class Client:
             except (http.client.HTTPException, OSError) as exc:
                 connection.close()
                 self.connections.connection = None
-                if method != 'GET' or attempt:
+                if not etag:
+                    partial.clear()
+                if not retryable or attempt==attempts-1:
                     raise RemoteError(f'{self.url}{path}: {exc}') from None
-                time.sleep(.1)
+                time.sleep(min(1,.1*2**attempt))
         return raw if binary else json.loads(raw)
 
     def health(self, *, brief=False):
@@ -92,6 +149,8 @@ class Client:
         if result.get("protocol") != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
         self._capabilities = result.get('capabilities',[])
+        if not brief and result.get('role')=='worker' and 'active_jobs' in result:
+            self._status_sample=(time.monotonic(),{j['id']:j for j in result['active_jobs'] or []})
         return result
 
     def control(self, **changes):
@@ -161,6 +220,10 @@ class Client:
         return Machine(self, node, cwd=cwd)
 
     def status(self, identity=None, *, brief=False):
+        if brief and identity:
+            stamp,active=self.__dict__.get('_status_sample',(0,{}))
+            if time.monotonic()-stamp<=2 and identity in active:
+                return dict(active[identity])
         return self.request("/jobs" + ("/" + identity if identity else ""), brief=brief)
 
     def cancel(self, identity):

@@ -39,3 +39,40 @@ def weighted_threads(capacity, shares, demands):
                 allocated[name] += 1
                 remaining -= 1
     return allocated
+
+
+def weighted_node_threads(capacities, shares, demands, rooms):
+    """Integer weighted max-min shares, with only usable node edges in the flow."""
+    if len(capacities)==1:
+        node,capacity=next(iter(capacities.items()))
+        grants=weighted_threads(capacity,shares,{p:min(demands[p],rooms.get(p,{}).get(node,0)) for p in shares})
+        return {p:({node:grants[p]} if node in rooms.get(p,{}) else {}) for p in shares}
+    placed={name:{node:0 for node in rooms.get(name,{})} for name in shares}
+    used={node:0 for node in capacities}
+    total={name:0 for name in shares}
+    def place(name,seen):
+        nodes=[node for node in placed[name] if node in capacities and node not in seen
+               and placed[name][node]<rooms[name][node]]
+        nodes.sort(key=lambda node:(used[node]>=capacities[node],
+                                   sum(node in edges for edges in rooms.values()),node))
+        for node in nodes:
+            seen.add(node)
+            if used[node]<capacities[node]:
+                placed[name][node]+=1;used[node]+=1
+                return True
+            for other in shares:
+                if other!=name and placed[other].get(node,0) and place(other,seen):
+                    placed[other][node]-=1
+                    placed[name][node]+=1
+                    return True
+        return False
+    for _ in range(sum(capacities.values())):
+        candidates=sorted((name for name in shares if total[name]<demands[name]),
+                          key=lambda name:((total[name]+1)/shares[name],name))
+        for name in candidates:
+            if place(name,set()):
+                total[name]+=1
+                break
+        else:
+            break
+    return placed
