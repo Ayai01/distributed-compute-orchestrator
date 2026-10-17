@@ -15,6 +15,7 @@ import re
 import shutil
 import socket
 import select
+import ssl
 import sys
 import threading
 import time
@@ -81,12 +82,14 @@ def file_hash(path):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
             "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256, **task}
     cpus, timeout = task["cpus"], task["timeout"]
+    if type(task.get('retries',2)) is not int or not 0<=task.get('retries',2)<=10:
+        raise ValueError('retries must be an integer in 0..10')
     if not isinstance(task.get('project', ''), str):
         raise ValueError('project must be a string')
     share = task.get('resource_share', 1.0)
@@ -205,7 +208,7 @@ class Worker:
                     "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
-                    "capabilities": ["machine", "resize", "resize_memory", "resize_auto", "resize_memory_model", "max_cpus"] + (["restart"] if self.restart_available else []),
+                    "capabilities": ["machine", "resize", "resize_memory", "resize_auto", "resize_memory_model", "max_cpus", "lease_polling", "job_identity"] + (["restart"] if self.restart_available else []),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
                     "service": service_usage(),
@@ -213,7 +216,7 @@ class Worker:
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started')},
-                                     'rss_mb':round(j.get('rss_mb',0),2)}
+                                     'rss_mb':round(j.get('rss_mb',0),2),**({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
 
@@ -344,6 +347,34 @@ class Worker:
                 self.condition.notify_all()
             return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus)
 
+    def lease(self, identity, request):
+        """A task asks locally; the center answers through its existing poll."""
+        with self.condition:
+            job=self.jobs[identity]
+            if job['result']['status']!='running':raise Conflict('Only a running task can request resources')
+            if 'request_id' in request:
+                current=job['result'].get('resource_request')
+                if current and current['request_id']==request['request_id']:
+                    job['resource_reply']=request
+                    self.condition.notify_all()
+                return {'accepted':True}
+            if job.get('callback',{}).get('mode')!='poll':raise Conflict('Task is not owned by a polling center')
+            if 'resource_request' in job['result']:raise Conflict('A resource request is already pending')
+            serial=job['lease_serial']=job.get('lease_serial',0)+1
+            job['result']['resource_request']={**request,'request_id':serial}
+            deadline=time.monotonic()+120
+            try:
+                while 'resource_reply' not in job:
+                    if self.stopping or job['cancel'].is_set():raise Conflict('Worker is stopping')
+                    remaining=deadline-time.monotonic()
+                    if remaining<=0:raise Conflict('Center resource reply timed out; existing grant retained')
+                    self.condition.wait(min(remaining,.5))
+                reply=job.pop('resource_reply')
+                if reply.get('error'):raise Conflict(reply['error'])
+                return reply['grant']
+            finally:
+                job['result'].pop('resource_request',None)
+
     def submit(self, identity, payload, *, callback=None):
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
@@ -450,10 +481,15 @@ class Worker:
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
             callback=job.get('callback',{})
+            polling=callback.get('mode')=='poll'
+            if polling:callback={**self.callback,**callback}
             environment.update(REMOTE_COMPUTE_URL=callback.get('url',''),
+                               REMOTE_COMPUTE_JOB_ID=callback.get('job_id',result['id']),
                                REMOTE_COMPUTE_TOKEN=callback.get('token',''),
                                REMOTE_COMPUTE_TIMEOUT=str(callback.get('timeout',10)),
                                REMOTE_COMPUTE_RESIZE='1' if callback.get('url') else '0',
+                               REMOTE_COMPUTE_LEASE='1' if polling else '0',
+                               REMOTE_COMPUTE_CA=callback.get('ca_file') or '',
                                REMOTE_COMPUTE_HOME=str(Path(__file__).resolve().parent.parent))
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 for argv in job["commands"]:
@@ -674,16 +710,20 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, address, worker, *, restart=None):
+    def __init__(self, address, worker, *, restart=None, certfile=None, keyfile=None):
         self.worker = worker
         self.restart = restart
         self.connections = set()
         self.connections_lock = threading.Lock()
         super().__init__(address, Handler)
+        if certfile:
+            context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile,keyfile)
+            self.socket=context.wrap_socket(self.socket,server_side=True)
         if hasattr(worker,'restart_node'):
             worker.callback_address=self.server_address
         else:
-            worker.callback=dict(url=f'http://127.0.0.1:{self.server_port}',token=worker.token)
+            worker.callback=dict(url=f'{"https" if certfile else "http"}://127.0.0.1:{self.server_port}',token=worker.token,ca_file=certfile)
 
     def get_request(self):
         connection, address = super().get_request()
@@ -832,6 +872,8 @@ class Handler(BaseHTTPRequestHandler):
                     request = json.loads(body)
                     options={k:request[k] for k in ('memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
                     value = worker.resize(identity, request['cpus'], **options)
+                elif parts[2:] == ['lease'] and self.command == 'POST' and hasattr(worker,'lease'):
+                    value=worker.lease(identity,json.loads(body))
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
                     value = (worker.artifacts(identity,is_connected=self._connected) if hasattr(worker,'pool')
                              else worker.artifacts(identity))

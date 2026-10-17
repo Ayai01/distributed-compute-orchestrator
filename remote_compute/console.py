@@ -105,6 +105,7 @@ def _console_size_probe():
 
 def _enable_ansi():
     """Return a restoration callback, or None for a plain console/redirect."""
+    if os.name!='nt':return (lambda:None) if sys.stdout.isatty() else None
     import ctypes
     from ctypes import wintypes
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -215,6 +216,7 @@ def _initial_size(columns=160, rows=50):
 
 
 def _focus_probe():
+    if os.name!='nt':return lambda:True
     import ctypes
     from ctypes import wintypes
     user = ctypes.WinDLL('user32', use_last_error=True)
@@ -256,6 +258,30 @@ class FocusRefresh:
         return refresh
 
 
+class _PosixKeyboard:
+    """Translate ordinary terminal keys to the dashboard's existing key codes."""
+    def __init__(self):
+        import codecs,termios,tty
+        self.fd=sys.stdin.fileno();self.termios=termios
+        self.previous=termios.tcgetattr(self.fd);tty.setcbreak(self.fd)
+        self.decoder=codecs.getincrementaldecoder('utf-8')();self.buffer=''
+        self.keys={'\x1b[A':'H','\x1b[B':'P','\x1b[C':'M','\x1b[D':'K','\x1b[H':'G','\x1b[F':'O',
+                   '\x1b[3~':'S','\x1b[5~':'I','\x1b[6~':'Q','\x1b[Z':'\x0f'}
+    def kbhit(self):
+        import select
+        if select.select([self.fd],[],[],0)[0]:self.buffer+=self.decoder.decode(os.read(self.fd,128))
+        return bool(self.buffer)
+    def getwch(self):
+        if self.buffer.startswith('\x1b['):
+            for sequence,key in self.keys.items():
+                if self.buffer.startswith(sequence):
+                    self.buffer='\x00'+key+self.buffer[len(sequence):];break
+        key,self.buffer=self.buffer[0],self.buffer[1:]
+        return '\x08' if key=='\x7f' else '\r' if key=='\n' else key
+    def close(self):
+        self.termios.tcsetattr(self.fd,self.termios.TCSADRAIN,self.previous)
+
+
 class Dashboard:
     def __init__(self, shell, health, url='', alive=lambda: True):
         self.shell, self.health, self.url, self.alive = shell, health, url, alive
@@ -287,13 +313,15 @@ class Dashboard:
         return max(1, getattr(self, 'columns', shutil.get_terminal_size((110, 32)).columns) - 5)
 
     def run(self, _state=None):
-        import msvcrt
         restore = _enable_ansi()
         if restore is None:
             return False
-        if self.stream.isatty() and _state is None:
+        if os.name=='nt':
+            import msvcrt
+        else:msvcrt=_PosixKeyboard()
+        if os.name=='nt' and self.stream.isatty() and _state is None:
             _initial_size()
-        width_probe,close_probe=_console_width_probe() if self.stream.isatty() else (None,lambda: None)
+        width_probe,close_probe=_console_width_probe() if os.name=='nt' and self.stream.isatty() else (None,lambda: None)
         set_width_probe(width_probe)
         focus, refresh = _focus_probe(), FocusRefresh()
         state = _state or {}
@@ -311,7 +339,7 @@ class Dashboard:
             if _state is None:
                 self.stream.write('\x1b[?1049h\x1b[2J')
                 self.stream.flush()
-            size = _console_size_probe() if self.stream.isatty() else lambda: shutil.get_terminal_size((110, 32))
+            size = _console_size_probe() if os.name=='nt' and self.stream.isatty() else lambda: shutil.get_terminal_size((110, 32))
             while True:
                 try:
                     if not self.alive():
@@ -416,4 +444,5 @@ class Dashboard:
             finally:
                 set_width_probe(None)
                 close_probe()
+                if os.name!='nt':msvcrt.close()
                 restore()

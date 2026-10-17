@@ -222,10 +222,11 @@ class ConsoleTests(unittest.TestCase):
     def test_tunnel_device_shows_public_ip_instead_of_localhost(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
             dict(name='Server',url='http://127.0.0.1:26134',callback_url='http://127.0.0.1:26134',
-                 host_ip='203.0.113.42',capacity=96)])
+                 host_ip='203.0.113.42',capacity=96,peers=[dict(ip='127.0.0.1')])])
         text='\n'.join(format_status(value,width=159).fit(38))
         self.assertIn('203.0.113.42',text)
         self.assertNotIn('本机',text)
+        self.assertIn('Server: 中心/隧道',text)
         value['nodes'][0]['host_ip']=None
         self.assertIn('隧道','\n'.join(format_status(value,width=159).fit(38)))
 

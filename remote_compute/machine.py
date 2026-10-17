@@ -31,6 +31,8 @@ class Machine:
             files[_PREFIX + "/stdin"] = stdin
             options["stdin"] = _PREFIX + "/stdin"
         options.setdefault("label", "machine/exec " + str(argv[0]))
+        if getattr(self.client,'_capabilities',None) is None:self.client.health(brief=True)
+        if 'retry_jobs' in self.client._capabilities:options.setdefault('retries',0)
         task = command(argv, node=self.node, cwd=self.cwd if cwd is None else cwd, **options)
         accepted = self.client.submit(task, files=files, job_id=job_id)
         identity = accepted["id"]

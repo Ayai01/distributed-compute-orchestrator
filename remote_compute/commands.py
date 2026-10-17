@@ -252,7 +252,7 @@ class Shell(cmd.Cmd):
             print("操作失败:", error)
 
     def loop(self, health=None, url='', alive=lambda: True):
-        if health and os.name == 'nt' and sys.stdin.isatty() and sys.stdout.isatty():
+        if health and sys.stdin.isatty() and sys.stdout.isatty():
             from .console import Dashboard
             if Dashboard(self, health, url, alive).run():
                 return
@@ -510,6 +510,8 @@ class SchedulerShell(Shell):
                 node['host_ip'] = addresses[row['name']]
             if row.get('timeout',10)!=10:
                 node['timeout']=row['timeout']
+            for key in ('ca_file','aliases'):
+                if row.get(key):node[key]=row[key]
             token = tokens.get(row["url"], self.center.token if self.center else "")
             if token:
                 node["token"] = token
@@ -600,6 +602,19 @@ class SchedulerShell(Shell):
         for future in list(self.futures.values()):
             future.cancel()
         self.executor.shutdown(wait=True)
+
+
+class RemoteWorker:
+    """WorkerShell's small API over the same authenticated node connection."""
+    def __init__(self,client):
+        self.client=client;self.condition=threading.RLock()
+    @property
+    def jobs(self):return {row['id']:{'result':row} for row in self.client.status()}
+    def control(self,changes):return self.client.control(**changes)
+    def health(self):return self.client.health()
+    def cancel(self,identity):return self.client.cancel(identity)
+    def logs(self,identity):return self.client.logs(identity)
+    def delete(self,identity):return self.client.delete(identity)
 
 
 class WorkerShell(Shell):

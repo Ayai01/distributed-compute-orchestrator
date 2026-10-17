@@ -3,7 +3,7 @@
 
 def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=256, cwd=None, stdin=None,
-            project='', resource_share=1.0, max_cpus=None, single_thread_weight=1.0):
+            project='', resource_share=1.0, max_cpus=None, single_thread_weight=1.0,retries=2):
     task = {"steps": [list(argv)], "cpus": cpus, "timeout": timeout,
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
             "render": list(render), "label": label, "priority": priority,
@@ -17,6 +17,7 @@ def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, ren
         task["cwd"] = str(cwd)
     if stdin is not None:
         task["stdin"] = str(stdin)
+    if retries!=2:task['retries']=retries
     return task
 
 

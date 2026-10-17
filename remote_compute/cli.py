@@ -318,6 +318,12 @@ def main(argv=None):
         if getattr(args, "detach", False) and not args.url:
             raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
+        if args.url and args.mode=='worker' and args.action is None:
+            from .commands import RemoteWorker
+            client=Client(args.url,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'))
+            if client.health().get('role')!='worker':raise ValueError('Worker console requires a worker URL')
+            WorkerShell(RemoteWorker(client)).loop(client.health,client.url)
+            return 0
         if args.mode == "worker" and args.action:
             raise ValueError("worker 模式使用本地操作终端；提交任务使用 scheduler/hybrid 模式")
         existing_worker = None
@@ -370,7 +376,8 @@ def main(argv=None):
             if args.mode == 'worker':
                 host = args.host or config.get("host", "127.0.0.1")
                 worker.restart_available = args.service_child
-                server = Server((host, port), worker, restart=restart_worker if args.service_child else None)
+                server = Server((host, port), worker, restart=restart_worker if args.service_child else None,
+                                certfile=config.get('certfile'),keyfile=config.get('keyfile'))
                 print(f"算力提供者 http://{host}:{server.server_port}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
                 thread.start()

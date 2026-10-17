@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import select
+import ssl
 import threading
 import time
 from urllib.parse import quote
@@ -38,7 +39,7 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None):
         self.url, self.token = url.rstrip("/"), token
         if timeout is None:
             timeout = (float(os.environ.get('REMOTE_COMPUTE_TIMEOUT',10))
@@ -47,6 +48,8 @@ class Client:
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
         self._capabilities = None
+        self.ca_file=ca_file or (os.environ.get('REMOTE_COMPUTE_CA') if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else None)
+        self.ssl_context=ssl.create_default_context(cafile=self.ca_file) if self.ca_file else None
 
     def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         pool=self.__dict__.get('_transport')
@@ -95,7 +98,8 @@ class Client:
             connection = getattr(self.connections, 'connection', None)
             if connection is None:
                 factory = http.client.HTTPSConnection if self.endpoint.scheme == 'https' else http.client.HTTPConnection
-                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=self.timeout)
+                options={'context':getattr(self,'ssl_context',None)} if self.endpoint.scheme=='https' else {}
+                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=self.timeout,**options)
                 self.connections.connection = connection
             connection.timeout = self.timeout
             if connection.sock is not None:
@@ -140,7 +144,9 @@ class Client:
                 if not etag:
                     partial.clear()
                 if not retryable or attempt==attempts-1:
-                    raise RemoteError(f'{self.url}{path}: {exc}') from None
+                    error=RemoteError(f'{self.url}{path}: {exc}')
+                    error.transport_code=getattr(exc,'winerror',None) or getattr(exc,'errno',None)
+                    raise error from None
                 time.sleep(min(1,.1*2**attempt))
         return raw if binary else json.loads(raw)
 
@@ -196,7 +202,9 @@ class Client:
             request['memory_mb'] = memory_mb
         if modeled:
             request.update(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
-        return self.request('/jobs/'+identity+'/resize', request)
+        action='lease' if (os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
+                           and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/')) else 'resize'
+        return self.request('/jobs/'+identity+'/'+action, request)
 
     def nodes(self):
         return self.request("/nodes")
@@ -262,7 +270,7 @@ class Client:
         if self.endpoint.scheme in {'http','https'}:
             backend=self.__dict__.get('_result_client')
             if backend is None:
-                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout)))
+                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None)))
             backend.timeout=max(120,self.timeout)
         raw = backend.request("/jobs/" + identity + "/artifacts", binary=True)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -367,12 +375,13 @@ class Pool:
                 node = Node(f"node{index + 1}", entry)
             else:
                 node = Node(entry.get("name", f"node{index + 1}"),
-                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10)),
+                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10),ca_file=entry.get('ca_file')),
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
                 node.callback_url = entry.get("callback_url", "")
                 node.host_ip = entry.get("host_ip", "")
+                node.aliases = entry.get('aliases',[])
             self._validate_node(node)
             self.nodes.append(node)
         if not self.nodes or len({x.name for x in self.nodes}) != len(self.nodes):
@@ -475,6 +484,7 @@ class Pool:
                  "callback_url": getattr(n, 'callback_url', ''),
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
                  "timeout": getattr(n.client,'timeout',10),
+                 "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),

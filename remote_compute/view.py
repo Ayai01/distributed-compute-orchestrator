@@ -101,16 +101,15 @@ def _gb(value):
 
 def _capabilities(tags):
     tags=set(tags or [])
-    groups=[('SPICE',{'ngspice','spice'}),('RTL',{'rtl','verilator'}),
-            ('Python',{'python'}|{t for t in tags if t.endswith('_python')}),
+    groups=[('ngspice',{'ngspice','spice'}),('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
+            ('Python',{'python'}|{t for t in tags if '_python' in t}),
             ('ML',{'rgcn_train'}),('GPU',{'gpu','cuda','rocm'})]
     known={'cpu','win32','linux','darwin'}
     result=[]
     for name,members in groups:
         known.update(members)
         if tags & members:result.append(name)
-    other=len(tags-known)
-    if other:result.append('+'+str(other))
+    result.extend(sorted(tags-known))
     return ' '.join(result) or '-'
 
 
@@ -199,7 +198,8 @@ class StatusRows(list):
             memory=f'{_gb(total-available)}/{_gb(total)}'
             peers=list(dict.fromkeys(item['ip'] for item in node.get('peers') or []))
             external=[ip for ip in peers if ip not in ('local','127.0.0.1','::1')]
-            peers=', '.join(external or ['本机' if ip in ('local','127.0.0.1','::1') else ip for ip in peers]) or '-'
+            loopback='中心/隧道' if node.get('callback_url') else '本机'
+            peers=', '.join(external or [loopback if ip in ('local','127.0.0.1','::1') else ip for ip in peers]) or '-'
             benchmark=node.get('benchmark') or {}
             measured=benchmark.get('score')
             if measured is not None and benchmark.get('unit','kiter/s')=='kiter/s':
@@ -264,8 +264,15 @@ class StatusRows(list):
             else:
                 table=[_line(' '.join(map(str,r)),width) for r in self.projects]
             sections.append(('工程份额',table if self.projects else [_line('等待工程任务',width)],0))
-        sections.append(('运行能力',[_line(r[0]+': '+_capabilities(node.get('tags')),width)
-                                      for node,r in self.devices],2))
+        capabilities=[]
+        for node,r in self.devices:
+            prefix=r[0]+': ';line=prefix
+            for word in _capabilities(node.get('tags')).split():
+                if _width(line+' '+word)>width-4 and line!=prefix:
+                    capabilities.append(_line(line,width));line='  '+word
+                else:line+=('' if line==prefix else ' ')+word
+            capabilities.append(_line(line,width))
+        sections.append(('运行能力',capabilities,2))
         sections.append(('访问来源',[_line(r[0]+': '+ip,width) for _,r in self.devices for ip in r[6].split(', ')],1))
         return sections
 
