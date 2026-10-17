@@ -1,9 +1,32 @@
-"""Own the launched process tree so cancellation also stops compilers."""
+"""Own service power requests and launched process trees."""
 
+from contextlib import contextmanager
 import os
 import signal
 import subprocess
 import time
+
+
+@contextmanager
+def keep_awake():
+    """Keep Windows services available while allowing the display to turn off."""
+    if os.name != 'nt':
+        yield
+        return
+    import ctypes as c
+    from ctypes import wintypes as w
+
+    set_state = c.WinDLL('kernel32').SetThreadExecutionState
+    set_state.argtypes = [w.DWORD]
+    set_state.restype = w.DWORD
+    continuous = 0x80000000
+    previous = set_state(continuous | 0x1)  # ES_SYSTEM_REQUIRED
+    if not previous:
+        raise OSError('Windows refused the service sleep prevention request')
+    try:
+        yield
+    finally:
+        set_state(continuous | previous)
 
 
 def low_integrity_directory(path):

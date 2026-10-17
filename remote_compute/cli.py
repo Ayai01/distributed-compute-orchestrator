@@ -1,6 +1,7 @@
 """The unified Python entry point and its operator consoles."""
 
 import argparse
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,7 @@ from .coordinator import Coordinator
 from .bundle import TERMINAL, atomic_json
 from .worker import Conflict, Server, Worker
 from .startup import Cancelled, resolve
+from .process import keep_awake
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -249,6 +251,7 @@ def main(argv=None):
             item.add_argument("--output", required=True)
     args = parser.parse_args(invocation)
     worker = server = thread = None
+    lifetime = ExitStack()
     restarting = threading.Event()
     try:
         path = Path(args.config) if args.config else ROOT / "worker.local.json"
@@ -286,6 +289,10 @@ def main(argv=None):
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         if args.check:
             return check_tools(config)
+        if not args.url and args.action is None:
+            # Both the supervisor and its service child own a request: reloads
+            # stay covered, and a directly launched child works independently.
+            lifetime.enter_context(keep_awake())
         if not args.service_child and not args.url and args.action is None:
             return supervise(invocation)
         if config.get('console') and sys.stdin.isatty():
@@ -373,10 +380,13 @@ def main(argv=None):
             print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py；统一连接地址 http://127.0.0.1:26133。', file=sys.stderr)
         return 2
     finally:
-        if server:
-            server.shutdown()
-            if thread:
-                thread.join()
-            server.server_close()
-        if worker:
-            worker.close()
+        try:
+            if server:
+                server.shutdown()
+                if thread:
+                    thread.join()
+                server.server_close()
+            if worker:
+                worker.close()
+        finally:
+            lifetime.close()

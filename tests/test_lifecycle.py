@@ -1,6 +1,7 @@
 """Shared scratch and persisted operator controls survive concurrent starts/reloads."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -17,10 +18,69 @@ from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
 from remote_compute import ramdisk, repository
-from remote_compute.cli import ROOT
-from remote_compute.process import Process
+from remote_compute.cli import ROOT, main
+from remote_compute.process import Process, keep_awake
 from test_center import center
-from test_compute import provider, python, until
+from test_compute import provider, python, until, scratch
+
+
+class ServicePowerTests(unittest.TestCase):
+    def test_all_service_modes_hold_request_until_cleanup_and_supervisor_exit(self):
+        for mode in ('scheduler', 'hybrid', 'worker'):
+            for child in (False, True):
+                with self.subTest(mode=mode, child=child), scratch() as directory:
+                    root = Path(directory)
+                    config = root / 'config.json'
+                    config.write_text('{}', encoding='utf8')
+                    events = []
+
+                    @contextmanager
+                    def awake():
+                        events.append('awake')
+                        try:
+                            yield
+                        finally:
+                            events.append('released')
+
+                    def running(*args, **kwargs):
+                        self.assertEqual(events, ['awake'])
+                        return 0
+
+                    with patch('remote_compute.cli.keep_awake', awake), \
+                            patch('remote_compute.cli.supervise', side_effect=running), \
+                            patch('remote_compute.cli.run_scheduler', side_effect=running), \
+                            patch('remote_compute.cli.WorkerShell.loop', side_effect=running):
+                        args = ['--mode', mode, '--config', str(config), '--root', str(root/'worker'),
+                                '--port', '0', '--cpus', '1']
+                        if child:
+                            args.append('--service-child')
+                        self.assertEqual(main(args), 0)
+                    self.assertEqual(events, ['awake', 'released'])
+
+    def test_client_commands_do_not_hold_machine_awake(self):
+        with patch('remote_compute.cli.keep_awake') as awake, \
+                patch('remote_compute.cli.run_scheduler', return_value=0):
+            self.assertEqual(main(['--url', 'http://127.0.0.1:26133', 'nodes']), 0)
+            self.assertEqual(main(['--url', 'http://127.0.0.1:26133']), 0)
+        awake.assert_not_called()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows execution-state ownership')
+    def test_native_request_restores_previous_thread_state_after_exception(self):
+        import ctypes as c
+        from ctypes import wintypes as w
+        state = c.WinDLL('kernel32').SetThreadExecutionState
+        state.argtypes, state.restype = [w.DWORD], w.DWORD
+        continuous, system, display = 0x80000000, 0x1, 0x2
+        previous = state(continuous | display)
+        self.assertTrue(previous)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'service stopped'):
+                with keep_awake():
+                    self.assertEqual(state(continuous | system), continuous | system)
+                    raise RuntimeError('service stopped')
+            self.assertEqual(state(continuous | display), continuous | display)
+        finally:
+            state(continuous | previous)
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows shared ImDisk lifecycle')

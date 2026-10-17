@@ -10,6 +10,8 @@ Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执�
 
 启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:26133` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
 
+Windows 下 scheduler / hybrid / worker 从启动到退出持续阻止自动休眠，空闲排队、终端失焦、headless 和服务重载期间均生效；屏幕可以正常关闭。退出后自动释放，恢复原有电源策略，无需管理员权限，也不修改系统电源计划。显式休眠、关机和合盖仍按用户操作执行。仅连接已有中心的 CLI 命令不申请防休眠。Linux 的电源管理接入保留待实机验证。
+
 端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心，hybrid 复用中心内置的本机算力）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
 
 ```text
