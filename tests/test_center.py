@@ -39,6 +39,25 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_capability_handshake_omits_large_dashboard_and_keeps_full_health(self):
+        from remote_compute.local import LocalClient
+        with scratch() as root, provider(Path(root)/'worker') as (worker,node):
+            worker.benchmark['trials']=['retained benchmark detail'*1000]*4
+            with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
+                full=client.health()
+                self.assertGreater(len(json.dumps(full)),90000)
+                for backend in (client,node,LocalClient(worker)):
+                    brief=backend.health(brief=True)
+                    self.assertLess(len(json.dumps(brief)),512)
+                    self.assertEqual(set(brief),{'protocol','node','role','version','capabilities'})
+                    self.assertIn('resize_memory_model',brief['capabilities'])
+                client._capabilities=None
+                with patch.object(client,'request',wraps=client.request) as requests:
+                    with self.assertRaises(RemoteError):client.resize('0'*32,0,memory_mb=64)
+                    self.assertEqual(requests.call_args_list[0].args,('/health',))
+                    self.assertEqual(requests.call_args_list[0].kwargs,{'brief':True})
+                self.assertIn('nodes',client.health())
+
     def test_project_shares_and_prefetch_exclude_unusable_server_capacity(self):
         with scratch() as root, provider(Path(root)/'native',cpus=2,cpu_limit=2,tags=['native_only']) as (_,native), \
                 provider(Path(root)/'bulk',cpus=8,cpu_limit=8,tags=['bulk_only']) as (_,bulk):

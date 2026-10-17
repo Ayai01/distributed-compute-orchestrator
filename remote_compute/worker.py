@@ -810,10 +810,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply({"error": "Unknown route"}, 404)
             else:
                 return self._reply({"error": "Unknown route"}, 404)
-            if self.command == 'GET' and parts[0] == 'jobs' and self.headers.get('X-Remote-Compute-Brief') == '1':
-                if len(parts) == 1:
+            if self.command == 'GET' and self.headers.get('X-Remote-Compute-Brief') == '1':
+                if parts == ['health']:
+                    value={k:value[k] for k in ('protocol','node','role','version','capabilities') if k in value}
+                elif parts == ['jobs']:
                     value = [progress(row) for row in value]
-                elif len(parts) == 2:
+                elif len(parts) == 2 and parts[0] == 'jobs':
                     value = progress(value)
             self._reply(value)
         except KeyError as exc:

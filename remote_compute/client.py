@@ -87,8 +87,8 @@ class Client:
                 time.sleep(.1)
         return raw if binary else json.loads(raw)
 
-    def health(self):
-        result = self.request("/health")
+    def health(self, *, brief=False):
+        result = self.request("/health", brief=True) if brief else self.request("/health")
         if result.get("protocol") != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
         self._capabilities = result.get('capabilities',[])
@@ -125,7 +125,7 @@ class Client:
         modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
         if memory_mb is not None or cpus==0 or modeled:
             if getattr(self, '_capabilities', None) is None:
-                self.health()
+                self.health(brief=True)
             if (memory_mb is not None and 'resize_memory' not in self._capabilities
                     or cpus==0 and 'resize_auto' not in self._capabilities
                     or modeled and 'resize_memory_model' not in self._capabilities):
