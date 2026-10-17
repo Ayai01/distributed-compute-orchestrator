@@ -369,7 +369,7 @@ class Pool:
                  "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
-                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version')},
+                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'host_ip', 'peers', 'events', 'root', 'version')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                  "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
 

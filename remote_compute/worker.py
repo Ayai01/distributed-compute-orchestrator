@@ -652,7 +652,7 @@ class Handler(BaseHTTPRequestHandler):
         worker = self.server.worker
         if worker.token and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + worker.token):
             return self._reply({"error": "Token required"}, 401)
-        worker.activity.access(self.client_address[0])
+        worker.activity.access(self.client_address[0], self.connection.getsockname()[0])
         parts = self.path.strip("/").split("/")
         try:
             body = None

@@ -54,6 +54,21 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_device_ip_is_distinct_from_visitors_and_keeps_complete_ipv4(self):
+        value=dict(role='scheduler',node='Aya1-PC',nodes=[
+            dict(name='Aya1-PC',url='local://Aya1-PC',capacity=24,peers=[dict(ip='local')]),
+            dict(name='Aya1-TX',url='http://192.168.100.100:26133',capacity=30,
+                 peers=[dict(ip='127.0.0.1'),dict(ip='192.168.1.6')])])
+        text='\n'.join(format_status(value,width=159).fit(38))
+        self.assertIn('设备IP',text)
+        self.assertIn('192.168.100.100',text)
+        self.assertIn('Aya1-TX: 192.168.1.6',text)
+        self.assertNotIn('127.0.0.1',text)
+        worker=dict(node='Aya1-TX',role='worker',cpus=30,host_ip='192.168.1.10')
+        self.assertIn('192.168.1.10','\n'.join(format_status(worker,url='http://0.0.0.0:26133',width=159)))
+        worker['host_ip']=None
+        self.assertIn('等待连接','\n'.join(format_status(worker,url='http://0.0.0.0:26133',width=159)))
+
     def test_center_and_worker_notices_merge_by_operation_and_keep_executing_device(self):
         from remote_compute.view import format_notices
         center=[dict(time=10,ip='127.0.0.1',message='upload main.py [aafe1122]'),

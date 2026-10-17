@@ -9,9 +9,12 @@ class Activity:
         self.lock = threading.Lock()
         self.events = deque(maxlen=6)
         self.peers = {}
+        self.host_ip = None
 
-    def access(self, address):
+    def access(self, address, host_ip=None):
         with self.lock:
+            if host_ip and host_ip not in ('0.0.0.0', '::', '::1') and not host_ip.startswith('127.'):
+                self.host_ip = host_ip
             self.peers[address] = time.time()
             self.peers = dict(sorted(self.peers.items(), key=lambda x: x[1])[-8:])
 
@@ -26,5 +29,5 @@ class Activity:
 
     def snapshot(self):
         with self.lock:
-            return dict(events=list(self.events), peers=[dict(ip=k, seen=v) for k, v in self.peers.items()
+            return dict(host_ip=self.host_ip, events=list(self.events), peers=[dict(ip=k, seen=v) for k, v in self.peers.items()
                                                        if time.time() - v < 120])

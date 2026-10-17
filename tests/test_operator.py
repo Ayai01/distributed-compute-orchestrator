@@ -13,6 +13,14 @@ from test_compute import provider, python, scratch, until
 
 
 class OperatorTests(unittest.TestCase):
+    def test_device_ip_comes_from_accepted_connection_and_survives_loopback_probe(self):
+        activity=Activity()
+        self.assertIsNone(activity.snapshot()['host_ip'])
+        activity.access('192.168.1.6','192.168.1.10')
+        activity.access('127.0.0.1','127.0.0.1')
+        self.assertEqual(activity.snapshot()['host_ip'],'192.168.1.10')
+        self.assertEqual({peer['ip'] for peer in activity.snapshot()['peers']},{'192.168.1.6','127.0.0.1'})
+
     def test_compute_submissions_do_not_displace_operator_notices(self):
         activity=Activity()
         activity.notify('write source.py','192.168.1.6')

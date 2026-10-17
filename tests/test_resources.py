@@ -37,9 +37,7 @@ class BenchmarkTests(unittest.TestCase):
                 for width in (80,110,160):
                     text='\n'.join(format_status(client.health(),width=width))
                     self.assertIn('kiter/s',text)
-                    if width>=120:
-                        self.assertRegex(text,r'\|\s+'+str(budget)+r' \|')
-                    elif width>=100:
+                    if width>=100:
                         self.assertIn(f'({budget})',text)
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):

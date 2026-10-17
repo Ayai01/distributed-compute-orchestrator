@@ -13,7 +13,8 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGES = ('numpy', 'scipy', 'numba', 'pymoo', 'moocore', 'threadpoolctl',
+PACKAGES = ('numpy', 'scipy', "numba>=0.65.1; python_version >= '3.14'", "numba; python_version < '3.14'",
+            'pymoo', 'moocore', 'threadpoolctl', 'scikit-learn', 'umap-learn',
             'opencv-python-headless', 'onnx', 'onnxruntime')
 NGSPICE_URL = 'https://downloads.sourceforge.net/project/ngspice/ng-spice-rework/47/ngspice-47_64.7z'
 SEVENZIP_URL = 'https://github.com/ip7z/7zip/releases/download/26.04/7zr.exe'
@@ -53,7 +54,7 @@ def _python(temporary):
     _run([executable, '-B', '-m', 'ensurepip'], env=env, capture_output=True)
     _run([executable, '-B', '-m', 'pip', 'install', '--disable-pip-version-check',
           '--no-cache-dir', '--no-compile', '--only-binary=:all:', *PACKAGES], env=env)
-    probe = ('import json,sys; import numpy,scipy,numba,pymoo,moocore,cv2,onnx,onnxruntime as ort; '
+    probe = ('import json,sys; import numpy,scipy,numba,pymoo,moocore,sklearn,umap,cv2,onnx,onnxruntime as ort; '
              'f=numba.njit(lambda x: x*x); assert f(7)==49; '
              'assert cv2.resize(numpy.zeros((2,2),numpy.uint8),(4,4)).shape==(4,4); '
              'h=onnx.helper; t=onnx.TensorProto.FLOAT; '
@@ -67,7 +68,8 @@ def _python(temporary):
              'print(json.dumps({"python":sys.version.split()[0],"executable":sys.executable,"packages":'
              '{n:getattr(m,"__version__","unknown") for n,m in '
              '[("numpy",numpy),("scipy",scipy),("numba",numba),("pymoo",pymoo),'
-             '("moocore",moocore),("opencv-python-headless",cv2),("onnx",onnx),("onnxruntime",ort)]}}))')
+             '("moocore",moocore),("scikit-learn",sklearn),("umap-learn",umap),'
+             '("opencv-python-headless",cv2),("onnx",onnx),("onnxruntime",ort)]}}))')
     return executable, json.loads(_run([executable, '-B', '-c', probe], env=env,
                                       capture_output=True, text=True).stdout)
 

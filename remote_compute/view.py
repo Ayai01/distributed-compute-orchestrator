@@ -6,6 +6,7 @@ import shutil
 import time
 import unicodedata
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 
 _ambiguous_width = None
@@ -112,6 +113,16 @@ def _project(name):
     return {'Analog-Opt-Bench':'Bench','ARH-DSE':'ARH'}.get(name,name or '-')
 
 
+def _device_address(node, url=''):
+    address=node.get('url') or url
+    if address.startswith('local://'):
+        return '本机'
+    host=urlsplit(address).hostname if address else None
+    if host in ('127.0.0.1','localhost','::1'):
+        return '本机'
+    return node.get('host_ip') or (host if host and host not in ('0.0.0.0','::') else '等待连接')
+
+
 def _label(job):
     parts = job.get('label','').replace('\\','/').split('/')
     project = (job.get('project') or '').casefold()
@@ -156,13 +167,15 @@ class StatusRows(list):
             total=node.get('memory_total_mb') or 0
             available=node.get('host_memory_available_mb') or 0
             memory=f'{_gb(total-available)}/{_gb(total)}'
-            peers=', '.join('本机' if item['ip']=='local' else item['ip'] for item in node.get('peers') or []) or '-'
+            peers=list(dict.fromkeys(item['ip'] for item in node.get('peers') or []))
+            external=[ip for ip in peers if ip not in ('local','127.0.0.1','::1')]
+            peers=', '.join(external or ['本机' if ip in ('local','127.0.0.1','::1') else ip for ip in peers]) or '-'
             benchmark=node.get('benchmark') or {}
             score=f"{benchmark['score']:.1f}" if benchmark.get('score') is not None else '待测'
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
-                                       benchmark.get('threads','-')]))
+                                       benchmark.get('threads','-'),_device_address(node,'' if center else self.url)]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
         self.projects=[]
         if center:
@@ -178,8 +191,8 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','线程(总)','CPU','kiter/s(T)','内存GiB','可配','RSS/预留','访问IP'],
-                         [[*r[:3],f'{r[7]}({r[8]})' if r[8]!='-' else r[7],*r[3:7]] for r in records],
+            table=_table(['设备','线程(总)','CPU','kiter/s(T)','内存GiB','可配','RSS/预留','设备IP'],
+                         [[*r[:3],f'{r[7]}({r[8]})' if r[8]!='-' else r[7],*r[3:6],r[9]] for r in records],
                          [7,10,6,11,10,5,9,None],width,right=(1,2,3,4,5,6))
         elif width>=54:
             table=_table(['设备','线程(总)','CPU','内存GiB','可配'],[r[:5] for r in records],
@@ -194,12 +207,12 @@ class StatusRows(list):
         sections=[('设备资源',table,0)]
         if width<100:
             if width>=54:
-                details=_table(['设备','kiter/s','线程','RSS/预留','访问IP'],
-                               [[r[0],r[7],r[8],r[5],r[6]] for r in records],
-                               [7,8,4,9,None],width,right=(1,2,3))
+                details=_table(['设备','kiter/s(T)','RSS/预留','设备IP'],
+                               [[r[0],f'{r[7]}({r[8]})',r[5],r[9]] for r in records],
+                               [7,12,9,None],width,right=(1,2))
             else:
                 details=[_line(f'{r[0]} {r[7]} kiter/s ({r[8]})',width) for r in records]
-                details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[6]}',width) for r in records)
+                details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
             sections.append(('启动算力 kiter/s | RSS/预留 GiB',details,1))
         if self.value.get('role')=='scheduler':
             if width>=42:
@@ -210,6 +223,7 @@ class StatusRows(list):
             sections.append(('工程份额',table if self.projects else [_line('等待工程任务',width)],0))
         sections.append(('运行能力',[_line(r[0]+': '+_capabilities(node.get('tags')),width)
                                       for node,r in self.devices],2))
+        sections.append(('访问来源',[_line(r[0]+': '+ip,width) for _,r in self.devices for ip in r[6].split(', ')],1))
         return sections
 
     def _resource_rows(self, sections, width, limit=None, *, bottom=False):
