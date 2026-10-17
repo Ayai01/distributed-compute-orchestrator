@@ -261,8 +261,8 @@ class Node:
 class Pool:
     """Shared admission across concurrent batches; workers enforce the final budget.
 
-    CPU pressure chooses the least-busy host; adaptive uses same-label elapsed
-    time for near ties. round_robin gives predictable rotation. Accepted work stays put.
+    CPU pressure chooses the least-busy host; adaptive seeds near ties with mixed
+    throughput, then learns same-label elapsed time. Accepted work stays put.
     """
     POLICIES = {"adaptive", "balanced", "round_robin"}
 
@@ -436,10 +436,19 @@ class Pool:
                         # difference, retain speed learning and operator weights.
                         close = [n for n in ready if pressures[n.name] - pressures[least.name]
                                  < max(1 / logical(n), 1 / logical(least))]
-                        observations = [n.durations[label] for n in matching if label in n.durations]
+                        # Same-version mixed work is a prior, per measured CPU.
+                        # Real same-label timings anchor and then replace it.
+                        benchmarks = [n.health.get('benchmark') or {} for n in matching]
+                        rates = [b['score']/b['threads'] for b in benchmarks
+                                 if b.get('name') == 'mixed-cpu-v1' and b.get('unit') == 'Miter/s'
+                                 and b.get('score',0)>0 and b.get('threads',0)>0]
+                        priors = {n.name:1.0 for n in matching}
+                        if len(rates)==len(matching):
+                            priors = {n.name:1/r for n,r in zip(matching,rates)}
+                        observations = [n.durations[label]/priors[n.name] for n in matching if label in n.durations]
                         typical = sum(observations) / len(observations) if observations else 1.0
                         def score(n):
-                            speed = n.durations.get(label, typical * 0.8) / typical if self.policy == "adaptive" else 1.0
+                            speed = n.durations.get(label, typical * priors[n.name] * 0.8) / typical if self.policy == "adaptive" else 1.0
                             load = n.reserved + n.external
                             return ((load + cpus) * speed / (n.capacity * n.weight), pressures[n.name])
                         unexplored = [n for n in close if label not in n.durations] if self.policy == "adaptive" else []

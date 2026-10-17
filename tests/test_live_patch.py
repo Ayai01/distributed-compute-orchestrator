@@ -10,7 +10,7 @@ import time
 import unittest
 import zipfile
 
-from remote_compute import Client, RemoteError, command
+from remote_compute import Client, RemoteError, command, __version__
 from test_compute import scratch, until
 
 
@@ -71,7 +71,7 @@ finally:
                 until(receipt.exists,seconds=10)
                 applied=json.loads(receipt.read_text())
                 self.assertTrue(applied['jobs_unchanged'])
-                self.assertEqual((client.health()['pid'],client.health()['version']),(address['pid'],'0.7.13'))
+                self.assertEqual((client.health()['pid'],client.health()['version']),(address['pid'],__version__))
                 grant=client.resize(identity,3,memory_mb=256)
                 self.assertEqual((grant['cpus'],grant['memory_mb']),(3,256))
                 self.assertEqual(client.read_job_file(identity,'pid.txt'),child_pid)

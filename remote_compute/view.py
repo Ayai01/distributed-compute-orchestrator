@@ -175,7 +175,8 @@ class StatusRows(list):
             measured=benchmark.get('score')
             if measured is not None and benchmark.get('unit','kiter/s')=='kiter/s':
                 measured/=1000
-            score=f"{measured:.1f}" if measured is not None else '待测'
+            score=('旧哈希' if benchmark.get('name')=='pbkdf2-sha256-v1' else
+                   f"{measured:.3f}" if measured is not None else '待测')
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
