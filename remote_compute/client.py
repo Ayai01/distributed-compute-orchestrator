@@ -36,6 +36,7 @@ class Client:
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
+        self._capabilities = None
 
     def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
@@ -84,6 +85,7 @@ class Client:
         result = self.request("/health")
         if result.get("protocol") != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
+        self._capabilities = result.get('capabilities',[])
         return result
 
     def control(self, **changes):
@@ -114,6 +116,13 @@ class Client:
 
     def resize(self, identity, cpus, *, memory_mb=None):
         """Borrow/return resources at a safe boundary; use the actual returned grant."""
+        if memory_mb is not None:
+            if self._capabilities is None:
+                self.health()
+            if 'resize_memory' not in self._capabilities:
+                state=self.status(identity,brief=True)
+                return dict(id=identity,node=state.get('assigned_node',state.get('node')),
+                            cpus=state['cpus'],memory_mb=state['memory_mb'],requested_cpus=cpus,supported=False)
         request = dict(cpus=cpus)
         if memory_mb is not None:
             request['memory_mb'] = memory_mb
