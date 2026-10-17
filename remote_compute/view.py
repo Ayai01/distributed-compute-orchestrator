@@ -310,7 +310,7 @@ class StatusRows(list):
                          [4,9,6,None],width,right=(1,2))
         else:
             table=[_line('ID 任务/线程 运行秒 标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {r[6]}',width) for r in records]
-        title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页 | Tab/ShiftTab'
+        title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页 | 空输入 Tab/ShiftTab'
         if not self.records:
             table.append(_line('空闲',width))
         return _panel(title,table,width,framed=True)
@@ -361,15 +361,25 @@ def format_notices(value):
             for e in sorted(notices.values(),key=lambda e:e['time'])[-6:]]
 
 
-def _layout(status, events, output, height):
-    budget=max(1,height-2)
+def _layout(status, events, output, height, *, reserved=2):
+    budget=max(0,height-reserved)
+    if not budget:
+        return []
     sections=int(bool(events))+int(bool(output))
     if isinstance(status,StatusRows):
         reserve=max(6,min(25,budget-3*sections))
         count=min(6,max(1,(budget-reserve-2*sections)//sections)) if sections else 0
-        footer=(_panel('最近通知',events[-count:],status.width) if events else [])
-        footer+=(_panel('命令输出 | PgUp/PgDn',output[-count:],status.width) if output else [])
-        return (status.fit(max(0,budget-len(footer)))+footer)[-budget:]
+        def footer_rows(count):
+            return ((_panel('最近通知',events[-count:],status.width) if events else []) +
+                    (_panel('命令输出 | PgUp/PgDn',output[-count:],status.width) if output else []))
+        footer=footer_rows(count)
+        head=status.fit(max(0,budget-len(footer)))
+        if sections:
+            spare=budget-len(head)-len(footer)
+            count=min(6,count+max(0,spare)//sections)
+            footer=footer_rows(count)
+            head=status.fit(max(0,budget-len(footer)))
+        return (head+footer)[-budget:]
     count=min(6,max(1,(budget-3-sections)//sections)) if sections else 0
     footer=(['最近操作（最多6条）:']+events[-count:] if events else [])
     footer+=(['终端输出（PgUp/PgDn翻页）:']+output[-count:] if output else [])

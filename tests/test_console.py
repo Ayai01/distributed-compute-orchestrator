@@ -12,7 +12,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.cli import Shell
-from remote_compute.console import Dashboard, FocusRefresh, RowPainter, format_status, _enable_ansi, _initial_size, _input_view, _layout, _width, _clip
+from remote_compute.console import (Dashboard, FocusRefresh, RowPainter, CommandCompletion,
+    format_status, _enable_ansi, _initial_size, _input_view, _layout, _width, _clip,
+    _command_rows, _console_size_probe)
+from remote_compute.commands import SchedulerShell, WorkerShell
 
 
 class Keyboard:
@@ -54,6 +57,168 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_command_suggestions_use_cached_nodes_ids_and_real_parser_options(self):
+        shell = object.__new__(SchedulerShell)
+        shell.pool = Mock()
+        identity = 'abcd' + '1'*28
+        snapshot = dict(nodes=[dict(name='Aya1-PC', active_jobs=[dict(id=identity)]),
+                               dict(name='Aya1-TX', active_jobs=[])])
+        def suggest(line):
+            return shell.suggest(line, len(line), snapshot)
+        self.assertEqual(suggest('cpu')['matches'], ['cpus'])
+        self.assertEqual(suggest('cpus Aya')['matches'], ['Aya1-PC','Aya1-TX'])
+        self.assertEqual(suggest('logs Aya1-PC abc')['matches'], [identity])
+        self.assertEqual(suggest('logs Aya1-TX abc')['matches'], [])
+        self.assertEqual(suggest('jobs abc')['matches'], [identity])
+        self.assertEqual(suggest('exec --node Aya')['matches'], ['Aya1-PC','Aya1-TX'])
+        self.assertEqual(suggest('exec --node ')['matches'], ['Aya1-PC','Aya1-TX'])
+        self.assertEqual(suggest('exec --no')['matches'], ['--node'])
+        self.assertEqual(suggest('run --cpus ')['matches'], [])
+        self.assertIn('--max-cpus', suggest('run --')['matches'])
+        self.assertEqual(suggest('policy b')['matches'], ['balanced'])
+        self.assertIn('节点 N', suggest('cpus Aya1-PC 12')['usage'])
+        shell.pool.assert_not_called()
+        worker = WorkerShell(Mock())
+        local = dict(active_jobs=[dict(id=identity)])
+        self.assertEqual(worker.suggest('logs ab', 7, local)['matches'], [identity])
+        self.assertIn('all', worker.suggest('cancel ', 7, local)['matches'])
+        self.assertEqual(worker.suggest('cpus ', 5, local)['matches'], [])
+
+    def test_completion_extends_prefix_cycles_both_directions_and_preserves_suffix(self):
+        shell = object.__new__(SchedulerShell)
+        shell.pool = Mock()
+        snapshot = dict(nodes=[dict(name='Aya1-PC'),dict(name='Aya1-TX')])
+        completion = CommandCompletion()
+        def complete(line, cursor=None, reverse=False):
+            cursor = len(line) if cursor is None else cursor
+            return completion.apply(line, cursor, shell.suggest(line,cursor,snapshot), reverse=reverse)
+        line, cursor = complete('cpu')
+        self.assertEqual((line,cursor), ('cpus ',5))
+        line, cursor = complete('cpus Aya')
+        self.assertEqual(line, 'cpus Aya1-')
+        line, cursor = complete(line,cursor)
+        self.assertEqual(line, 'cpus Aya1-PC')
+        line, cursor = complete(line,cursor)
+        self.assertEqual(line, 'cpus Aya1-TX')
+        line, cursor = complete(line,cursor,reverse=True)
+        self.assertEqual(line, 'cpus Aya1-PC')
+        completion.last = None
+        line, cursor = complete('cpus Aya1-TX 12', len('cpus Aya1-T'))
+        self.assertEqual(line, 'cpus Aya1-TX 12')
+        self.assertEqual(cursor,len('cpus Aya1-TX'))
+        completion.last = None
+        self.assertEqual(complete('unknown'), ('unknown',7))
+
+    def test_footer_shows_selected_candidate_short_ids_and_command_usage(self):
+        shell, completion = OperatorShell(), CommandCompletion()
+        matches = [f'{i:04x}' + 'a'*28 for i in range(30)]
+        context = dict(usage='jobs [任务ID]', matches=matches)
+        completion.matches, completion.index, completion.last = matches, 29, ('jobs f',6)
+        rows, column = _command_rows(shell,'jobs f',6,79,context,completion)
+        self.assertEqual(len(rows),4)
+        self.assertIn('[001d]',rows[1])
+        self.assertNotIn('a'*28,rows[1])
+        self.assertIn('jobs [任务ID]',rows[0])
+        self.assertTrue(rows[-1].startswith(shell.prompt))
+        self.assertEqual(column,len(shell.prompt)+6)
+        self.assertTrue(all(_width(row)<=79 for row in rows))
+
+    def test_input_and_four_row_footer_stay_inside_small_and_resized_windows(self):
+        jobs = [dict(id=f'{i:04x}'+'b'*28, label='long-label/'*20, cpus=1, status='running') for i in range(70)]
+        health = dict(node='Aya1-PC',role='worker',cpus=24,active_jobs=jobs,
+                      events=[dict(time=i,ip='local',message='notice '+str(i)) for i in range(8)])
+        original = RowPainter.frame
+        for columns, height in ((80,1),(80,3),(80,4),(44,8),(80,16),(120,24),(160,51)):
+            with self.subTest(size=(columns,height)), redirect_stdout(io.StringIO()):
+                frames = []
+                def paint(painter, rows, width, count, cursor):
+                    self.assertEqual(len(rows),height)
+                    self.assertTrue(rows[-1].startswith('test> '))
+                    self.assertTrue(all(_width(row)<=columns-1 for row in rows[-min(4,height):]))
+                    frames.append(list(rows))
+                    return original(painter,rows,width,count,cursor)
+                dashboard = Dashboard(OperatorShell(),lambda:health)
+                for i in range(30):
+                    dashboard.write(f'output {i}\n')
+                with patch.dict(sys.modules,msvcrt=Keyboard([*'quit\r'])), \
+                        patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                        patch('remote_compute.console.time.sleep'), \
+                        patch('remote_compute.console.shutil.get_terminal_size',return_value=os.terminal_size((columns,height))), \
+                        patch.object(RowPainter,'frame',paint):
+                    dashboard.run()
+                self.assertGreater(len(frames),1)
+                if height>=4:
+                    self.assertIn('用法:',frames[0][-4])
+                    self.assertIn('候选:',frames[0][-3])
+
+    def test_typing_tab_completes_command_without_changing_task_page(self):
+        with redirect_stdout(io.StringIO()) as stream:
+            shell = OperatorShell()
+            with patch.dict(sys.modules,msvcrt=Keyboard(['\t',*'pi\t\rquit\r'])), \
+                    patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                    patch('remote_compute.console.time.sleep'):
+                Dashboard(shell, lambda:dict(role='worker',cpus=24)).run()
+        self.assertEqual(shell.completed,1)
+        self.assertNotIn('Unknown syntax',stream.getvalue())
+        self.assertIn('PING_OK',stream.getvalue())
+
+    def test_live_ui_handoff_keeps_input_history_and_painter_without_clearing_screen(self):
+        with redirect_stdout(io.StringIO()) as stream:
+            shell = OperatorShell()
+            painter = RowPainter()
+            state = dict(line='pi',cursor=2,history=['ping'],selected=1,painter=painter)
+            dashboard = Dashboard(shell,lambda:dict(role='worker',cpus=24))
+            dashboard.write('earlier output\n')
+            with patch.dict(sys.modules,msvcrt=Keyboard(['\t','\r','\xe0','H','\r',*'quit\r'])), \
+                    patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                    patch('remote_compute.console.time.sleep'):
+                dashboard.run(state)
+        self.assertEqual(shell.completed,2)
+        self.assertIn('earlier output','\n'.join(dashboard.output))
+        self.assertTrue(painter.rows[-1].startswith('test> quit'))
+        for code in ('\x1b[2J','\x1b[?1049h','\x1b[?1049l'):
+            self.assertNotIn(code,stream.getvalue())
+
+    def test_window_resize_reflows_content_without_losing_the_bottom_input(self):
+        geometry, seen = [160,51], []
+        original = RowPainter.frame
+        def paint(painter, rows, columns, height, cursor):
+            self.assertEqual(len(rows),height)
+            self.assertTrue(rows[-1].startswith('test> '))
+            seen.append((columns,height))
+            result=original(painter,rows,columns,height,cursor)
+            geometry[:] = (80,12) if len(seen)==1 else (120,24)
+            return result
+        with redirect_stdout(io.StringIO()), \
+                patch.dict(sys.modules,msvcrt=Keyboard([*'quit\r'])), \
+                patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                patch('remote_compute.console.time.sleep'), \
+                patch('remote_compute.console.shutil.get_terminal_size',side_effect=lambda *_:os.terminal_size(geometry)), \
+                patch.object(RowPainter,'frame',paint):
+            Dashboard(OperatorShell(),lambda:dict(role='worker',cpus=24)).run()
+        self.assertEqual(seen[:3],[(160,51),(80,12),(120,24)])
+
+    def test_visible_viewport_ignores_large_buffer_and_environment_dimensions(self):
+        kernel = Mock()
+        kernel.GetStdHandle.return_value = 2**40+7
+        def fill(_handle, ptr):
+            info=ptr._obj
+            info.size.x,info.size.y=180,9000
+            info.window.left,info.window.top,info.window.right,info.window.bottom=0,8,119,31
+            return True
+        kernel.GetConsoleScreenBufferInfo.side_effect=fill
+        with patch.dict(os.environ,LINES='9000',COLUMNS='180'), patch.object(ctypes,'WinDLL',return_value=kernel):
+            probe=_console_size_probe()
+            self.assertEqual(probe(),os.terminal_size((120,24)))
+            kernel.GetConsoleScreenBufferInfo.assert_called_with(kernel.GetStdHandle.return_value,unittest.mock.ANY)
+
+    def test_unused_status_rows_go_to_command_feedback_before_blank_padding(self):
+        status=format_status(dict(role='worker',node='device',cpus=3),width=109)
+        rows=_layout(status,[],[f'log {i}' for i in range(20)],32,reserved=4)
+        self.assertLessEqual(len(rows),28)
+        for i in range(14,20):
+            self.assertIn(f'log {i}','\n'.join(rows))
+
     def test_tunnel_device_shows_public_ip_instead_of_localhost(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
             dict(name='Server',url='http://127.0.0.1:26134',callback_url='http://127.0.0.1:26134',

@@ -185,13 +185,60 @@ class Shell(cmd.Cmd):
     intro = "输入 help 查看命令。空行保持当前状态，Ctrl+C 返回提示符，quit 退出。"
     command_groups = (('终端','help quit'),)
 
+    def suggest(self, line, cursor, snapshot):
+        """Complete from command definitions and the already displayed snapshot."""
+        before = line[:cursor]
+        tokens = before.split()
+        prefix = tokens[-1] if before and not before[-1].isspace() else ''
+        index = len(tokens) - bool(prefix)
+        previous = tokens[index-1] if index else ''
+        start = cursor - len(prefix)
+        end = cursor
+        while end < len(line) and not line[end].isspace():
+            end += 1
+        commands = [name[3:] for name in self.get_names() if name.startswith('do_') and name != 'do_EOF']
+        command = tokens[0] if tokens else ''
+        method = getattr(self, 'do_' + command, None)
+        usage = ((method.__doc__ or '').strip().splitlines() or [command])[0] if method else ''
+        nodes = snapshot.get('nodes') or []
+        names = [n.get('name') or n.get('node') for n in nodes]
+        jobs = [(n.get('name') or n.get('node'), j) for n in nodes for j in n.get('active_jobs') or []]
+        jobs.extend((snapshot.get('node'), j) for j in snapshot.get('active_jobs') or [])
+        scheduler = hasattr(self, 'pool')
+        choices = []
+        if index == 0 or command == 'help' and index == 1:
+            choices = commands
+        elif previous == '--node':
+            choices = names
+        elif command == 'policy' and index == 1:
+            choices = ['adaptive', 'balanced', 'round_robin']
+        elif command == 'set' and index >= 2:
+            choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false', 'callback_url=']
+        elif scheduler and index == 1 and command in {'cpus','memory','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
+            choices = names + ([j.get('id') for _, j in jobs] if command == 'jobs' else [])
+        elif command in {'jobs','logs','cancel','delete','fetch'} and index == (2 if scheduler else 1):
+            choices = [j.get('id') for node, j in jobs if not scheduler or node == tokens[1]]
+            if not scheduler and command == 'cancel':
+                choices.append('all')
+        if prefix.startswith('-') or not prefix:
+            parser = (submission_parser(command) if command in {'run','spice','rtl'} else
+                      machine_parser(command) if command in MACHINE_ACTIONS else None)
+            if parser:
+                action = parser._option_string_actions.get(previous)
+                if action is None or action.nargs == 0:
+                    choices += list(parser._option_string_actions)
+            elif command == 'restart':
+                choices.append('--wait')
+        matches = sorted({value for value in choices if value and value.casefold().startswith(prefix.casefold())})
+        return dict(start=start, end=end, prefix=prefix, matches=matches, usage=usage)
+
     def do_help(self, line):
         """help [命令]：按用途查看操作，或查看单条命令用法。"""
         if line.strip():
             return super().do_help(line)
         for title, commands in self.command_groups:
             print(title + '  ' + commands)
-        print('输入 help 命令 查看参数；PgUp/PgDn 翻阅输出；↑/↓ 选择历史命令。')
+        print('输入 help 命令 查看参数；输入后Tab补全，空输入Tab/ShiftTab翻任务页；PgUp/PgDn翻输出；↑/↓历史。')
 
     def emptyline(self):
         pass

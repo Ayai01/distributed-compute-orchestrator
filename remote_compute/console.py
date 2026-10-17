@@ -7,7 +7,7 @@ import time
 import os
 import subprocess
 
-from .view import _width, _clip, _layout, StatusRows, format_status, format_notices, set_width_probe
+from .view import _width, _clip, _rule, _line, _layout, StatusRows, format_status, format_notices, set_width_probe
 
 
 def _input_view(prompt, line, cursor, width):
@@ -22,6 +22,85 @@ def _input_view(prompt, line, cursor, width):
     marker = '<' if start and room > 1 else ''
     visible = _clip(line[start:], room - len(marker))
     return prompt + marker + visible, _width(prompt + marker) + before
+
+
+class CommandCompletion:
+    """Cycle a local candidate list without changing the command's other words."""
+    def __init__(self):
+        self.last = None
+        self.matches = []
+        self.index = -1
+
+    def apply(self, line, cursor, context, *, reverse=False):
+        if self.last == (line, cursor):
+            self.index = (self.index + (-1 if reverse else 1)) % len(self.matches)
+            text = self.matches[self.index]
+        else:
+            self.matches = context['matches']
+            if not self.matches:
+                return line, cursor
+            self.before, self.after = line[:context['start']], line[context['end']:]
+            common = os.path.commonprefix(self.matches)
+            self.index = -1
+            if not reverse and len(self.matches) > 1 and len(common) > len(context['prefix']):
+                text = common
+            else:
+                self.index = len(self.matches)-1 if reverse else 0
+                text = self.matches[self.index]
+        if len(self.matches) == 1 and not self.after and not text.endswith('='):
+            text += ' '
+        result = self.before + text + self.after
+        position = len(self.before + text)
+        self.last = (result, position) if len(self.matches) > 1 else None
+        return result, position
+
+
+def _command_rows(shell, line, cursor, width, context, completion):
+    usage = context['usage'] or ('Tab 补全命令 | Enter 执行 | Esc 清空 | help 命令' if line.strip() else
+                                 'Tab/ShiftTab 翻任务 | PgUp/PgDn 输出 | 上下键 历史 | help 命令')
+    matches = completion.matches if completion.last == (line, cursor) else context['matches']
+    selected = completion.index if completion.last == (line, cursor) else -1
+    candidates = []
+    order = list(range(len(matches)))
+    if selected >= 0:
+        order = order[selected:] + order[:selected]
+    for position, index in enumerate(order):
+        match = matches[index]
+        label = match[:4] if len(match) == 32 and all(c in '0123456789abcdef' for c in match) else match
+        if index == selected:
+            label = '[' + label + ']'
+        suffix = ' ... +' + str(len(matches)-position)
+        if candidates and _width('候选: ' + '  '.join(candidates + [label]) + suffix) > width-4:
+            candidates.append(suffix.strip())
+            break
+        candidates.append(label)
+    choices = '候选: ' + '  '.join(candidates) if candidates else 'Tab 补全 | Shift+Tab 反向 | Enter 执行 | Esc 清空'
+    prompt, column = _input_view(shell.prompt, line, cursor, width)
+    return [_rule('用法: ' + usage, width), _line(choices, width), _rule('', width), prompt], column
+
+
+def _console_size_probe():
+    """Read the visible viewport, independently of buffer rows and LINES/COLUMNS."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    class Coord(c.Structure):
+        _fields_ = [('x', w.SHORT), ('y', w.SHORT)]
+    class Rect(c.Structure):
+        _fields_ = [(name, w.SHORT) for name in ('left', 'top', 'right', 'bottom')]
+    class Info(c.Structure):
+        _fields_ = [('size', Coord), ('cursor', Coord), ('attributes', w.WORD), ('window', Rect), ('maximum', Coord)]
+    kernel = c.WinDLL('kernel32')
+    kernel.GetStdHandle.argtypes = [w.DWORD]
+    kernel.GetStdHandle.restype = w.HANDLE
+    kernel.GetConsoleScreenBufferInfo.argtypes = [w.HANDLE, c.POINTER(Info)]
+    handle = kernel.GetStdHandle(-11 & 0xffffffff)
+    def size():
+        info = Info()
+        if kernel.GetConsoleScreenBufferInfo(handle, c.byref(info)):
+            return os.terminal_size((max(1, info.window.right-info.window.left+1),
+                                     max(1, info.window.bottom-info.window.top+1)))
+        return shutil.get_terminal_size((110, 32))
+    return size
 
 
 def _enable_ansi():
@@ -205,27 +284,34 @@ class Dashboard:
 
     @property
     def output_width(self):
-        return max(1, shutil.get_terminal_size((110, 32)).columns - 5)
+        return max(1, getattr(self, 'columns', shutil.get_terminal_size((110, 32)).columns) - 5)
 
-    def run(self):
+    def run(self, _state=None):
         import msvcrt
         restore = _enable_ansi()
         if restore is None:
             return False
-        if self.stream.isatty():
+        if self.stream.isatty() and _state is None:
             _initial_size()
         width_probe,close_probe=_console_width_probe() if self.stream.isatty() else (None,lambda: None)
         set_width_probe(width_probe)
         focus, refresh = _focus_probe(), FocusRefresh()
-        line, cursor, history, selected = '', 0, [], 0
-        last, offset, page_size, task_page = 0, 0, 6, 0
-        painter=RowPainter()
-        rows, events = [], []
+        state = _state or {}
+        line, cursor = state.get('line', ''), state.get('cursor', 0)
+        history, selected = state.get('history', []), state.get('selected', 0)
+        last, offset, page_size, task_page = 0, state.get('offset', 0), 6, state.get('task_page', 0)
+        completion = CommandCompletion()
+        painter=state.get('painter') or RowPainter()
+        rows, events, value = [], [], {}
         revision, cached_key, body = 0, None, []
+        context_key, context = None, None
         stdout, stderr, shell_stdout = sys.stdout, sys.stderr, self.shell.stdout
         try:
             sys.stdout = sys.stderr = self.shell.stdout = self
-            self.stream.write('\x1b[?1049h\x1b[2J')
+            if _state is None:
+                self.stream.write('\x1b[?1049h\x1b[2J')
+                self.stream.flush()
+            size = _console_size_probe() if self.stream.isatty() else lambda: shutil.get_terminal_size((110, 32))
             while True:
                 try:
                     if not self.alive():
@@ -240,7 +326,9 @@ class Dashboard:
                             rows = ['连接状态: ' + str(error)]
                         revision += 1
                         last = now
-                    columns, height = shutil.get_terminal_size((110, 32))
+                    columns, height = size()
+                    self.columns = columns
+                    reserved = min(4, height)
                     with self.output_lock:
                         key = (revision,self.output_revision,offset,task_page,columns,height)
                         if key != cached_key:
@@ -251,24 +339,31 @@ class Dashboard:
                             if isinstance(rows,StatusRows):
                                 rows.resize(columns-1)
                                 rows.task_page=task_page
-                            visible = _layout(rows,events,output,height)
+                            visible = _layout(rows,events,output,height,reserved=reserved)
                             if isinstance(rows,StatusRows):
                                 task_page=rows.task_page
                             for index,text in enumerate(visible):
                                 if text.startswith('+ 命令输出'):
                                     page_size=max(1,len(visible)-index-2)
-                            visible += [''] * max(0,height-2-len(visible))
-                            body = visible+['-'*max(1,columns-1)]
+                            body = visible[:height-reserved]
+                            body += [''] * max(0,height-reserved-len(body))
                             cached_key = (revision,self.output_revision,offset,task_page,columns,height)
-                    prompt, column = _input_view(self.shell.prompt, line, cursor, max(1, columns - 1))
-                    frame = painter.frame(body+[prompt],columns,height,column)
+                    if context_key != (line, cursor, revision):
+                        context = self.shell.suggest(line, cursor, value)
+                        context_key = (line, cursor, revision)
+                    footer, column = _command_rows(self.shell, line, cursor, max(1,columns-1), context, completion)
+                    frame = painter.frame(body+footer[-reserved:],columns,height,column)
                     if frame:
                         self.stream.write(frame)
                         self.stream.flush()
                     while msvcrt.kbhit():
                         key = msvcrt.getwch()
+                        if key not in ('\t', '\x00', '\xe0'):
+                            completion.last = None
                         if key in ('\x00', '\xe0'):
                             key = msvcrt.getwch()
+                            if key != '\x0f':
+                                completion.last = None
                             if key == 'K': cursor = max(0, cursor - 1)
                             elif key == 'M': cursor = min(len(line), cursor + 1)
                             elif key == 'G': cursor = 0
@@ -276,13 +371,20 @@ class Dashboard:
                             elif key == 'S': line = line[:cursor] + line[cursor + 1:]
                             elif key == 'I': offset += page_size
                             elif key == 'Q': offset = max(0, offset - page_size)
-                            elif key == '\x0f': task_page -= 1
+                            elif key == '\x0f':
+                                if line.strip():
+                                    line, cursor = completion.apply(line,cursor,self.shell.suggest(line,cursor,value),reverse=True)
+                                else:
+                                    task_page -= 1
                             elif key in ('H', 'P') and history:
                                 selected = max(0, min(len(history), selected + (-1 if key == 'H' else 1)))
                                 line = history[selected] if selected < len(history) else ''
                                 cursor = len(line)
                         elif key == '\t':
-                            task_page += 1
+                            if line.strip():
+                                line, cursor = completion.apply(line,cursor,self.shell.suggest(line,cursor,value))
+                            else:
+                                task_page += 1
                         elif key == '\r':
                             if line.strip():
                                 self.write(self.shell.prompt + line + '\n')
@@ -308,8 +410,9 @@ class Dashboard:
         finally:
             sys.stdout, sys.stderr, self.shell.stdout = stdout, stderr, shell_stdout
             try:
-                self.stream.write('\x1b[?1049l')
-                self.stream.flush()
+                if _state is None:
+                    self.stream.write('\x1b[?1049l')
+                    self.stream.flush()
             finally:
                 set_width_probe(None)
                 close_probe()
