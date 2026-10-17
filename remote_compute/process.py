@@ -6,6 +6,33 @@ import subprocess
 import time
 
 
+def low_integrity_directory(path):
+    """Let existing Low native tools write inside a newly owned job directory."""
+    if os.name != 'nt':
+        return
+    import ctypes as c
+    from ctypes import wintypes as w
+
+    security=c.WinDLL('advapi32',use_last_error=True)
+    kernel=c.WinDLL('kernel32',use_last_error=True)
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes=[w.LPCWSTR,w.DWORD,c.POINTER(c.c_void_p),c.POINTER(w.DWORD)]
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype=w.BOOL
+    security.SetFileSecurityW.argtypes=[w.LPCWSTR,w.DWORD,c.c_void_p]
+    security.SetFileSecurityW.restype=w.BOOL
+    kernel.LocalFree.argtypes=[c.c_void_p]
+    kernel.LocalFree.restype=c.c_void_p
+    descriptor=c.c_void_p()
+    if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW('S:(ML;OICI;NW;;;LW)',1,c.byref(descriptor),None):
+        raise c.WinError(c.get_last_error())
+    try:
+        # Label only a new, empty directory. This preserves DACL inheritance;
+        # files and subdirectories created later inherit the Low label.
+        if not security.SetFileSecurityW(str(path),0x10,descriptor):
+            raise c.WinError(c.get_last_error())
+    finally:
+        kernel.LocalFree(descriptor)
+
+
 class Process:
     def __init__(self, argv, cwd, env, stdout, stderr, *, stdin=None):
         self.job = None

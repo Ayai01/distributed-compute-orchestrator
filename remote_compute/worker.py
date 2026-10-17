@@ -22,7 +22,7 @@ from urllib.parse import unquote
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
 from . import __version__
-from .process import Process
+from .process import Process, low_integrity_directory
 from .resources import Host, process_usage
 from .telemetry import Activity
 from .client import RemoteError
@@ -334,6 +334,7 @@ class Worker:
             directory = work.parent
             try:
                 directory.mkdir()
+                low_integrity_directory(directory)
                 unpack(payload, directory)
                 work.mkdir(exist_ok=True)
                 if "stdin" in task and not inside(work, task["stdin"]).is_file():

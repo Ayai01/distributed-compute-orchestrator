@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,37 @@ def until(check, seconds=5):
 
 
 class ExecutionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name=='nt','Windows mandatory labels')
+    def test_low_integrity_tool_writes_job_outputs_and_temp_without_changing_parent_acl(self):
+        from remote_compute.process import low_integrity_directory
+        def permissions(path):
+            raw=subprocess.check_output(['icacls.exe',str(path)],creationflags=subprocess.CREATE_NO_WINDOW).decode(errors='replace')
+            return '\n'.join(line for line in raw.splitlines() if '(NW)' not in line)
+        low_tool=self.root/'low-tool'
+        low_tool.mkdir()
+        original=permissions(low_tool)
+        low_integrity_directory(low_tool)
+        self.assertEqual(permissions(low_tool),original)
+        executable=low_tool/'cmd.exe'
+        shutil.copyfile(Path(os.environ['SystemRoot'])/'System32/cmd.exe',executable)
+        ordinary=self.root/'ordinary'
+        ordinary.mkdir()
+        denied=subprocess.run([str(executable),'/d','/c','echo denied>denied.txt'],cwd=ordinary,
+                              capture_output=True,creationflags=subprocess.CREATE_NO_WINDOW,timeout=5)
+        self.assertNotEqual(denied.returncode,0)
+        self.assertFalse((ordinary/'denied.txt').exists())
+        parent=self.worker.root/'jobs'
+        before=permissions(parent)
+        task=command([str(executable),'/d','/c','run.cmd'],outputs=['value.txt'])
+        script=b'@echo off\r\necho result>value.txt\r\necho temp>"%TEMP%\\value.txt"\r\ntype "%TEMP%\\value.txt"\r\n'
+        identity=self.client.submit(task,files={'run.cmd':script})['id']
+        self.client.wait(identity)
+        result=self.client.fetch(identity)
+        self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+        self.assertEqual(result['files']['value.txt'].strip(),b'result')
+        self.assertEqual(result['stdout'].strip(),'temp')
+        self.assertEqual(permissions(parent),before)
+
     def test_explicit_numerical_threads_survive_worker_defaults(self):
         keys=('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS')
         with scratch() as directory, provider(Path(directory)/'worker',cpus=3,env={key:'99' for key in keys}) as (_,client):
@@ -260,9 +292,11 @@ class ConsoleTests(unittest.TestCase):
         with scratch() as directory:
             config = Path(directory)/'worker.json'
             config.write_text(json.dumps({'host':'0.0.0.0','shared':{},'tools':{}}))
+            nodes = Path(directory)/'nodes.json'
+            nodes.write_text(json.dumps({'nodes':[]}))
             result = subprocess.run([sys.executable,'-B',str(ROOT/'main.py'),'--config',str(config),
                                      '--mode','hybrid','--host','0.0.0.0','--port','0','--cpus','1',
-                                     '--root',str(Path(directory)/'service')],
+                                     '--nodes',str(nodes),'--root',str(Path(directory)/'service')],
                                     input=b'quit\n',capture_output=True,timeout=15)
             self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
             output = result.stdout.decode('utf8')
