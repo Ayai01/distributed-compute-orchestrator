@@ -840,8 +840,12 @@ class CenterTests(unittest.TestCase):
                 with self.assertRaises(RemoteError):
                     Client(local.url).health()
                 with Pool([local]) as pool, center(pool,Path(root)/'center') as (_,client):
-                    client.health()  # Keep the caller's one center connection open.
-                    with patch('remote_compute.client.http.client.HTTPConnection',side_effect=AssertionError('worker opened HTTP')):
+                    client.health()
+                    from http.client import HTTPConnection
+                    def center_connection(host,port,**options):
+                        self.assertEqual((host,port),(client.endpoint.hostname,client.endpoint.port))
+                        return HTTPConnection(host,port,**options)
+                    with patch('remote_compute.client.http.client.HTTPConnection',side_effect=center_connection):
                         with patch('remote_compute.worker.pack',wraps=module.pack) as packed:
                             result=client.run(python("from pathlib import Path; Path('value').write_text('42')",outputs=['value']))
                         self.assertEqual(packed.call_count,1)
