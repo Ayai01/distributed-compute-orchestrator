@@ -39,6 +39,20 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_window_tracks_new_worker_capabilities_and_budget_reductions(self):
+        import sys
+        with scratch() as root, provider(Path(root)/'one',cpus=2,cpu_limit=2,tools={'bench_python':sys.executable}) as (_,one), \
+                provider(Path(root)/'two',cpus=4,cpu_limit=4) as (_,two):
+            with Pool([one,two]) as pool, center(pool,Path(root)/'center') as (_,client):
+                window=client.window('Bench',requires=['bench_python'],queue_ratio=0)
+                self.assertEqual((window.current(),window.maximum),(2,2))
+                client.control(node='node2',worker={'tools':{'bench_python':[sys.executable]}})
+                window.updated=0
+                self.assertEqual((window.current(),window.maximum),(6,6))
+                client.control(node='node2',worker={'tools':{'bench_python':None}})
+                window.updated=0
+                self.assertEqual((window.current(),window.maximum),(2,2))
+
     def test_modeled_resize_fits_cpu_and_ram_and_rechecks_later_budget(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=768,memory_reserve_mb=0) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
