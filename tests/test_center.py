@@ -356,6 +356,9 @@ class CenterTests(unittest.TestCase):
                 until(lambda: client.status(identity)['status']=='running')
                 pool.refresh()
                 self.assertEqual(len(pool.nodes[0].health['active_jobs']),1)
+                started=worker.status(identity)['started']
+                self.assertEqual(pool.nodes[0].health['active_jobs'][0]['started'],started)
+                until(lambda:client.health()['nodes'][0]['active_jobs'][0]['started']==started)
                 client.wait(identity)
                 client.fetch(identity)
                 until(lambda: pool.nodes[0].reserved==0)
@@ -368,6 +371,7 @@ class CenterTests(unittest.TestCase):
                 snapshot=client.health()
                 self.assertEqual(snapshot['used_cpus'],1)
                 self.assertEqual([j['id'] for j in snapshot['nodes'][0]['active_jobs']],[direct])
+                self.assertEqual(snapshot['nodes'][0]['active_jobs'][0]['started'],worker.status(direct)['started'])
                 worker.wait(direct)
                 worker.fetch(direct)
 

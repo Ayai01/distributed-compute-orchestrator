@@ -190,6 +190,32 @@ class ConsoleTests(unittest.TestCase):
             self.assertRegex(stream.getvalue(),r'2/\d+页')
             self.assertEqual(shell.completed,1)
 
+    def test_elapsed_seconds_sort_globally_before_pagination_and_leave_unstarted_last(self):
+        jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label=f'task-{i}',cpus=2,
+                   status='running',started=1000-i*10) for i in range(35)]
+        waiting=dict(id='ffff'+'b'*28,label='not-started',cpus=1,status='dispatching',started=None)
+        value=dict(role='scheduler',nodes=[dict(name='Aya1-PC',active_jobs=[waiting,*jobs[::2]]),
+                                          dict(name='Aya1-TX',active_jobs=jobs[1::2])],projects={})
+        with patch('remote_compute.view.time.time',return_value=1200.9):
+            for width in (44,64,80,110,120,160,200):
+                status=format_status(value,width=width)
+                status.fit(22)
+                self.assertGreater(status.page_count,1)
+                self.assertEqual([row[0] for row in status.records],
+                                 [job['id'][:4] for job in reversed(jobs)]+['ffff'])
+                self.assertEqual([status.records[0][7],status.records[-2][7],status.records[-1][7]],
+                                 ['540','200','-'])
+                seen=[]
+                for page in range(status.page_count):
+                    status.task_page=page
+                    rows=status.fit(22)
+                    self.assertTrue(all(_width(row)==width for row in rows))
+                    self.assertIn('运行秒','\n'.join(rows))
+                    for row in rows:
+                        seen.extend(record[0] for record in status.records
+                                    if any(prefix+record[0]+' |' in row for prefix in ('| ','+ ')))
+                self.assertEqual(seen,[row[0] for row in status.records])
+
     def test_console_grows_to_screen_limit_without_shrinking_existing_window(self):
         kernel,user=Mock(),Mock()
         user.IsWindowVisible.return_value=True

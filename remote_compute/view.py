@@ -193,11 +193,15 @@ class StatusRows(list):
             for name,a in value.get('projects',{}).items():
                 count=sum(job.get('project')==name for _,job in self.jobs)
                 self.projects.append([_project(name),f"{a['resource_share']:g}",f"{count}/{a['used']}",a['target'],a['queued']])
+        self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
+        now=time.time()
         self.records=[]
         for name,job in self.jobs:
             state=job.get('status','running')
+            started=job.get('started')
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"1/{job.get('cpus',0)}",
-                                 _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),_label(job)])
+                                 _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),_label(job),
+                                 str(max(0,int(now-started))) if started is not None else '-'])
 
     def _resources(self, width):
         records=[r for _,r in self.devices]
@@ -265,14 +269,19 @@ class StatusRows(list):
         self.page_count=max(1,math.ceil(len(self.records)/size))
         self.task_page%=self.page_count
         records=self.records[self.task_page*size:(self.task_page+1)*size]
-        if width>=70:
-            table=_table(['ID','设备','工程','任务/线程','RAM','状态','标签'],records,
-                         [4,7,6,9,4,4,None],width,right=(3,4))
-        elif width>=42:
-            table=_table(['ID','设备','任务/线程','标签'],[[r[i] for i in (0,1,3,6)] for r in records],
-                         [4,7,9,None],width,right=(2,))
+        records=[r if len(r)>7 else [*r,'-'] for r in records]
+        if width>=80:
+            table=_table(['ID','设备','工程','任务/线程','RAM','运行秒','状态','标签'],
+                         [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
+                         [4,7,6,9,4,6,4,None],width,right=(3,4,5))
+        elif width>=54:
+            table=_table(['ID','设备','任务/线程','运行秒','标签'],[[r[i] for i in (0,1,3,7,6)] for r in records],
+                         [4,7,9,6,None],width,right=(2,3))
+        elif width>=38:
+            table=_table(['ID','任务/线程','运行秒','标签'],[[r[i] for i in (0,3,7,6)] for r in records],
+                         [4,9,6,None],width,right=(1,2))
         else:
-            table=[_line('ID 设备 任务/线程 标签',width)]+[_line(f'{r[0]} {r[1]} {r[3]} {r[6]}',width) for r in records]
+            table=[_line('ID 任务/线程 运行秒 标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {r[6]}',width) for r in records]
         title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页 | Tab/ShiftTab'
         if not self.records:
             table.append(_line('空闲',width))

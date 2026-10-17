@@ -112,7 +112,7 @@ class Coordinator:
             for job in self.jobs.values():
                 result = job['result']
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
-                    item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb')}
+                    item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb','started')}
                     item['project'] = job.get('task',{}).get('project','')
                     active.setdefault(result['assigned_node'],[]).append(item)
             for node in snapshot['nodes']:
