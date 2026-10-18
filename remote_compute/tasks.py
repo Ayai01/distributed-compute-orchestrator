@@ -9,7 +9,9 @@ def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, ren
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
             "render": list(render), "label": label, "priority": priority,
             "requires": list(requires), "node": node, "memory_mb": memory_mb,
-            "project": project, "resource_share": resource_share, "accelerator": accelerator}
+            "project": project, "resource_share": resource_share}
+    if accelerator is not None:
+        task["accelerator"] = accelerator
     if max_cpus is not None:
         task['max_cpus'] = max_cpus
     if tool_sha256:
