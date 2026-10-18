@@ -1,4 +1,6 @@
 """Local listener checks and explicit operator choices before opening services."""
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,44 @@ from .client import Client, RemoteError
 
 class Cancelled(RuntimeError):
     pass
+
+
+@contextmanager
+def single_instance(name):
+    """Hold one operator-console instance for a local DCO endpoint."""
+    token = hashlib.sha256(str(name).encode('utf-8')).hexdigest()[:24]
+    handle = None
+    lock_fd = None
+    if os.name == 'nt':
+        import ctypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel.CreateMutexW.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.CreateMutexW(None, False, 'Local\\DCO-' + token)
+        if not handle:
+            raise OSError('无法创建 DCO 单实例锁')
+        if ctypes.get_last_error() == 183:
+            kernel.CloseHandle(handle)
+            raise Cancelled('DCO 已在运行；请使用现有窗口（端口固定为 26133）。')
+    else:
+        import fcntl
+        lock_path = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / ('dco-' + token + '.lock')
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            raise Cancelled('DCO 已在运行；请使用现有窗口（端口固定为 26133）。') from None
+    try:
+        yield
+    finally:
+        if handle:
+            kernel.CloseHandle(handle)
+        if lock_fd is not None:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 def available(host, port):

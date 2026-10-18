@@ -14,11 +14,12 @@ from .client import Client, Pool, RemoteError
 from .coordinator import Coordinator
 from .bundle import TERMINAL, atomic_json
 from .worker import Conflict, Server, Worker
-from .startup import Cancelled, resolve
+from .startup import Cancelled, resolve, single_instance
 from .process import keep_awake
 from .terminal import require_visible
 
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PORT = 26133
 
 
 # Preserve the existing Python imports while command ownership lives in commands.
@@ -82,7 +83,7 @@ def run_scheduler(args, local_client=None, restarting=None):
             root = Path(args.root) / "scheduler" if args.root else ROOT / '.local/state/scheduler'
             coordinator = Coordinator(pool, root, token=args.local_token,
                                       operator_token=getattr(args, 'operator_token', '') or None)
-            port = args.center_port if args.center_port is not None else (args.port if args.port is not None else 26133)
+            port = args.center_port if args.center_port is not None else (args.port if args.port is not None else DEFAULT_PORT)
             if args.mode == "scheduler" and args.port is not None and args.center_port is None:
                 port = args.port
             def restart_center(*, check=False):
@@ -255,6 +256,8 @@ def main(argv=None):
         args.mode = args.mode or ('scheduler' if args.url else config.get('mode', 'hybrid'))
         if args.mode not in {'scheduler', 'hybrid', 'worker'}:
             raise ValueError('mode must be scheduler, hybrid or worker')
+        if args.action is None and not (args.test or args.test_native or args.check):
+            lifetime.enter_context(single_instance('operator-console'))
         if args.action == 'ramdisk':
             from .ramdisk import ensure_shared, install_driver
             print(install_driver() if args.install else ensure_shared())
@@ -315,16 +318,18 @@ def main(argv=None):
         existing_worker = None
         if not args.url:
             if args.mode != 'worker':
-                center_port = args.center_port if args.center_port is not None else (args.port if args.port is not None else 26133)
+                center_port = args.center_port if args.center_port is not None else (args.port if args.port is not None else DEFAULT_PORT)
                 if args.mode == 'scheduler' and args.port is not None and args.center_port is None:
                     center_port = args.port
                 existing = resolve(args.host or '127.0.0.1', center_port, policy=args.on_port_conflict,
                                    token=args.local_token, reuse_role='scheduler')
                 if existing:
+                    if args.action is None:
+                        raise Cancelled(f'DCO 已在运行：{existing}；请使用现有窗口。端口固定为 {center_port}。')
                     args.mode, args.url = 'scheduler', existing
             if args.mode == 'worker':
                 existing_worker = resolve(args.host or config.get('host', '127.0.0.1'),
-                                          args.port if args.port is not None else config.get('port', 26133),
+                                          args.port if args.port is not None else DEFAULT_PORT,
                                           policy=args.on_port_conflict, token=args.local_token,
                                           reuse_role='worker',ca_file=config.get('ca_file') or config.get('certfile'),
                                           tls=bool(config.get('certfile')))
@@ -334,7 +339,7 @@ def main(argv=None):
                     WorkerShell(RemoteWorker(client)).loop(client.health,client.url)
                     return 0
         if args.mode != "scheduler" and not existing_worker:
-            port = args.port if args.port is not None else config.get("port", 26133)
+            port = args.port if args.port is not None else DEFAULT_PORT
             from .ramdisk import scratch
             root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
             options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root", "accelerators") if key in config}

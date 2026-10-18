@@ -241,7 +241,9 @@ class StatusRows(list):
     def _build(self):
         value,width=self.value,self.width
         center=value.get('role')=='scheduler'
-        self.title=f"{ABBREVIATION} | {value.get('node','')} | {'调度中心' if center else '算力提供者'}"
+        port = urlsplit(self.url).port if self.url else None
+        port_label = f' | 端口 {port}' if port else ''
+        self.title=f"{ABBREVIATION} | {value.get('node','')} | {'调度中心' if center else '算力提供者'}{port_label}"
         self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))

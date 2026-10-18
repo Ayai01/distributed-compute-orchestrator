@@ -28,5 +28,4 @@ if exist "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" (
   )
 )
 set "compute_exit=%errorlevel%"
-if not "%compute_exit%"=="0" pause
 exit /b %compute_exit%
