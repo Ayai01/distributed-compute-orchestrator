@@ -432,9 +432,10 @@ class Dashboard:
                         last = now
                     columns, height = size()
                     self.columns = columns
-                    # The command footer owns the last five rows.  Keeping a
-                    # spare row above it prevents a refresh from painting over
-                    # the prompt in short Windows/ConPTY viewports.
+                    # The command footer owns the last five rows.  The final
+                    # row is a blank guard on Windows: writing the prompt on
+                    # the physical last console row can make classic cmd.exe
+                    # scroll and clip that prompt.
                     reserved = min(5, height)
                     with self.output_lock:
                         key = (revision,self.output_revision,offset,task_page,columns,height)
@@ -462,7 +463,7 @@ class Dashboard:
                     footer, column = _command_rows(self.shell, line, cursor, max(1,columns-1), context, completion)
                     # The footer is an independent fixed-height viewport.  Do
                     # not let a status/output refresh consume its last row.
-                    footer = ([''] * max(0, reserved-len(footer))) + footer[-reserved:]
+                    footer = footer[-reserved:] + ([''] * max(0, reserved-len(footer)))
                     frame = painter.frame(body+footer,columns,height,column)
                     if frame:
                         self.stream.write(frame)

@@ -182,7 +182,7 @@ class ConsoleTests(unittest.TestCase):
                 frames = []
                 def paint(painter, rows, width, count, cursor):
                     self.assertEqual(len(rows),height)
-                    self.assertTrue(rows[-1].startswith('test> '))
+                    self.assertTrue(rows[-2 if height >= 5 else -1].startswith('test> '))
                     self.assertTrue(all(_width(row)<=columns-1 for row in rows[-min(4,height):]))
                     frames.append(list(rows))
                     return original(painter,rows,width,count,cursor)
@@ -197,8 +197,10 @@ class ConsoleTests(unittest.TestCase):
                     dashboard.run()
                 self.assertGreater(len(frames),1)
                 if height>=4:
-                    self.assertIn('用法:',frames[0][-4])
-                    self.assertIn('候选:',frames[0][-3])
+                    usage_index = -5 if height >= 5 else -4
+                    choice_index = -4 if height >= 5 else -3
+                    self.assertIn('用法:',frames[0][usage_index])
+                    self.assertIn('候选:',frames[0][choice_index])
 
     def test_typing_tab_completes_command_without_changing_task_page(self):
         with redirect_stdout(io.StringIO()) as stream:
@@ -224,7 +226,7 @@ class ConsoleTests(unittest.TestCase):
                 dashboard.run(state)
         self.assertEqual(shell.completed,2)
         self.assertIn('earlier output','\n'.join(dashboard.output))
-        self.assertTrue(painter.rows[-1].startswith('test> quit'))
+        self.assertTrue(painter.rows[-2].startswith('test> quit'))
         for code in ('\x1b[2J','\x1b[?1049h','\x1b[?1049l'):
             self.assertNotIn(code,stream.getvalue())
 
@@ -233,7 +235,7 @@ class ConsoleTests(unittest.TestCase):
         original = RowPainter.frame
         def paint(painter, rows, columns, height, cursor):
             self.assertEqual(len(rows),height)
-            self.assertTrue(rows[-1].startswith('test> '))
+            self.assertTrue(rows[-2].startswith('test> '))
             seen.append((columns,height))
             result=original(painter,rows,columns,height,cursor)
             geometry[:] = (80,12) if len(seen)==1 else (120,24)

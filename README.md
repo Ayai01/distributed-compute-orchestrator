@@ -8,7 +8,7 @@
 
 在工程目录运行，两个启动脚本都调用同一个 `main.py`：
 
-```powershell
+```cmd
 .\start.cmd
 ```
 
