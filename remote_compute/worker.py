@@ -581,6 +581,17 @@ class Worker:
         cpu_seconds = 0.0
         try:
             environment = dict(os.environ, **self.env)
+            # MSYS2 compiler frontends (cc1plus, clang and their runtime DLLs)
+            # are launched as children of the configured tool.  Keep the
+            # matching UCRT64 and MSYS runtime directories on PATH so a
+            # configured C++ alias is executable in a clean worker process,
+            # without requiring a machine-global PATH mutation.
+            if os.name == 'nt' and self.env.get('MSYS2_ROOT'):
+                msys_root = Path(self.env['MSYS2_ROOT'])
+                msys_paths = [msys_root / 'ucrt64' / 'bin', msys_root / 'usr' / 'bin']
+                inherited = environment.get('PATH', '')
+                environment['PATH'] = os.pathsep.join(
+                    [str(path) for path in msys_paths if path.is_dir()] + ([inherited] if inherited else []))
             environment.update({key: self._expand(value, task, work) for key, value in task["env"].items()})
             # Default libraries to the grant; callers with outer parallelism
             # can explicitly keep each numerical kernel single-threaded.

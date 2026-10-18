@@ -280,6 +280,8 @@ Windows 的 `setup` 优先复用本机系统Python3.14科学环境，验证Numba
 
 AOP/RGCN SPICE、Bench优化、ARH CPU推理在各设备均优先使用本机系统CPython 3.14.8，通过`aop_python`、`rgcn_python`、`bench_python`和`arh_python`登记到tools。RGCN神经训练单独使用`rgcn_train`能力；两端已通过Torch/PyG加载和检查点续跑验证，沿用同一系统解释器。`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB；ARH的GSIM另用公共MSYS中的Clang/Flex/Bison。需要GPU的独立训练保留调用工程的指定环境。跨机复制后用`setup`校验版本和本机路径，配置随worker自然启动或空闲重载加载。
 
+Chisel、CIRCT和C++是三台设备的共同能力，必须在每台 worker 的本地配置中登记可执行文件：`java`、`scala-cli`、`firtool`、`circt-translate`，以及通用 C++ 别名`cxx`。Windows 使用本机 `.tools` 下的 JDK、Scala CLI、firtool 和 MSYS2，Linux 使用系统 Java/Clang 与 worker 工具目录中的 firtool/Scala CLI；路径只写该设备真实存在且已通过版本检查的文件。失效路径不保留在配置中，也不会通过标签伪造能力。GPU 硬件不自动登记为 DCO 加速器，只有 CUDA 运行时、框架后端和最小计算样例全部通过后，才在 `accelerators` 中增加对应档案。
+
 Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/DCO/.projects/arh`，Python复用 `arh_python`。该目录的 `.tools` 保存Java、Scala CLI、firtool/circt-translate、模型、Coursier缓存和Rocket/GSIM必要资产；`.tools/msys64`是指向DCO公共MSYS的目录联接，GCC、Verilator与Clang共用一份。`run_remote`提交时冻结小型源码资产，入口、执行和摘要校验均使用该版本；新旧源码任务可同时存在。工具与模型继续共享，已有原生小产物经过原编译指纹决定能否复用，科研统计缓存留在shared.arh。重连使用原ID及原源码资产，取消取回中的结果时保留最近成功报告。
 
 `worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过 `Client().machine('Aya1-TX', cwd=上述目录)` 或指定 `node='Aya1-TX'` 的普通任务按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。生产任务声明`shared:arh`及编译器能力，由中心筛选；工程不查询`shared_paths`选择设备。
