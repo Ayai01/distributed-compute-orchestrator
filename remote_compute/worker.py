@@ -31,6 +31,10 @@ from .client import RemoteError
 from .compat import sha256
 from .cleanup import AssetCache, remove_owned
 from .allocation import plan_resize
+from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
+                     MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
+                     MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement,
+                     normalize_accelerators, aggregate_accelerators)
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -82,22 +86,26 @@ def file_hash(path):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "tool_sha256"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "tool_sha256", "accelerator"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
-            "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256, **task}
+            "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256,
+            "accelerator": None, **task}
     cpus, timeout = task["cpus"], task["timeout"]
     if type(task.get('retries',2)) is not int or not 0<=task.get('retries',2)<=10:
         raise ValueError('retries must be an integer in 0..10')
     if not isinstance(task.get('project', ''), str):
         raise ValueError('project must be a string')
     share = task.get('resource_share', 1.0)
-    if isinstance(share, bool) or not isinstance(share, (int, float)) or not math.isfinite(share) or share <= 0:
-        raise ValueError('resource_share must be positive and finite')
+    if (isinstance(share, bool) or not isinstance(share, (int, float))
+            or not math.isfinite(share) or not 0 < share <= MAX_RESOURCE_SHARE):
+        raise ValueError(f'resource_share must be in (0, {MAX_RESOURCE_SHARE:g}]')
     serial = task.get('single_thread_weight', 1.0)
-    if isinstance(serial, bool) or not isinstance(serial, (int, float)) or not math.isfinite(serial) or serial <= 0:
-        raise ValueError('single_thread_weight must be positive and finite')
+    if (isinstance(serial, bool) or not isinstance(serial, (int, float))
+            or not math.isfinite(serial) or not 0 < serial <= MAX_SINGLE_THREAD_WEIGHT):
+        raise ValueError(f'single_thread_weight must be in (0, {MAX_SINGLE_THREAD_WEIGHT:g}]')
+    task['accelerator'] = normalize_accelerator_requirement(task.get('accelerator'))
     if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
         raise ValueError(f"Task cpus must be in 1..{capacity}")
     if 'max_cpus' in task and (type(task['max_cpus']) is not int or task['max_cpus']<1 or cpus>task['max_cpus']):
@@ -127,10 +135,14 @@ def validate_task(task, capacity, *, allow_auto=False):
         raise ValueError("assets must map names to synchronized SHA256 ids")
     if not isinstance(task["label"], str):
         raise ValueError("label must be a string")
-    if type(task["priority"]) is not int:
-        raise ValueError("priority must be an integer; larger values run first")
-    if not isinstance(task["requires"], list) or any(not isinstance(x, str) for x in task["requires"]):
-        raise ValueError("requires must be a list of node tags")
+    if (type(task["priority"]) is not int
+            or not MIN_PRIORITY <= task["priority"] <= MAX_PRIORITY):
+        raise ValueError(f"priority must be an integer in {MIN_PRIORITY}..{MAX_PRIORITY}")
+    if (not isinstance(task["requires"], list)
+            or len(task["requires"]) > MAX_REQUIREMENTS
+            or any(not isinstance(x, str) or not x or len(x) > MAX_REQUIREMENT_LENGTH
+                   for x in task["requires"])):
+        raise ValueError(f"requires must contain at most {MAX_REQUIREMENTS} short capability tags")
     validate_tool_constraints(task.get('tool_sha256',{}))
     if task["node"] is not None and not isinstance(task["node"], str):
         raise ValueError("node must be a configured node name")
@@ -144,15 +156,17 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 def validate_tool_constraints(value):
-    if (not isinstance(value,dict) or any(not isinstance(name,str) or not _NAME.fullmatch(name)
+    if (not isinstance(value,dict) or len(value) > MAX_REQUIREMENTS or any(not isinstance(name,str) or not _NAME.fullmatch(name)
             or not isinstance(hashes,list) or not hashes or any(not isinstance(h,str) or not _ASSET.fullmatch(h) for h in hashes)
             for name,hashes in value.items())):
-        raise ValueError('tool_sha256 maps tool names to nonempty SHA256 lists')
+        raise ValueError(f'tool_sha256 maps at most {MAX_REQUIREMENTS} tool names to nonempty SHA256 lists')
+    if any(len(hashes) > MAX_REQUIREMENTS for hashes in value.values()):
+        raise ValueError(f'tool_sha256 accepts at most {MAX_REQUIREMENTS} hashes per tool')
     return value
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None, temp_root=None):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None, temp_root=None, accelerators=None):
         self.root = Path(root).expanduser().resolve()
         self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
         if self.temp_root:
@@ -170,6 +184,8 @@ class Worker:
         self.save_settings = None
         self.configuration_revision = 0
         self.token = token
+        self.accelerators = normalize_accelerators(accelerators)
+        self.accelerator_reservations = {}
         self.tags = list(tags)
         self.paused = False
         self.host = Host()
@@ -191,6 +207,8 @@ class Worker:
         self.tools,self.tool_info=self._probe_tools(self.tools)
         self.tags = sorted(set(self.tags) | {sys.platform} | {'shared:'+name for name in self.shared}
                            | {k for k, v in self.tool_info.items() if v["available"]})
+        if self.accelerators:
+            self.tags = sorted(set(self.tags) | {'gpu', *{tag for item in self.accelerators for tag in item['tags']}})
         if self.tool_info['verilator']['available']:
             self.tags = sorted(set(self.tags) | {'rtl'})
         # The lock is released by the OS on exit; no stale PID files to repair.
@@ -222,7 +240,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version']+(['restart'] if self.restart_available else []))
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version','accelerators']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -231,6 +249,8 @@ class Worker:
                     "role": "worker", "benchmark": self.benchmark, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
+                    "accelerators": self.accelerators,
+                    "accelerator_used": sum(len(items) for items in self.accelerator_reservations.values()),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "configuration_revision": self.configuration_revision,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
@@ -238,7 +258,7 @@ class Worker:
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
-                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started')},
+                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started', 'accelerator')},
                                      'rss_mb':round(j.get('rss_mb',0),2),**({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
@@ -246,6 +266,46 @@ class Worker:
                 for name in ('benchmark','tools','shared','tags','home','tool_root','shared_paths','unavailable_shared','root'):
                     value.pop(name,None)
             return value
+
+    def _accelerator_units(self):
+        units=[]
+        for profile_index, profile in enumerate(self.accelerators):
+            ids=profile.get('ids') or [str(index) for index in range(profile['count'])]
+            for index in range(profile['count']):
+                units.append((profile_index, index, profile['kind'], profile['memory_mb'], tuple(profile['tags']), ids[index]))
+        return units
+
+    def _match_accelerator(self, requirement):
+        requirement=normalize_accelerator_requirement(requirement)
+        if requirement is None:
+            return []
+        used={unit[:2] for items in self.accelerator_reservations.values() for unit in items}
+        matches=[]
+        for unit in self._accelerator_units():
+            if unit[:2] in used:
+                continue
+            _,_,kind,memory,tags,_=unit
+            if requirement['kind'] not in ('any', kind):
+                continue
+            if memory < requirement['memory_mb'] or not set(requirement['requires']).issubset(tags):
+                continue
+            matches.append(unit)
+            if len(matches) >= requirement['count']:
+                return matches
+        return None
+
+    def _accelerator_environment(self, job_id, environment):
+        units=self.accelerator_reservations.get(job_id, [])
+        if not units:
+            return
+        kind=units[0][2]
+        ids=[unit[5] for unit in units]
+        environment.update(DCO_ACCELERATOR_KIND=kind,
+                           DCO_ACCELERATOR_COUNT=str(len(units)),
+                           DCO_ACCELERATOR_MEMORY_MB=str(min(unit[3] for unit in units)),
+                           DCO_ACCELERATOR_IDS=','.join(ids))
+        if kind == 'cuda':
+            environment['CUDA_VISIBLE_DEVICES']=','.join(ids)
 
     def _probe_tools(self, tools):
         resolved,info={},{}
@@ -422,6 +482,8 @@ class Worker:
                         raise ValueError('Tool SHA256 constraint no longer matches: '+name)
                 if task["memory_mb"] > self.memory_capacity:
                     raise ValueError("Task memory_mb exceeds worker memory budget")
+                if task.get('accelerator') is not None and not self._match_accelerator(task['accelerator']):
+                    raise ValueError('Task accelerator requirement is not provided by this worker')
                 for item in archive.infolist():
                     inside(self.root, item.filename)
                     if item.filename != "task.json" and not item.filename.startswith("input/"):
@@ -459,7 +521,8 @@ class Worker:
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
                           "stdout": "", "stderr": "", "tools": self.tool_info,
-                          "assets": task["assets"], "cwd": cwd.as_posix()}
+                          "assets": task["assets"], "cwd": cwd.as_posix(),
+                          "accelerator": task.get('accelerator')}
                 job = {"result": result, "cancel": threading.Event(), "task": task,
                        "commands": commands, "directory": directory, "cwd": cwd,
                        'callback':dict(self.callback if callback is None else callback)}
@@ -481,9 +544,11 @@ class Worker:
                 if self.queue and not self.paused:
                     job = self.jobs[self.queue[0]]
                     if (self.used + job["task"]["cpus"] <= self.capacity
-                            and job["task"]["memory_mb"] <= self._memory_state()["memory_available_mb"]):
+                            and job["task"]["memory_mb"] <= self._memory_state()["memory_available_mb"]
+                            and (job['task'].get('accelerator') is None or self._match_accelerator(job['task']['accelerator']))):
                         self.queue.popleft()
                         self.used += job["task"]["cpus"]
+                        self.accelerator_reservations[job['result']['id']]=self._match_accelerator(job['task'].get('accelerator')) or []
                         job["result"].update(status="running", started=time.time())
                         self._save(job)
                         thread = threading.Thread(target=self._execute, args=(job,), name="compute-job", daemon=True)
@@ -523,6 +588,7 @@ class Worker:
                                REMOTE_COMPUTE_LEASE='1' if polling else '0',
                                REMOTE_COMPUTE_CA=callback.get('ca_file') or '',
                                REMOTE_COMPUTE_HOME=str(Path(__file__).resolve().parent.parent))
+            self._accelerator_environment(result['id'], environment)
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 for argv in job["commands"]:
                     if job["cancel"].is_set():
@@ -564,6 +630,7 @@ class Worker:
             self._clean_temp(job)
             self._clean_work(job)
             with self.condition:
+                self.accelerator_reservations.pop(result['id'], None)
                 if job["cancel"].is_set() and state == "succeeded":
                     state = "cancelled"
                 result.update(status=state, finished=time.time())
@@ -861,8 +928,18 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self):
         self.connection.settimeout(None)
         worker = self.server.worker
-        if worker.token and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + worker.token):
+        authorization = self.headers.get("Authorization", "")
+        operator_secret = getattr(worker, 'operator_token', None)
+        operator_auth = bool(operator_secret and hmac.compare_digest(authorization, "Bearer " + operator_secret))
+        if worker.token and not (hmac.compare_digest(authorization, "Bearer " + worker.token) or operator_auth):
             return self._reply({"error": "Token required"}, 401)
+        # A scheduler has two views: project clients receive aggregate
+        # capabilities and redacted job state, while the visible DCO console
+        # carries the explicit operator role for placement and machine data.
+        scheduler = hasattr(worker, 'nodes') and hasattr(worker, 'admission')
+        operator = self.headers.get('X-DCO-Role') == 'operator' and (operator_auth or not scheduler)
+        if scheduler and self.headers.get('X-DCO-Role') == 'operator' and not operator_auth:
+            return self._reply({"error": "Operator token required"}, 403)
         worker.activity.access(self.client_address[0], self.connection.getsockname()[0])
         parts = self.path.strip("/").split("/")
         try:
@@ -875,16 +952,27 @@ class Handler(BaseHTTPRequestHandler):
                 if len(body) != length:
                     raise ValueError("Incomplete request body")
             if parts == ["health"] and self.command == "GET":
-                value = worker.health(brief=self.headers.get("X-Remote-Compute-Brief")=="1",
-                                      sample=self.headers.get("X-DCO-Sample")=="1")
+                if scheduler and not operator:
+                    value = worker.public_health(brief=self.headers.get("X-Remote-Compute-Brief")=="1")
+                else:
+                    value = worker.health(brief=self.headers.get("X-Remote-Compute-Brief")=="1",
+                                          sample=self.headers.get("X-DCO-Sample")=="1")
+            elif parts == ['capabilities'] and self.command == 'GET' and scheduler:
+                value = worker.capabilities()
             elif parts == ["nodes"] and self.command == "GET" and hasattr(worker, "nodes"):
+                if not operator:
+                    return self._reply({"error": "Device list is operator-only; use /capabilities"}, 403)
                 value = worker.nodes()
             elif parts == ['admission'] and self.command == 'POST' and hasattr(worker, 'admission'):
-                value = worker.admission(json.loads(body))
+                value = worker.admission(json.loads(body), operator=operator)
             elif parts == ["control"] and self.command == "POST":
+                if scheduler and not operator:
+                    return self._reply({"error": "Scheduler control is operator-only"}, 403)
                 value = worker.control(json.loads(body))
                 worker.activity.notify('Control ' + body.decode('utf-8'), self.client_address[0])
             elif parts == ["restart"] and self.command == "POST":
+                if scheduler and not operator:
+                    return self._reply({"error": "Scheduler restart is operator-only"}, 403)
                 request = json.loads(body)
                 if self.server.restart and (not hasattr(worker, 'restart_node') or request.get('node') in (None,socket.gethostname())):
                     self.server.restart(check=True)
@@ -897,30 +985,44 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Restart requires a supervised service")
             elif parts == ["jobs"] and self.command == "GET":
                 with worker.condition:
-                    value = [worker.get(identity) for identity in worker.jobs]
+                    value = [worker.public_get(identity) if scheduler and not operator else worker.get(identity)
+                             for identity in worker.jobs]
             elif len(parts) == 2 and parts[0] == "assets" and self.command in {"GET", "POST"}:
                 value = worker.asset(parts[1], body)
             elif len(parts) >= 2 and parts[0] == "jobs":
                 identity = parts[1]
                 if len(parts) == 2 and self.command == "POST":
                     callback=self.headers.get('X-Remote-Compute-Callback')
-                    value = worker.submit(identity,body,callback=json.loads(callback)) if callback else worker.submit(identity,body)
+                    if scheduler:
+                        value = worker.submit(identity,body,operator=operator)
+                    else:
+                        if not operator:
+                            with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                                if json.loads(archive.read('task.json')).get('node') is not None:
+                                    raise ValueError('node selection belongs to the DCO operator')
+                        value = worker.submit(identity,body,callback=json.loads(callback)) if callback else worker.submit(identity,body)
+                    if scheduler and not operator and isinstance(value, dict):
+                        value = worker.public_result(value)
                     worker.activity.submitted(value, worker.jobs[identity].get('task', {}), self.client_address[0])
                     return self._reply(value, 202)
                 if len(parts) == 2 and self.command == "GET":
-                    value = worker.get(identity)
+                    value = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
                 elif len(parts) == 2 and self.command == "DELETE":
                     value = worker.delete(identity)
                 elif parts[2:] == ["cancel"] and self.command == "POST":
                     value = worker.cancel(identity)
+                    if scheduler and not operator and isinstance(value, dict):
+                        value = worker.public_result(value)
                 elif parts[2:] == ['resize'] and self.command == 'POST':
                     request = json.loads(body)
                     options={k:request[k] for k in ('memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
                     value = worker.resize(identity, request['cpus'], **options)
+                    if scheduler and not operator and isinstance(value, dict):
+                        value = worker.public_result(value)
                 elif parts[2:] == ['lease'] and self.command == 'POST' and hasattr(worker,'lease'):
                     value=worker.lease(identity,json.loads(body))
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
-                    value = (worker.artifacts(identity,is_connected=self._connected) if hasattr(worker,'pool')
+                    value = (worker.artifacts(identity,is_connected=self._connected,public=not operator) if hasattr(worker,'pool')
                              else worker.artifacts(identity))
                 elif parts[2:] == ["logs"] and self.command == "GET":
                     value = worker.logs(identity)

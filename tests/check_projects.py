@@ -44,7 +44,6 @@ class Trace:
         self.directory = directory
         self.lock = threading.RLock()
         self.active, self.jobs = {}, {}
-        self.pin = None
 
     def wrap(self, module):
         original, trace = module.Client, self
@@ -58,8 +57,6 @@ class Trace:
                     task['env'].update(BENCH_ADAPTIVE_THREADS='0',BENCH_CPU_MAX='1')
                 if not task['label'].startswith(PREFIX):
                     task['label'] = PREFIX + task['label'] + '/真实结果一致性·线程分配与运行退出自动清理验证-long-label-tail'
-                if trace.pin:
-                    task['node'] = trace.pin
                 files['task.json'] = json_bytes(task)
                 with trace.lock:
                     trace.active[identity] = task['label']
@@ -70,7 +67,7 @@ class Trace:
                 result = super().fetch(identity, *args, **options)
                 with trace.lock:
                     trace.jobs[identity] = {key:result.get(key) for key in
-                        ('status','assigned_node','node','cpus','peak_cpus','peak_rss_mb','cpu_seconds','elapsed','total_elapsed')}
+                        ('status','provider','cpus','peak_cpus','peak_rss_mb','cpu_seconds','elapsed','total_elapsed')}
                 return result
 
             def delete(self, identity):
@@ -133,12 +130,10 @@ def aop(root, directory, trace, url):
             try:
                 value=np.full(len(cfg['variables']),.5)
                 pair=[]
-                for node in ('Aya1-PC','Aya1-TX'):
-                    trace.pin=node
+                for _ in range(2):
                     result=session.evaluate(value)
                     assert result.ok, result.corners
                     pair.append(result.raw)
-                trace.pin=None
                 assert np.array_equal(*pair,equal_nan=True), pair
                 end=started(directory)
                 window=Client(url).window('AOP',requires=['aop_python','ngspice'])
@@ -168,7 +163,7 @@ def rgcn(root, directory, trace, url):
     excluded=set(unresolved_designs(root).get(config.circuit.id,[]))
     with ExitStack() as stack:
         runners=[stack.enter_context(PhysicalRunner(root,tools,state_directory=directory/f'state-{i}')) for i in range(2)]
-        def compare(index,pinned=False):
+        def compare(index):
             candidate=config.circuit.default_candidate()
             rng=random.Random(42+index)
             for key,spec in config.circuit.parameters.items():
@@ -181,14 +176,14 @@ def rgcn(root, directory, trace, url):
                 mapping=config.to_mapping()
                 mapping['resources'].update(workers=0,spice_threads=1)
                 mapping['circuit']['pre']['remote_compute']=dict(url=url,client_path=str(ROOT),
-                    node=('Aya1-PC','Aya1-TX')[offset] if pinned else None,cpus=1,memory_mb=512)
+                    cpus=1,memory_mb=512)
                 values.append(runner.run(load_config(mapping),candidate))
                 assert not values[-1].analyses['remote_execution']['reused'], 'Expected a real native task'
             assert values[0].measurements==values[1].measurements, (values[0].measurements,values[1].measurements)
             waves=[{name:v['numeric_sha256'] for name,v in r.analyses.get('waveforms',{}).items()} for r in values]
             assert waves[0]==waves[1], waves
             return len(values[0].measurements)
-        size=compare(0,True)
+        size=compare(0)
         end=started(directory)
         window=Client(url).window('RGCN',requires=['rgcn_python','ngspice'])
         count=stream_until(end,lambda i:compare(i+1),window)
@@ -206,8 +201,8 @@ def bench(root, directory, trace, url):
         remote_compute={'url':url,'task_cpus':1,'memory_mb':1024},resource_share=1.0)
     settings=select_backend(config)
     pair=[]
-    for node in ('Aya1-PC','Aya1-TX'):
-        pair.append(next(iter(run_tasks([('class-ab','nsga2',98117,config)],dict(settings,node=node),0)))[1])
+    for _ in range(2):
+        pair.append(next(iter(run_tasks([('class-ab','nsga2',98117,config)],dict(settings),0)))[1])
     fields=('X','F','G','metric_values','physical_X')
     for field in fields:
         assert np.array_equal(pair[0][field],pair[1][field],equal_nan=True),field
@@ -231,10 +226,8 @@ def arh(root, directory, trace, url):
         fault_environment='steady',radiation_range_mode='manual',aggregate_cache_mode='fresh',history_mode='off',
         budget_mode='fixed',memory_budget_mib=1536,resource_share=1.0))
     results=[]
-    for i,node in enumerate(('Aya1-PC','Aya1-TX')):
-        trace.pin=node
+    for i in range(2):
         results.append(run_remote(root,'mac',config,url,artifact_root=directory/f'pair-{i}',transient=True))
-    trace.pin=None
     def scientific(value):
         return sorted([dict(row,metrics={key:v for key,v in row['metrics'].items()
                                         if key not in ('evaluation_s','cache_hit')})
@@ -430,7 +423,7 @@ def main(args):
         for name in PROJECTS:
             jobs=summary[name].pop('jobs')
             summary[name]['job_count']=len(jobs)
-            summary[name]['nodes']={node:sum(j.get('assigned_node',j.get('node'))==node for j in jobs.values()) for node in ('Aya1-PC','Aya1-TX')}
+            summary[name]['provider']='DCO'
             summary[name]['peak_task_cpus']=max(j.get('peak_cpus') or j.get('cpus') or 0 for j in jobs.values())
         print('PROJECT_RESULTS',json.dumps(summary,ensure_ascii=False),flush=True)
     print('OWNED_SCRATCH_REMOVED',not Path(temporary).exists(),'PROTECTED_REPORTS',len(before),flush=True)

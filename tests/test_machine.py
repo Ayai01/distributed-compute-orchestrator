@@ -138,7 +138,8 @@ class MachineTests(unittest.TestCase):
         base = [sys.executable, "-B", str(ROOT / "main.py"), "--url", self.client.url]
         def run(*args):
             completed = subprocess.run([*base, *args], capture_output=True, timeout=15,
-                                       env=dict(os.environ, PYTHONUTF8="1"))
+                                       env=dict(os.environ, PYTHONUTF8="1",
+                                                REMOTE_COMPUTE_OPERATOR_TOKEN=self.state.operator_token))
             self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
             return completed.stdout.decode("utf-8")
         result = json.loads(run("exec", "--node", "device2", "--cwd", str(self.project), "--",

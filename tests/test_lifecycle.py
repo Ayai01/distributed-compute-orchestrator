@@ -308,13 +308,17 @@ class ControlLifecycleTests(unittest.TestCase):
             config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False)),encoding='utf8')
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
-            client=Client(f'http://127.0.0.1:{port}',timeout=1)
+            client=Client(f'http://127.0.0.1:{port}',timeout=1,operator=True)
             with (root/'service.log').open('wb') as log:
                 process=Process([sys.executable,'-B',str(copied/'main.py'),'--headless','--port',str(port),
                                  '--root',str(root/'state'),'--cpus=2'],copied,dict(os.environ,PYTHONPATH='',PYTHONUTF8='1'),log,log)
                 try:
                     def ready():
-                        try:return 'restart' in client.health().get('capabilities',[])
+                        try:
+                            token_path=root/'state'/'scheduler'/'operator.token'
+                            if token_path.is_file():
+                                client.operator_token=token_path.read_text(encoding='utf8').strip()
+                            return 'restart' in client.health().get('capabilities',[])
                         except RemoteError:return False
                     until(ready,seconds=15)
                     initial=client.health()

@@ -12,6 +12,11 @@ import zipfile
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import PoolBusy, RemoteError
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, validate_tool_constraints
+from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
+                     MAX_REQUIREMENT_LENGTH,
+                     MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
+                     public_capabilities, normalize_accelerator_requirement,
+                     aggregate_accelerators)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
@@ -19,18 +24,21 @@ from .cleanup import AssetCache
 import socket
 import math
 import os
+import re
+import secrets
 from urllib.parse import urlsplit
 from . import __version__
 
 
 class Coordinator:
-    def __init__(self, pool, root, *, token=""):
+    def __init__(self, pool, root, *, token="", operator_token=None):
         self.pool, self.token = pool, token
         self.activity = Activity()
         self.root = Path(root).resolve()
         self.root_lock = lock_root(self.root, "scheduler")
         (self.root / "jobs").mkdir(parents=True, exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
+        self.operator_token = self._load_operator_token(operator_token)
         self.condition = threading.Condition(threading.RLock())
         self.jobs, self.queue, self.threads = {}, [], set()
         self.stopping = self.paused = False
@@ -61,10 +69,27 @@ class Coordinator:
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
 
+    def _load_operator_token(self, supplied):
+        path = self.root / 'operator.token'
+        token = supplied or os.environ.get('REMOTE_COMPUTE_OPERATOR_TOKEN', '')
+        if not token and path.is_file():
+            token = path.read_text(encoding='utf-8').strip()
+        if not token:
+            token = secrets.token_urlsafe(32)
+        # The token is local operator state, never part of a task or report.
+        if not path.is_file() or path.read_text(encoding='utf-8').strip() != token:
+            path.write_text(token + '\n', encoding='utf-8')
+            try:
+                if os.name != 'nt':
+                    path.chmod(0o600)
+            except OSError:
+                pass
+        return token
+
     def nodes(self):
         return self.pool.snapshot()
 
-    def admission(self, request):
+    def admission(self, request, *, operator=False):
         project = request.get('project') or 'default'
         job_id=request.get('job_id')
         advice={}
@@ -87,20 +112,27 @@ class Coordinator:
         cpus = request.get('cpus', 1)
         maximum_cpus = request.get('max_cpus')
         requires = request.get('requires', [])
+        accelerator = normalize_accelerator_requirement(request.get('accelerator'))
         constraints=validate_tool_constraints(request.get('tool_sha256',{}))
-        node_name=request.get('node')
+        if not operator and request.get('node') is not None:
+            raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
+        node_name=request.get('node') if operator else None
         if (not isinstance(project, str) or isinstance(share, bool) or not isinstance(share, (int,float))
-                or not math.isfinite(share) or share <= 0 or isinstance(ratio, bool)
-                or not isinstance(ratio, (int,float)) or not math.isfinite(ratio) or ratio < 0
+                or not math.isfinite(share) or not 0 < share <= MAX_RESOURCE_SHARE or isinstance(ratio, bool)
+                or not isinstance(ratio, (int,float)) or not math.isfinite(ratio) or not 0 <= ratio <= MAX_QUEUE_RATIO
                 or type(cpus) is not int or cpus < 0 or not isinstance(requires,list)
-                or any(not isinstance(tag,str) for tag in requires) or (node_name is not None and not isinstance(node_name,str))
+                or len(requires) > MAX_REQUIREMENTS
+                or any(not isinstance(tag,str) or not tag or len(tag) > MAX_REQUIREMENT_LENGTH for tag in requires)
+                or (accelerator is not None and not isinstance(accelerator, dict))
+                or (node_name is not None and not isinstance(node_name,str))
                 or (maximum_cpus is not None and (type(maximum_cpus) is not int or maximum_cpus<max(1,cpus)))):
-            raise ValueError('project, positive resource_share, nonnegative queue_ratio and cpus required')
+            raise ValueError(f'project, resource_share <= {MAX_RESOURCE_SHARE:g}, queue_ratio <= {MAX_QUEUE_RATIO:g} and cpus required')
         resources = self.project_resources()
         shares = {name: row['resource_share'] for name,row in resources.items()}
         demands = {name: min(row['demand'],row['capacity']) for name,row in resources.items()}
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled
                   and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))
+                   and n.supports_accelerator(accelerator)
                   and all(n.health.get('tools',{}).get(tool,{}).get('sha256') in allowed for tool,allowed in constraints.items())]
         capable=sum(n.capacity for n in eligible)
         tool_sha256={name:sorted({info['sha256'] for n in eligible
@@ -140,6 +172,7 @@ class Coordinator:
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
                     tool_sha256=tool_sha256,
+                    accelerator=accelerator,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
@@ -156,9 +189,107 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
+
+    def capabilities(self):
+        """Return the scheduler's aggregate project-facing capability view.
+
+        This deliberately has no node names, URLs, paths, jobs, project
+        quotas, or placement policy.  The operator console continues to use
+        :meth:`health` for that private view.
+        """
+        with self.condition, self.pool.condition:
+            online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled]
+            tags = set()
+            tools = {}
+            accelerator_profiles = []
+            for node in online:
+                tags.update(node.health.get('tags', ()))
+                accelerator_profiles.extend(node.health.get('accelerators', ()))
+                for name, info in node.health.get('tools', {}).items():
+                    if not info.get('available'):
+                        continue
+                    hashes = tools.setdefault(name, set())
+                    if info.get('sha256'):
+                        hashes.add(info['sha256'])
+            cpu_capacity = sum(n.capacity for n in online)
+            cpu_available = sum(max(0, n.capacity - n.reserved - n.external) for n in online)
+            memory_capacity = sum(n.memory_capacity for n in online)
+            memory_available = sum(max(0, n.memory_free) for n in online)
+            return {
+                'protocol': PROTOCOL,
+                'role': 'scheduler',
+                'version': __version__,
+                'capabilities': public_capabilities(),
+                'tags': sorted(tags),
+                'tools': {name: sorted(values) for name, values in sorted(tools.items())},
+                'accelerators': aggregate_accelerators(accelerator_profiles),
+                'cpu': {'capacity': cpu_capacity, 'available': cpu_available, 'unit': 'logical_threads'},
+                'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
+            }
+
+    @staticmethod
+    def public_result(result):
+        """Return a project result without placement or worker-local paths."""
+        hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd',
+                  'tool_root', 'root', 'home', 'worker_root',
+                  'shared_paths', 'unavailable_shared', 'resource_request'}
+
+        def clean_text(text):
+            if not isinstance(text, str):
+                return text
+            # Errors are useful to the project, but transport URLs and local
+            # worker paths are private scheduler details.
+            text = re.sub(r'https?://[^\s\])}]+', '<remote>', text)
+            return re.sub(r'(?i)(?:[A-Za-z]:[\\/]|/(?:home|tmp|var|mnt)/)[^\s\])}]+', '<remote-path>', text)
+
+        def clean_mapping(mapping):
+            cleaned = {key: item for key, item in mapping.items() if key not in hidden}
+            for key in ('error', 'connection_error'):
+                if key in cleaned:
+                    cleaned[key] = clean_text(cleaned[key])
+            # Keep per-step timing and return codes without argv/path data.
+            if isinstance(mapping.get('steps'), list):
+                cleaned['steps'] = [{key: step[key] for key in ('started', 'finished', 'returncode') if key in step}
+                                   for step in mapping['steps'] if isinstance(step, dict)]
+            if isinstance(mapping.get('tools'), dict):
+                cleaned['tools'] = {}
+                for name, info in mapping['tools'].items():
+                    if not isinstance(info, dict):
+                        continue
+                    item = {key: info[key] for key in ('available', 'sha256', 'engine_sha256') if key in info}
+                    supporting = info.get('supporting_sha256')
+                    if isinstance(supporting, dict):
+                        # Keep the hash multiset for engine identity while
+                        # replacing worker-local path keys with stable labels.
+                        item['supporting_sha256'] = {
+                            f'asset_{index}': digest
+                            for index, digest in enumerate(sorted(supporting.values()))
+                        }
+                    cleaned['tools'][name] = item
+            return cleaned
+
+        value = clean_mapping(result)
+        if isinstance(result.get('attempts'), list):
+            value['attempts'] = [
+                clean_mapping(attempt)
+                for attempt in result['attempts']
+            ]
+        return value
+
+    def public_health(self, *, brief=False):
+        value = self.capabilities()
+        if brief:
+            return {key: value[key] for key in ('protocol', 'role', 'version', 'capabilities')}
+        with self.condition:
+            value.update({
+                'used_cpus': sum(n.reserved + n.external for n in self.pool.nodes if not n.error and n.enabled),
+                'queued': len(self.queue),
+                'paused': self.paused,
+            })
+        return value
 
     def _health(self):
         snapshot = self.pool.snapshot()
@@ -202,7 +333,7 @@ class Coordinator:
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': sum(j['result']['status'] in TERMINAL for j in self.jobs.values()),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -277,7 +408,7 @@ class Coordinator:
     def _save(self, job):
         atomic_json(job["directory"] / "result.json", job["result"])
 
-    def submit(self, identity, payload):
+    def submit(self, identity, payload, *, operator=False):
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
@@ -290,7 +421,10 @@ class Coordinator:
                     raise Conflict("Job id already contains a different request")
                 return dict(saved)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                task = validate_task(json.loads(archive.read("task.json")),
+                raw_task = json.loads(archive.read("task.json"))
+                if not operator and raw_task.get('node') is not None:
+                    raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
+                task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
             directory = self.root / "jobs" / identity
             directory.mkdir()
@@ -298,6 +432,7 @@ class Coordinator:
             job = {"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
                    "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
                               "single_thread_weight": task.get('single_thread_weight',1.0),
+                              "accelerator": task.get('accelerator'),
                               "max_retries": task.get('retries',2), "attempts": [],
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
@@ -370,11 +505,23 @@ class Coordinator:
                 grant=remote or job['result']
                 task.update(cpus=grant['cpus'],memory_mb=grant['memory_mb'])
                 job.update(task=task,auto_cpus=automatic,node=node,reattach=True,worker_id=worker_id)
-                node.reserved+=task['cpus'];node.reserved_memory_mb+=task['memory_mb']
-                if remote and worker_id not in node.known_jobs:
+                was_known=worker_id in node.known_jobs
+                if remote and not was_known:
                     node.external=max(0,node.external-(task['cpus'] if remote['status']=='running' else 0))
                     node.external_memory_mb=max(0,node.external_memory_mb-max(task['memory_mb'],remote.get('rss_mb',0)))
-                node.known_jobs.add(worker_id);node.live_jobs.add(worker_id)
+                # Treat the reattached worker job as owned before rebuilding
+                # external accelerator reservations.  This prevents a GPU
+                # already running after a center restart from being counted
+                # twice while the original job is reconnected.
+                node.known_jobs.add(worker_id)
+                node.refresh_external_accelerators(node.health.get('active_jobs') or [])
+                if node.reserve_accelerator(task.get('accelerator'), worker_id) is None:
+                    # The worker snapshot is authoritative; retain a local
+                    # external reservation until the next health sample if a
+                    # provider has not exposed the same profile yet.
+                    node.external_accelerator_reservations.extend(node.accelerator_units())
+                node.reserved+=task['cpus'];node.reserved_memory_mb+=task['memory_mb']
+                node.live_jobs.add(worker_id)
                 job['result'].pop('error',None)
                 job['result'].setdefault('dispatched',job['result']['submitted'])
                 if remote:self._update(job,remote)
@@ -391,11 +538,13 @@ class Coordinator:
         try:
             if not job.pop('reattach',False):
                 payload = (job['directory'] / 'request.zip').read_bytes()
-                if job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task or 'retries' in task:
+                if (job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task
+                        or 'retries' in task or task.get('node') is not None):
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                         files = {name: archive.read(name) for name in archive.namelist()}
                     worker_task = dict(task)
                     # Placement hints belong to the dispatcher, not the executable.
+                    worker_task.pop('node',None)
                     worker_task.pop('single_thread_weight',None)
                     worker_task.pop('retries',None)
                     if 'max_cpus' not in node.health.get('capabilities',[]):
@@ -648,6 +797,9 @@ class Coordinator:
             job = self.jobs[identity]
             return json.loads(json_bytes(job["result"]))
 
+    def public_get(self, identity):
+        return self.public_result(self.get(identity))
+
     def logs(self, identity):
         with self.condition:
             job = self.jobs[identity]
@@ -697,7 +849,7 @@ class Coordinator:
                 self.condition.notify_all()
             return self.get(identity)
 
-    def artifacts(self, identity, *, is_connected=None):
+    def artifacts(self, identity, *, is_connected=None, public=False):
         with self.condition:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
@@ -711,7 +863,7 @@ class Coordinator:
         if client:
             from .local import LocalClient
             if isinstance(client, LocalClient) and result['status'] != 'interrupted':
-                return client.worker.artifacts(worker_id, result=result)
+                return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
             try:
                 with result_lock:
                     if is_connected and not is_connected():
@@ -751,7 +903,7 @@ class Coordinator:
                             job['result'].pop('connection_error',None)
                             self._update(job,remote)
                             result=self.get(identity)
-        files["result.json"] = json_bytes(result)
+        files["result.json"] = json_bytes(self.public_result(result) if public else result)
         return pack(files)
 
     def delete(self, identity):

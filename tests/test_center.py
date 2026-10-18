@@ -24,7 +24,10 @@ def center(pool, root):
     thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
     thread.start()
     try:
-        yield state, Client(f'http://127.0.0.1:{server.server_port}')
+        # The scheduler test harness represents the visible DCO operator
+        # console; project-facing redaction is covered with a normal Client.
+        yield state, Client(f'http://127.0.0.1:{server.server_port}', operator=True,
+                            operator_token=state.operator_token)
     finally:
         state.close()
         server.shutdown()

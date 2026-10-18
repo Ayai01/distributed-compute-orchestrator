@@ -66,7 +66,12 @@ restart Aya1-TX
 restart --wait
 ```
 
-各工程 `resource_share` 默认 1.0，按相对权重分配，整数余量与空闲份额继续使用。`queue_ratio` 默认 1.0，提交窗口随当前份额刷新；同步计算可在批次边界向中心借还线程。CPU/内存准入由中心统一控制。看板按设备资源、工程份额、当前任务和通知分区，输入区固定在底部；聚焦时每秒刷新，失焦时每 5 秒刷新。中心与 worker 均支持在原终端等待空闲后重新加载，更新源码后执行 `restart --wait`，指定设备时使用 `restart Aya1-TX --wait`。
+这些设备名、IP、节点预算和任务分配只属于 DCO 操作端。工程客户端不读取设备列表、项目配额或分配详情，只通过 `/capabilities` 看到汇总后的标签、工具摘要、CPU/RAM 总量和协议能力。
+操作端使用中心状态目录中的本机操作令牌；工程令牌不能通过伪造请求头提升为操作端。
+
+各工程只提交通用需求：`requires` 能力标签、`tool_sha256` 引擎摘要、`cpus/max_cpus`、`memory_mb`、`resource_share` 和有限的 `queue_ratio/priority/single_thread_weight`。中心统一准入和选点，工程不得提交 `node` 或 IP；工程也不接触设备分配明细。`queue_ratio` 默认 1.0，提交窗口随汇总能力刷新；同步计算可在批次边界向中心借还线程。CPU/内存准入由中心统一控制。看板按设备资源、工程份额、当前任务和通知分区，输入区固定在底部；聚焦时每秒刷新，失焦时每 5 秒刷新。中心与 worker 均支持在原终端等待空闲后重新加载，更新源码后执行 `restart --wait`，指定设备的重载仅由 DCO 操作端执行。
+
+GPU/其他加速器也用同一套需求边界：工程在 `capabilities()['accelerators']` 中看到汇总后的 `kind/count/memory_mb/tags`，任务用 `accelerator={"kind":"cuda","count":1,"memory_mb":8192,"requires":["gpu:training"]}` 声明训练、仿真或通用计算标签。中心按配置文件中的能力档案保留和分配加速器，任务结束、取消、掉线重试都会归还；没有匹配加速器时任务排队或明确失败，不会静默改成 CPU。无 GPU 的设备使用空 `accelerators`，仍可承接 CPU 任务。
 
 默认调度优先选择预计 CPU 负载较低的设备，结合当前采样与尚未反映的线程预留；负载接近时再参考任务历史速度和节点权重。线程、内存及工程份额先参与准入。
 

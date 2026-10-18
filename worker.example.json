@@ -5,6 +5,7 @@
   "memory_mb": 0,
   "memory_reserve_mb": 512,
   "tags": ["cpu"],
+  "accelerators": [],
   "tools": {},
   "shared": {},
   "env": {}

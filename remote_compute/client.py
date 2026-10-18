@@ -22,6 +22,7 @@ import uuid
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
+from .policy import normalize_accelerator_requirement
 
 
 class RemoteError(RuntimeError):
@@ -68,8 +69,9 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None):
-        self.url, self.token = url.rstrip("/"), token
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None):
+        self.url, self.token, self.operator = url.rstrip("/"), token, bool(operator)
+        self.operator_token = operator_token if self.operator else None
         if timeout is None:
             timeout = (float(os.environ.get('REMOTE_COMPUTE_TIMEOUT',10))
                        if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else 10)
@@ -113,11 +115,20 @@ class Client:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
                    'Accept-Encoding': 'gzip','X-Remote-Compute-Keepalive':'1'}
-        if self.token:
-            headers["Authorization"] = "Bearer " + self.token
+        auth_token = (self.operator_token or self.token) if self.operator else self.token
+        if auth_token:
+            headers["Authorization"] = "Bearer " + auth_token
+        if self.operator:
+            headers['X-DCO-Role'] = 'operator'
         if brief:
             headers['X-Remote-Compute-Brief'] = '1'
         headers.update(extra_headers or {})
+        # Project clients cannot elevate a request by smuggling the role in
+        # per-call headers; only an operator Client instance sets it.
+        if self.operator:
+            headers['X-DCO-Role'] = 'operator'
+        else:
+            headers.pop('X-DCO-Role', None)
         if data is not None and not isinstance(data, bytes):
             data = json_bytes(data)
         method = method or ('POST' if data is not None else 'GET')
@@ -192,6 +203,14 @@ class Client:
             self._status_sample=(time.monotonic(),{j['id']:j for j in result['active_jobs'] or []})
         return result
 
+    def capabilities(self):
+        """Small aggregate view intended for project adapters."""
+        result = self.request('/capabilities')
+        if result.get('protocol') != PROTOCOL:
+            raise RemoteError("Worker protocol differs: " + self.url)
+        self._capabilities = result.get('capabilities', getattr(self, '_capabilities', None) or [])
+        return result
+
     def control(self, **changes):
         return self.request("/control", changes)
 
@@ -224,9 +243,9 @@ class Client:
         if memory_mb is not None or cpus==0 or modeled:
             if getattr(self, '_capabilities', None) is None:
                 self.health(brief=True)
-            if (memory_mb is not None and 'resize_memory' not in self._capabilities
-                    or cpus==0 and 'resize_auto' not in self._capabilities
-                    or modeled and 'resize_memory_model' not in self._capabilities):
+            if (memory_mb is not None and not ({'resize_memory','memory_resize'} & set(self._capabilities))
+                    or cpus==0 and not ({'resize_auto','cpu_auto_resize'} & set(self._capabilities))
+                    or modeled and not ({'resize_memory_model','memory_resize_model'} & set(self._capabilities))):
                 state=self.status(identity,brief=True)
                 return dict(id=identity,node=state.get('assigned_node',state.get('node')),
                             cpus=state['cpus'],memory_mb=state['memory_mb'],requested_cpus=cpus,supported=False)
@@ -241,11 +260,17 @@ class Client:
         return self.request('/jobs/'+target+'/'+action, request)
 
     def nodes(self):
+        if not self.operator:
+            raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, tool_sha256=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, tool_sha256=None, accelerator=None):
         """Center-owned transport window; execution slots stay in the central queue."""
+        if node is not None and not self.operator:
+            raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,cpus=cpus,requires=list(requires))
+        if accelerator is not None:
+            request['accelerator'] = accelerator
         if node:
             request['node']=node
         if max_cpus is not None:
@@ -263,6 +288,8 @@ class Client:
 
     def machine(self, node, *, cwd="~"):
         """Operate on a named worker through this same center connection."""
+        if not self.operator:
+            raise RemoteError('Named machine operations are operator-only')
         from .machine import Machine
         return Machine(self, node, cwd=cwd)
 
@@ -316,7 +343,7 @@ class Client:
         if self.endpoint.scheme in {'http','https'}:
             backend=self.__dict__.get('_result_client')
             if backend is None:
-                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None)))
+                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token))
             backend.timeout=max(120,self.timeout)
         raw = backend.request("/jobs/" + identity + "/artifacts", binary=True)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -398,6 +425,8 @@ class Node:
     live_jobs: set = field(default_factory=set)
     host_ip: str = ""
     aliases: list = field(default_factory=list)
+    accelerator_reservations: dict = field(default_factory=dict)
+    external_accelerator_reservations: list = field(default_factory=list)
 
     @property
     def capacity(self):
@@ -414,6 +443,70 @@ class Node:
         unreported = max(0, self.reserved_memory_mb - self.health.get("memory_reserved_mb", 0))
         return min(self.memory_capacity - self.reserved_memory_mb - self.external_memory_mb,
                    self.health.get("memory_available_mb", 0) - unreported)
+
+    def accelerator_units(self):
+        units=[]
+        for profile_index, profile in enumerate(self.health.get('accelerators', ())):
+            ids=profile.get('ids') or [str(index) for index in range(profile.get('count', 0))]
+            for index in range(profile.get('count', 0)):
+                units.append((profile_index,index,profile.get('kind','any'),profile.get('memory_mb',0),
+                              tuple(profile.get('tags',())),ids[index] if index < len(ids) else str(index)))
+        return units
+
+    def _select_accelerator(self, requirement, extra_used=(), *, include_reserved=True):
+        """Return provider-local accelerator units for a request.
+
+        Selection is kept in the scheduler ledger.  Project clients only send
+        semantic requirements; ids are used after dispatch and never leave the
+        operator view.
+        """
+        requirement=normalize_accelerator_requirement(requirement)
+        if requirement is None:
+            return []
+        used=set()
+        if include_reserved:
+            used.update(unit[:2] for items in self.accelerator_reservations.values() for unit in items)
+            used.update(unit[:2] for unit in self.external_accelerator_reservations)
+        used.update(unit[:2] for unit in extra_used)
+        selected=[]
+        needed_tags=set(requirement['requires'])
+        for unit in self.accelerator_units():
+            if unit[:2] in used:
+                continue
+            if (requirement['kind'] in ('any',unit[2])
+                    and unit[3] >= requirement['memory_mb']
+                    and needed_tags.issubset(unit[4])):
+                selected.append(unit)
+                if len(selected) == requirement['count']:
+                    return selected
+        return None
+
+    def refresh_external_accelerators(self, jobs):
+        """Rebuild reservations for work accepted outside this scheduler."""
+        self.external_accelerator_reservations=[]
+        known=self.known_jobs | self.live_jobs
+        for job in jobs or ():
+            if job.get('status') != 'running' or job.get('id') in known:
+                continue
+            selected=self._select_accelerator(job.get('accelerator'))
+            if selected:
+                self.external_accelerator_reservations.extend(selected)
+
+    def can_match_accelerator(self, requirement):
+        return self._select_accelerator(requirement) is not None
+
+    def supports_accelerator(self, requirement):
+        """Whether the provider advertises a matching profile, regardless of load."""
+        return self._select_accelerator(requirement, include_reserved=False) is not None
+
+    def reserve_accelerator(self, requirement, job_id):
+        selected=self._select_accelerator(requirement)
+        if selected is not None:
+            self.accelerator_reservations[job_id]=selected
+        return selected
+
+    def release_accelerator(self, job_id):
+        self.accelerator_reservations.pop(job_id, None)
 
 
 class Pool:
@@ -493,6 +586,7 @@ class Pool:
                 jobs=value.get('active_jobs') or []
                 running=[job for job in jobs if job['status']=='running']
                 node.external=sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
+                node.refresh_external_accelerators(running)
                 owned_memory=sum(max(job['memory_mb'],job.get('rss_mb',0)) for job in running if job['id'] in node.known_jobs)
                 node.external_memory_mb=max(0,value.get('memory_reserved_mb',0)-owned_memory)
                 node.known_jobs.intersection_update({job['id'] for job in jobs}|node.live_jobs)
@@ -581,6 +675,8 @@ class Pool:
                  "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
+                 "accelerators": n.health.get("accelerators", []),
+                 "accelerator_reserved": sum(len(items) for items in n.accelerator_reservations.values()),
                  "shared_paths": n.health.get("shared_paths", {}),
                  "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
@@ -602,7 +698,8 @@ class Pool:
                         for tool,allowed in task.get('tool_sha256',{}).items())
                 and all(n.health.get('tools',{}).get(tool,{}).get('available') for tool in required_tools)
                 and required_shared.issubset(n.health.get('shared',()))
-                and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)]
+                and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)
+                and n.supports_accelerator(task.get('accelerator'))]
 
     def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
@@ -628,7 +725,8 @@ class Pool:
                 ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
                          and n.capacity - n.reserved - n.external >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
-                         and n.health.get("queued", 0) == 0]
+                         and n.health.get("queued", 0) == 0
+                         and n.can_match_accelerator(task.get('accelerator'))]
                 if ready:
                     if self.policy == "round_robin":
                         node = next((n for n in self.nodes[self.rotation:] + self.nodes[:self.rotation] if n in ready))
@@ -656,6 +754,9 @@ class Pool:
                             cpus = min(cpus, cpu_limit)
                         cpus = min(cpus, task.get('max_cpus',node.capacity))
                         task['cpus'] = cpus
+                    reservation_id=job_id or f'local:{id(task)}'
+                    if node.reserve_accelerator(task.get('accelerator'), reservation_id) is None:
+                        continue
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
                     if job_id:
@@ -705,6 +806,7 @@ class Pool:
     def _release(self, node, task, result=None, *, job_id=None):
         label = task.get("label", "")
         with self.condition:
+            node.release_accelerator(job_id or f'local:{id(task)}')
             node.reserved -= task.get("cpus", 1)
             node.reserved_memory_mb -= task.get("memory_mb", 256)
             node.live_jobs.discard(job_id)

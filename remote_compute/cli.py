@@ -27,10 +27,11 @@ from .commands import (Shell, SchedulerShell, WorkerShell, MACHINE_ACTIONS, read
                        machine_action, batch)
 
 
-def load_nodes(path=None, url=None, local_client=None):
+def load_nodes(path=None, url=None, local_client=None, operator_token=None):
     if url:
         token = os.environ.get('REMOTE_COMPUTE_TOKEN', '')
-        return {"nodes": [{"name": Client(url, token).health()['node'], "url": url, "token": token}]}
+        health = Client(url, token, operator=bool(operator_token), operator_token=operator_token).health()
+        return {"nodes": [{"name": health.get('node', 'scheduler'), "url": url, "token": token}]}
     path = Path(path) if path else ROOT / "nodes.local.json"
     value = read_json(path) if path.exists() else {"nodes": [{"name": socket.gethostname(), "url": 'local://' + socket.gethostname()}]}
     for node in value["nodes"]:
@@ -39,7 +40,7 @@ def load_nodes(path=None, url=None, local_client=None):
             node.update(url=local_client.url, client=local_client)
             continue
         try:
-            node['name'] = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file')).health()['node']
+            node['name'] = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),operator=True).health()['node']
         except RemoteError:
             pass
     return value
@@ -47,7 +48,17 @@ def load_nodes(path=None, url=None, local_client=None):
 
 def run_scheduler(args, local_client=None, restarting=None):
     restarting = restarting or threading.Event()
-    config = load_nodes(args.nodes, args.url, local_client)
+    operator_token = getattr(args, 'operator_token', '')
+    if args.url and not operator_token:
+        candidates = []
+        if args.root:
+            candidates.append(Path(args.root) / 'scheduler' / 'operator.token')
+        candidates.append(ROOT / '.local' / 'state' / 'scheduler' / 'operator.token')
+        for candidate in candidates:
+            if candidate.is_file():
+                operator_token = candidate.read_text(encoding='utf-8').strip()
+                break
+    config = load_nodes(args.nodes, args.url, local_client, operator_token=operator_token or None)
     if local_client:
         if not args.nodes and not args.url and not (ROOT / "nodes.local.json").exists():
             config["nodes"] = []
@@ -63,12 +74,14 @@ def run_scheduler(args, local_client=None, restarting=None):
     dispatch = None
     try:
         if args.url:
-            dispatch = Client(args.url, os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
+            dispatch = Client(args.url, os.environ.get("REMOTE_COMPUTE_TOKEN", ""), operator=True,
+                              operator_token=operator_token or None)
             if dispatch.health().get("role") != "scheduler":
                 dispatch = None  # existing direct-worker CLI calls retain their route
         else:
             root = Path(args.root) / "scheduler" if args.root else ROOT / '.local/state/scheduler'
-            coordinator = Coordinator(pool, root, token=args.local_token)
+            coordinator = Coordinator(pool, root, token=args.local_token,
+                                      operator_token=getattr(args, 'operator_token', '') or None)
             port = args.center_port if args.center_port is not None else (args.port if args.port is not None else 26133)
             if args.mode == "scheduler" and args.port is not None and args.center_port is None:
                 port = args.port
@@ -88,7 +101,8 @@ def run_scheduler(args, local_client=None, restarting=None):
             api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             api_thread.start()
             print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}", flush=True)
-            dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token)
+            dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token, operator=True,
+                              operator_token=coordinator.operator_token)
         if args.action is None:
             if args.headless:
                 try:
@@ -322,9 +336,19 @@ def main(argv=None):
         if getattr(args, "detach", False) and not args.url:
             raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
+        args.operator_token = os.environ.get("REMOTE_COMPUTE_OPERATOR_TOKEN", config.get("operator_token", ""))
+        if not args.operator_token and args.url:
+            candidates = []
+            if args.root:
+                candidates.append(Path(args.root) / 'scheduler' / 'operator.token')
+            candidates.append(ROOT / '.local' / 'state' / 'scheduler' / 'operator.token')
+            for candidate in candidates:
+                if candidate.is_file():
+                    args.operator_token = candidate.read_text(encoding='utf-8').strip()
+                    break
         if args.url and args.mode=='worker' and args.action is None:
             from .commands import RemoteWorker
-            client=Client(args.url,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'))
+            client=Client(args.url,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'),operator=True)
             if client.health().get('role')!='worker':raise ValueError('Worker console requires a worker URL')
             WorkerShell(RemoteWorker(client)).loop(client.health,client.url)
             return 0
@@ -348,14 +372,14 @@ def main(argv=None):
                                           tls=bool(config.get('certfile')))
                 if existing_worker:
                     from .commands import RemoteWorker
-                    client=Client(existing_worker,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'))
+                    client=Client(existing_worker,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'),operator=True)
                     WorkerShell(RemoteWorker(client)).loop(client.health,client.url)
                     return 0
         if args.mode != "scheduler" and not existing_worker:
             port = args.port if args.port is not None else config.get("port", 26133)
             from .ramdisk import scratch
             root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root", "accelerators") if key in config}
             options.setdefault('temp_root', scratch('Remote-Compute') / 'tmp')
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb

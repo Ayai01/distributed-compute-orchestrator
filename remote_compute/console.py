@@ -10,6 +10,43 @@ import subprocess
 from .view import _width, _clip, _rule, _line, _layout, StatusRows, format_status, format_notices, set_width_probe
 
 
+_COLOR_ENABLED = False
+_RESET = '\x1b[0m'
+
+
+def _paint_row(row):
+    """Add restrained ANSI hierarchy after width calculation.
+
+    Rows remain plain strings in the painter cache, so ANSI bytes never affect
+    clipping, Unicode width, or change detection.  The same SGR sequences are
+    supported by Windows 10+ virtual terminals and POSIX terminals.
+    """
+    if not _COLOR_ENABLED or not row:
+        return row
+    text = row.strip()
+    if not text:
+        return row
+    if any(word in row for word in ('错误', '失败', '异常', 'blocked', 'error', 'failed')):
+        color = '\x1b[31;1m'       # red
+    elif any(word in row for word in ('运行', '成功', 'online', 'succeeded', '完成')):
+        color = '\x1b[32m'          # green
+    elif any(word in row for word in ('排队', '等待', 'queued', '暂停', 'paused')):
+        color = '\x1b[33m'          # yellow
+    elif text.startswith(('候选:', '用法:', '输入 ', 'Tab/')):
+        color = '\x1b[34m'          # blue
+    elif text.startswith(('最近通知', '命令输出', '通知')):
+        color = '\x1b[35m'          # magenta
+    elif text.startswith(('调度>', '算力>', 'worker>', 'scheduler>')):
+        color = '\x1b[36;1m'         # cyan prompt
+    elif text.startswith(('+', '|')) and any(char.isalpha() or '\u4e00' <= char <= '\u9fff' for char in text):
+        color = '\x1b[36m'          # section/title row
+    elif set(text) <= set('+-|='):
+        color = '\x1b[90m'          # separators
+    else:
+        return row
+    return color + row + _RESET
+
+
 def _input_view(prompt, line, cursor, width):
     """Keep the editable cursor visible even when a command exceeds one row."""
     prompt = _clip(prompt, max(0, width // 3))
@@ -105,7 +142,18 @@ def _console_size_probe():
 
 def _enable_ansi():
     """Return a restoration callback, or None for a plain console/redirect."""
-    if os.name!='nt':return (lambda:None) if sys.stdout.isatty() else None
+    global _COLOR_ENABLED
+    allowed = not (os.environ.get('NO_COLOR') is not None
+                   or os.environ.get('DCO_NO_COLOR') is not None
+                   or os.environ.get('TERM','').lower() == 'dumb')
+    if os.name!='nt':
+        if not sys.stdout.isatty():
+            return None
+        _COLOR_ENABLED = allowed
+        def restore_posix():
+            global _COLOR_ENABLED
+            _COLOR_ENABLED = False
+        return restore_posix
     import ctypes
     from ctypes import wintypes
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -120,7 +168,12 @@ def _enable_ansi():
         return None
     if not kernel.SetConsoleMode(handle, mode.value | 4):
         return None
-    return lambda: kernel.SetConsoleMode(handle, mode.value)
+    _COLOR_ENABLED = allowed
+    def restore_windows():
+        global _COLOR_ENABLED
+        _COLOR_ENABLED = False
+        kernel.SetConsoleMode(handle, mode.value)
+    return restore_windows
 
 
 def _console_width_probe():
@@ -164,7 +217,7 @@ class RowPainter:
         rows=tuple(_clip(row,max(0,columns-1)) for row in rows[:height])
         rows+=('',)*max(0,height-len(rows))
         previous=self.rows if self.size==(columns,height) else ()
-        changes=[f'\x1b[{i+1};1H'+row+'\x1b[K' for i,row in enumerate(rows)
+        changes=[f'\x1b[{i+1};1H'+_paint_row(row)+'\x1b[K' for i,row in enumerate(rows)
                  if i>=len(previous) or row!=previous[i]]
         position=(height,min(max(0,cursor),max(0,columns-2))+1)
         result=''

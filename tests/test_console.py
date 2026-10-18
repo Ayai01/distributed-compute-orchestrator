@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from remote_compute.cli import Shell
 from remote_compute.console import (Dashboard, FocusRefresh, RowPainter, CommandCompletion,
     format_status, _enable_ansi, _initial_size, _input_view, _layout, _width, _clip,
-    _command_rows, _console_size_probe)
+    _command_rows, _console_size_probe, _paint_row)
 from remote_compute.commands import SchedulerShell, WorkerShell
 
 
@@ -57,6 +57,19 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_dashboard_colors_are_width_neutral_and_respect_no_color(self):
+        import remote_compute.console as console
+        with patch.object(console, '_COLOR_ENABLED', True):
+            painted = _paint_row('任务运行 失败')
+            self.assertIn('\x1b[', painted)
+            self.assertTrue(painted.endswith('\x1b[0m'))
+        with patch.object(console, '_COLOR_ENABLED', False):
+            self.assertEqual(_paint_row('任务运行 失败'), '任务运行 失败')
+        painter = RowPainter()
+        with patch.object(console, '_COLOR_ENABLED', True):
+            painter.frame(['任务运行'], 40, 1, 0)
+        self.assertNotIn('\x1b[', painter.rows[0])
+
     def test_command_suggestions_use_cached_nodes_ids_and_real_parser_options(self):
         shell = object.__new__(SchedulerShell)
         shell.pool = Mock()

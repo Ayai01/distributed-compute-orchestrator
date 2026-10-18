@@ -4,15 +4,46 @@
 
 ## 算力分配与提前排队
 
+## 工程接口边界
+
+工程客户端只表达通用算力需求：`requires` 能力标签、`tool_sha256` 引擎摘要、`cpus/max_cpus`、`memory_mb`、`resource_share`，以及有界的 `priority`、`queue_ratio` 和 `single_thread_weight`。`resource_share` 为 `(0,16]`，`queue_ratio` 为 `[0,4]`，`single_thread_weight` 为 `(0,8]`，`priority` 为 `-1000..1000`。`node`、IP、节点权重、节点预算和完整 `/health` 只属于 DCO 操作端；操作端令牌保存在中心状态目录，普通工程令牌不能提升权限。
+
+工程查看能力时使用：
+
+```python
+from remote_compute import Client
+center = Client()
+print(center.capabilities())  # tags/tools/CPU/RAM 的汇总视图
+```
+
+能力摘要只返回汇总标签、可用工具及 SHA 集合、CPU/RAM 总量与单位、以及去掉设备 ID 的加速器档案，不含设备名、URL、路径、活动任务或工程配额。大输入先用 `sync_files(..., content_id=...)` 内容寻址同步，任务只引用资产 ID；不要把模型、源码或完整健康快照随每个任务重复上传。
+
+GPU 和其他加速器使用同一套汇总能力协议。`capabilities()['accelerators']` 返回去掉设备 ID 后的能力档案，例如：
+
+```json
+{"kind":"cuda", "count":2, "memory_mb":24576, "tags":["gpu","gpu:training","gpu:general"]}
+```
+
+任务声明语义需求，不指定卡号或设备名：
+
+```python
+task = command(["${tool:python}", "train.py"], cpus=4, memory_mb=8192,
+               project="rgcn", accelerator={"kind":"cuda", "memory_mb":8192,
+                                             "requires":["gpu:training"]})
+```
+
+调度器按加速器类型、显存和标签分配并锁定对应单元，运行环境提供 `DCO_ACCELERATOR_KIND`、`DCO_ACCELERATOR_COUNT`、`DCO_ACCELERATOR_MEMORY_MB`、`DCO_ACCELERATOR_IDS`；CUDA 任务同时得到 `CUDA_VISIBLE_DEVICES`。这些变量只描述已获授权的执行资源，工程不读取节点清单。训练、GPU 仿真和通用 GPU 任务可用不同的标签表达偏好；无 GPU 设备配置空档案，CPU 任务照常使用。
+
+
 默认部署中，科研工程运行在 Aya1-PC，向本机中心 `http://127.0.0.1:26133` 提交任务。Aya1-TX 的同一端口提供 worker 服务；在该设备运行科研工程时，auto 会检查服务角色，未检测到本地中心便独立计算，需要接入 Aya1-PC 时显式填写其中心地址。中心模式下，工程原有 workers / 并发上限不参与 CPU 准入；有限的提交窗口用于提前准备任务，实际 CPU 和内存由中心统一分配。
 
-每个工程设置 `resource_share`（默认 1.0），中心按活跃工程的相对权重分配整数线程，用最大余数补齐余量。例如可承接54线程、三个工程同权且需求充足时为18/18/18；两个工程权重2:1时为36/18。不能整除时，例如53线程、三个工程同权，为18/18/17。份额和预取按实际匹配任务的设备容量计算：工具、共享路径、指定节点和RAM不匹配的设备不抬高项目目标。需求不足的份额供其他待运行任务使用。
+每个工程设置 `resource_share`（默认 1.0），中心按活跃工程的相对权重分配整数线程，用最大余数补齐余量。例如可承接54线程、三个工程同权且需求充足时为18/18/18；两个工程权重2:1时为36/18。不能整除时，例如53线程、三个工程同权，为18/18/17。份额和预取按实际匹配能力计算：工具、能力标签、共享路径和RAM不匹配的供给不抬高项目目标。需求不足的份额供其他待运行任务使用。
 
-单线程 SPICE 任务声明 `cpus: 1`。可并行的整轮任务声明 `cpus: 0`，中心按工程份额和可用节点授予实际线程数，并把 `${cpus}` 传给程序。`max_cpus` 限定任务有用的并行规模，同时约束初始自动授予和后续借核；省略时沿用节点上限。`cpus: 0` 由中心处理，直接 worker 任务需声明正整数。整轮任务在单个节点执行；公平轮先安排各工程能运行的固定任务，自动任务最多等待一秒凑齐目标，之后可用部分授予启动。等待CPU或内存的任务不跨工程锁住空闲线程。任务保留原节点；支持协作借还的同步内核可在安全批次边界调整授予，其余在途计算保持原授予。
+单线程 SPICE 任务声明 `cpus: 1`。可并行的整轮任务声明 `cpus: 0`，中心按工程份额和可用节点授予实际线程数，并把 `${cpus}` 传给程序。`max_cpus` 限定任务有用的并行规模，同时约束初始自动授予和后续借核；省略时沿用节点上限。`cpus: 0` 由中心处理，直接 worker 任务需声明正整数。整轮任务在单个节点执行；公平轮先安排各工程能运行的固定任务，自动任务最多等待一秒凑齐目标，之后可用部分授予启动。等待CPU或内存的任务不跨工程锁住空闲线程。支持协作借还的同步内核可在安全批次边界调整授予，其余在途计算保持原授予；工程端不提交节点约束。
 
 自动线程任务按每台候选节点的实际容量计算所需线程；较大节点忙碌时，可在空闲的小节点取得相应授予，不为等待较大节点留下整台机器空闲。
 
-调用工程仅连接中心，以`health(brief=True)`识别中心和协议能力，通过`admission`/`window`按requires声明工具及实验环境。`capable_cpus`是匹配能力的在线预算（0表示暂无供给），`target_cpus`是当前工程份额；查询不登记活跃需求。`tool_sha256`给出同时匹配requires的工具SHA集合，不含路径或设备拓扑，供原有数值缓存识别引擎。工程不枚举nodes或绑定设备名，设备配置与选择由中心管理，完成回执保留执行来源用于溯源。
+调用工程通过`capabilities()`或`health(brief=True)`识别汇总协议能力，再用`admission`/`window`按requires声明工具及实验环境。`capable_cpus`是匹配能力的在线预算（0表示暂无供给），`target_cpus`是当前工程份额；查询不登记活跃需求。`tool_sha256`给出匹配工具的SHA集合，不含路径或设备拓扑，供原有数值缓存识别引擎。工程不枚举nodes、不绑定设备名，也不读取分配详情，设备配置与选择由中心管理。
 
 中心声明`admission_job`时，`admission(project, job_id=原任务ID)`返回该任务的`recommended_cpus`、`current_cpus`、`current_memory_mb`和`available_memory_mb`，供阶段边界先判断是否值得调整工作池。此查询不改变授权；需要调整时排空当前池，再调用`resize`并按实际回执建池。运行中的worker任务通过同一lease通路查询。
 
@@ -24,7 +55,7 @@
 提交窗口 = 当前运行槽位 + 预取任务
 ```
 
-整轮 `cpus: 0` 未设上限时，初始运行槽位为可承接节点数，并受工程目标线程数限制，至少为 1；设置 `max_cpus` 时按该任务需求计算完整波次。自动任务在编译后归还线程时，窗口计入仍在运行的任务，按目标剩余线程和设备空闲槽位补充下一波；预取数量继续按完整波次乘`queue_ratio`计算，避免把每个已退核任务再乘一次排队比例。最大窗口覆盖每任务退到1CPU的情况，工程端提交池应允许窗口增长，实际待处理数量始终受`window.current()`约束。两台节点都可承接时，`queue_ratio: 0`也可同时提交两项整轮任务。CPU、内存、工具、共享路径和指定节点仍决定实际派发；提交窗口不是CPU授权，也不是服务端全局队列硬上限。工程只预取已就绪工作，保留搜索批次和代际边界。已启动的旧控制器和在途任务在自然边界更新。
+整轮 `cpus: 0` 未设上限时，初始运行槽位为可承接节点数，并受工程目标线程数限制，至少为 1；设置 `max_cpus` 时按该任务需求计算完整波次。自动任务在编译后归还线程时，窗口计入仍在运行的任务，按目标剩余线程和设备空闲槽位补充下一波；预取数量继续按完整波次乘`queue_ratio`计算，避免把每个已退核任务再乘一次排队比例。最大窗口覆盖每任务退到1CPU的情况，工程端提交池应允许窗口增长，实际待处理数量始终受`window.current()`约束。两台节点都可承接时，`queue_ratio: 0`也可同时提交两项整轮任务。CPU、内存、工具、能力标签和共享路径仍决定实际派发；提交窗口不是CPU授权，也不是服务端全局队列硬上限。工程只预取已就绪工作，保留搜索批次和代际边界。已启动的旧控制器和在途任务在自然边界更新。
 
 配置位置：AOP 原运行配置、ARH-DSE、Bench 顶层使用这两个字段；AOP 规范化配置在 `execution` 中映射，RGCN 放在 `resources` 中。
 
@@ -73,7 +104,7 @@ RAM随并发线性增长时，使用 `client.resize(id, 0, base_memory_mb=1024, 
 
 worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 
-任务还可设置 `priority`、`node`、`requires`。较大的 `priority` 先启动；`node` 固定节点名称；`requires` 要求节点标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选节点。多个批次共享同一调度器的资源账本，节点再按自身预算统一准入。
+任务还可设置 `priority`、`requires` 和 `tool_sha256`。较大的 `priority` 先启动；`requires` 要求汇总能力标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选供给。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
 
 中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度，内存同时扣除本方任务的预留或实际 RSS。任务取消只向 worker 发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
 
@@ -105,7 +136,7 @@ Windows新建作业目录设置可继承的Low完整性标签，允许现有带L
 
 仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告；本次验证使用该隔离方式，正式结果与已有报告保持原样。日常正式运行仍按各工程规则更新当前成功报告。
 
-ONNX CPU推理任务额外声明`onnx_cpu`：此工具别名指向已验证同时具备OpenCV、ONNX Runtime及CPUExecutionProvider的Python，不能用`arh_python`存在代替推理依赖检查。模型、输入数据与descriptor另作为内容资产同步。GPU硬件存在不等于CUDA推理后端可用；当前协议只分配CPU/RAM，不提供GPU额度借还。
+ONNX CPU推理任务额外声明`onnx_cpu`：此工具别名指向已验证同时具备OpenCV、ONNX Runtime及CPUExecutionProvider的Python。模型、输入数据与descriptor另作为内容资产同步。GPU硬件存在不等于CUDA推理后端可用；需要GPU的工程必须同时声明`accelerator`和对应的已验证工具标签。
 
 ## 脚本与 Python 接口
 
@@ -125,7 +156,7 @@ python main.py --test-native
 from remote_compute import Client, ngspice
 
 result = Client().run(ngspice("divider.spice"), inputs="examples/spice")
-print(result["status"], result["assigned_node"])
+print(result["status"])
 print(result["files"]["ngspice.log"].decode(errors="replace"))
 ```
 
@@ -145,7 +176,7 @@ task = command(["${tool:python}", "runner.py", "--workers", "${cpus}"],
                cpus=0, max_cpus=8, memory_mb=1024, project="my-project", resource_share=1.0,
                outputs=["measurements.json"])
 result = center.run(task, inputs="my-batch")
-print(result["status"], result["assigned_node"], result["cpus"])
+print(result["status"], result["cpus"])
 ```
 
 同一工程的任务保持相同 project 和 resource_share；多个调用者各自的有限窗口由调用者维护，中心统一控制执行资源。
@@ -167,7 +198,7 @@ finally:
     center.resize(identity, 1, memory_mb=resident_ram_mb)
 ```
 
-`resize` 保留原任务ID、节点和输入摘要，返回 `id/cpus/memory_mb/requested_cpus/node`。增长受工程权重、任务 `max_cpus`、节点预算和当前空闲线程约束；调用方始终使用实际 `cpus`。可选 `memory_mb` 在同一请求中调整内存预留，例如编译结束、子进程退出后 `center.resize(identity, 1, memory_mb=512)`。内存准入失败返回409并保留原CPU/内存授予；实际RSS仍参与准入，降低申报不隐藏真实占用。两端声明 `resize_memory` 能力后使用联合调整，旧节点返回 `supported=False` 并保留原授予。同步批次结束后才归还，异步 pending 期间维持固定授予。BLAS 内层保持1，避免与外层并行相乘。worker 与中心同步计账，取消、异常和完成均按最后授予释放；回执保留 `initial_cpus/peak_cpus/resize_count`。旧节点未声明 resize 能力时继续原授予。
+`resize` 保留原任务ID和输入摘要，返回 `id/cpus/memory_mb/requested_cpus`。增长受工程权重、任务 `max_cpus`、当前可用线程和RAM约束；调用方始终使用实际 `cpus`。可选 `memory_mb` 在同一请求中调整内存预留，例如编译结束、子进程退出后 `center.resize(identity, 1, memory_mb=512)`。内存准入失败返回409并保留原CPU/内存授予；实际RSS仍参与准入，降低申报不隐藏真实占用。两端声明 `resize_memory` 能力后使用联合调整，旧节点返回 `supported=False` 并保留原授予。同步批次结束后才归还，异步 pending 期间维持固定授予。BLAS 内层保持1，避免与外层并行相乘。worker 与中心同步计账，取消、异常和完成均按最后授予释放；回执保留 `initial_cpus/peak_cpus/resize_count`。旧节点未声明 resize 能力时继续原授予。
 
 DCO负责跨工程份额、CPU/内存准入、实际授予和原ID资源账本；调用工程负责判断是否有可伸缩内核，并在并行池/子进程已收齐的安全边界借还。YOLO包审计默认每包1CPU；对约50毫秒的串行尾段增加线程会增加通信和调度开销，较大通道块才按实测启用多核。Rocket/BOOM可在编译结束后按实际仿真并发和DDR规模同时收缩CPU/内存，ARH常驻池保持初始授予直到池关闭。工程资源配置不参与科学结果缓存身份。
 

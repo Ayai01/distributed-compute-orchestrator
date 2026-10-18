@@ -118,7 +118,7 @@ pool=Pool([dict(name='original',url=sys.argv[1])],refresh=.1)
 state=Coordinator(pool,root/'center')
 server=Server(('127.0.0.1',0),state)
 threading.Thread(target=server.serve_forever,daemon=True).start()
-print(json.dumps(dict(url='http://127.0.0.1:'+str(server.server_port))),flush=True)
+print(json.dumps(dict(url='http://127.0.0.1:'+str(server.server_port),operator_token=state.operator_token)),flush=True)
 try:
  while not (root/'stop').exists():time.sleep(.02)
 finally:
@@ -127,7 +127,8 @@ finally:
             def start():
                 process=subprocess.Popen([sys.executable,'-B','-c',code,node.url,str(root)],
                     stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8')
-                return process,Client(json.loads(process.stdout.readline())['url'])
+                info=json.loads(process.stdout.readline())
+                return process,Client(info['url'], operator=True, operator_token=info['operator_token'])
             process,client=start()
             try:
                 task=python("import os,time;from pathlib import Path\nPath('pid.txt').write_text(str(os.getpid()))\nwhile not Path('release').exists():time.sleep(.02)\nprint('once')",

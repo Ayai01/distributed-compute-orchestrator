@@ -6,13 +6,78 @@ import time
 import unittest
 from unittest.mock import patch
 
-from remote_compute import Pool
+from remote_compute import Client, Pool
 from remote_compute.benchmark import calibrated, NAME
 from test_compute import provider, python, scratch, until
 from test_center import center
 
 
 class ContractTests(unittest.TestCase):
+    def test_project_view_is_aggregate_and_rejects_node_selection(self):
+        with scratch() as directory, provider(Path(directory) / 'worker', cpus=2, tags=['rtl']) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
+                project = Client(operator.url)
+                capabilities = project.capabilities()
+                self.assertNotIn('nodes', capabilities)
+                self.assertNotIn('node', capabilities)
+                self.assertEqual(capabilities['cpu']['capacity'], 2)
+                self.assertIn('rtl', capabilities['tags'])
+                public_health = project.health()
+                self.assertNotIn('nodes', public_health)
+                self.assertNotIn('projects', public_health)
+                with self.assertRaisesRegex(Exception, 'operator-only'):
+                    project.nodes()
+                forged = Client(operator.url, operator=True)
+                with self.assertRaisesRegex(Exception, 'Operator token'):
+                    forged.nodes()
+                with self.assertRaisesRegex(Exception, 'node selection'):
+                    project.submit(python('print(1)', node='worker'))
+                result = project.run(python('print(2)'))
+                self.assertEqual(result['status'], 'succeeded', result)
+                self.assertNotIn('assigned_node', result)
+                self.assertNotIn('worker_url', result)
+
+    def test_project_view_bounds_optional_scheduler_hints(self):
+        with scratch() as directory, provider(Path(directory) / 'worker') as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
+                project = Client(operator.url)
+                with self.assertRaisesRegex(Exception, 'queue_ratio'):
+                    project.admission('bounded', queue_ratio=5)
+                with self.assertRaisesRegex(Exception, 'resource_share'):
+                    project.admission('bounded', resource_share=17)
+
+    def test_accelerator_request_uses_aggregate_profiles_and_serializes_gpu_jobs(self):
+        with scratch() as directory, provider(
+                Path(directory) / 'gpu', cpus=2,
+                accelerators=[dict(kind='cuda', count=1, memory_mb=8192,
+                                   tags=['gpu', 'gpu:training'], ids=['0'])]) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
+                project = Client(operator.url)
+                capabilities = project.capabilities()
+                self.assertEqual(capabilities['accelerators'], [
+                    dict(kind='cuda', count=1, memory_mb=8192, tags=['gpu', 'gpu:training'])])
+                request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
+                self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 2)
+                first = project.submit(python('import time; time.sleep(.35)', project='gpu', accelerator=request))['id']
+                until(lambda: project.status(first, brief=True)['status'] == 'running')
+                second = project.submit(python('print(2)', project='gpu', accelerator=request))['id']
+                self.assertEqual(project.status(second, brief=True)['status'], 'queued')
+                self.assertEqual(project.wait(first)['status'], 'succeeded')
+                result = project.wait(second)
+                self.assertEqual(result['status'], 'succeeded')
+                self.assertIn('tools', result)
+                self.assertTrue(all('argv' not in info for info in result['tools'].values()))
+                self.assertNotIn('D:\\', json.dumps(result))
+                self.assertNotIn('cwd', result)
+                self.assertNotIn('assigned_node', result)
+
+    def test_accelerator_requirement_does_not_fallback_to_cpu(self):
+        with scratch() as directory, provider(Path(directory) / 'cpu', cpus=2) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
+                project = Client(operator.url)
+                request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
+                self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 0)
+
     def test_engine_constraint_and_shared_alias_route_without_device_names(self):
         with scratch() as directory:
             root=Path(directory);data=root/'data';data.mkdir()

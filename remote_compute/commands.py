@@ -70,13 +70,13 @@ def submission_parser(kind):
     parser.add_argument("source", help="任务 JSON、SPICE 文件或 RTL 目录")
     parser.add_argument("--input", help="要传输的任务输入目录")
     parser.add_argument("--output", help="结果保存目录")
-    parser.add_argument("--node", help="固定分配给指定节点")
     parser.add_argument("--cpus", type=int, dest="task_cpus")
     parser.add_argument("--max-cpus", type=int, help="任务线程需求硬上界，包含后续借核")
     parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
     parser.add_argument("--priority", type=int)
     parser.add_argument("--single-thread-weight", type=float, help="单线程偏好，默认1；较高偏单线程、较低偏总吞吐")
     parser.add_argument("--requires", help="节点标签，以逗号分隔")
+    parser.add_argument("--accelerator", help='加速器需求 JSON，例如 {"kind":"cuda","memory_mb":8192,"requires":["gpu:training"]}')
     parser.add_argument("--keep", action="store_true", help="回收后保留节点任务目录")
     if kind == "rtl":
         parser.add_argument("--top", default="tb")
@@ -96,12 +96,14 @@ def prepare(kind, args):
     else:
         task = verilator(args.sources, args.top, flags=words(args.flags))
         inputs = inputs or source
-    for key in ("cpus", "max_cpus", "priority", "node", "single_thread_weight"):
+    for key in ("cpus", "max_cpus", "priority", "single_thread_weight"):
         value = getattr(args, "task_cpus" if key == "cpus" else key)
         if value is not None:
             task[key] = value
     if args.requires:
         task["requires"] = args.requires.split(",")
+    if args.accelerator:
+        task["accelerator"] = json.loads(args.accelerator)
     if args.memory_mb is not None:
         task["memory_mb"] = args.memory_mb
     output = Path(args.output) if args.output else ROOT / "results" / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])
@@ -479,11 +481,11 @@ class SchedulerShell(Shell):
         print(f"\n已接单 {client.url}  {identity}")
 
     def do_run(self, line):
-        """run 任务.json [--input 目录] [--output 目录] [--node 节点] [--cpus N] [--priority N]"""
+        """run 任务.json [--input 目录] [--output 目录] [--cpus N] [--priority N]"""
         self._submit("run", line)
 
     def do_spice(self, line):
-        """spice 网表.spice [--cpus N] [--node 节点] [--output 目录]"""
+        """spice 网表.spice [--cpus N] [--output 目录]"""
         self._submit("spice", line)
 
     def do_rtl(self, line):
@@ -561,7 +563,7 @@ class SchedulerShell(Shell):
     def do_add(self, line):
         """add http://设备IP:26133：以设备实际名称加入节点。"""
         url = words(line)[-1]
-        name = Client(url, os.environ.get('REMOTE_COMPUTE_TOKEN', '')).health()['node']
+        name = Client(url, os.environ.get('REMOTE_COMPUTE_TOKEN', ''), operator=True).health()['node']
         if self.center:
             self.center.control(add={"name": name, "url": url, "token": os.environ.get("REMOTE_COMPUTE_TOKEN", "")})
         else:
