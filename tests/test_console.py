@@ -374,6 +374,7 @@ class ConsoleTests(unittest.TestCase):
     def test_project_and_task_descriptions_are_compact_without_changing_request_labels(self):
         from remote_compute.view import _label, _project
         cases=[('rocket-nn-host','rocket-nn-host/boom/shufflenet_v2_x0_5/kitten/f4d61bbf5462da2d','NCNN','BOOM ShuffleV2-0.5 kitten'),
+               ('rocket-nn-host','BOOM yolov8n-dog d9bc25af61428879','NCNN','BOOM YOLOv8n dog'),
                ('RGCN','RGCN/fsa-online-frozen-model-seed42','RGCN','FSA online-s42'),
                ('RGCN','RGCN/tsa-neural_previous_control-fresh','RGCN','TSA nn-prev'),
                ('RGCN','rgcn-tsa-pre','RGCN','TSA pre'),

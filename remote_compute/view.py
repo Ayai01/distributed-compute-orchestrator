@@ -147,8 +147,22 @@ def _label(job):
     if project=='rocket-nn-host':
         names={'rocket':'Rocket','boom':'BOOM','shufflenet_v2_x0_5':'ShuffleV2-0.5',
                'mobilenet_v2':'MobileV2','yolov8n':'YOLOv8n','resnet18':'ResNet18'}
-        parts=[names.get(part,part) for part in parts if not re.fullmatch(r'[0-9a-f]{12,64}',part)]
-        return ' '.join(parts[-3:]) or '-'
+        tokens=[]
+        for part in re.split(r'[/\s]+',' '.join(parts)):
+            if not part or part.casefold() in {'rocket-nn-host','rocket'}:
+                continue
+            if re.fullmatch(r'[0-9a-f]{12,64}',part,re.IGNORECASE):
+                continue
+            match=re.fullmatch(r'(.+?)[_-](dog|kitten|cat|car|person)',part,re.IGNORECASE)
+            if match and match[1].casefold() in names:
+                tokens.extend((names[match[1].casefold()],match[2].lower()))
+            else:
+                tokens.append(names.get(part.casefold(),part))
+        compact=[]
+        for token in tokens:
+            if token not in compact:
+                compact.append(token)
+        return ' '.join(compact[-4:]) or '-'
     if project=='rgcn':
         text=re.sub(r'^rgcn-', '', '/'.join(parts[-3:]), flags=re.IGNORECASE)
         for before,after in (('-frozen-model',''),('-fresh',''),('analytic_previous_control','ana-prev'),
