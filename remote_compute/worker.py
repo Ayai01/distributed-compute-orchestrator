@@ -609,11 +609,11 @@ class Worker:
         else:
             job['result'].pop('input_cleanup_error', None)
 
-    def _prune_assets(self):
+    def _prune_assets(self, *, recent=True):
         # A check/upload and the following submit are separate LAN requests.
         # Keep their short handoff intact even if active assets exceed the LRU target.
         now = time.time()
-        protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if now-used<5}
+        protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if recent and now-used<5}
         for job in self.jobs.values():
             protected.update(job['result'].get('assets', {}).values())
         for error in self.asset_cache.prune(protected):
@@ -628,7 +628,7 @@ class Worker:
         issue=None
         for temporary in {self._temporary(job),job['directory']/'tmp'}:
             try:
-                shutil.rmtree(temporary)
+                remove_owned(temporary)
             except FileNotFoundError:
                 pass
             except OSError as error:
@@ -709,7 +709,7 @@ class Worker:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Cancel and wait for the job before deleting it")
-            shutil.rmtree(job["directory"])
+            remove_owned(job["directory"])
             del self.jobs[identity]
             self._prune_assets()
             return {"deleted": identity}
@@ -729,7 +729,7 @@ class Worker:
                     temporary.replace(directory)
                 finally:
                     if temporary.exists():
-                        shutil.rmtree(temporary)
+                        remove_owned(temporary)
             if directory.is_dir():
                 self.asset_cache.touch(identity)
             return {"id": identity, "exists": directory.is_dir()}
@@ -746,7 +746,7 @@ class Worker:
         for job in self.jobs.values():
             self._clean_temp(job)
             self._clean_work(job)
-        self._prune_assets()
+        self._prune_assets(recent=False)
         self.root_lock.close()
 
 

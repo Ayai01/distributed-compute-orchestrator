@@ -1,7 +1,9 @@
 """Real process and transport cleanup, including cached-source rehydration."""
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import os
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,55 @@ from test_compute import provider, python, scratch, until
 
 
 class CleanupTests(unittest.TestCase):
+    def test_two_collection_cleanups_do_not_delete_the_same_job_twice(self):
+        class Together:
+            def __init__(self):
+                self.ready=threading.Barrier(2);self.lock=threading.Lock()
+            def __enter__(self):
+                self.ready.wait(timeout=3);self.lock.acquire()
+            def __exit__(self,*args):
+                self.lock.release()
+        with scratch() as directory,provider(Path(directory)/'worker') as (_,node):
+            with Pool([node]) as pool,center(pool,Path(directory)/'center') as (state,client):
+                identity=client.submit(python("print('once')"))['id'];client.wait(identity)
+                state.jobs[identity]['artifact_lock']=Together()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results=list(executor.map(lambda _:client.delete(identity),range(2)))
+                self.assertEqual(results,[{'deleted':identity}]*2)
+                self.assertEqual(client.status(),[])
+
+    def test_center_reclaims_old_unreferenced_archives_without_breaking_upload_handoff(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (_,provider_client):
+            with Pool([dict(name='test',client=provider_client)]) as pool:
+                state=Path(directory)/'center'
+                with center(pool,state) as (coordinator,client):
+                    coordinator.asset_cache.limit=1
+                    first=client.sync_files({'data':b'original model'})
+                    # Even an old upload must survive the gap before submission.
+                    with patch('remote_compute.coordinator.time.time',return_value=time.time()+60):
+                        client.sync_files({'data':b'next model'})
+                    task=python("print('retained')",assets={'model':first})
+                    identity=client.submit(task)['id'];client.wait(identity)
+                    self.assertTrue((state/'assets'/(first+'.zip')).exists())
+                # Closing prunes the unreferenced upload, protects the receipt.
+                self.assertEqual(list((state/'assets').glob('*.zip')),[state/'assets'/(first+'.zip')])
+                self.assertTrue((state/'jobs'/identity/'result.json').exists())
+                with center(pool,state) as (_,client):
+                    self.assertIn('retained',client.fetch(identity)['stdout'])
+
+    def test_worker_exit_prunes_recent_unreferenced_cache_but_keeps_uncollected_results(self):
+        with scratch() as directory:
+            root=Path(directory)
+            with provider(root/'worker') as (worker,client):
+                worker.asset_cache.limit=1
+                kept=client.sync_files({'data':b'needed model'})
+                identity=client.submit(python("print('saved')",assets={'data':kept}))['id']
+                client.wait(identity)
+                unused=client.sync_files({'data':b'unused source'})
+            self.assertTrue((root/'worker/assets'/kept).exists())
+            self.assertFalse((root/'worker/assets'/unused).exists())
+            self.assertTrue((root/'worker/jobs'/identity/'result.json').exists())
+
     @unittest.skipUnless(os.name=='nt','Windows junction cleanup')
     def test_result_cleanup_removes_junction_without_deleting_dependency(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (worker, client):

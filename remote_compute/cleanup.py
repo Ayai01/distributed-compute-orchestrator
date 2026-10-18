@@ -25,21 +25,28 @@ def remove_owned(path):
 
 class AssetCache:
     """LRU metadata is collected once; ordinary health polls never scan files."""
-    def __init__(self, root, limit=512 * 1024**2):
+    def __init__(self, root, limit=512 * 1024**2, *, archives=False):
         self.root, self.limit = Path(root), limit
+        self.archives = archives
         self.entries = {}
         self.revision = 0
         for path in self.root.iterdir():
-            if re.fullmatch(r'[a-f0-9]{64}', path.name) and path.is_dir() and path.resolve() == path:
+            identity = path.stem if archives else path.name
+            valid = path.suffix == '.zip' and path.is_file() if archives else path.is_dir()
+            if re.fullmatch(r'[a-f0-9]{64}', identity) and valid and not self._linked(path):
                 self._add(path)
 
     def _add(self, path):
-        size = 0
-        for folder, directories, files in os.walk(path, followlinks=False):
-            directories[:] = [name for name in directories if not self._linked(Path(folder)/name)]
-            size += sum((Path(folder)/name).stat().st_size for name in files
-                        if not self._linked(Path(folder)/name))
-        self.entries[path.name] = (size, path.stat().st_mtime)
+        size = path.stat().st_size if self.archives else 0
+        if not self.archives:
+            for folder, directories, files in os.walk(path, followlinks=False):
+                directories[:] = [name for name in directories if not self._linked(Path(folder)/name)]
+                size += sum((Path(folder)/name).stat().st_size for name in files
+                            if not self._linked(Path(folder)/name))
+        self.entries[path.stem if self.archives else path.name] = (size, path.stat().st_mtime)
+
+    def _path(self, identity):
+        return self.root / (identity + '.zip' if self.archives else identity)
 
     @staticmethod
     def _linked(path):
@@ -47,7 +54,7 @@ class AssetCache:
         return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 1024)
 
     def touch(self, identity):
-        path = self.root/identity
+        path = self._path(identity)
         if identity not in self.entries:
             self._add(path)
         size, _ = self.entries[identity]
@@ -67,7 +74,7 @@ class AssetCache:
             if identity in protected:
                 continue
             try:
-                remove_owned(self.root/identity)
+                remove_owned(self._path(identity))
             except OSError as error:
                 errors.append(str(error))
             else:

@@ -1,6 +1,6 @@
 # Distributed Compute Orchestrator（DCO）
 
-面向简单局域网的远程计算、统一调度和工程操作工具，用于 ngspice、Verilator、原生模拟器批次与 Python 任务。服务、调度与终端只依赖标准库，源码兼容 Python 3.7–3.15；日常优先本机标准版 CPython 3.14，当前两机统一3.14.8。仿真工具和科学依赖按任务安装在设备本地。
+面向简单局域网的远程计算、统一调度和工程操作工具，用于 ngspice、Verilator、原生模拟器批次与 Python 任务。服务、调度与终端只依赖标准库，源码兼容 Python 3.7–3.15；日常优先本机系统安装的标准版 CPython 3.14。仿真工具和科学依赖按任务安装在设备本地。
 
 工程简称统一使用 **DCO**，仓库为 `distributed-compute-orchestrator`。现有部署目录、`remote_compute` Python 包、`REMOTE_COMPUTE_*` 环境变量和历史回执保持兼容；这些是同一工程的稳定接口，不另设第二套配置字段。
 
@@ -31,6 +31,20 @@ python main.py --mode worker --host 0.0.0.0 --port 26133
 | worker | 独立提供算力和远程操作，不依赖其他工程 |
 
 中心和独立 worker 的对外端口统一 **26133**；hybrid 的本机 worker 直接在调度器进程内调用，**不监听额外端口**。`--url` 连接已有服务，服务尚未启动时先运行启动脚本。
+
+启动后的 `调度>` 输入行可直接执行：
+
+```text
+help                       按用途查看指令和例子
+status                     查看设备和任务资源
+cpus 16                    本机使用16线程，自动保存
+memory 8G                  本机任务RAM预算8GiB，自动保存
+logs ab12                  查看唯一4位任务ID的日志
+fetch ab12 "D:/结果"        保存结果并清理该任务
+restart --wait             空闲后重新加载中心
+```
+
+资源命令也可指定设备，例如 `cpus Aya1-TX 30`。输入指令或设备名称的一部分后按 Tab 补全，`help cpus` 查看详细用法。方括号表示可省略参数，不需要照着输入；上述任务ID `ab12` 需换成看板上的实际ID。
 
 ## 当前设备与控制
 

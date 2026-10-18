@@ -76,13 +76,49 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(suggest('run --cpus ')['matches'], [])
         self.assertIn('--max-cpus', suggest('run --')['matches'])
         self.assertEqual(suggest('policy b')['matches'], ['balanced'])
-        self.assertIn('节点 N', suggest('cpus Aya1-PC 12')['usage'])
+        self.assertIn('[节点] N', suggest('cpus Aya1-PC 12')['usage'])
+        self.assertEqual(suggest('logs abc')['matches'], [identity])
         shell.pool.assert_not_called()
         worker = WorkerShell(Mock())
         local = dict(active_jobs=[dict(id=identity)])
         self.assertEqual(worker.suggest('logs ab', 7, local)['matches'], [identity])
         self.assertIn('all', worker.suggest('cancel ', 7, local)['matches'])
         self.assertEqual(worker.suggest('cpus ', 5, local)['matches'], [])
+
+    def test_operator_short_ids_local_resource_defaults_and_actionable_errors(self):
+        identity='abcd'+'1'*28
+        center=Mock();pool=Mock()
+        center.status.return_value=[dict(id=identity)]
+        center.nodes.return_value=dict(policy='adaptive',nodes=[])
+        center.logs.return_value=dict(stdout='ready')
+        center.cancel.return_value=dict(status='cancelled')
+        center.fetch.return_value=dict(status='succeeded',output_dir='D:/结果')
+        shell=SchedulerShell(pool,center)
+        try:
+            output=io.StringIO()
+            with redirect_stdout(output),patch('remote_compute.commands.socket.gethostname',return_value='local-device'):
+                shell.onecmd('cpus 12')
+                center.control.assert_called_with(node='local-device',worker={'cpus':12})
+                shell.onecmd('memory 1.5G')
+                center.control.assert_called_with(node='local-device',worker={'memory_mb':1536})
+                shell.onecmd('logs abcd')
+                center.logs.assert_called_with(identity)
+                shell.onecmd('fetch abcd "D:/结果"')
+                center.fetch.assert_called_with(identity,'D:/结果')
+                shell.onecmd('cancel local-device abcd')
+                center.cancel.assert_called_once_with(identity)
+                center.status.return_value=[dict(id=identity),dict(id='abcd'+'2'*28)]
+                shell.onecmd('cancel abcd')
+                self.assertEqual(center.cancel.call_count,1)
+                shell.onecmd('cpus local-device wrong')
+                shell.onecmd('cpuss 12')
+                shell.onecmd('help')
+            self.assertIn('ID匹配多个任务',output.getvalue())
+            self.assertIn('用法：cpus',output.getvalue())
+            self.assertIn('你可能要输入 cpus',output.getvalue())
+            self.assertIn('cpus 16',output.getvalue())
+        finally:
+            shell.close()
 
     def test_completion_extends_prefix_cycles_both_directions_and_preserves_suffix(self):
         shell = object.__new__(SchedulerShell)

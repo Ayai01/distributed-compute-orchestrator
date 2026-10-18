@@ -15,6 +15,7 @@ from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, validate_to
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
+from .cleanup import AssetCache
 import socket
 import math
 import os
@@ -55,6 +56,8 @@ class Coordinator:
                     job['recover']=True
                 value.pop('error',None)
                 atomic_json(path, value)
+        self.asset_cache = AssetCache(self.root / 'assets', archives=True)
+        self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
 
@@ -197,6 +200,8 @@ class Coordinator:
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
+                    'asset_cache': self.asset_cache.snapshot(),
+                    'retained_jobs': sum(j['result']['status'] in TERMINAL for j in self.jobs.values()),
                     'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
@@ -757,6 +762,9 @@ class Coordinator:
             client = self._client(job)
             result_lock=job.setdefault('artifact_lock',threading.RLock())
         with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    return {"deleted": identity}
             if client:
                 try:
                     client.delete(job.get('worker_id',job['result'].get('worker_id',identity)))
@@ -767,6 +775,14 @@ class Coordinator:
             with self.condition:
                 del self.jobs[identity]
             return {"deleted": identity}
+
+    def _prune_assets(self, *, recent=True):
+        now = time.time()
+        protected = {key for key, (_, used) in self.asset_cache.entries.items() if recent and now-used < 5}
+        for job in self.jobs.values():
+            protected.update(job['result'].get('assets', {}).values())
+        for error in self.asset_cache.prune(protected):
+            self.activity.notify('资产缓存待清理 '+error, 'local')
 
     def asset(self, identity, payload=None):
         if not _ASSET.fullmatch(identity):
@@ -782,6 +798,8 @@ class Coordinator:
                     temporary.replace(path)
                 finally:
                     unlink(temporary)
+            if path.is_file():
+                self.asset_cache.touch(identity)
             return {"id": identity, "exists": path.is_file()}
 
     def close(self):
@@ -793,4 +811,5 @@ class Coordinator:
         self.scheduler.join()
         for thread in list(self.threads):
             thread.join()
+        self._prune_assets(recent=False)
         self.root_lock.close()

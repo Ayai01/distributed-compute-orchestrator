@@ -4,10 +4,12 @@ import argparse
 import cmd
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 import shutil
 from pathlib import Path
 import shlex
+import socket
 import sys
 import threading
 import time
@@ -181,6 +183,29 @@ def batch(pool, source, output, *, on_submit=None, stop_event=None):
     return results
 
 
+def ram_mib(value):
+    text = str(value).strip().upper()
+    for suffix in ('GIB', 'GB', 'G'):
+        if text.endswith(suffix):
+            amount = float(text[:-len(suffix)]) * 1024
+            if not math.isfinite(amount) or amount < 0 or not amount.is_integer():
+                raise ValueError('RAM需要非负整数MiB或G容量，例如8192或8G')
+            return int(amount)
+    amount = int(text)
+    if amount < 0:
+        raise ValueError('RAM预算不能为负数；0为自动')
+    return amount
+
+
+def job_identity(rows, prefix):
+    if len(prefix) < 4:
+        raise ValueError('请输入至少4位任务ID；输入 jobs 查看ID')
+    matches = [row['id'] for row in rows if row['id'].startswith(prefix)]
+    if len(matches) != 1:
+        raise ValueError('任务ID未找到' if not matches else 'ID匹配多个任务，请增加位数：'+', '.join(matches))
+    return matches[0]
+
+
 class Shell(cmd.Cmd):
     intro = "输入 help 查看命令。空行保持当前状态，Ctrl+C 返回提示符，quit 退出。"
     command_groups = (('终端','help quit'),)
@@ -215,7 +240,7 @@ class Shell(cmd.Cmd):
         elif command == 'set' and index >= 2:
             choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
         elif scheduler and index == 1 and command in {'cpus','memory','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
-            choices = names + ([j.get('id') for _, j in jobs] if command == 'jobs' else [])
+            choices = names + ([j.get('id') for _, j in jobs] if command in {'jobs','logs','cancel','fetch'} else [])
         elif command in {'jobs','logs','cancel','delete','fetch'} and index == (2 if scheduler else 1):
             choices = [j.get('id') for node, j in jobs if not scheduler or node == tokens[1]]
             if not scheduler and command == 'cancel':
@@ -234,11 +259,43 @@ class Shell(cmd.Cmd):
 
     def do_help(self, line):
         """help [命令]：按用途查看操作，或查看单条命令用法。"""
-        if line.strip():
+        all_commands = line.strip() == 'all'
+        if line.strip() and not all_commands:
             return super().do_help(line)
+        print('直接在下方输入指令后按 Enter；<参数> 要替换成实际值，方括号表示可省略。')
         for title, commands in self.command_groups:
-            print(title + '  ' + commands)
-        print('输入 help 命令 查看参数；输入后Tab补全，空输入Tab/ShiftTab翻任务页；PgUp/PgDn翻输出；↑/↓历史。')
+            selected = [command for command in commands.split() if all_commands or command in {
+                'status','jobs','cpus','memory','pause','resume','logs','cancel','fetch','delete','restart','help','quit'}]
+            if not selected:
+                continue
+            print('\n'+title)
+            for command in selected:
+                method = getattr(self, 'do_'+command, None)
+                description = (method.__doc__ or '').strip().splitlines()[0] if method else command
+                if not description.startswith(command):
+                    description = command+'：'+description
+                print('  '+description)
+        print('\n常用例子：')
+        if hasattr(self, 'pool'):
+            print('  status                  查看全部设备资源')
+            print('  cpus 16                 将本机预算设为16线程（自动保存）')
+            print('  cpus '+socket.gethostname()+' 16   指定设备；其他设备名称可按 Tab 选择')
+            print('  memory 8G               将本机任务 RAM 预算设为8 GiB')
+            print('  logs ab12               查看4位任务ID的日志')
+            print('  fetch ab12 "D:/结果"     保存结果并清理该任务')
+            print('  restart --wait          空闲后重新加载本机中心')
+        else:
+            print('  cpus 16                 将本设备预算设为16线程')
+            print('  logs ab12               查看4位任务ID的日志')
+        print('  help cpus               查看单条指令的参数和例子')
+        print('help all 查看其余指令。Tab 补全；空输入 Tab/ShiftTab 翻任务页；PgUp/PgDn 翻输出；↑/↓ 历史。')
+
+    def default(self, line):
+        import difflib
+        command = line.split()[0] if line.split() else ''
+        commands = [name[3:] for name in self.get_names() if name.startswith('do_')]
+        near = difflib.get_close_matches(command, commands, n=1)
+        print('未知指令：'+command+'。'+('你可能要输入 '+near[0]+'；' if near else '')+'输入 help 查看操作示例。')
 
     def emptyline(self):
         pass
@@ -250,6 +307,9 @@ class Shell(cmd.Cmd):
             return False  # argparse --help and syntax errors keep the console open.
         except (ValueError, OSError, RuntimeError, KeyError, StopIteration) as error:
             print("操作失败:", error)
+            method = getattr(self, 'do_'+line.split()[0], None) if line.split() else None
+            if method and method.__doc__:
+                print('用法：'+method.__doc__.strip())
 
     def loop(self, health=None, url='', alive=lambda: True):
         if health and sys.stdin.isatty() and sys.stdout.isatty():
@@ -297,9 +357,9 @@ class Shell(cmd.Cmd):
 
 class SchedulerShell(Shell):
     prompt = "调度> "
-    command_groups = (('资源','status nodes cpus memory pause resume policy set add save'),
-                      ('任务','run spice rtl batch jobs logs cancel fetch wait'),
-                      ('机器','exec python ls read put get restart'),('终端','help quit'))
+    command_groups = (('查看','status nodes jobs'),('调资源','cpus memory pause resume'),
+                      ('任务','logs cancel fetch wait run spice rtl batch'),
+                      ('维护','restart policy set add save exec python ls read put get'),('帮助','help quit'))
 
     def __init__(self, pool, center=None):
         super().__init__()
@@ -313,7 +373,24 @@ class SchedulerShell(Shell):
         self.operation_number = 0
 
     def _node(self, name):
-        return next(n for n in self.pool.nodes if n.name == name)
+        node = next((n for n in self.pool.nodes if n.name.casefold() == name.casefold()), None)
+        if node is None:
+            raise ValueError('未找到设备 '+name+'；可用设备：'+', '.join(n.name for n in self.pool.nodes))
+        return node
+
+    def _job(self, line, *, output=False):
+        args = words(line)
+        count = 2 if output else 1
+        if self.center and len(args) in (count, count+1):
+            if len(args) == count+1:
+                args = args[1:]  # Keep the old "node id" spelling available.
+            client = self.center
+        elif not self.center and len(args) in (count,count+1):
+            client = self._node(args.pop(0) if len(args)==count+1 else socket.gethostname()).client
+        else:
+            raise ValueError('需要任务ID'+('和结果目录' if output else '')+'；例如 '+('fetch ab12 "D:/结果"' if output else 'logs ab12'))
+        identity = job_identity(client.status(brief=True), args[0])
+        return client, identity, args[1:]
 
     def _start(self, function, *args, show_logs=False, **kwargs):
         future = self.executor.submit(function, *args, **kwargs)
@@ -518,33 +595,51 @@ class SchedulerShell(Shell):
         print("已保存:", path)
 
     def do_pause(self, line):
-        """pause 节点：暂停该提供者的新任务，已运行任务继续。"""
+        """pause [节点]：暂停接新任务；省略节点即本机，当前计算继续。"""
+        name = line.strip() or socket.gethostname()
         if self.center:
-            self.center.control(node=line.strip(), worker={"paused": True})
+            self.center.control(node=name, worker={"paused": True})
         else:
-            self._node(line.strip()).client.control(paused=True)
+            self._node(name).client.control(paused=True)
         self.pool.refresh()
 
     def do_resume(self, line):
-        """resume 节点：恢复该提供者接单。"""
+        """resume [节点]：恢复接单；省略节点即本机。"""
+        name = line.strip() or socket.gethostname()
         if self.center:
-            self.center.control(node=line.strip(), worker={"paused": False})
+            self.center.control(node=name, worker={"paused": False})
         else:
-            self._node(line.strip()).client.control(paused=False)
+            self._node(name).client.control(paused=False)
         self.pool.refresh()
 
     def do_cpus(self, line):
-        """cpus 节点 N：调整提供者的总CPU预算，现有任务自然收尾。"""
-        name, count = words(line)
+        """cpus [节点] N：设置CPU预算；省略节点即本机，0为自动，现有任务自然收尾。
+        例：cpus 16；cpus Aya1-TX 30。设置自动保存，下次启动继续使用。
+        """
+        args = words(line)
+        if not args:
+            self.do_nodes(''); print(self.do_cpus.__doc__.strip()); return
+        if len(args) not in (1,2):
+            raise ValueError('需要线程数，可在前面指定设备')
+        name, count = (socket.gethostname(),args[0]) if len(args)==1 else args
         if self.center:
             self.center.control(node=name, worker={"cpus": int(count)})
         else:
             self._node(name).client.control(cpus=int(count))
         self.pool.refresh()
+        print(name+' CPU预算已设为 '+str(count)+'；配置已保存。')
 
     def do_memory(self, line):
-        """memory 节点 MiB：调整提供者的任务内存总预算。"""
-        name, amount = words(line)
+        """memory [节点] RAM：设置任务RAM预算；8G=8GiB，无单位按MiB，0为自动。
+        例：memory 8G；memory Aya1-TX 16384。省略节点即本机，设置自动保存。
+        """
+        args = words(line)
+        if not args:
+            self.do_nodes(''); print(self.do_memory.__doc__.strip()); return
+        if len(args) not in (1,2):
+            raise ValueError('需要RAM容量，可在前面指定设备')
+        name, amount = (socket.gethostname(),args[0]) if len(args)==1 else args
+        amount = ram_mib(amount)
         if self.center:
             self.center.control(node=name, worker={"memory_mb": int(amount)})
         else:
@@ -552,20 +647,20 @@ class SchedulerShell(Shell):
         self.do_nodes("")
 
     def do_cancel(self, line):
-        """cancel 节点 任务ID：取消指定任务及其子进程。"""
-        name, identity = words(line)
-        display((self.center or self._node(name).client).cancel(identity))
+        """cancel 任务ID：取消任务及其子进程；可用唯一4位ID，例如 cancel ab12。"""
+        client, identity, _ = self._job(line)
+        display(client.cancel(identity))
 
     def do_logs(self, line):
-        """logs 节点 任务ID：读取实时日志末尾。"""
-        name, identity = words(line)
-        for key, value in (self.center or self._node(name).client).logs(identity).items():
+        """logs 任务ID：查看日志末尾；可用唯一4位ID，例如 logs ab12。"""
+        client, identity, _ = self._job(line)
+        for key, value in client.logs(identity).items():
             print(key + ":\n" + value)
 
     def do_fetch(self, line):
-        """fetch 节点 任务ID 结果目录：回收结果并清理节点任务目录。"""
-        name, identity, output = words(line)
-        result = (self.center or self._node(name).client).fetch(identity, output)
+        """fetch 任务ID 结果目录：保存结果并清理任务；例如 fetch ab12 "D:/结果"。"""
+        client, identity, (output,) = self._job(line, output=True)
+        result = client.fetch(identity, output)
         print(result["status"], result["output_dir"])
 
     def do_sync(self, line):
@@ -631,8 +726,8 @@ class WorkerShell(Shell):
                                       "memory_total_mb", "memory_available_mb", "memory_reserved_mb", "rss_mb", "paused", "tags")})
 
     def do_memory(self, line):
-        """memory MiB：调整本机任务内存总预算。"""
-        self.worker.control({"memory_mb": int(line)})
+        """memory RAM：设置本设备任务RAM预算；例如 memory 8G，0为自动。"""
+        self.worker.control({"memory_mb": ram_mib(line)})
         self.do_status("")
 
     def do_jobs(self, line):
@@ -650,7 +745,7 @@ class WorkerShell(Shell):
             table(rows,["id", "status", "label", "cpus"])
 
     def do_cpus(self, line):
-        """cpus N：调整总CPU预算。"""
+        """cpus N：设置本设备CPU预算并保存；例如 cpus 16，0为自动。"""
         self.worker.control({"cpus": int(line)})
         self.do_status("")
 
@@ -665,16 +760,21 @@ class WorkerShell(Shell):
     def do_cancel(self, line):
         """cancel 任务ID|all：取消任务及其子进程。"""
         with self.worker.condition:
-            identities = list(self.worker.jobs) if line.strip() == "all" else [line.strip()]
+            rows = [job['result'] for job in self.worker.jobs.values()]
+            identities = list(self.worker.jobs) if line.strip() == "all" else [job_identity(rows,line.strip())]
         for identity in identities:
             self.worker.cancel(identity)
         print("已发出取消。")
 
     def do_logs(self, line):
-        """logs 任务ID：读取实时日志末尾。"""
-        for key, value in self.worker.logs(line.strip()).items():
+        """logs 任务ID：查看日志；支持唯一4位ID，例如 logs ab12。"""
+        with self.worker.condition:
+            identity = job_identity([job['result'] for job in self.worker.jobs.values()],line.strip())
+        for key, value in self.worker.logs(identity).items():
             print(key + ":\n" + value)
 
     def do_delete(self, line):
         """delete 任务ID：删除已经结束且不再需要的任务文件。"""
-        display(self.worker.delete(line.strip()))
+        with self.worker.condition:
+            identity = job_identity([job['result'] for job in self.worker.jobs.values()],line.strip())
+        display(self.worker.delete(identity))
