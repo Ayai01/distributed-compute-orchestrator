@@ -257,7 +257,14 @@ def main(argv=None):
         if args.mode not in {'scheduler', 'hybrid', 'worker'}:
             raise ValueError('mode must be scheduler, hybrid or worker')
         if args.action is None and not (args.test or args.test_native or args.check):
-            lifetime.enter_context(single_instance('operator-console'))
+            if args.url:
+                endpoint = args.url
+            elif args.mode == 'worker':
+                endpoint = 'worker:' + str(args.port if args.port is not None else DEFAULT_PORT)
+            else:
+                endpoint = 'center:' + str(args.center_port if args.center_port is not None else
+                                           args.port if args.port is not None else DEFAULT_PORT)
+            lifetime.enter_context(single_instance(endpoint))
         if args.action == 'ramdisk':
             from .ramdisk import ensure_shared, install_driver
             print(install_driver() if args.install else ensure_shared())
