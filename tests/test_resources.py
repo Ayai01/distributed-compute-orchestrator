@@ -25,7 +25,7 @@ class BenchmarkTests(unittest.TestCase):
         finally:
             cpu_benchmark.cache_clear()
 
-    def test_native_lanes_share_deadline_with_import_inside_two_second_budget(self):
+    def test_native_lanes_share_deadline_with_equal_single_and_multi_budgets(self):
         states=[]
         def create(np):
             state=Mock()
@@ -39,13 +39,13 @@ class BenchmarkTests(unittest.TestCase):
             result=_sample(np,2,100,duration=2)
         self.assertEqual(result['name'],NAME)
         self.assertEqual(result['threads'],2)
-        self.assertTrue(2<=result['total_seconds']<2.6)
+        self.assertTrue(4<=result['total_seconds']<4.6)
         self.assertEqual(result['iterations'],sum(s.block.call_count-1 for s in states[1:])*BATCH)
         self.assertAlmostEqual(result['score'],result['iterations']/result['seconds']/1000000,places=4)
         self.assertEqual(result['single']['threads'],1)
         self.assertEqual(result['single']['iterations'],(states[0].block.call_count-1)*BATCH)
         self.assertGreater(result['single']['score'],0)
-        self.assertLess(result['single']['seconds'],.5)
+        self.assertTrue(2<=result['single']['seconds']<2.1)
 
     def test_helper_limits_blas_threads_without_changing_service_environment(self):
         from os import environ

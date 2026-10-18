@@ -63,7 +63,9 @@ class MixedLoad:
 def _sample(np, cpus, began, duration=60):
     # Import, allocation and thread warmup are outside the measured intervals.
     serial=MixedLoad(np);serial.block()
-    started=time.monotonic();deadline=started+duration/6
+    # Keep the two measurements independent and equally long.  ``duration``
+    # is the per-mode budget, so the full calibration takes 2*duration.
+    started=time.monotonic();deadline=started+duration
     count=0
     while time.monotonic()<deadline:
         serial.block();count+=BATCH
@@ -73,7 +75,7 @@ def _sample(np, cpus, began, duration=60):
     bulk_started=deadline=0.0
     def start():
         nonlocal bulk_started,deadline
-        bulk_started=time.monotonic();deadline=bulk_started+duration*5/6
+        bulk_started=time.monotonic();deadline=bulk_started+duration
     ready=threading.Barrier(cpus+1,action=start)
     def lane():
         try:
@@ -116,7 +118,7 @@ def measure(cpus, *, executable=None, environment=(), duration=60):
             env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',
             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)) as helper:
         try:
-            stdout,stderr = helper.communicate(timeout=duration+15)
+            stdout,stderr = helper.communicate(timeout=duration*2+15)
         except subprocess.TimeoutExpired:
             helper.kill(); helper.communicate()
             return _unavailable('Native estimate exceeded startup budget')
@@ -157,7 +159,7 @@ def calibrated(cpus, *, executable=None, environment=(), cache_file=None, force=
     total=after[0]-before[0]
     load=100*(1-(after[1]-before[1])/total) if total else 100
     if load>20:return _unavailable('CPU busy; calibration deferred until an idle startup')
-    print('DCO: CPU '+str(round(load,1))+'%, calibrating 1/'+str(cpus)+' threads (~60s)...',flush=True)
+    print('DCO: CPU '+str(round(load,1))+'%, calibrating 1/'+str(cpus)+' threads (single 60s + multi 60s)...',flush=True)
     result=measure(cpus,executable=executable,environment=environment)
     if result.get('available'):
         cache.parent.mkdir(parents=True,exist_ok=True)
