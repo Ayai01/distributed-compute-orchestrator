@@ -632,7 +632,7 @@ class CenterTests(unittest.TestCase):
             endpoint=urlsplit(client.url)
             with patch.object(Server,'handle_error') as errors,patch.object(Handler,'finish',finish):
                 connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port)
-                connection.request('GET','/health',headers={'X-Remote-Compute-Keepalive':'1'});connection.getresponse().read()
+                connection.request('GET','/health',headers={'X-DCO-Keepalive':'1'});connection.getresponse().read()
                 connection.sock.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('hh' if os.name=='nt' else 'ii',1,0))
                 connection.close()
                 self.assertTrue(finished.wait(3))

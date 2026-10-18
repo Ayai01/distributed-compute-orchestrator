@@ -16,6 +16,25 @@ MAX_TOOL_CONSTRAINTS = 32
 MAX_ACCELERATORS = 16
 MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
 
+# Capability names are part of the project-facing contract.  Keep the older
+# tool labels accepted at the boundary while publishing compact canonical
+# fields to health, admission and the operator view.
+CAPABILITY_ALIASES = {
+    'circt-translate': 'circt',
+    'ngspice47': 'ng47',
+    'onnx_cpu': 'onnx',
+    'aop_hspice_python': 'aop-hs',
+    'rgcn_python_linux': 'rgcn-linux',
+}
+
+
+def canonical_capability(value):
+    return CAPABILITY_ALIASES.get(str(value), str(value))
+
+
+def canonical_capabilities(values):
+    return sorted({canonical_capability(value) for value in (values or ())})
+
 def normalize_accelerator_requirement(value):
     """Normalize one project accelerator request without exposing a device id."""
     if value is None:
@@ -33,7 +52,8 @@ def normalize_accelerator_requirement(value):
             or any(not isinstance(tag, str) or not tag or len(tag) > MAX_REQUIREMENT_LENGTH
                    for tag in requires)):
         raise ValueError('accelerator requires kind, count 1..16, memory_mb and short capability tags')
-    return dict(kind=kind, count=count, memory_mb=memory_mb, requires=sorted(set(requires)))
+    return dict(kind=kind, count=count, memory_mb=memory_mb,
+                requires=canonical_capabilities(requires))
 
 
 def normalize_accelerators(value):
@@ -60,7 +80,7 @@ def normalize_accelerators(value):
                                          or any(not isinstance(item, str) or not item for item in ids)))):
             raise ValueError('accelerator profiles require kind, count, memory_mb, tags and optional ids')
         result.append(dict(kind=kind, count=count, memory_mb=memory_mb,
-                           tags=sorted(set(tags)), ids=list(ids) if ids is not None else None))
+                           tags=canonical_capabilities(tags), ids=list(ids) if ids is not None else None))
     return result
 
 

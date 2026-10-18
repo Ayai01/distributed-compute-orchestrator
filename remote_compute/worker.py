@@ -34,7 +34,7 @@ from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement,
-                     normalize_accelerators, aggregate_accelerators)
+                     normalize_accelerators, aggregate_accelerators, canonical_capabilities)
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -106,6 +106,7 @@ def validate_task(task, capacity, *, allow_auto=False):
             or not math.isfinite(serial) or not 0 < serial <= MAX_SINGLE_THREAD_WEIGHT):
         raise ValueError(f'single_thread_weight must be in (0, {MAX_SINGLE_THREAD_WEIGHT:g}]')
     task['accelerator'] = normalize_accelerator_requirement(task.get('accelerator'))
+    task['requires'] = canonical_capabilities(task.get('requires', ()))
     if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
         raise ValueError(f"Task cpus must be in 1..{capacity}")
     if 'max_cpus' in task and (type(task['max_cpus']) is not int or task['max_cpus']<1 or cpus>task['max_cpus']):
@@ -195,7 +196,7 @@ class Worker:
             self.tools[name] = [value] if isinstance(value, str) else list(value)
         self.tools,self.tool_info=self._probe_tools(self.tools)
         self.tags = sorted(set(self.tags) | {sys.platform} | {'shared:'+name for name in self.shared}
-                           | {k for k, v in self.tool_info.items() if v["available"]})
+                           | set(canonical_capabilities(k for k, v in self.tool_info.items() if v["available"])))
         if self.accelerators:
             self.tags = sorted(set(self.tags) | {'gpu', *{tag for item in self.accelerators for tag in item['tags']}})
         if self.tool_info['verilator']['available']:
@@ -428,6 +429,7 @@ class Worker:
                 return self.shared[name]
             if kind == "asset":
                 return (self.root / "assets" / task["assets"][name]).as_posix()
+            name = {'circt': 'circt-translate'}.get(name, name)
             if len(self.tools[name]) != 1:
                 raise ValueError("Multi-argument tools belong at argv[0]")
             return Path(self.tools[name][0]).as_posix()
@@ -944,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
             if compressed:
                 self.send_header('Content-Encoding', 'gzip')
                 self.send_header('Vary', 'Accept-Encoding')
-            if self.headers.get('X-Remote-Compute-Keepalive') != '1':
+            if self.headers.get('X-DCO-Keepalive') != '1':
                 # Older clients expect POST connections to stay live forever.
                 # Announce closure instead of surprising them on their next POST.
                 self.send_header('Connection','close')
@@ -982,9 +984,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Incomplete request body")
             if parts == ["health"] and self.command == "GET":
                 if scheduler and not operator:
-                    value = worker.public_health(brief=self.headers.get("X-Remote-Compute-Brief")=="1")
+                    value = worker.public_health(brief=self.headers.get("X-DCO-Brief")=="1")
                 else:
-                    value = worker.health(brief=self.headers.get("X-Remote-Compute-Brief")=="1",
+                    value = worker.health(brief=self.headers.get("X-DCO-Brief")=="1",
                                           sample=self.headers.get("X-DCO-Sample")=="1")
             elif parts == ['capabilities'] and self.command == 'GET' and scheduler:
                 value = worker.capabilities()
@@ -1021,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) >= 2 and parts[0] == "jobs":
                 identity = parts[1]
                 if len(parts) == 2 and self.command == "POST":
-                    callback=self.headers.get('X-Remote-Compute-Callback')
+                    callback=self.headers.get('X-DCO-Callback')
                     if scheduler:
                         value = worker.submit(identity,body,operator=operator)
                     else:
@@ -1067,7 +1069,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply({"error": "Unknown route"}, 404)
             else:
                 return self._reply({"error": "Unknown route"}, 404)
-            if self.command == 'GET' and self.headers.get('X-Remote-Compute-Brief') == '1':
+            if self.command == 'GET' and self.headers.get('X-DCO-Brief') == '1':
                 if parts == ['health']:
                     value={k:value[k] for k in ('protocol','node','role','version','capabilities') if k in value}
                 elif parts == ['jobs']:

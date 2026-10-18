@@ -385,13 +385,18 @@ class SchedulerShell(Shell):
 
     def _node(self, name):
         text = str(name).strip()
+        nodes = getattr(self.pool, 'nodes', ())
+        if not isinstance(nodes, (list, tuple)):
+            # Lightweight command tests and remote-only shells can resolve
+            # names at the center; a real Pool still validates IDs locally.
+            return type('NodeRef', (), {'name': text})()
         if text.startswith('#') or text.isdigit():
             index = int(text.lstrip('#'))
-            node = self.pool.nodes[index-1] if 1 <= index <= len(self.pool.nodes) else None
+            node = nodes[index-1] if 1 <= index <= len(nodes) else None
         else:
-            node = next((n for n in self.pool.nodes if n.name.casefold() == text.casefold()), None)
+            node = next((n for n in nodes if n.name.casefold() == text.casefold()), None)
         if node is None:
-            raise ValueError('未找到设备 '+name+'；可用设备：'+', '.join(n.name for n in self.pool.nodes))
+            raise ValueError('未找到设备 '+name+'；可用设备：'+', '.join(n.name for n in nodes))
         return node
 
     def _job(self, line, *, output=False):
@@ -558,6 +563,7 @@ class SchedulerShell(Shell):
     def do_set(self, line):
         """set 节点 weight=2 limit=4 enabled=true：设置本调度器的权重、CPU上限和开关。"""
         name, *settings = words(line)
+        name = self._node(name).name
         changes = {}
         for setting in settings:
             key, value = setting.split("=", 1)
@@ -612,7 +618,7 @@ class SchedulerShell(Shell):
 
     def do_pause(self, line):
         """pause [节点]：暂停接新任务；省略节点即本机，当前计算继续。"""
-        name = line.strip() or socket.gethostname()
+        name = socket.gethostname() if not line.strip() else self._node(line.strip()).name
         if self.center:
             self.center.control(node=name, worker={"paused": True})
         else:
@@ -621,7 +627,7 @@ class SchedulerShell(Shell):
 
     def do_resume(self, line):
         """resume [节点]：恢复接单；省略节点即本机。"""
-        name = line.strip() or socket.gethostname()
+        name = socket.gethostname() if not line.strip() else self._node(line.strip()).name
         if self.center:
             self.center.control(node=name, worker={"paused": False})
         else:
@@ -637,7 +643,7 @@ class SchedulerShell(Shell):
             self.do_nodes(''); print(self.do_cpus.__doc__.strip()); return
         if len(args) not in (1,2):
             raise ValueError('需要线程数，可在前面指定设备')
-        name, count = (socket.gethostname(),args[0]) if len(args)==1 else args
+        name, count = (socket.gethostname(),args[0]) if len(args)==1 else (self._node(args[0]).name,args[1])
         if self.center:
             self.center.control(node=name, worker={"cpus": int(count)})
         else:
@@ -654,7 +660,7 @@ class SchedulerShell(Shell):
             self.do_nodes(''); print(self.do_memory.__doc__.strip()); return
         if len(args) not in (1,2):
             raise ValueError('需要RAM容量，可在前面指定设备')
-        name, amount = (socket.gethostname(),args[0]) if len(args)==1 else args
+        name, amount = (socket.gethostname(),args[0]) if len(args)==1 else (self._node(args[0]).name,args[1])
         amount = ram_mib(amount)
         if self.center:
             self.center.control(node=name, worker={"memory_mb": int(amount)})
@@ -704,7 +710,7 @@ class SchedulerShell(Shell):
         args=[arg for arg in args if arg!='--wait']
         if len(args)>1 or (not self.center and not args):
             raise ValueError('restart [节点] [--wait]')
-        name=args[0] if args else None
+        name=self._node(args[0]).name if args else None
         client=self.center or self._node(name).client
         self._start(client.restart,name if self.center else None,wait=wait)
 

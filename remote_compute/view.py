@@ -101,9 +101,9 @@ def _gb(value):
 
 def _capabilities(tags):
     tags=set(tags or [])
-    groups=[('ngspice47' if 'ngspice47' in tags else 'ngspice',{'ngspice','ngspice47','spice'}),
+    groups=[('ng47' if {'ng47','ngspice47'} & tags else 'ng',{'ng','ng47','ngspice','ngspice47','spice'}),
             ('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
-            ('Chisel',{'java','scala-cli','firtool'}),
+            ('Chisel',{'java','scala-cli','firtool'}),('CIRCT',{'circt','circt-translate'}),
             ('C++',{'cxx','gcc','g++','clang','clang++'}),
             ('ONNX',{'onnx','onnx_cpu','onnxruntime'}),
             ('Python',{'python'}|{t for t in tags if '_python' in t}),
@@ -125,9 +125,9 @@ def _capabilities(tags):
 def _short_capability(value):
     """Keep a custom capability readable without exposing project internals."""
     value=str(value)
-    aliases={'aop_hspice_python':'AOP-Py','rgcn_python':'RGCN-Py','rgcn_train':'RGCN-ML',
-             'onnx_cpu':'ONNX-CPU','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
-    return aliases.get(value, value if len(value)<=14 else value[:11]+'…')
+    aliases={'aop_hspice_python':'AOP-HS','rgcn_python':'RGCN-Py','rgcn_train':'RGCN-ML',
+             'rgcn_python_linux':'RGCN-Linux','onnx_cpu':'ONNX-CPU','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
+    return aliases.get(value, value)
 
 
 def _project(name):
@@ -161,6 +161,17 @@ def _accelerator_summary(node):
         memory_text=f'{memory/1024:.0f}G' if memory and memory%1024==0 else f'{memory}M'
         parts.append(f'{kind} {count}x{memory_text}')
     return f'{used}/{sum(int(p.get("count",0) or 0) for p in profiles)} ' + ','.join(parts)
+
+
+def _network_text(network):
+    network=network or {}
+    if network.get('local'):
+        return '本机'
+    rtt=network.get('rtt_ms')
+    loss=network.get('packet_loss_pct')
+    if rtt is None and loss is None:
+        return '--'
+    return f"{rtt:.1f}ms/{loss:.0f}%" if isinstance(rtt,(int,float)) and isinstance(loss,(int,float)) else '--'
 
 
 def _label(job):
@@ -283,7 +294,7 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','线程(总)','CPU','单/总','RAM','可配','GPU','RSS/预留'],
+            table=_table(['设备','线程(总)','CPU','单/总','RAM','可配','GPU','进程RAM/预留'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
                          [11,10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
@@ -297,16 +308,20 @@ class StatusRows(list):
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
         sections=[('设备资源 | RAM GiB | 算力 Miter/s',table,0)]
-        if width<100:
-            if width>=54:
-                details=_table(['设备','单/总','RSS/预留','设备IP'],
-                               [[r[0],r[7],r[5],r[9]] for r in records],
-                               [7,11,9,None],width,right=(1,2,3))
-            else:
-                details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
-                details.extend(_line(f'#{r[10]} {r[0]} GPU {r[11]}',width) for r in records)
-                details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
-            sections.append(('启动基准 Miter/s | RSS/预留 GiB',details,1))
+        if width>=100:
+            details=_table(['设备','单/总','进程RAM/预留','设备IP','网络'],
+                           [[r[0],r[7],r[5],r[9],
+                             _network_text(node.get('network'))] for node,r in self.devices],
+                           [7,11,9,15,None],width,right=(1,2,3,4))
+        elif width>=54:
+            details=_table(['设备','单/总','进程RAM/预留','设备IP'],
+                           [[r[0],r[7],r[5],r[9]] for _,r in self.devices],
+                           [7,11,9,None],width,right=(1,2,3))
+        else:
+            details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
+            details.extend(_line(f'#{r[10]} {r[0]} GPU {r[11]}',width) for r in records)
+            details.extend(_line(f'{r[0]} 进程RAM/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
+        sections.append(('启动基准 Miter/s | 进程RAM/预留 GiB',details,1))
         if self.value.get('role')=='scheduler':
             if width>=42:
                 table=_table(['工程','权重','任务/线程','目标','排队'],self.projects,
@@ -326,25 +341,6 @@ class StatusRows(list):
         accelerators=[_line(f'#{r[10]} {r[0]}: {r[11]}',width) for _,r in self.devices]
         if any(r[11] != '-' for _,r in self.devices):
             sections.append(('加速器可用性',accelerators,2))
-        sources=[]
-        quality=[]
-        for node,r in self.devices:
-            local = r[9] == '本机'
-            direction = '本机调度 → 本机算力' if local else '调度中心 → 远端算力'
-            sources.append(_line(f'#{r[10]} {r[0]}: {direction}',width))
-            if not local:
-                network=node.get('network') or {}
-                rtt=network.get('rtt_ms')
-                loss=network.get('packet_loss_pct')
-                if rtt is None and loss is None:
-                    quality.append(_line(f'#{r[10]} {r[0]}: 连接质量 --',width))
-                else:
-                    latency=f'{rtt:.1f}ms' if isinstance(rtt,(int,float)) else '--'
-                    dropped=f'{loss:.0f}%' if isinstance(loss,(int,float)) else '--'
-                    quality.append(_line(f'#{r[10]} {r[0]}: 延迟 {latency} | 丢包 {dropped}',width))
-        sections.append(('连接方向',sources,1))
-        if quality:
-            sections.append(('连接质量 | 低频采样',quality,2))
         return sections
 
     def _resource_rows(self, sections, width, limit=None, *, bottom=False):

@@ -138,7 +138,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(_capabilities(tags),'ng RTL Py ML')
         self.assertEqual(len(tags),11)
         self.assertEqual(_capabilities([*tags,'ngspice47','java','scala-cli','firtool','shared:arh']),'ng47 RTL Chisel Py ML')
-        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'ng RTL Py ML long-custom…')
+        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'ng RTL Py ML '+'long-custom-tag'*8)
         self.assertIn('HS',_capabilities([*tags,'hspice','aop_hspice_python']))
         value=dict(role='worker',node='Aya1-TX',cpus=30,tags=tags)
         for width in (56,80,110,160):

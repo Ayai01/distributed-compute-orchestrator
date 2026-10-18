@@ -23,7 +23,7 @@ import uuid
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
-from .policy import normalize_accelerator_requirement
+from .policy import normalize_accelerator_requirement, canonical_capabilities
 
 
 class RemoteError(RuntimeError):
@@ -115,14 +115,14 @@ class Client:
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
-                   'Accept-Encoding': 'gzip','X-Remote-Compute-Keepalive':'1'}
+                   'Accept-Encoding': 'gzip','X-DCO-Keepalive':'1'}
         auth_token = (self.operator_token or self.token) if self.operator else self.token
         if auth_token:
             headers["Authorization"] = "Bearer " + auth_token
         if self.operator:
             headers['X-DCO-Role'] = 'operator'
         if brief:
-            headers['X-Remote-Compute-Brief'] = '1'
+            headers['X-DCO-Brief'] = '1'
         headers.update(extra_headers or {})
         # Project clients cannot elevate a request by smuggling the role in
         # per-call headers; only an operator Client instance sets it.
@@ -235,7 +235,7 @@ class Client:
     def submit_bundle(self, identity, payload, *, callback=None):
         if callback:
             return self.request('/jobs/'+identity,payload,
-                                extra_headers={'X-Remote-Compute-Callback':json.dumps(callback)})
+                                extra_headers={'X-DCO-Callback':json.dumps(callback)})
         return self.request("/jobs/" + identity, payload)
 
     def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
@@ -732,8 +732,9 @@ class Pool:
         texts=[*task.get('env',{}).values(),task.get('cwd',''),
                *(arg for argv in task.get('steps',()) for arg in argv)]
         required_shared={name for text in texts for name in re.findall(r'\$\{shared:([\w-]+)\}',text)}
+        required=canonical_capabilities(task.get('requires',()))
         return [n for n in self.nodes if (not task.get('node') or n.name==task['node'])
-                and set(task.get('requires',())).issubset(n.health.get('tags',()))
+                and set(required).issubset(canonical_capabilities(n.health.get('tags',())))
                 and all(n.health.get('tools',{}).get(tool,{}).get('available') for tool in required_tools)
                 and required_shared.issubset(n.health.get('shared',()))
                 and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)

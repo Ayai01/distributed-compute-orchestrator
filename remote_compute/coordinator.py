@@ -16,7 +16,7 @@ from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
-                     aggregate_accelerators)
+                     aggregate_accelerators, canonical_capabilities)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
@@ -111,7 +111,7 @@ class Coordinator:
         ratio = request.get('queue_ratio', 1.0)
         cpus = request.get('cpus', 1)
         maximum_cpus = request.get('max_cpus')
-        requires = request.get('requires', [])
+        requires = canonical_capabilities(request.get('requires', []))
         accelerator = normalize_accelerator_requirement(request.get('accelerator'))
         if not operator and request.get('node') is not None:
             raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')

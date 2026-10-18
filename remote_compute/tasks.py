@@ -1,4 +1,5 @@
 """Task constructors; callers keep their measurement and scientific semantics."""
+from .policy import canonical_capabilities
 
 
 def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
@@ -8,7 +9,7 @@ def command(argv, *, cpus=1, timeout=300, outputs=(), env=None, assets=None, ren
     task = {"steps": [list(argv)], "cpus": cpus, "timeout": timeout,
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
             "render": list(render), "label": label, "priority": priority,
-            "requires": list(requires), "node": node, "memory_mb": memory_mb,
+            "requires": canonical_capabilities(requires), "node": node, "memory_mb": memory_mb,
             "project": project, "resource_share": resource_share}
     if accelerator is not None:
         task["accelerator"] = accelerator

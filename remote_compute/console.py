@@ -39,8 +39,9 @@ def _paint_row(row):
         color = '\x1b[90m'            # separators
     else:
         hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
-        number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)(?![\w.])')
-        state_pattern = re.compile(r'运行(?!秒)|排队|等待|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
+        number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?)(?![\w.])')
+        state_pattern = re.compile(r'运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
+        device_pattern = re.compile(r'(?<![\w])(?:Aya1-[A-Za-z0-9_-]+|ku26s|Server(?:-[A-Za-z0-9_-]+)?|device)(?![\w])')
         state_colors = {
             '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
             '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
@@ -48,13 +49,14 @@ def _paint_row(row):
             '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
             'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
         result, position = [], 0
-        matches = [*hash_pattern.finditer(row), *number_pattern.finditer(row), *state_pattern.finditer(row)]
+        matches = [*hash_pattern.finditer(row), *number_pattern.finditer(row), *state_pattern.finditer(row), *device_pattern.finditer(row)]
         for match in sorted(matches, key=lambda m: (m.start(), -m.end())):
             if match.start() < position:
                 continue
             result.append(row[position:match.start()])
             token = match.group()
             token_color = ('\x1b[36m' if hash_pattern.fullmatch(token) else
+                           '\x1b[35;1m' if device_pattern.fullmatch(token) else
                            state_colors.get(token.casefold(), '\x1b[33m'))
             result.extend((token_color, match.group(), _RESET))
             position = match.end()
@@ -118,14 +120,12 @@ def _command_rows(shell, line, cursor, width, context, completion):
     order = list(range(len(matches)))
     if selected >= 0:
         order = order[selected:] + order[:selected]
-    for position, index in enumerate(order):
+    for position, index in enumerate(order[:6]):
         match = matches[index]
         label = match[:4] if len(match) == 32 and all(c in '0123456789abcdef' for c in match) else match
         if index == selected:
             label = '[' + label + ']'
-        suffix = ' ... +' + str(len(matches)-position)
-        if candidates and _width('候选: ' + '  '.join(candidates + [label]) + suffix) > width-4:
-            candidates.append(suffix.strip())
+        if candidates and _width('候选: ' + '  '.join(candidates + [label])) > width-4:
             break
         candidates.append(label)
     choices = '候选: ' + '  '.join(candidates) if candidates else 'Tab 补全命令 | Ctrl+Tab 翻任务 | Enter 执行 | Esc 清空'

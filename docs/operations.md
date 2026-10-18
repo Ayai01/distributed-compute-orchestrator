@@ -20,7 +20,7 @@ Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执�
 
 从旧Python加载新版本时，空闲重载后的服务子进程会把同一终端交给本机首选3.14，旧托管器正常退出；配置和任务目录保持原路径。中心合并转发通知时按完整操作标识去重，显示执行设备与访问IP，不把同一操作重复计为两条通知。
 
-设备IP只在“启动基准”区域显示一次，来自该设备实际接受连接的地址，完整显示IPv4，不按网卡枚举顺序猜测。worker监听`0.0.0.0`时，首次外部连接前显示“等待连接”，之后显示实际连接使用的本机地址；连接方向区域只表达“本机调度 → 本机算力”或“调度中心 → 远端算力”，不重复粘贴IP。远端连接质量每30秒最多采样一次，显示TCP往返延迟和最近5次探测的丢包比例。启动算力使用`Miter/s`，单线程/总线程放在同一项中。能力在看板中使用短标签`ng47`、`HS`、`RTL`、`Chisel`、`C++`、`ONNX`、`Py`、`ML`、`GPU`，协议标签仍保留完整名称。
+设备IP只在“启动基准”区域显示一次，来自该设备实际接受连接的地址，完整显示IPv4，不按网卡枚举顺序猜测。worker监听`0.0.0.0`时，首次外部连接前显示“等待连接”，之后显示实际连接使用的本机地址。启动算力使用`Miter/s`，单线程/总线程放在同一项中，网络栏按已有采样显示延迟/丢包。能力字段使用短协议名`ng47`、`HS`、`RTL`、`Chisel`、`CIRCT`、`C++`、`ONNX`、`Py`、`ML`、`GPU`，旧工具名在准入边界自动映射到短字段。
 
 Windows 下 scheduler / hybrid / worker 从启动到退出持续阻止自动休眠，空闲排队、终端失焦、headless 和服务重载期间均生效；屏幕可以正常关闭。退出后自动释放，恢复原有电源策略，无需管理员权限，也不修改系统电源计划。显式休眠、关机和合盖仍按用户操作执行。仅连接已有中心的 CLI 命令不申请防休眠。Linux 的电源管理接入保留待实机验证。
 
@@ -58,9 +58,9 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 
 ## 实时终端与运行中控制
 
-Windows交互终端在窗口获得焦点时每秒刷新、失焦时每5秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签与访问IP。设备区显示启动算力测量结果，移除温度和常驻在线列，异常或暂停单独提示。最近6条指令/文件操作滚动显示，普通计算提交放在任务表中，避免刷掉重要操作通知；命令输入同时保持可用。`--headless`只关闭交互看板，仍检查可见终端；设备配置`console: true`可启用看板。
+Windows交互终端在窗口获得焦点时每秒刷新、失焦时每5秒刷新CPU负载、主机内存、任务进程RAM/预留/可分配内存、已分配/可用线程、设备总线程、任务标签与访问IP。设备区显示启动算力测量结果，移除温度和常驻在线列，异常或暂停单独提示。最近6条指令/文件操作滚动显示，普通计算提交放在任务表中，避免刷掉重要操作通知；命令输入同时保持可用。`--headless`只关闭交互看板，仍检查可见终端；设备配置`console: true`可启用看板。
 
-当前任务逐条显示4位ID、任务/线程与运行秒数。运行时间从实际开始执行计算，不包含排队等待；设备按`#1`、`#2`…编号，各设备的任务统一按运行最久在前排序。Tab 始终补全命令，Ctrl+Tab 翻当前任务页，空输入 Shift+Tab 反向翻页。尚未开始执行的任务显示`-`并排在末尾。
+当前任务逐条显示4位ID、任务/线程与运行秒数。运行时间从实际开始执行计算，不包含排队等待；设备按`#1`、`#2`…编号，各设备的任务统一按运行最久在前排序。资源命令接受设备名称、`#编号`或纯数字编号。Tab 始终补全命令，Ctrl+Tab 翻当前任务页，空输入 Shift+Tab 反向翻页。尚未开始执行的任务显示`-`并排在末尾。
 
 `cpus N`（worker）或 `cpus Aya1-TX N`（中心）在线调整并持久保存，现有任务自然完成。也可一次性运行：
 
@@ -124,7 +124,7 @@ Windows迁移旧状态目录前检查所有目录联接与符号链接，不沿�
 
 耗时计算、命令和文件传输在后台执行，输入行持续可用。help 按资源、任务、机器、终端分组显示操作；完成后的后台操作及时释放结果引用。宽度达到120列时，看板左侧显示设备资源和工程份额，右侧逐任务显示4位ID、设备、工程、任务/线程、RAM、状态与标签；两栏共享固定中线和完整边框，表头有水平分隔。设备摘要移除温度和常驻在线列，异常或暂停单独提示。工程汇总中的任务/线程如8/8，单任务行如1/2。长标签保留首尾，窄窗口切换为上下分区。结构符号使用ASCII；中文Windows控制台的歧义字符按实际显示宽度测量并缓存。刷新仅按绝对坐标重画变化行，避免清屏和换行滚动，状态未变时不写终端。
 
-底部固定4行：命令用法、补全候选、分隔线、输入行。按实际可见视口计算行数，忽略滚动缓冲区和`LINES/COLUMNS`的虚高；缩小窗口先缩减上方内容，输入行始终占最后一行。极矮窗口优先保留输入。Tab 补全命令、设备名、当前任务ID、策略和选项，Ctrl+Tab 翻任务页，多候选时先扩展共同前缀，再循环选择，空输入 Shift+Tab 反向翻页。ID候选仅显示4位，填入完整ID执行。补全只读取现有命令定义和当前状态快照，不发送网络请求；候选选择后仍需`Enter`执行。`↑` / `↓`选历史，`Esc` / `Ctrl+C`清空当前输入，`PgUp` / `PgDn`翻命令输出。
+底部固定4行：命令用法、有限补全候选、分隔线、输入行。按实际可见视口计算行数，忽略滚动缓冲区和`LINES/COLUMNS`的虚高；缩小窗口先缩减上方内容，输入行始终占最后一行。极矮窗口优先保留输入。Tab 补全命令、设备名、当前任务ID、策略和选项，Ctrl+Tab 翻任务页，多候选时先扩展共同前缀，再循环选择，空输入 Shift+Tab 反向翻页。ID候选仅显示4位，填入完整ID执行。补全只读取现有命令定义和当前状态快照，不发送网络请求；候选选择后仍需`Enter`执行。`↑` / `↓`选历史，`Esc` / `Ctrl+C`清空当前输入，`PgUp` / `PgDn`翻命令输出。
 
 Windows经典控制台启动看板时尝试扩展至160列×50行，按当前屏幕和字体允许的最大尺寸调整；已有更大的窗口保持原大小。Windows Terminal和编辑器内终端由宿主控制窗口尺寸，看板随可用宽高排版。
 
@@ -251,7 +251,7 @@ center = Client()
 node = next(n for n in center.nodes()["nodes"] if n["name"] == "Aya1-TX")
 if node["active_jobs"] or node["queued"]:
     raise RuntimeError("Aya1-TX 仍有任务，待空闲后更新")
-machine = center.machine("Aya1-TX", cwd="D:/Desktop/Remote-Compute")
+machine = center.machine("Aya1-TX", cwd="D:/Desktop/DCO")
 result = machine.python("from remote_compute.repository import update; print(update())")
 print(result["status"], result["stdout"], result["stderr"])
 if result["status"] == "succeeded":
@@ -280,7 +280,7 @@ Windows 的 `setup` 优先复用本机系统Python3.14科学环境，验证Numba
 
 AOP/RGCN SPICE、Bench优化、ARH CPU推理在各设备均优先使用本机系统CPython 3.14.8，通过`aop_python`、`rgcn_python`、`bench_python`和`arh_python`登记到tools。RGCN神经训练单独使用`rgcn_train`能力；两端已通过Torch/PyG加载和检查点续跑验证，沿用同一系统解释器。`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB；ARH的GSIM另用公共MSYS中的Clang/Flex/Bison。需要GPU的独立训练保留调用工程的指定环境。跨机复制后用`setup`校验版本和本机路径，配置随worker自然启动或空闲重载加载。
 
-Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/Remote-Compute/.projects/arh`，Python复用 `arh_python`。该目录的 `.tools` 保存Java、Scala CLI、firtool/circt-translate、模型、Coursier缓存和Rocket/GSIM必要资产；`.tools/msys64`是指向DCO公共MSYS的目录联接，GCC、Verilator与Clang共用一份。`run_remote`提交时冻结小型源码资产，入口、执行和摘要校验均使用该版本；新旧源码任务可同时存在。工具与模型继续共享，已有原生小产物经过原编译指纹决定能否复用，科研统计缓存留在shared.arh。重连使用原ID及原源码资产，取消取回中的结果时保留最近成功报告。
+Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/DCO/.projects/arh`，Python复用 `arh_python`。该目录的 `.tools` 保存Java、Scala CLI、firtool/circt-translate、模型、Coursier缓存和Rocket/GSIM必要资产；`.tools/msys64`是指向DCO公共MSYS的目录联接，GCC、Verilator与Clang共用一份。`run_remote`提交时冻结小型源码资产，入口、执行和摘要校验均使用该版本；新旧源码任务可同时存在。工具与模型继续共享，已有原生小产物经过原编译指纹决定能否复用，科研统计缓存留在shared.arh。重连使用原ID及原源码资产，取消取回中的结果时保留最近成功报告。
 
 `worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过 `Client().machine('Aya1-TX', cwd=上述目录)` 或指定 `node='Aya1-TX'` 的普通任务按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。生产任务声明`shared:arh`及编译器能力，由中心筛选；工程不查询`shared_paths`选择设备。
 
