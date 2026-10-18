@@ -186,46 +186,6 @@ def check_tools(config):
     return 0 if all(x["ready"] for x in result) else 1
 
 
-def supervise(argv):
-    """Keep the service terminal alive across requested code/config reloads."""
-    while True:
-        process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv])
-        while True:
-            try:
-                code = process.wait()
-                break
-            except KeyboardInterrupt:
-                continue  # the child receives the same console signal
-        if code != 75:
-            return code
-        # Live controls are saved to the device config. Replaying the original
-        # launch override would silently undo the operator's latest selection.
-        cleaned, skip = [], False
-        for arg in argv:
-            if skip:
-                skip = False
-            elif arg in {'--cpus', '--memory-mb'}:
-                skip = True
-            elif not arg.startswith(('--cpus=', '--memory-mb=')):
-                cleaned.append(arg)
-        argv = cleaned
-        print("正在重新加载服务源码和配置。", flush=True)
-
-
-def handoff_python(invocation):
-    """Let a reloaded child replace its old supervisor through a normal exit."""
-    from .setup_tools import preferred_python
-    executable=preferred_python()
-    if executable.resolve()==Path(sys.executable).resolve():
-        return False
-    environment=dict(os.environ,PYTHONUTF8='1',PYTHONDONTWRITEBYTECODE='1')
-    environment.pop('PYTHONHOME',None)
-    environment['PATH']=str(executable.parent)+os.pathsep+str(executable.parent/'Scripts')+os.pathsep+environment.get('PATH','')
-    args=[arg for arg in invocation if arg!='--service-child']
-    subprocess.Popen([str(executable),'-B',str(ROOT/'main.py'),*args],cwd=ROOT,env=environment)
-    return True
-
-
 def main(argv=None):
     invocation = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Distributed Compute Orchestrator (DCO)：调度器、本机调度+算力、独立worker")
@@ -288,9 +248,6 @@ def main(argv=None):
     try:
         if args.action is None and not (args.test or args.test_native or args.check):
             require_visible()
-        if (args.service_child and not args.url and args.action is None and
-                not (args.test or args.test_native or args.check) and handoff_python(invocation)):
-            return 0
         path = Path(args.config) if args.config else ROOT / "worker.local.json"
         if args.config and not path.exists():
             raise ValueError("Missing worker config: " + str(path))
@@ -332,8 +289,6 @@ def main(argv=None):
             # Both the supervisor and its service child own a request: reloads
             # stay covered, and a directly launched child works independently.
             lifetime.enter_context(keep_awake())
-        if not args.service_child and not args.url and args.action is None:
-            return supervise(invocation)
         if config.get('console') and sys.stdin.isatty():
             args.headless = False
         if getattr(args, "detach", False) and not args.url:

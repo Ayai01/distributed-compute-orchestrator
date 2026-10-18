@@ -55,14 +55,12 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
             for extra in ([], ['--headless'], ['--service-child'], ['--service-child', '--headless']):
                 with self.subTest(mode=mode, extra=extra), \
                         patch.object(terminal.sys.stdin, 'isatty', return_value=False), \
-                        patch('remote_compute.cli.handoff_python') as handoff, \
-                        patch('remote_compute.cli.supervise') as supervisor, \
                         patch('remote_compute.cli.Worker') as worker, \
                         patch('remote_compute.cli.resolve') as resolve, \
                         io.StringIO() as output, redirect_stderr(output):
                     self.assertEqual(main(['--mode', mode, '--config', 'absent-device.json', *extra]), 2)
                     self.assertIn('可见终端', output.getvalue())
-                    for action in (handoff, supervisor, worker, resolve):
+                    for action in (worker, resolve):
                         action.assert_not_called()
 
     def test_real_detached_launch_refuses_before_creating_root(self):
