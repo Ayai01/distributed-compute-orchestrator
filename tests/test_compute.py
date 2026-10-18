@@ -327,14 +327,15 @@ class PoolTests(unittest.TestCase):
 
 class ConsoleTests(unittest.TestCase):
     def test_hybrid_worker_has_no_http_listener_when_center_listens_on_lan(self):
+        from service_fixture import command
         with scratch() as directory:
             config = Path(directory)/'worker.json'
             config.write_text(json.dumps({'host':'0.0.0.0','shared':{},'tools':{}}))
             nodes = Path(directory)/'nodes.json'
             nodes.write_text(json.dumps({'nodes':[]}))
-            result = subprocess.run([sys.executable,'-B',str(ROOT/'main.py'),'--config',str(config),
+            result = subprocess.run(command('--config',str(config),
                                      '--mode','hybrid','--host','0.0.0.0','--port','0','--cpus','1',
-                                     '--nodes',str(nodes),'--root',str(Path(directory)/'service')],
+                                     '--nodes',str(nodes),'--root',str(Path(directory)/'service')),
                                     input=b'quit\n',capture_output=True,timeout=15)
             self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
             output = result.stdout.decode('utf8')
@@ -350,6 +351,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertFalse((ROOT / "worker.py").exists())
 
     def test_worker_and_hybrid_console_accept_commands(self):
+        from service_fixture import command
         with scratch() as directory:
             task_path = Path(directory) / "task.json"
             task_path.write_text(json.dumps(python("print('terminal-task')")))
@@ -357,20 +359,21 @@ class ConsoleTests(unittest.TestCase):
             nodes_path.write_text(json.dumps({'nodes':[]}))
             for mode, commands in [("worker", "status\ncpus 1\npause\nresume\njobs\nquit\n"),
                                    ("hybrid", f'nodes\npolicy balanced\nset {__import__("socket").gethostname()} weight=2 limit=1\nrun "{task_path}" --output "{directory}/terminal-result"\nwait\njobs\nquit\n')]:
-                result = subprocess.run([sys.executable, "-B", str(ROOT / "main.py"), "--mode", mode,
+                result = subprocess.run(command("--mode", mode,
                                          "--cpus", "1", "--port", "0", "--nodes", str(nodes_path),
-                                         "--root", str(Path(directory) / mode)],
+                                         "--root", str(Path(directory) / mode)),
                                         input=commands.encode(), capture_output=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
                 self.assertNotIn("操作失败", result.stdout.decode("utf-8"))
             self.assertEqual((Path(directory) / "terminal-result/stdout.log").read_text().strip(), "terminal-task")
 
     def test_separate_worker_and_scheduler_processes(self):
+        from service_fixture import command
         with scratch() as directory:
             task_path = Path(directory) / "task.json"
             task_path.write_text(json.dumps(python("print('separate-process')")))
-            worker = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--mode", "worker",
-                                       "--cpus", "1", "--port", "0", "--root", str(Path(directory) / "node")],
+            worker = subprocess.Popen(command("--mode", "worker",
+                                       "--cpus", "1", "--port", "0", "--root", str(Path(directory) / "node")),
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 line = worker.stdout.readline().decode("utf-8")

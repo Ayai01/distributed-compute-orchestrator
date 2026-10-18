@@ -16,6 +16,7 @@ from .bundle import TERMINAL, atomic_json
 from .worker import Conflict, Server, Worker
 from .startup import Cancelled, resolve
 from .process import keep_awake
+from .terminal import require_visible
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -223,7 +224,7 @@ def main(argv=None):
     parser.add_argument("--cpus", type=lambda v: 0 if v == "auto" else int(v), help="本机算力预算")
     parser.add_argument("--memory-mb", type=int, dest="worker_memory_mb", help="本机提供者的任务内存总预算，MiB")
     parser.add_argument("--root", help="持久任务/资产目录；默认工程内 .local/state，临时物单独使用RAM盘")
-    parser.add_argument("--headless", action="store_true", help="启动后台服务，不打开交互终端；console=true可启用设备终端")
+    parser.add_argument("--headless", action="store_true", help="仅关闭交互看板；仍须在可见终端前台运行")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument('--on-port-conflict', choices=('ask', 'reuse', 'kill', 'admin-kill', 'cancel'),
                         default='ask', help='端口冲突处理；交互终端默认询问，admin-kill请求管理员权限')
@@ -268,6 +269,8 @@ def main(argv=None):
     lifetime = ExitStack()
     restarting = threading.Event()
     try:
+        if args.action is None and not (args.test or args.test_native or args.check):
+            require_visible()
         if (args.service_child and not args.url and args.action is None and
                 not (args.test or args.test_native or args.check) and handoff_python(invocation)):
             return 0

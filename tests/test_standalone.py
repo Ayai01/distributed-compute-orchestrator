@@ -16,6 +16,7 @@ from remote_compute.cli import ROOT
 from remote_compute.process import Process
 from test_center import center
 from test_compute import provider, python, scratch, until
+from service_fixture import write_entry
 
 
 class StandaloneTests(unittest.TestCase):
@@ -69,7 +70,7 @@ class StandaloneTests(unittest.TestCase):
             root = Path(directory)
             copied = root/'copied-tool'
             copied.mkdir()
-            shutil.copyfile(ROOT/'main.py', copied/'main.py')
+            write_entry(copied)
             shutil.copytree(ROOT/'remote_compute', copied/'remote_compute', ignore=shutil.ignore_patterns('__pycache__'))
             config = {'shared': {'old-project': str(root/'missing')}, 'cpus': 1, 'memory_mb': 512}
             (copied/'worker.local.json').write_text(json.dumps(config), encoding='utf-8')

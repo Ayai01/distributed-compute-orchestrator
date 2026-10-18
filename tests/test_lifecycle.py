@@ -22,6 +22,7 @@ from remote_compute.cli import ROOT, main
 from remote_compute.process import Process, keep_awake
 from test_center import center
 from test_compute import provider, python, until, scratch
+from service_fixture import write_entry
 
 
 class ServicePowerTests(unittest.TestCase):
@@ -55,7 +56,8 @@ class ServicePowerTests(unittest.TestCase):
             self.assertEqual(len(scans),3)  # A later cleanup still gets a new scan.
 
     def test_reloaded_child_hands_old_supervisor_to_preferred_runtime_by_normal_exit(self):
-        with patch('remote_compute.setup_tools.preferred_python',return_value=Path('C:/preferred314/python.exe')), \
+        with patch('remote_compute.cli.require_visible'), \
+                patch('remote_compute.setup_tools.preferred_python',return_value=Path('C:/preferred314/python.exe')), \
                 patch('remote_compute.cli.subprocess.Popen') as launch, \
                 patch('remote_compute.cli.Worker') as worker:
             self.assertEqual(main(['--service-child','--mode','worker','--config','device.json','--root','owned-root']),0)
@@ -87,7 +89,8 @@ class ServicePowerTests(unittest.TestCase):
                         self.assertEqual(events, ['awake'])
                         return 0
 
-                    with patch('remote_compute.cli.keep_awake', awake), \
+                    with patch('remote_compute.cli.require_visible'), \
+                            patch('remote_compute.cli.keep_awake', awake), \
                             patch('remote_compute.cli.supervise', side_effect=running), \
                             patch('remote_compute.cli.run_scheduler', side_effect=running), \
                             patch('remote_compute.cli.WorkerShell.loop', side_effect=running):
@@ -99,7 +102,8 @@ class ServicePowerTests(unittest.TestCase):
                     self.assertEqual(events, ['awake', 'released'])
 
     def test_client_commands_do_not_hold_machine_awake(self):
-        with patch('remote_compute.cli.keep_awake') as awake, \
+        with patch('remote_compute.cli.require_visible'), \
+                patch('remote_compute.cli.keep_awake') as awake, \
                 patch('remote_compute.cli.run_scheduler', return_value=0):
             self.assertEqual(main(['--url', 'http://127.0.0.1:26133', 'nodes']), 0)
             self.assertEqual(main(['--url', 'http://127.0.0.1:26133']), 0)
@@ -298,7 +302,7 @@ class ControlLifecycleTests(unittest.TestCase):
     def test_hybrid_reloads_without_console_relaunch_and_preserves_unfetched_results(self):
         with tempfile.TemporaryDirectory(prefix='compute-hybrid-reload-') as directory:
             root=Path(directory);copied=root/'tool';copied.mkdir()
-            shutil.copyfile(ROOT/'main.py',copied/'main.py')
+            write_entry(copied)
             shutil.copytree(ROOT/'remote_compute',copied/'remote_compute',ignore=shutil.ignore_patterns('__pycache__'))
             config=copied/'worker.local.json'
             config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False)),encoding='utf8')
@@ -343,7 +347,7 @@ class ControlLifecycleTests(unittest.TestCase):
             root = Path(directory)
             copied = root / 'tool'
             copied.mkdir()
-            shutil.copyfile(ROOT / 'main.py', copied / 'main.py')
+            write_entry(copied)
             shutil.copytree(ROOT / 'remote_compute', copied / 'remote_compute',
                             ignore=shutil.ignore_patterns('__pycache__'))
             config = copied / 'worker.local.json'

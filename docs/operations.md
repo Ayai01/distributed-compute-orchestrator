@@ -12,18 +12,24 @@ Windows 双击 `start.cmd`，或在 PowerShell 运行 `.\start.cmd`；Linux 执�
 
 启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:26133` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
 
+所有系统和启动方式都在`main.py`统一检查可见终端，检查先于解释器交接、服务托管、端口监听、状态目录写入和算力校准。输入和输出必须连接终端：Windows检查真实控制台窗口，ConPTY检查可见的终端或编辑器宿主；Linux/macOS检查TTY前台进程组，tmux/screen还须有附着客户端。失败返回退出码2及启动提示，不在后台继续运行。Windows Terminal的伪控制台窗口与真正宿主不同，按[微软的控制台说明](https://learn.microsoft.com/en-us/windows/console/getconsolewindow)分别处理。
+
+不要用隐藏窗口、输出重定向、`nohup`、无终端systemd服务或无人登录的计划任务启动DCO。桌面开机启动应使用登录后打开终端的快捷方式；Linux桌面`.desktop`入口设置`Terminal=true`并指向`start.sh`。终端可以失焦或最小化。一次性`--url ... jobs/nodes/exec/put/get`等命令、Python Client与测试不启动常驻服务，继续支持管道。`--headless`只关闭交互看板，仍须在可见终端前台运行。
+
+已有隐藏旧服务承接任务时，先打开`--url`看板保留任务，待全部任务和领取排空，再退出旧入口、从可见终端重新托管；不要对旧隐藏托管器直接重载后期待它变成前台窗口。日常由服务自己的可见终端托管生命周期，连接已有服务的额外看板不替代它。
+
 从旧Python加载新版本时，空闲重载后的服务子进程会把同一终端交给本机首选3.14，旧托管器正常退出；配置和任务目录保持原路径。中心合并转发通知时按完整操作标识去重，显示执行设备与访问IP，不把同一操作重复计为两条通知。
 
 设备IP来自该设备实际接受连接的地址，完整显示IPv4，不按网卡枚举顺序猜测。worker监听`0.0.0.0`时，首次外部连接前显示“等待连接”，之后显示实际连接使用的本机地址；回环探测不覆盖它。访问来源单独显示，有外部访问时省略内部回环探测，多个来源各占一行。启动算力使用`Miter/s`，测量槽数留在API，不在数值后重复显示。能力明确区分ngspice和HSPICE，再按RTL、Python、ML、GPU合并；自定义标签完整显示并在本区域内换行，不使用`+N`。
 
 Windows 下 scheduler / hybrid / worker 从启动到退出持续阻止自动休眠，空闲排队、终端失焦、headless 和服务重载期间均生效；屏幕可以正常关闭。退出后自动释放，恢复原有电源策略，无需管理员权限，也不修改系统电源计划。显式休眠、关机和合盖仍按用户操作执行。仅连接已有中心的 CLI 命令不申请防休眠。Linux 的电源管理接入保留待实机验证。
 
-端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心或worker，hybrid复用中心内置的本机算力；worker复用时只打开终端界面，退出界面保留后台服务）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。非交互运行可显式选择，例如 `python main.py --on-port-conflict reuse --headless` 或 `--on-port-conflict admin-kill`；默认取消并给出操作提示。
+端口冲突会显示监听进程的 PID 和命令，并提供 `reuse`（复用已识别的中心或worker，hybrid复用中心内置的本机算力；worker复用时只打开额外终端，退出该看板保留原服务）、`kill`、`admin-kill`、`cancel`。Windows 的 `admin-kill` 通过 UAC 请求管理员权限并结束进程树；Linux 使用 `sudo kill`。取消保留已有进程。可见终端中可显式选择`--on-port-conflict reuse`；所有服务入口仍先检查终端，不用端口冲突参数绕过可见性要求。
 
 ```text
 python main.py
 python main.py --mode hybrid --cpus 8 --memory-mb 8192
-python main.py --mode scheduler --host 0.0.0.0 --headless
+python main.py --mode scheduler --host 0.0.0.0
 python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 8192
 ```
 
@@ -33,7 +39,7 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 | `scheduler` | 调度其他设备，本机仅负责分配和回收 |
 | `worker` | 提供算力，启动本节点的操作终端 |
 
-调度中心默认端口 `26133`，独立算力提供者默认端口 `26133`；hybrid 的本机 worker 使用进程内私有调用，不监听端口；`local://设备名` 只是节点标记，由当前调度器持有。`--port` 设置当前对外服务端口；hybrid / scheduler 可用 `--center-port` 显式设置中心端口，优先于 `--port`。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless` 启动持续运行的后台服务。
+调度中心默认端口 `26133`，独立算力提供者默认端口 `26133`；hybrid 的本机 worker 使用进程内私有调用，不监听端口；`local://设备名` 只是节点标记，由当前调度器持有。`--port` 设置当前对外服务端口；hybrid / scheduler 可用 `--center-port` 显式设置中心端口，优先于 `--port`。其他设备使用 `--host 0.0.0.0` 启动，再把设备 IP 加入总调度器。`--headless`仅关闭交互看板，服务仍在可见终端前台运行。
 
 调用工程连接中心的 `26133`，多个工程共享中心队列、资源预算和分配策略。中心将任务转交给配置的 worker，回收结果后同时清理两侧的任务文件；模型和源码资产按内容同步并复用。
 
@@ -48,11 +54,11 @@ python main.py --mode worker --host 0.0.0.0 --port 26133 --cpus 8 --memory-mb 81
 日常配置统一使用 26133；调整中心端口后，调用工程的显式 URL 也要相应调整。`--port 0` 用于临时验证，由系统分配端口。
 
 
-独立worker支持原生HTTPS：设备配置`certfile`、`keyfile`，中心节点配置对应`ca_file`并直接访问设备IP的26133端口。资源借还通过worker本地接口和中心已有连接转交，无需反向端口或隧道。Linux桌面可以运行`python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json`附着现有服务；关闭看板保留后台计算。
+独立worker支持原生HTTPS：设备配置`certfile`、`keyfile`，中心节点配置对应`ca_file`并直接访问设备IP的26133端口。资源借还通过worker本地接口和中心已有连接转交，无需反向端口或隧道。Linux桌面可以运行`python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json`附着现有服务；额外看板退出保留原服务，原服务自己的终端仍应保持可见。
 
 ## 实时终端与运行中控制
 
-Windows交互终端在窗口获得焦点时每秒刷新、失焦时每5秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签与访问IP。设备区显示启动算力测量结果，移除温度和常驻在线列，异常或暂停单独提示。最近6条指令/文件操作滚动显示，普通计算提交放在任务表中，避免刷掉重要操作通知；命令输入同时保持可用。`--headless` 保留无界面服务；设备配置 `console: true` 可在原headless启动终端打开看板。
+Windows交互终端在窗口获得焦点时每秒刷新、失焦时每5秒刷新CPU负载、主机内存、任务RSS/预留/可分配内存、已分配/可用线程、设备总线程、任务标签与访问IP。设备区显示启动算力测量结果，移除温度和常驻在线列，异常或暂停单独提示。最近6条指令/文件操作滚动显示，普通计算提交放在任务表中，避免刷掉重要操作通知；命令输入同时保持可用。`--headless`只关闭交互看板，仍检查可见终端；设备配置`console: true`可启用看板。
 
 当前任务逐条显示4位ID、任务/线程与运行秒数。运行时间从实际开始执行计算，不包含排队等待；各设备的任务统一按运行最久在前排序，输入为空时用Tab/ShiftTab翻页。尚未开始执行的任务显示`-`并排在末尾。
 
@@ -160,7 +166,7 @@ quit
 另一台电脑复制本工程后，先用示例配置启动 worker，在调度终端加入它并保存；随后可将工具路径写入那台电脑自己的 `worker.local.json`：
 
 ```text
-python main.py --mode worker --config worker.example.json --host 0.0.0.0 --headless --cpus 8 --memory-mb 8192
+python main.py --mode worker --config worker.example.json --host 0.0.0.0 --cpus 8 --memory-mb 8192
 
 add http://192.168.1.10:26133
 save
@@ -278,11 +284,11 @@ Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/Remote-Compu
 
 ## 部署到其他设备
 
-Linux 使用普通磁盘时，在设备配置中显式指定 `root` 为用户可写的磁盘绝对路径，例如 `~` 展开后的 `/home/user/.local/state/dco/worker`，并将进程 `TMPDIR` 指向普通磁盘；不运行 `ramdisk`。例如 `mode=worker`、`cpus=96`、`cpu_limit=96`、`memory_mb=98304`、`memory_reserve_mb=4096`，然后执行 `python3 -B main.py --config worker.local.json --headless`。节点使用系统 hostname，跨平台任务按实际工具和 `requires` 标签匹配；Linux 节点不会声明 `win32`。
+Linux 使用普通磁盘时，在设备配置中显式指定 `root` 为用户可写的磁盘绝对路径，例如 `~` 展开后的 `/home/user/.local/state/dco/worker`，并将进程 `TMPDIR` 指向普通磁盘；不运行 `ramdisk`。例如 `mode=worker`、`cpus=96`、`cpu_limit=96`、`memory_mb=98304`、`memory_reserve_mb=4096`，然后执行 `python3 -B main.py --config worker.local.json`。节点使用系统 hostname，跨平台任务按实际工具和 `requires` 标签匹配；Linux 节点不会声明 `win32`。
 
 设备统一按 IP:26133 直连。公网 worker 在本机配置设置 host="0.0.0.0"、certfile、keyfile，中心节点使用 https://设备IP:26133 及 ca_file 信任该设备证书，私钥只留提供者；不修改全局证书信任、不依赖 SSH 或转发端口。计算进程在 worker 本地提出 CPU/RAM 请求，中心通过已有状态轮询处理并返回实际授权，提供者无需反向访问中心。旧反向callback_url入口已退役，配置只保存实际直连URL。令牌与设备配置放在忽略目录。
 
-已有服务的桌面终端使用 python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json 连接，证书从本机配置读取。它只显示和控制同一 worker；退出终端保留服务和任务。Windows、Linux 均使用标准库实时看板，Tab/翻页/输入区保持一致。
+已有服务的桌面终端使用 python main.py --mode worker --url https://127.0.0.1:26133 --config worker.local.json 连接，证书从本机配置读取。它只显示和控制同一 worker；额外看板退出保留服务和任务，原服务自己的终端保持可见。Windows、Linux 均使用标准库实时看板，Tab/翻页/输入区保持一致。
 
 复制工程源码，准备 Python 3.11+，即可使用 worker 模式提供远程 Python、文件访问和控制。`worker.example.json` 是独立节点的最小配置，不依赖 AOP、RGCN、ARH-DSE 或 Analog-Opt-Bench。计算任务需要的源码可以通过资产包发送，依赖和工具按实际任务安装；工程解释器别名可在 `tools` 中追加。`python main.py --check` 用于检查仿真工具。Windows 的原生 Verilator 可通过 `env.MSYS2_ROOT` 指向已有 MSYS2；Linux 在 Python 环境中按调用工程安装科学依赖，配置 tools 指向解释器与 ngspice，Verilator 和编译器使用 PATH 中的工具；setup 当前提供 Windows 可移动工具链。
 

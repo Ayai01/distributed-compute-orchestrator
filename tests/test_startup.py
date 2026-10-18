@@ -1,12 +1,15 @@
 """Startup handles occupied ports before touching service state."""
 from pathlib import Path
+from contextlib import redirect_stderr
+import io
+import os
 import socket
 import subprocess
 import sys
 import unittest
 from unittest.mock import patch
 
-from remote_compute import startup
+from remote_compute import startup, terminal
 from remote_compute.cli import ROOT
 from test_center import center
 from test_compute import provider, scratch
@@ -14,6 +17,110 @@ from remote_compute import Pool
 
 
 class StartupTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Native Windows console visibility')
+    def test_native_visible_console_passes_and_same_hidden_console_fails(self):
+        code = '''import ctypes as c,sys
+from pathlib import Path
+from remote_compute.terminal import require_visible
+from ctypes import wintypes as w
+kernel=c.WinDLL('kernel32'); user=c.WinDLL('user32')
+kernel.GetConsoleWindow.restype=w.HWND
+user.ShowWindow.argtypes=[w.HWND,c.c_int]
+window=kernel.GetConsoleWindow()
+require_visible()
+try:
+    user.ShowWindow(window,0)
+    try:require_visible()
+    except RuntimeError:pass
+    else:raise AssertionError('hidden console accepted')
+finally:user.ShowWindow(window,5)
+require_visible()
+Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
+'''
+        with scratch() as directory:
+            evidence = Path(directory) / 'visibility.txt'
+            child = subprocess.Popen([sys.executable, '-B', '-c', code, str(evidence)],
+                                     creationflags=subprocess.CREATE_NEW_CONSOLE, cwd=ROOT)
+            try:
+                self.assertEqual(child.wait(timeout=10), 0)
+                self.assertEqual(evidence.read_text(encoding='utf-8'), 'visible-hidden-visible passed')
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+
+    def test_all_service_entry_modes_reject_redirects_before_startup_side_effects(self):
+        from remote_compute.cli import main
+        for mode in ('scheduler', 'hybrid', 'worker'):
+            for extra in ([], ['--headless'], ['--service-child'], ['--service-child', '--headless']):
+                with self.subTest(mode=mode, extra=extra), \
+                        patch.object(terminal.sys.stdin, 'isatty', return_value=False), \
+                        patch('remote_compute.cli.handoff_python') as handoff, \
+                        patch('remote_compute.cli.supervise') as supervisor, \
+                        patch('remote_compute.cli.Worker') as worker, \
+                        patch('remote_compute.cli.resolve') as resolve, \
+                        io.StringIO() as output, redirect_stderr(output):
+                    self.assertEqual(main(['--mode', mode, '--config', 'absent-device.json', *extra]), 2)
+                    self.assertIn('可见终端', output.getvalue())
+                    for action in (handoff, supervisor, worker, resolve):
+                        action.assert_not_called()
+
+    def test_real_detached_launch_refuses_before_creating_root(self):
+        with scratch() as directory:
+            root = Path(directory) / 'must-not-be-created'
+            for mode in ('scheduler', 'hybrid', 'worker'):
+                result = subprocess.run([sys.executable, '-B', str(ROOT/'main.py'), '--mode', mode,
+                    '--headless', '--port', '0', '--root', str(root)],
+                    input='', capture_output=True, text=True, encoding='utf-8', timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('可见终端', result.stderr)
+                self.assertFalse(root.exists())
+
+    def test_client_actions_keep_pipe_support_and_console_connection_is_checked(self):
+        from remote_compute.cli import main
+        with patch('remote_compute.cli.require_visible') as visible, \
+                patch('remote_compute.cli.run_scheduler', return_value=0):
+            self.assertEqual(main(['--url', 'http://127.0.0.1:26133', 'jobs']), 0)
+            visible.assert_not_called()
+            self.assertEqual(main(['--url', 'http://127.0.0.1:26133']), 0)
+            visible.assert_called_once_with()
+
+    def test_redirected_output_and_hidden_windows_are_rejected(self):
+        with patch.object(terminal.sys.stdin, 'isatty', return_value=True), \
+                patch.object(terminal.sys.stdout, 'isatty', return_value=False), \
+                patch.object(terminal, '_windows_visible') as probe:
+            with self.assertRaisesRegex(RuntimeError, '可见终端'):
+                terminal.require_visible()
+            probe.assert_not_called()
+        if os.name == 'nt':
+            with patch.object(terminal.sys.stdin, 'isatty', return_value=True), \
+                    patch.object(terminal.sys.stdout, 'isatty', return_value=True), \
+                    patch.object(terminal, '_windows_visible', return_value=False):
+                with self.assertRaisesRegex(RuntimeError, '可见终端'):
+                    terminal.require_visible()
+
+    def test_posix_requires_foreground_and_attached_multiplexers(self):
+        with patch.object(terminal.os, 'tcgetpgrp', return_value=42, create=True), \
+                patch.object(terminal.os, 'getpgrp', return_value=42, create=True), \
+                patch.object(terminal.sys.stdin, 'fileno', return_value=0), \
+                patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(terminal._posix_visible())
+            with patch.object(terminal.os, 'tcgetpgrp', return_value=43):
+                self.assertFalse(terminal._posix_visible())
+            with patch.dict(os.environ, {'TMUX': '/tmp/tmux/default,1,0', 'TMUX_PANE': '%2'}), \
+                    patch.object(terminal.subprocess, 'run') as run:
+                run.return_value.returncode, run.return_value.stdout = 0, '0\n'
+                self.assertFalse(terminal._posix_visible())
+                run.return_value.stdout = '1\n'
+                self.assertTrue(terminal._posix_visible())
+                self.assertIn('%2', run.call_args.args[0])
+            with patch.dict(os.environ, {'STY': '123.dco'}), \
+                    patch.object(terminal.subprocess, 'run') as run:
+                run.return_value.stdout = '\t123.dco\t(Detached)\n'
+                self.assertFalse(terminal._posix_visible())
+                run.return_value.stdout = '\t123.dco\t(Attached)\n'
+                self.assertTrue(terminal._posix_visible())
+
     def test_cancel_preserves_listener(self):
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))

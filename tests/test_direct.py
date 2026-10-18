@@ -48,7 +48,8 @@ class DirectTests(unittest.TestCase):
         with scratch() as temporary,provider(Path(temporary)/'worker') as (worker,client):
             identity=client.submit(python("import time;from pathlib import Path\nwhile not Path('release').exists():time.sleep(.02)"))['id']
             until(lambda:worker.get(identity)['status']=='running')
-            result=subprocess.run([sys.executable,'-B','main.py','--mode','worker','--url',client.url],
+            from service_fixture import command
+            result=subprocess.run(command('--mode','worker','--url',client.url),
                 input='status\nquit\n',capture_output=True,text=True,encoding='utf-8',timeout=10)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertIn('算力>',result.stdout)
