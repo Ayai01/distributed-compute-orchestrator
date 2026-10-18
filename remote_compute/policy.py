@@ -16,7 +16,6 @@ MAX_TOOL_CONSTRAINTS = 32
 MAX_ACCELERATORS = 16
 MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
 
-
 def normalize_accelerator_requirement(value):
     """Normalize one project accelerator request without exposing a device id."""
     if value is None:
@@ -88,7 +87,6 @@ def public_capabilities():
         "resize_memory_model",
         "semantic_requires",
         "single_thread_weight",
-        "tool_sha256",
         "asset_cache",
         "accelerators",
     ]

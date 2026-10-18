@@ -275,7 +275,7 @@ class ConsoleTests(unittest.TestCase):
         text='\n'.join(format_status(value,width=159).fit(38))
         self.assertIn('203.0.113.42',text)
         self.assertNotIn('本机',text)
-        self.assertIn('Server: 192.0.2.10',text)
+        self.assertIn('Server: 调度中心 → 远端算力',text)
 
     def test_device_ip_is_distinct_from_visitors_and_keeps_complete_ipv4(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
@@ -285,7 +285,7 @@ class ConsoleTests(unittest.TestCase):
         text='\n'.join(format_status(value,width=159).fit(38))
         self.assertIn('设备IP',text)
         self.assertIn('192.168.100.100',text)
-        self.assertIn('Aya1-TX: 192.168.1.6',text)
+        self.assertIn('Aya1-TX: 调度中心 → 远端算力',text)
         self.assertNotIn('127.0.0.1',text)
         worker=dict(node='Aya1-TX',role='worker',cpus=30,host_ip='192.168.1.10')
         self.assertIn('192.168.1.10','\n'.join(format_status(worker,url='http://0.0.0.0:26133',width=159)))

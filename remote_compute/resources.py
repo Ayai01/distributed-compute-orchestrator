@@ -14,12 +14,15 @@ import time
 MIB = 1024 * 1024
 MACHINE_ID = socket.gethostname() + ":" + f"{uuid.getnode():012x}"
 @lru_cache(maxsize=None)
-def cpu_benchmark(cpus, executable=None, environment=()):
+def cpu_benchmark(cpus, executable=None, environment=(), *, force=False):
     """Measure a fixed circuit/RTL/scientific mix at the worker CPU budget."""
     if type(cpus) is not int or cpus < 1:
         raise ValueError('Benchmark cpus must be a positive integer')
     from .benchmark import calibrated
-    return calibrated(cpus,executable=executable,environment=environment)
+    options = dict(executable=executable, environment=environment)
+    if force:
+        options['force'] = True
+    return calibrated(cpus, **options)
 
 
 def memory():

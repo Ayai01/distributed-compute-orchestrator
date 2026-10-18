@@ -6,6 +6,7 @@ import threading
 import time
 import os
 import subprocess
+import re
 
 from .view import _width, _clip, _rule, _line, _layout, StatusRows, format_status, format_notices, set_width_probe
 
@@ -26,24 +27,39 @@ def _paint_row(row):
     text = row.strip()
     if not text:
         return row
-    if any(word in row for word in ('错误', '失败', '异常', 'blocked', 'error', 'failed')):
-        color = '\x1b[31;1m'       # red
-    elif any(word in row for word in ('运行', '成功', 'online', 'succeeded', '完成')):
-        color = '\x1b[32m'          # green
-    elif any(word in row for word in ('排队', '等待', 'queued', '暂停', 'paused')):
-        color = '\x1b[33m'          # yellow
-    elif text.startswith(('候选:', '用法:', '输入 ', 'Tab/')):
-        color = '\x1b[34m'          # blue
-    elif text.startswith(('最近通知', '命令输出', '通知')):
-        color = '\x1b[35m'          # magenta
-    elif text.startswith(('调度>', '算力>', 'worker>', 'scheduler>')):
-        color = '\x1b[36;1m'         # cyan prompt
-    elif text.startswith(('+', '|')) and any(char.isalpha() or '\u4e00' <= char <= '\u9fff' for char in text):
-        color = '\x1b[36m'          # section/title row
+    # Keep prose at the terminal's normal white.  Panel structure and the
+    # command prompt may span a whole row; task state/value colors below are
+    # applied to individual tokens so a right-hand task never tints a left
+    # resource panel in the two-column layout.
+    if text.startswith(('调度>', '算力>', 'worker>', 'scheduler>')):
+        color = '\x1b[36;1m'          # command input
+    elif text.startswith('+ ') and any(char.isalpha() or '\u4e00' <= char <= '\u9fff' for char in text):
+        color = '\x1b[34;1m'          # panel/section title
     elif set(text) <= set('+-|='):
-        color = '\x1b[90m'          # separators
+        color = '\x1b[90m'            # separators
     else:
-        return row
+        hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
+        number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)(?![\w.])')
+        state_pattern = re.compile(r'运行(?!秒)|排队|等待|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
+        state_colors = {
+            '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
+            '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
+            '派发':'\x1b[36m', '校准中':'\x1b[36m',
+            '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
+            'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
+        result, position = [], 0
+        matches = [*hash_pattern.finditer(row), *number_pattern.finditer(row), *state_pattern.finditer(row)]
+        for match in sorted(matches, key=lambda m: (m.start(), -m.end())):
+            if match.start() < position:
+                continue
+            result.append(row[position:match.start()])
+            token = match.group()
+            token_color = ('\x1b[36m' if hash_pattern.fullmatch(token) else
+                           state_colors.get(token.casefold(), '\x1b[33m'))
+            result.extend((token_color, match.group(), _RESET))
+            position = match.end()
+        result.append(row[position:])
+        return ''.join(result)
     return color + row + _RESET
 
 
@@ -93,8 +109,9 @@ class CommandCompletion:
 
 
 def _command_rows(shell, line, cursor, width, context, completion):
-    usage = context['usage'] or ('Tab 补全命令 | Enter 执行 | Esc 清空 | help 命令' if line.strip() else
-                                 'Tab/ShiftTab 翻任务 | PgUp/PgDn 输出 | 上下键 历史 | help 命令')
+    usage = context['usage'] or ('Tab 补全命令 | Ctrl+Tab 翻任务 | Enter 执行 | Esc 清空 | help 命令'
+                                 if line.strip() else
+                                 'Tab 补全命令 | Ctrl+Tab 翻任务 | PgUp/PgDn 输出 | 上下键 历史 | help 命令')
     matches = completion.matches if completion.last == (line, cursor) else context['matches']
     selected = completion.index if completion.last == (line, cursor) else -1
     candidates = []
@@ -111,7 +128,7 @@ def _command_rows(shell, line, cursor, width, context, completion):
             candidates.append(suffix.strip())
             break
         candidates.append(label)
-    choices = '候选: ' + '  '.join(candidates) if candidates else 'Tab 补全 | Shift+Tab 反向 | Enter 执行 | Esc 清空'
+    choices = '候选: ' + '  '.join(candidates) if candidates else 'Tab 补全命令 | Ctrl+Tab 翻任务 | Enter 执行 | Esc 清空'
     prompt, column = _input_view(shell.prompt, line, cursor, width)
     return [_rule('用法: ' + usage, width), _line(choices, width), _rule('', width), prompt], column
 
@@ -319,7 +336,12 @@ class _PosixKeyboard:
         self.previous=termios.tcgetattr(self.fd);tty.setcbreak(self.fd)
         self.decoder=codecs.getincrementaldecoder('utf-8')();self.buffer=''
         self.keys={'\x1b[A':'H','\x1b[B':'P','\x1b[C':'M','\x1b[D':'K','\x1b[H':'G','\x1b[F':'O',
-                   '\x1b[3~':'S','\x1b[5~':'I','\x1b[6~':'Q','\x1b[Z':'\x0f'}
+                   '\x1b[3~':'S','\x1b[5~':'I','\x1b[6~':'Q','\x1b[Z':'\x0f',
+                   # Terminals differ in how they encode Ctrl+Tab.  Normalize
+                   # the common xterm/kitty forms to the Windows-style code
+                   # consumed by the dashboard loop.
+                   '\x1b[27;5;9~':'\x94','\x1b[9;5~':'\x94',
+                   '\x1b[9;5u':'\x94','\x1b[1;5I':'\x94'}
     def kbhit(self):
         import select
         if select.select([self.fd],[],[],0)[0]:self.buffer+=self.decoder.decode(os.read(self.fd,128))
@@ -381,6 +403,7 @@ class Dashboard:
         line, cursor = state.get('line', ''), state.get('cursor', 0)
         history, selected = state.get('history', []), state.get('selected', 0)
         last, offset, page_size, task_page = 0, state.get('offset', 0), 6, state.get('task_page', 0)
+        empty_tab = False
         completion = CommandCompletion()
         painter=state.get('painter') or RowPainter()
         rows, events, value = [], [], {}
@@ -409,7 +432,10 @@ class Dashboard:
                         last = now
                     columns, height = size()
                     self.columns = columns
-                    reserved = min(4, height)
+                    # The command footer owns the last five rows.  Keeping a
+                    # spare row above it prevents a refresh from painting over
+                    # the prompt in short Windows/ConPTY viewports.
+                    reserved = min(5, height)
                     with self.output_lock:
                         key = (revision,self.output_revision,offset,task_page,columns,height)
                         if key != cached_key:
@@ -426,24 +452,30 @@ class Dashboard:
                             for index,text in enumerate(visible):
                                 if text.startswith('+ 命令输出'):
                                     page_size=max(1,len(visible)-index-2)
-                            body = visible[:height-reserved]
-                            body += [''] * max(0,height-reserved-len(body))
+                            body_height=max(0, height-reserved)
+                            body = visible[-body_height:] if body_height else []
+                            body = ([''] * max(0, body_height-len(body))) + body
                             cached_key = (revision,self.output_revision,offset,task_page,columns,height)
                     if context_key != (line, cursor, revision):
                         context = self.shell.suggest(line, cursor, value)
                         context_key = (line, cursor, revision)
                     footer, column = _command_rows(self.shell, line, cursor, max(1,columns-1), context, completion)
-                    frame = painter.frame(body+footer[-reserved:],columns,height,column)
+                    # The footer is an independent fixed-height viewport.  Do
+                    # not let a status/output refresh consume its last row.
+                    footer = ([''] * max(0, reserved-len(footer))) + footer[-reserved:]
+                    frame = painter.frame(body+footer,columns,height,column)
                     if frame:
                         self.stream.write(frame)
                         self.stream.flush()
                     while msvcrt.kbhit():
                         key = msvcrt.getwch()
                         if key not in ('\t', '\x00', '\xe0'):
+                            empty_tab = False
+                        if key not in ('\t', '\x00', '\xe0'):
                             completion.last = None
                         if key in ('\x00', '\xe0'):
                             key = msvcrt.getwch()
-                            if key != '\x0f':
+                            if key not in ('\x0f','\x94'):
                                 completion.last = None
                             if key == 'K': cursor = max(0, cursor - 1)
                             elif key == 'M': cursor = min(len(line), cursor + 1)
@@ -452,10 +484,23 @@ class Dashboard:
                             elif key == 'S': line = line[:cursor] + line[cursor + 1:]
                             elif key == 'I': offset += page_size
                             elif key == 'Q': offset = max(0, offset - page_size)
+                            elif key == '\x94':
+                                task_page += 1
+                                empty_tab = False
                             elif key == '\x0f':
                                 if line.strip():
                                     line, cursor = completion.apply(line,cursor,self.shell.suggest(line,cursor,value),reverse=True)
+                                elif empty_tab:
+                                    # Older Windows console hosts report
+                                    # Ctrl+Tab as the same extended code as
+                                    # Shift+Tab.  A preceding root Tab makes
+                                    # that intent unambiguous while Tab itself
+                                    # still only exposes command candidates.
+                                    task_page += 1
+                                    empty_tab = False
                                 else:
+                                    # Shift+Tab is a convenient reverse page
+                                    # gesture when the command line is empty.
                                     task_page -= 1
                             elif key in ('H', 'P') and history:
                                 selected = max(0, min(len(history), selected + (-1 if key == 'H' else 1)))
@@ -465,7 +510,12 @@ class Dashboard:
                             if line.strip():
                                 line, cursor = completion.apply(line,cursor,self.shell.suggest(line,cursor,value))
                             else:
-                                task_page += 1
+                                # An empty line is already the command root;
+                                # keep it empty and expose the root candidates
+                                # in the footer instead of inserting an
+                                # arbitrary command.
+                                completion.last = None
+                                empty_tab = True
                         elif key == '\r':
                             if line.strip():
                                 self.write(self.shell.prompt + line + '\n')

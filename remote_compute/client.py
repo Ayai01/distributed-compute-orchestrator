@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import select
+import socket
 import ssl
 import threading
 import time
@@ -264,7 +265,7 @@ class Client:
             raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, tool_sha256=None, accelerator=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, accelerator=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         if node is not None and not self.operator:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
@@ -276,7 +277,6 @@ class Client:
         if max_cpus is not None:
             request['max_cpus'] = max_cpus
         if job_id is not None:request['job_id']=job_id
-        if tool_sha256:request['tool_sha256']=tool_sha256
         if os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'):
             identity=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',os.environ['REMOTE_COMPUTE_JOB_ID'])
             return self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission'))
@@ -427,6 +427,9 @@ class Node:
     aliases: list = field(default_factory=list)
     accelerator_reservations: dict = field(default_factory=dict)
     external_accelerator_reservations: list = field(default_factory=list)
+    network_checked_at: float = 0.0
+    network_samples: list = field(default_factory=list)
+    network: dict = field(default_factory=dict)
 
     @property
     def capacity(self):
@@ -577,6 +580,7 @@ class Pool:
             error=''
         except RemoteError as exc:
             value,error={},str(exc)
+        self._sample_network(node)
         with self.condition:
             if client is not node.client:return
             node.sampled_at=time.monotonic()
@@ -591,6 +595,40 @@ class Pool:
                 node.external_memory_mb=max(0,value.get('memory_reserved_mb',0)-owned_memory)
                 node.known_jobs.intersection_update({job['id'] for job in jobs}|node.live_jobs)
             self.condition.notify_all()
+
+    @staticmethod
+    def _network_target(node):
+        parsed=urlsplit(node.client.url)
+        host=parsed.hostname
+        if parsed.scheme == 'local' or not host or host in {'127.0.0.1','localhost','::1'}:
+            return None
+        return host, parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+    def _sample_network(self, node):
+        """Take one bounded TCP reachability sample at most every 30 seconds."""
+        now=time.monotonic()
+        if now-node.network_checked_at < 30:
+            return
+        target=self._network_target(node)
+        node.network_checked_at=now
+        if target is None:
+            node.network={"local": True}
+            return
+        started=time.perf_counter()
+        success=False
+        try:
+            with socket.create_connection(target, timeout=min(1.5, max(.2, node.client.timeout))):
+                success=True
+        except OSError:
+            pass
+        elapsed=round((time.perf_counter()-started)*1000,1) if success else None
+        node.network_samples=(node.network_samples+[(success,elapsed)])[-5:]
+        attempts=len(node.network_samples)
+        losses=sum(not ok for ok,_ in node.network_samples)
+        valid=[rtt for ok,rtt in node.network_samples if ok and rtt is not None]
+        node.network={"local": False, "rtt_ms": round(sum(valid)/len(valid),1) if valid else None,
+                      "packet_loss_pct": round(100*losses/attempts,1), "samples": attempts,
+                      "measured_at": time.time()}
 
     def refresh(self, *, monitor=False):
         # A slow/offline worker never stalls another worker's CPU or lease sample.
@@ -665,7 +703,7 @@ class Pool:
                  "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),
-                 "benchmark": n.health.get("benchmark"), "asset_cache": n.health.get("asset_cache"),
+                 "benchmark": n.health.get("benchmark"), "benchmark_state": n.health.get("benchmark_state", "ready"), "asset_cache": n.health.get("asset_cache"),
                  "service": n.health.get("service"), "scratch_disk": n.health.get("scratch_disk"),
                  "memory_capacity_mb": n.memory_capacity, "memory_available_mb": max(0, int(n.memory_free)),
                  "memory_reserved_mb": n.health.get("memory_reserved_mb", 0),
@@ -677,6 +715,8 @@ class Pool:
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
                  "accelerators": n.health.get("accelerators", []),
                  "accelerator_reserved": sum(len(items) for items in n.accelerator_reservations.values()),
+                 "accelerator_used": n.health.get("accelerator_used", 0),
+                 "network": dict(getattr(n, 'network', {}) or {}),
                  "shared_paths": n.health.get("shared_paths", {}),
                  "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
@@ -694,8 +734,6 @@ class Pool:
         required_shared={name for text in texts for name in re.findall(r'\$\{shared:([\w-]+)\}',text)}
         return [n for n in self.nodes if (not task.get('node') or n.name==task['node'])
                 and set(task.get('requires',())).issubset(n.health.get('tags',()))
-                and all(n.health.get('tools',{}).get(tool,{}).get('sha256') in allowed
-                        for tool,allowed in task.get('tool_sha256',{}).items())
                 and all(n.health.get('tools',{}).get(tool,{}).get('available') for tool in required_tools)
                 and required_shared.issubset(n.health.get('shared',()))
                 and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)

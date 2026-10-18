@@ -104,6 +104,8 @@ def _capabilities(tags):
     groups=[('ngspice47' if 'ngspice47' in tags else 'ngspice',{'ngspice','ngspice47','spice'}),
             ('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
             ('Chisel',{'java','scala-cli','firtool'}),
+            ('C++',{'cxx','gcc','g++','clang','clang++'}),
+            ('ONNX',{'onnx','onnx_cpu','onnxruntime'}),
             ('Python',{'python'}|{t for t in tags if '_python' in t}),
             ('ML',{'rgcn_train'}),('GPU',{'gpu','cuda','rocm'})]
     known={'cpu','win32','linux','darwin'}|{t for t in tags if t.startswith('shared:')}
@@ -111,8 +113,21 @@ def _capabilities(tags):
     for name,members in groups:
         known.update(members)
         if (members<=tags if name=='Chisel' else tags & members):result.append(name)
-    result.extend(sorted(tags-known))
+    # The operator view is a compact routing summary.  Keep the protocol tags
+    # stable in the worker/API and shorten only what is painted in the table.
+    labels={'ngspice47':'ng47','ngspice':'ng','HSPICE':'HS','Python':'Py'}
+    result=[labels.get(item,item) for item in result]
+    custom=sorted(tags-known)
+    result.extend(_short_capability(item) for item in custom)
     return ' '.join(result) or '-'
+
+
+def _short_capability(value):
+    """Keep a custom capability readable without exposing project internals."""
+    value=str(value)
+    aliases={'aop_hspice_python':'AOP-Py','rgcn_python':'RGCN-Py','rgcn_train':'RGCN-ML',
+             'onnx_cpu':'ONNX-CPU','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
+    return aliases.get(value, value if len(value)<=14 else value[:11]+'…')
 
 
 def _project(name):
@@ -130,6 +145,22 @@ def _device_address(node, url=''):
     if host in ('127.0.0.1','localhost','::1'):
         return '本机'
     return node.get('host_ip') or (host if host and host not in ('0.0.0.0','::') else '等待连接')
+
+
+def _accelerator_summary(node):
+    """Compact capacity/availability text for the operator dashboard."""
+    profiles = node.get('accelerators') or []
+    if not profiles:
+        return '-'
+    used = int(node.get('accelerator_reserved', node.get('accelerator_used', 0)) or 0)
+    parts=[]
+    for profile in profiles:
+        kind=str(profile.get('kind','accel')).upper()
+        count=int(profile.get('count',0) or 0)
+        memory=int(profile.get('memory_mb',0) or 0)
+        memory_text=f'{memory/1024:.0f}G' if memory and memory%1024==0 else f'{memory}M'
+        parts.append(f'{kind} {count}x{memory_text}')
+    return f'{used}/{sum(int(p.get("count",0) or 0) for p in profiles)} ' + ','.join(parts)
 
 
 def _label(job):
@@ -205,7 +236,7 @@ class StatusRows(list):
             self.summary+=' | '+str(value.get('policy','adaptive'))
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
         self.devices,self.jobs=[],[]
-        for node in nodes:
+        for number,node in enumerate(nodes,1):
             name=node.get('node') or node.get('name') or '-'
             allocated=(node.get('reserved',0)+node.get('external_cpus',0) if 'reserved' in node else node.get('used_cpus',0))
             threads=f"{allocated}/{node.get('capacity',0)}({node.get('logical_cpus','?')})"
@@ -218,7 +249,10 @@ class StatusRows(list):
             peers=', '.join(external or [loopback if ip in ('local','127.0.0.1','::1') else ip for ip in peers]) or '-'
             benchmark=node.get('benchmark') or {}
             measured=benchmark.get('score');single=(benchmark.get('single') or {}).get('score')
-            if benchmark.get('name')!='native-mixed-v4' and measured is not None:
+            benchmark_state=node.get('benchmark_state','ready')
+            if benchmark_state in {'queued','running'}:
+                score='校准中'
+            elif benchmark.get('name')!='native-mixed-v4' and measured is not None:
                 score='-/待校准'
             elif measured is not None:
                 score=(f'{single:.3g}/' if single is not None else '-/')+f'{measured:.3g}'
@@ -227,7 +261,9 @@ class StatusRows(list):
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
-                                       benchmark.get('threads','-'),_device_address(node,'' if center else self.url)]))
+                                       benchmark.get('threads','-'),_device_address(node,'' if center else self.url),
+                                       number,_accelerator_summary(node),
+                                       node.get('benchmark_state','ready')]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
         self.projects=[]
         if center:
@@ -247,9 +283,9 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','线程(总)','CPU','单/总','RAM','可配','RSS/预留','设备IP'],
-                         [[*r[:3],r[7],*r[3:6],r[9]] for r in records],
-                         [7,10,6,11,10,5,9,None],width,right=(1,2,3,4,5,6))
+            table=_table(['设备','线程(总)','CPU','单/总','RAM','可配','GPU','RSS/预留'],
+                         [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
+                         [11,10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
             table=_table(['设备','线程(总)','CPU','RAM','可配'],[r[:5] for r in records],
                          [7,10,6,None,5],width,right=(1,2,3,4))
@@ -265,9 +301,10 @@ class StatusRows(list):
             if width>=54:
                 details=_table(['设备','单/总','RSS/预留','设备IP'],
                                [[r[0],r[7],r[5],r[9]] for r in records],
-                               [7,11,9,None],width,right=(1,2))
+                               [7,11,9,None],width,right=(1,2,3))
             else:
                 details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
+                details.extend(_line(f'#{r[10]} {r[0]} GPU {r[11]}',width) for r in records)
                 details.extend(_line(f'{r[0]} RSS/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
             sections.append(('启动基准 Miter/s | RSS/预留 GiB',details,1))
         if self.value.get('role')=='scheduler':
@@ -286,7 +323,28 @@ class StatusRows(list):
                 else:line+=('' if line==prefix else ' ')+word
             capabilities.append(_line(line,width))
         sections.append(('运行能力',capabilities,2))
-        sections.append(('访问来源',[_line(r[0]+': '+ip,width) for _,r in self.devices for ip in r[6].split(', ')],1))
+        accelerators=[_line(f'#{r[10]} {r[0]}: {r[11]}',width) for _,r in self.devices]
+        if any(r[11] != '-' for _,r in self.devices):
+            sections.append(('加速器可用性',accelerators,2))
+        sources=[]
+        quality=[]
+        for node,r in self.devices:
+            local = r[9] == '本机'
+            direction = '本机调度 → 本机算力' if local else '调度中心 → 远端算力'
+            sources.append(_line(f'#{r[10]} {r[0]}: {direction}',width))
+            if not local:
+                network=node.get('network') or {}
+                rtt=network.get('rtt_ms')
+                loss=network.get('packet_loss_pct')
+                if rtt is None and loss is None:
+                    quality.append(_line(f'#{r[10]} {r[0]}: 连接质量 --',width))
+                else:
+                    latency=f'{rtt:.1f}ms' if isinstance(rtt,(int,float)) else '--'
+                    dropped=f'{loss:.0f}%' if isinstance(loss,(int,float)) else '--'
+                    quality.append(_line(f'#{r[10]} {r[0]}: 延迟 {latency} | 丢包 {dropped}',width))
+        sections.append(('连接方向',sources,1))
+        if quality:
+            sections.append(('连接质量 | 低频采样',quality,2))
         return sections
 
     def _resource_rows(self, sections, width, limit=None, *, bottom=False):
@@ -330,7 +388,7 @@ class StatusRows(list):
                          [4,9,6,None],width,right=(1,2))
         else:
             table=[_line('ID 任务/线程 运行秒 标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {r[6]}',width) for r in records]
-        title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页 | 空输入 Tab/ShiftTab'
+        title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页 | Ctrl+Tab 翻页'
         if not self.records:
             table.append(_line('空闲',width))
         return _panel(title,table,width,framed=True)

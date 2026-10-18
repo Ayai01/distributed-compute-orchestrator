@@ -112,6 +112,14 @@ def prepare(kind, args):
 
 MACHINE_ACTIONS = {"exec", "python", "ls", "read", "put", "get"}
 
+COMMAND_TREE = (
+    ('查看', ('status', 'nodes', 'jobs')),
+    ('资源', ('cpus', 'memory', 'calibrate', 'pause', 'resume', 'policy', 'set')),
+    ('任务', ('run', 'spice', 'rtl', 'batch', 'logs', 'cancel', 'fetch', 'wait')),
+    ('设备与文件', ('add', 'save', 'exec', 'python', 'ls', 'read', 'put', 'get', 'restart')),
+    ('终端', ('help', 'quit')),
+)
+
 
 def machine_parser(action):
     parser = argparse.ArgumentParser(prog=action)
@@ -241,7 +249,7 @@ class Shell(cmd.Cmd):
             choices = ['adaptive', 'balanced', 'round_robin']
         elif command == 'set' and index >= 2:
             choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
-        elif scheduler and index == 1 and command in {'cpus','memory','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
+        elif scheduler and index == 1 and command in {'cpus','memory','calibrate','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
             choices = names + ([j.get('id') for _, j in jobs] if command in {'jobs','logs','cancel','fetch'} else [])
         elif command in {'jobs','logs','cancel','delete','fetch'} and index == (2 if scheduler else 1):
             choices = [j.get('id') for node, j in jobs if not scheduler or node == tokens[1]]
@@ -264,10 +272,11 @@ class Shell(cmd.Cmd):
         all_commands = line.strip() == 'all'
         if line.strip() and not all_commands:
             return super().do_help(line)
-        print('直接在下方输入指令后按 Enter；<参数> 要替换成实际值，方括号表示可省略。')
-        for title, commands in self.command_groups:
-            selected = [command for command in commands.split() if all_commands or command in {
-                'status','jobs','cpus','memory','pause','resume','logs','cancel','fetch','delete','restart','help','quit'}]
+        print('命令树（Tab 补全命令，Ctrl+Tab 翻当前任务）：')
+        allowed = {command for _title, commands in self.command_groups for command in commands.split()}
+        for title, tree_commands in COMMAND_TREE:
+            selected = [command for command in tree_commands if command in allowed and (all_commands or command in {
+                'status','jobs','cpus','memory','calibrate','pause','resume','logs','cancel','fetch','restart','help','quit'})]
             if not selected:
                 continue
             print('\n'+title)
@@ -276,7 +285,7 @@ class Shell(cmd.Cmd):
                 description = (method.__doc__ or '').strip().splitlines()[0] if method else command
                 if not description.startswith(command):
                     description = command+'：'+description
-                print('  '+description)
+                print('  ├─ '+description)
         print('\n常用例子：')
         if hasattr(self, 'pool'):
             print('  status                  查看全部设备资源')
@@ -290,7 +299,7 @@ class Shell(cmd.Cmd):
             print('  cpus 16                 将本设备预算设为16线程')
             print('  logs ab12               查看4位任务ID的日志')
         print('  help cpus               查看单条指令的参数和例子')
-        print('help all 查看其余指令。Tab 补全；空输入 Tab/ShiftTab 翻任务页；PgUp/PgDn 翻输出；↑/↓ 历史。')
+        print('help all 查看其余指令。Tab 补全；Ctrl+Tab/Shift+Tab 翻任务页；PgUp/PgDn 翻输出；↑/↓ 历史。')
 
     def default(self, line):
         import difflib
@@ -359,7 +368,7 @@ class Shell(cmd.Cmd):
 
 class SchedulerShell(Shell):
     prompt = "调度> "
-    command_groups = (('查看','status nodes jobs'),('调资源','cpus memory pause resume'),
+    command_groups = (('查看','status nodes jobs'),('调资源','cpus memory calibrate pause resume'),
                       ('任务','logs cancel fetch wait run spice rtl batch'),
                       ('维护','restart policy set add save exec python ls read put get'),('帮助','help quit'))
 
@@ -375,7 +384,12 @@ class SchedulerShell(Shell):
         self.operation_number = 0
 
     def _node(self, name):
-        node = next((n for n in self.pool.nodes if n.name.casefold() == name.casefold()), None)
+        text = str(name).strip()
+        if text.startswith('#') or text.isdigit():
+            index = int(text.lstrip('#'))
+            node = self.pool.nodes[index-1] if 1 <= index <= len(self.pool.nodes) else None
+        else:
+            node = next((n for n in self.pool.nodes if n.name.casefold() == text.casefold()), None)
         if node is None:
             raise ValueError('未找到设备 '+name+'；可用设备：'+', '.join(n.name for n in self.pool.nodes))
         return node
@@ -647,6 +661,20 @@ class SchedulerShell(Shell):
         else:
             self._node(name).client.control(memory_mb=int(amount))
         self.do_nodes("")
+
+    def do_calibrate(self, line):
+        """calibrate [设备]：在调度中心触发 native-mixed-v4 算力校准，空闲后自动运行。"""
+        names = words(line)
+        if len(names) > 1:
+            raise ValueError('calibrate [设备]')
+        targets = names or [n.name for n in self.pool.nodes]
+        for name in targets:
+            node = self._node(name)
+            result = (self.center.control(node=node.name, worker={'benchmark': True})
+                      if self.center else node.client.control(benchmark=True))
+            state = result.get('benchmark_state', result.get('status', 'started')) if isinstance(result, dict) else result
+            print(f'{node.name} 算力校准: {state}')
+        self.pool.refresh()
 
     def do_cancel(self, line):
         """cancel 任务ID：取消任务及其子进程；可用唯一4位ID，例如 cancel ab12。"""

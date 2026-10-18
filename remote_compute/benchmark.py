@@ -88,7 +88,11 @@ def _sample(np, cpus, began, duration=60):
             futures=[executor.submit(lane) for _ in range(cpus)]
             ready.wait();samples=[future.result() for future in futures]
         finally:ready.abort()
-    seconds=max(finished for _,finished in samples)-bulk_started
+    # The barrier action starts all lanes from one clock edge.  Use the last
+    # lane's completion as the denominator so lane startup and teardown never
+    # inflate the reported total-thread throughput.
+    finished=max(finished for _,finished in samples)
+    seconds=max(1e-9,finished-bulk_started)
     count=sum(count for count,_ in samples)
     return dict(name=NAME,available=True,score=round(count/seconds/1000000,6),unit='Miter/s',
                 threads=cpus,seconds=round(seconds,3),total_seconds=round(time.monotonic()-began,3),
@@ -138,16 +142,17 @@ def cpu_identity(cpus):
                 affinity=sorted(os.sched_getaffinity(0)) if hasattr(os,'sched_getaffinity') else None,threads=cpus)
 
 
-def calibrated(cpus, *, executable=None, environment=(), cache_file=None):
+def calibrated(cpus, *, executable=None, environment=(), cache_file=None, force=False):
     from .bundle import atomic_json
     from .resources import cpu_ticks
     cache=Path(cache_file) if cache_file else Path(os.environ.get('DCO_BENCHMARK_DIR',str(Path(__file__).resolve().parents[1]/'.local/benchmarks')))/(str(cpus)+'.json')
     identity=cpu_identity(cpus)
-    try:
-        saved=json.loads(cache.read_text(encoding='utf-8'))
-        if saved.get('identity')==identity and saved.get('benchmark',{}).get('available'):
-            return saved['benchmark']
-    except (FileNotFoundError,ValueError):pass
+    if not force:
+        try:
+            saved=json.loads(cache.read_text(encoding='utf-8'))
+            if saved.get('identity')==identity and saved.get('benchmark',{}).get('available'):
+                return saved['benchmark']
+        except (FileNotFoundError,ValueError):pass
     before=cpu_ticks();time.sleep(.6);after=cpu_ticks()
     total=after[0]-before[0]
     load=100*(1-(after[1]-before[1])/total) if total else 100

@@ -144,6 +144,8 @@ def run_scheduler(args, local_client=None, restarting=None):
             display(client.restart(args.node if dispatch else None, wait=args.wait))
         elif args.action == 'control':
             changes = {key: getattr(args, key) for key in ('cpus', 'memory_mb', 'paused') if getattr(args, key) is not None}
+            if args.calibrate:
+                changes['benchmark'] = True
             display(dispatch.control(node=args.node, worker=changes) if dispatch else next(n.client for n in pool.nodes if n.name == args.node).control(**changes))
         else:
             client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
@@ -260,6 +262,7 @@ def main(argv=None):
     item.add_argument('--cpus', type=int)
     item.add_argument('--memory-mb', type=int)
     item.add_argument('--paused', choices=(True, False), type=lambda x: x == 'true')
+    item.add_argument('--calibrate', action='store_true', help='触发该设备的 native-mixed-v4 算力校准')
     item = sub.add_parser("restart")
     item.add_argument("--node", help='省略时重载所连接的中心或worker')
     item.add_argument('--wait', action='store_true', help='等待在途任务完成后重载')
@@ -380,7 +383,7 @@ def main(argv=None):
             from .ramdisk import scratch
             root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
             options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root", "accelerators") if key in config}
-            options.setdefault('temp_root', scratch('Remote-Compute') / 'tmp')
+            options.setdefault('temp_root', scratch('DCO') / 'tmp')
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))

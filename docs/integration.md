@@ -6,7 +6,7 @@
 
 ## 工程接口边界
 
-工程客户端只表达通用算力需求：`requires` 能力标签、`tool_sha256` 引擎摘要、`cpus/max_cpus`、`memory_mb`、`resource_share`，以及有界的 `priority`、`queue_ratio` 和 `single_thread_weight`。`resource_share` 为 `(0,16]`，`queue_ratio` 为 `[0,4]`，`single_thread_weight` 为 `(0,8]`，`priority` 为 `-1000..1000`。`node`、IP、节点权重、节点预算和完整 `/health` 只属于 DCO 操作端；操作端令牌保存在中心状态目录，普通工程令牌不能提升权限。
+工程客户端只表达通用算力需求：`requires` 能力标签、`cpus/max_cpus`、`memory_mb`、`resource_share`，以及有界的 `priority`、`queue_ratio` 和 `single_thread_weight`。`resource_share` 为 `(0,16]`，`queue_ratio` 为 `[0,4]`，`single_thread_weight` 为 `(0,8]`，`priority` 为 `-1000..1000`。`node`、IP、节点权重、节点预算和完整 `/health` 只属于 DCO 操作端；操作端令牌保存在中心状态目录，普通工程令牌不能提升权限。
 
 工程查看能力时使用：
 
@@ -16,7 +16,7 @@ center = Client()
 print(center.capabilities())  # tags/tools/CPU/RAM 的汇总视图
 ```
 
-能力摘要只返回汇总标签、可用工具及 SHA 集合、CPU/RAM 总量与单位、以及去掉设备 ID 的加速器档案，不含设备名、URL、路径、活动任务或工程配额。大输入先用 `sync_files(..., content_id=...)` 内容寻址同步，任务只引用资产 ID；不要把模型、源码或完整健康快照随每个任务重复上传。
+能力摘要只返回汇总标签、可用工具名称、CPU/RAM 总量与单位、以及去掉设备 ID 的加速器档案，不含设备名、URL、路径、活动任务或工程配额。大输入先用 `sync_files(..., content_id=...)` 内容寻址同步，任务只引用资产 ID；不要把模型、源码或完整健康快照随每个任务重复上传。
 
 GPU 和其他加速器使用同一套汇总能力协议。`capabilities()['accelerators']` 返回去掉设备 ID 后的能力档案，例如：
 
@@ -43,7 +43,7 @@ task = command(["${tool:python}", "train.py"], cpus=4, memory_mb=8192,
 
 自动线程任务按每台候选节点的实际容量计算所需线程；较大节点忙碌时，可在空闲的小节点取得相应授予，不为等待较大节点留下整台机器空闲。
 
-调用工程通过`capabilities()`或`health(brief=True)`识别汇总协议能力，再用`admission`/`window`按requires声明工具及实验环境。`capable_cpus`是匹配能力的在线预算（0表示暂无供给），`target_cpus`是当前工程份额；查询不登记活跃需求。`tool_sha256`给出匹配工具的SHA集合，不含路径或设备拓扑，供原有数值缓存识别引擎。工程不枚举nodes、不绑定设备名，也不读取分配详情，设备配置与选择由中心管理。
+调用工程通过`capabilities()`或`health(brief=True)`识别汇总协议能力，再用`admission`/`window`按requires声明工具及实验环境。`capable_cpus`是匹配能力的在线预算（0表示暂无供给），`target_cpus`是当前工程份额；查询不登记活跃需求。实际工具身份由任务结果回执提供，缓存按工程自己的物理输入和回执分区。工程不枚举nodes、不绑定设备名，也不读取分配详情，设备配置与选择由中心管理。
 
 中心声明`admission_job`时，`admission(project, job_id=原任务ID)`返回该任务的`recommended_cpus`、`current_cpus`、`current_memory_mb`和`available_memory_mb`，供阶段边界先判断是否值得调整工作池。此查询不改变授权；需要调整时排空当前池，再调用`resize`并按实际回执建池。运行中的worker任务通过同一lease通路查询。
 
@@ -104,7 +104,7 @@ RAM随并发线性增长时，使用 `client.resize(id, 0, base_memory_mb=1024, 
 
 worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 
-任务还可设置 `priority`、`requires` 和 `tool_sha256`。较大的 `priority` 先启动；`requires` 要求汇总能力标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选供给。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
+任务还可设置 `priority` 和 `requires`。较大的 `priority` 先启动；`requires` 要求汇总能力标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选供给。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
 
 中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度，内存同时扣除本方任务的预留或实际 RSS。任务取消只向 worker 发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
 
@@ -301,7 +301,7 @@ python main.py --test-native
 ## 接入与传输约定
 
 - `requires`声明实际工具及`shared:<别名>`数据位置能力，步骤以`${shared:别名}`引用；同名工程目录不代表数据已同步。冻结数据与模型作为内容资产，结果取回后由工程发布到持久目录。
-- 固定引擎数据集可在`command`、`admission`、`window`传`tool_sha256={"ngspice":["允许的SHA256"]}`，中心按实际工具筛选。新请求无需绑定设备或OS；实际引擎回执决定缓存分区，允许集合不等于数值等价证明。
+- 固定引擎数据集使用 `requires` 声明能力名称；中心不按工具 SHA 拒绝设备。实际引擎回执决定缓存分区，新请求无需绑定设备或OS。
 - 科研工程不另建节点池、反向代理或隧道。来源设备保留在结果回执，用于追溯；调度不依赖特定主机名称。
 - 只提交已就绪、能消费结果的工作；源码/模型每内容版本同步一次，重复候选复用工程现有科学缓存。连续小内核合并阶段授权，阶段结束及时归还；等待/借还耗时与CPU计算分开统计。
 - `read_job_file_changed(id,path,version=None)`返回`version/data/changed`；后续传回版本，未更新返回304且data为None，中心与worker两跳都不重传文件。需要恢复状态时按原子发布批次更新，不反复下载未改变的检查点。

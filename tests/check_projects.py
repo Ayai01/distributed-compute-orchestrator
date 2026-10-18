@@ -347,7 +347,7 @@ def main(args):
     before=protected_reports()
     client=Client(args.url)
     summary={}
-    with tempfile.TemporaryDirectory(prefix='projects-',dir=scratch('Remote-Compute-verify')) as temporary:
+    with tempfile.TemporaryDirectory(prefix='projects-',dir=scratch('DCO-verify')) as temporary:
         base=Path(temporary)
         processes=[]
         try:

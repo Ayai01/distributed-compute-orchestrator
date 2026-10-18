@@ -86,7 +86,7 @@ def file_hash(path):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "tool_sha256", "accelerator"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
@@ -143,7 +143,6 @@ def validate_task(task, capacity, *, allow_auto=False):
             or any(not isinstance(x, str) or not x or len(x) > MAX_REQUIREMENT_LENGTH
                    for x in task["requires"])):
         raise ValueError(f"requires must contain at most {MAX_REQUIREMENTS} short capability tags")
-    validate_tool_constraints(task.get('tool_sha256',{}))
     if task["node"] is not None and not isinstance(task["node"], str):
         raise ValueError("node must be a configured node name")
     if "cwd" in task and (not isinstance(task["cwd"], str) or not task["cwd"] or "\0" in task["cwd"]):
@@ -153,16 +152,6 @@ def validate_task(task, capacity, *, allow_auto=False):
             raise ValueError("stdin must name an input file")
         inside(Path.cwd(), task["stdin"])
     return task
-
-
-def validate_tool_constraints(value):
-    if (not isinstance(value,dict) or len(value) > MAX_REQUIREMENTS or any(not isinstance(name,str) or not _NAME.fullmatch(name)
-            or not isinstance(hashes,list) or not hashes or any(not isinstance(h,str) or not _ASSET.fullmatch(h) for h in hashes)
-            for name,hashes in value.items())):
-        raise ValueError(f'tool_sha256 maps at most {MAX_REQUIREMENTS} tool names to nonempty SHA256 lists')
-    if any(len(hashes) > MAX_REQUIREMENTS for hashes in value.values()):
-        raise ValueError(f'tool_sha256 accepts at most {MAX_REQUIREMENTS} hashes per tool')
-    return value
 
 
 class Worker:
@@ -217,7 +206,11 @@ class Worker:
                                if self.tool_info.get(name,{}).get('available')),sys.executable)
         benchmark_env=tuple((name,self.env[name]) for name in ('PATH','LD_LIBRARY_PATH','OPENBLAS_CORETYPE','MKL_ENABLE_INSTRUCTIONS')
                             if name in self.env)
+        self.benchmark_python = benchmark_python
+        self.benchmark_env = benchmark_env
         self.benchmark = dict(cpu_benchmark(self.capacity,benchmark_python,benchmark_env))
+        self.benchmark_state = 'ready'
+        self.benchmark_thread = None
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
@@ -246,7 +239,7 @@ class Worker:
             resources = self._memory_state()
             disk = shutil.disk_usage(self.root)
             value = {**identity, "platform": sys.platform,
-                    "role": "worker", "benchmark": self.benchmark, **resources,
+                    "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "accelerators": self.accelerators,
@@ -329,9 +322,45 @@ class Worker:
                 info[name].update(available=ready,engine=engine,engine_sha256=file_hash(engine) if ready else None)
         return resolved,info
 
+    def _calibrate(self):
+        """Re-measure the fixed native mix without occupying a task slot."""
+        try:
+            cpu_benchmark.cache_clear()
+            result = dict(cpu_benchmark(self.capacity, self.benchmark_python, self.benchmark_env, force=True))
+            with self.condition:
+                self.benchmark = result
+                self.benchmark_state = 'ready' if result.get('available') else 'unavailable'
+                self.benchmark_thread = None
+                self.condition.notify_all()
+        except BaseException as error:
+            with self.condition:
+                self.benchmark_state = 'error: ' + str(error)
+                self.benchmark_thread = None
+                self.condition.notify_all()
+
+    def calibrate(self):
+        with self.condition:
+            if self.benchmark_thread and self.benchmark_thread.is_alive():
+                return {'status': 'running', 'benchmark': self.benchmark, 'benchmark_state': self.benchmark_state}
+            active = any(job['result']['status'] not in TERMINAL for job in self.jobs.values())
+            self.benchmark_state = 'queued' if active else 'running'
+            def run():
+                with self.condition:
+                    while active and not self.stopping and any(job['result']['status'] not in TERMINAL for job in self.jobs.values()):
+                        self.condition.wait(0.5)
+                    if self.stopping:
+                        self.benchmark_thread = None
+                        return
+                self._calibrate()
+            self.benchmark_thread = threading.Thread(target=run, name='native-calibration', daemon=True)
+            self.benchmark_thread.start()
+            return {'status': self.benchmark_state, 'benchmark': self.benchmark, 'benchmark_state': self.benchmark_state}
+
     def control(self, value):
-        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "tools"}:
-            raise ValueError("Control accepts cpus, memory_mb, paused and tools")
+        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "tools", "benchmark"}:
+            raise ValueError("Control accepts cpus, memory_mb, paused, tools and benchmark")
+        if value.get('benchmark'):
+            return self.calibrate()
         if "cpus" in value and (type(value["cpus"]) is not int or not 1 <= value["cpus"] <= self.cpu_limit):
             raise ValueError(f"cpus must be in 1..{self.cpu_limit}")
         if "paused" in value and not isinstance(value["paused"], bool):
@@ -477,9 +506,6 @@ class Worker:
                 return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), self.capacity)
-                for name,allowed in task.get('tool_sha256',{}).items():
-                    if self.tool_info.get(name,{}).get('sha256') not in allowed:
-                        raise ValueError('Tool SHA256 constraint no longer matches: '+name)
                 if task["memory_mb"] > self.memory_capacity:
                     raise ValueError("Task memory_mb exceeds worker memory budget")
                 if task.get('accelerator') is not None and not self._match_accelerator(task['accelerator']):
@@ -810,6 +836,9 @@ class Worker:
         self.scheduler.join()
         for thread in list(self.threads):
             thread.join()
+        # Calibration runs in a daemon thread and observes ``stopping`` while
+        # queued.  A running native helper has its own bounded timeout; do not
+        # hold service shutdown open just to wait for that optional probe.
         for job in self.jobs.values():
             self._clean_temp(job)
             self._clean_work(job)

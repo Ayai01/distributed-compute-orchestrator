@@ -11,7 +11,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import PoolBusy, RemoteError
-from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, validate_tool_constraints
+from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
@@ -113,7 +113,6 @@ class Coordinator:
         maximum_cpus = request.get('max_cpus')
         requires = request.get('requires', [])
         accelerator = normalize_accelerator_requirement(request.get('accelerator'))
-        constraints=validate_tool_constraints(request.get('tool_sha256',{}))
         if not operator and request.get('node') is not None:
             raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
         node_name=request.get('node') if operator else None
@@ -133,12 +132,8 @@ class Coordinator:
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled
                   and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))
                    and n.supports_accelerator(accelerator)
-                  and all(n.health.get('tools',{}).get(tool,{}).get('sha256') in allowed for tool,allowed in constraints.items())]
+                  ]
         capable=sum(n.capacity for n in eligible)
-        tool_sha256={name:sorted({info['sha256'] for n in eligible
-                                 for info in [n.health.get('tools',{}).get(name,{})]
-                                 if info.get('available') and info.get('sha256')})
-                     for name in requires if any(name in n.health.get('tools',{}) for n in eligible)}
         names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
         shares[project], demands[project] = share, capable
         rooms={name:row['node_demands'] for name,row in resources.items()}
@@ -171,7 +166,6 @@ class Coordinator:
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
-                    tool_sha256=tool_sha256,
                     accelerator=accelerator,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
@@ -189,7 +183,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -203,7 +197,7 @@ class Coordinator:
         with self.condition, self.pool.condition:
             online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled]
             tags = set()
-            tools = {}
+            tools = set()
             accelerator_profiles = []
             for node in online:
                 tags.update(node.health.get('tags', ()))
@@ -211,9 +205,7 @@ class Coordinator:
                 for name, info in node.health.get('tools', {}).items():
                     if not info.get('available'):
                         continue
-                    hashes = tools.setdefault(name, set())
-                    if info.get('sha256'):
-                        hashes.add(info['sha256'])
+                    tools.add(name)
             cpu_capacity = sum(n.capacity for n in online)
             cpu_available = sum(max(0, n.capacity - n.reserved - n.external) for n in online)
             memory_capacity = sum(n.memory_capacity for n in online)
@@ -224,7 +216,7 @@ class Coordinator:
                 'version': __version__,
                 'capabilities': public_capabilities(),
                 'tags': sorted(tags),
-                'tools': {name: sorted(values) for name, values in sorted(tools.items())},
+                'tools': sorted(tools),
                 'accelerators': aggregate_accelerators(accelerator_profiles),
                 'cpu': {'capacity': cpu_capacity, 'available': cpu_available, 'unit': 'logical_threads'},
                 'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
@@ -333,7 +325,7 @@ class Coordinator:
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': sum(j['result']['status'] in TERMINAL for j in self.jobs.values()),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),

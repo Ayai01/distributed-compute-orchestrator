@@ -78,23 +78,21 @@ class ContractTests(unittest.TestCase):
                 request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
                 self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 0)
 
-    def test_engine_constraint_and_shared_alias_route_without_device_names(self):
+    def test_tool_hash_is_provenance_only_and_shared_alias_route_without_device_names(self):
         with scratch() as directory:
             root=Path(directory);data=root/'data';data.mkdir()
             with provider(root/'a',tools={'science':__import__('sys').executable}) as (a,ac), provider(root/'b',shared={'data':data},tools={'science':__import__('sys').executable}) as (b,bc):
                 a.tool_info['science']['sha256']='a'*64;b.tool_info['science']['sha256']='b'*64
                 with Pool([ac,bc]) as pool,center(pool,root/'center') as (_,client):
-                    options=dict(requires=['science','shared:data'],tool_sha256={'science':['b'*64]})
+                    options=dict(requires=['science','shared:data'])
                     grant=client.admission('science',**options)
                     self.assertEqual(grant['capable_cpus'],1)
-                    self.assertEqual(grant['tool_sha256'],{'science':['b'*64]})
                     result=client.run(python('print(7)',project='science',**options))
                     self.assertEqual(result['status'],'succeeded',result)
                     self.assertEqual(result['assigned_node'],'node2')
-                    self.assertEqual(client.admission('science',tool_sha256={'science':['c'*64]})['capable_cpus'],0)
-                    from remote_compute.client import RemoteError
-                    with self.assertRaisesRegex(RemoteError,'SHA256 constraint'):
-                        ac.submit(python('print(1)',tool_sha256={'science':['b'*64]}))
+                    self.assertEqual(client.admission('science')['capable_cpus'],2)
+                    accepted=ac.submit(python('print(1'))
+                    self.assertEqual(accepted['status'],'queued')
 
     def test_brief_identity_does_not_compute_full_resources(self):
         with scratch() as directory,provider(directory) as (worker,client):

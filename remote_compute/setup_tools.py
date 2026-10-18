@@ -133,7 +133,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
     root = Path(root).resolve()
     tools = root/'.tools'
     tools.mkdir(exist_ok=True)
-    temporary_root = Path(temporary_root) if temporary_root else scratch('Remote-Compute')
+    temporary_root = Path(temporary_root) if temporary_root else scratch('DCO')
     temporary_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='install-science-', dir=temporary_root) as directory:
         temporary = Path(directory)

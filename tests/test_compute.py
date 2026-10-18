@@ -23,7 +23,7 @@ from remote_compute.worker import Conflict, Server, Worker
 
 
 def scratch():
-    base = Path("Z:/Remote-Compute-verify") if os.name == "nt" and Path("Z:/").exists() else None
+    base = Path("Z:/DCO-verify") if os.name == "nt" and Path("Z:/").exists() else None
     if base:
         base.mkdir(exist_ok=True)
     return tempfile.TemporaryDirectory(prefix="test-", dir=base)
