@@ -28,7 +28,6 @@ from .process import Process, low_integrity_directory
 from .resources import Host, process_usage, cpu_benchmark, service_usage
 from .telemetry import Activity
 from .client import RemoteError
-from .compat import sha256
 from .cleanup import AssetCache, remove_owned
 from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
@@ -72,15 +71,6 @@ def cpu_budget(value=0):
     if int(value) < 0 or int(value) > limit:
         raise ValueError(f'CPU budget must be in 1..{limit}, or 0/auto')
     return int(value) or limit
-
-
-def file_hash(path):
-    try:
-        with open(path, "rb") as stream:
-            return sha256(stream)
-    except OSError:
-        # Windows execution aliases can launch a tool without exposing readable file bytes.
-        return None
 
 
 def validate_task(task, capacity, *, allow_auto=False):
@@ -313,14 +303,12 @@ class Worker:
             # Resolving a venv's Python symlink would select the base interpreter.
             if executable:argv[0]=str(Path(executable).absolute())
             resolved[name]=argv
-            info[name]=dict(argv=argv,available=executable is not None,sha256=file_hash(executable) if executable else None)
-            supporting={str(Path(x).resolve()):file_hash(x) for x in argv[1:] if Path(x).is_file()}
-            if supporting:info[name]['supporting_sha256']=supporting
+            info[name]=dict(argv=argv,available=executable is not None)
             if name=='verilator' and argv[1:]==[str(Path(__file__).with_name('rtl.py'))]:
                 msys=self.env.get('MSYS2_ROOT',os.environ.get('MSYS2_ROOT'))
                 engine=(str(Path(msys)/'ucrt64/bin/verilator_bin.exe') if os.name=='nt' and msys else shutil.which('verilator',path=search_path))
                 ready=bool(engine and Path(engine).is_file())
-                info[name].update(available=ready,engine=engine,engine_sha256=file_hash(engine) if ready else None)
+                info[name].update(available=ready,engine=engine)
         return resolved,info
 
     def _calibrate(self):

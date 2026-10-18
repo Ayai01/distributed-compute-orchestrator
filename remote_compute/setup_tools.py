@@ -1,6 +1,5 @@
 """Reuse the machine Python for science; keep native tools inside the project."""
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -111,8 +110,7 @@ def _ngspice(destination, temporary, source=None):
         text = re.sub(r'(?m)^set num_threads\s*=.*$', 'set num_threads=1', text)
         spinit.write_text(re.sub(r'(?m)^(\s*(?:codemodel|osdi)\s+)([^\r\n]+)', relocate, text), encoding='utf8')
     version = _run([executable, '--version'], capture_output=True, text=True).stdout
-    return executable, {'version':next((line.strip(' *') for line in version.splitlines() if 'ngspice-' in line), version.strip()),
-                        'sha256':hashlib.sha256(executable.read_bytes()).hexdigest()}
+    return executable, {'version':next((line.strip(' *') for line in version.splitlines() if 'ngspice-' in line), version.strip())}
 
 
 def _merge_tree(source, destination):

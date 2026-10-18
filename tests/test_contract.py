@@ -78,11 +78,10 @@ class ContractTests(unittest.TestCase):
                 request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
                 self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 0)
 
-    def test_tool_hash_is_provenance_only_and_shared_alias_route_without_device_names(self):
+    def test_tool_info_is_availability_only_and_shared_alias_route_without_device_names(self):
         with scratch() as directory:
             root=Path(directory);data=root/'data';data.mkdir()
             with provider(root/'a',tools={'science':__import__('sys').executable}) as (a,ac), provider(root/'b',shared={'data':data},tools={'science':__import__('sys').executable}) as (b,bc):
-                a.tool_info['science']['sha256']='a'*64;b.tool_info['science']['sha256']='b'*64
                 with Pool([ac,bc]) as pool,center(pool,root/'center') as (_,client):
                     options=dict(requires=['science','shared:data'])
                     grant=client.admission('science',**options)

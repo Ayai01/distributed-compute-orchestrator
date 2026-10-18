@@ -43,7 +43,7 @@ class StandaloneTests(unittest.TestCase):
                     self.assertEqual(health['shared'], [])
                     self.assertIn('old-project', health['unavailable_shared'])
                     self.assertFalse(health['tools']['old_python']['available'])
-                    self.assertIsNone(health['tools']['python']['sha256'])
+                    self.assertEqual(set(health['tools']['python']), {'argv', 'available'})
                     result = client.run(python("print('independent worker')"))
                     self.assertEqual(result['status'], 'succeeded')
                     self.assertIn('independent worker', result['stdout'])

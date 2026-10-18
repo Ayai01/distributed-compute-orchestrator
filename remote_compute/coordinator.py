@@ -251,16 +251,7 @@ class Coordinator:
                 for name, info in mapping['tools'].items():
                     if not isinstance(info, dict):
                         continue
-                    item = {key: info[key] for key in ('available', 'sha256', 'engine_sha256') if key in info}
-                    supporting = info.get('supporting_sha256')
-                    if isinstance(supporting, dict):
-                        # Keep the hash multiset for engine identity while
-                        # replacing worker-local path keys with stable labels.
-                        item['supporting_sha256'] = {
-                            f'asset_{index}': digest
-                            for index, digest in enumerate(sorted(supporting.values()))
-                        }
-                    cleaned['tools'][name] = item
+                    cleaned['tools'][name] = {'available': bool(info.get('available'))}
             return cleaned
 
         value = clean_mapping(result)
