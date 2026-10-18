@@ -95,7 +95,9 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --cpus 30
 
 `--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听 `0.0.0.0:26133`，CLI 使用本机127.0.0.1地址。`--host 127.0.0.1` 可限定中心为本机入口；远端任务仍通过中心到worker的已有连接申请/归还线程。本机 worker 始终为进程内私有调用。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
 
-`temp_root`可将任务TMP与持久root分开：例如Linux使用现有`/run/user/1000/dco`，资产与回执继续保存在普通磁盘。DCO按worker目录身份和任务ID隔离TMP，成功、失败、取消和下次启动均回收已结束任务的临时物；调用工程只使用任务的TMPDIR，不另建无主内存目录。Linux进程统计与取消按子进程关系追踪，包括另建会话的原生仿真器。
+任务状态默认在工程`.local/state`：中心为`scheduler`，hybrid本机worker为`local`，独立worker以端口命名。`root`与`--root`可指定其他普通磁盘目录，`--root`下的中心使用`scheduler`子目录。资产、回执、输入与声明输出持久保留到领取；不要把root设置到重启即消失的RAM盘。
+
+`temp_root`单独控制任务TMP，默认使用共享RAM盘`Remote-Compute/tmp`；例如Linux可指定现有`/run/user/1000/dco`。DCO按worker目录身份和任务ID隔离TMP，成功、失败、取消和下次启动均回收已结束任务的临时物；调用工程只使用任务的TMPDIR，不另建无主内存目录。已有RAM root部署在任务排空后迁移完整状态目录、更新本机配置再重载，保留所有未领取回执和输出。Linux进程统计与取消按子进程关系追踪，包括另建会话的原生仿真器。
 
 Linux监控在所有任务间共享250毫秒的进程表快照，取消操作始终重新读取。每个节点的8个HTTP连接按请求进入顺序分配；连接槽等待超时属于本地背压，首次派发保留原任务ID和资源授权继续等待，用户可取消，不标成计算中断。
 
@@ -242,7 +244,7 @@ if result["status"] == "succeeded":
 
 `update` 仅允许 main 快进更新；本地源码改动先提交再更新。更新后检查两端 `git rev-parse HEAD` 一致，`nodes` 中设备重新在线。先重载独立 worker，再 `Client().restart(wait=True)` 重载本机中心；两边均保持原终端，无需手动关闭再启动。
 
-`Client.fetch`自动使用独立长超时连接（至少120秒），状态与提交继续原短超时，无需逐个工程设置。中心每节点同时取回一份结果，同ID重复领取复用中心原ZIP缓存；缓存随作业领取清理。现代HTTP连接空闲10秒释放，每连接池共享最多8条连接，避免SSH转发被线程各自保留的连接耗尽；二进制GET支持校验身份的断线续传。详情见[差网络处理](integration.md)。
+`Client.fetch`自动使用独立长超时连接（至少120秒），状态与提交继续原短超时，无需逐个工程设置。中心每节点同时取回一份结果，同ID重复领取复用中心原ZIP缓存；缓存随作业领取清理。现代HTTP连接空闲10秒释放，每连接池共享最多8条连接，避免闲置连接耗尽；二进制GET支持校验身份的断线续传。详情见[差网络处理](integration.md)。
 
 ## 每台设备唯一8 GiB共享内存盘
 

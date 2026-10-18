@@ -1,15 +1,109 @@
 """A crashed center reattaches the original worker process and grants."""
 import json
+import shutil
+import time
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
-from remote_compute import Client
+from remote_compute import Client, Pool, RemoteError
+from test_center import center
 from test_compute import provider,python,scratch,until
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_lost_worker_retries_original_request_on_healthy_worker(self):
+        for failure in ('refused','missing','interrupted'):
+            with self.subTest(failure=failure),scratch() as temporary:
+                root=Path(temporary)
+                with provider(root/'lost') as (_,lost),provider(root/'healthy') as (_,healthy):
+                    with Pool([lost,healthy],policy='round_robin') as pool,center(pool,root/'center') as (_,client):
+                        broken=pool.nodes[0]
+                        def unavailable(*args,**kwargs):
+                            broken.enabled=False
+                            if failure=='interrupted':
+                                return dict(status='interrupted',error='Worker stopped before completion',finished=time.time())
+                            error=RemoteError('worker unavailable')
+                            if failure=='refused':error.transport_code=10061
+                            else:error.status_code=404
+                            raise error
+                        with patch.object(lost,'submit_bundle',return_value={}),patch.object(lost,'status',side_effect=unavailable):
+                            task=python("from pathlib import Path;Path('answer').write_text('42')",outputs=['answer'])
+                            accepted=client.submit(task)
+                            result=client.wait(accepted['id'],wait_timeout=10)
+                            self.assertEqual(result['status'],'succeeded',result)
+                            self.assertEqual(result['max_retries'],2)
+                            self.assertEqual(result['id'],accepted['id'])
+                            self.assertEqual(result['request_sha256'],accepted['request_sha256'])
+                            self.assertEqual(result['assigned_node'],'node2')
+                            self.assertEqual(len(result['attempts']),1)
+                            self.assertNotEqual(result['worker_id'],accepted['id'])
+                            # A delayed worker sample must not show a retried job
+                            # again as unrelated work or hide a real direct job.
+                            snapshot=pool.snapshot()
+                            second=snapshot['nodes'][1]
+                            second.update(external_cpus=1,active_jobs=[
+                                dict(id=result['worker_id'],cpus=1),dict(id='direct',cpus=1)])
+                            with patch.object(pool,'snapshot',return_value=snapshot):
+                                self.assertEqual([j['id'] for j in client.health()['nodes'][1]['active_jobs']],['direct'])
+                            self.assertEqual(client.fetch(accepted['id'])['files']['answer'],b'42')
+                            until(lambda:sum(n.reserved for n in pool.nodes)==0)
+
+    def test_retry_limit_and_machine_operation_opt_out(self):
+        with scratch() as temporary,provider(Path(temporary)/'worker') as (_,node):
+            root=Path(temporary)
+            with Pool([node],refresh=.05) as pool,center(pool,root/'center') as (_,client):
+                def stopped(*args,**kwargs):
+                    return dict(status='interrupted',error='Worker stopped before completion',finished=time.time())
+                with patch.object(node,'submit_bundle',return_value={}),patch.object(node,'status',side_effect=stopped):
+                    identity=client.submit(python('pass',retries=1))['id']
+                    result=client.wait(identity,wait_timeout=5)
+                    self.assertEqual(result['status'],'interrupted')
+                    self.assertEqual(len(result['attempts']),1)
+                    client.delete(identity)
+                    accepted=client.machine('node1').python('pass',wait=False)
+                    result=client.wait(accepted['id'],wait_timeout=5)
+                    self.assertEqual(result['max_retries'],0)
+                    self.assertEqual(result['attempts'],[])
+                    client.delete(accepted['id'])
+
+    def test_center_recovers_queued_and_completed_uncollected_jobs(self):
+        with scratch() as temporary,provider(Path(temporary)/'worker') as (_,node):
+            root=Path(temporary)
+            with Pool([node]) as pool,center(pool,root/'center') as (_,client):
+                finished=client.submit(python("print('original result')"))['id']
+                client.wait(finished)
+                client.control(paused=True)
+                queued=client.submit(python("print('queued result')"))['id']
+            # Persist exactly the two crash states, without touching worker data.
+            for identity,status in ((finished,'running'),(queued,'queued')):
+                path=root/'center/jobs'/identity/'result.json'
+                result=json.loads(path.read_text())
+                result.update(status=status,finished=None)
+                result.pop('max_retries',None)  # Upgrade an existing 0.8.2 receipt.
+                path.write_text(json.dumps(result))
+            with Pool([node]) as pool,center(pool,root/'center') as (_,client):
+                for identity,output in ((finished,'original result'),(queued,'queued result')):
+                    self.assertEqual(client.wait(identity,wait_timeout=10)['status'],'succeeded')
+                    result=client.fetch(identity)
+                    self.assertEqual(result['stdout'].strip(),output)
+                    self.assertEqual(result['max_retries'],2)
+                    self.assertFalse(result['attempts'])
+
+    def test_persistent_worker_results_survive_loss_of_temporary_volume(self):
+        with scratch() as temporary:
+            root=Path(temporary);state=root/'persistent';ram=root/'ram'
+            with provider(state,temp_root=ram) as (_,client):
+                identity=client.submit(python("from pathlib import Path;Path('checkpoint').write_text('saved')",outputs=['checkpoint']))['id']
+                self.assertEqual(client.wait(identity)['status'],'succeeded')
+            shutil.rmtree(ram)
+            with provider(state,temp_root=ram) as (_,client):
+                result=client.fetch(identity)
+                self.assertEqual(result['status'],'succeeded')
+                self.assertEqual(result['files']['checkpoint'],b'saved')
+
     def test_center_crash_keeps_original_id_process_and_resource_resize(self):
         with scratch() as temporary,provider(Path(temporary)/'worker',cpus=2) as (worker,node):
             root=Path(temporary);stop=root/'stop'

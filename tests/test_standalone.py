@@ -79,7 +79,7 @@ class StandaloneTests(unittest.TestCase):
             client = Client(f'http://127.0.0.1:{port}', timeout=1)
             with (root/'worker.log').open('wb') as log:
                 process = Process([sys.executable, '-B', str(copied/'main.py'), '--mode', 'worker', '--headless',
-                                   '--port', str(port), '--root', str(root/'state')], copied,
+                                   '--port', str(port)], copied,
                                   dict(os.environ, PYTHONPATH='', PYTHONUTF8='1'), log, log)
                 try:
                     def ready():
@@ -88,6 +88,7 @@ class StandaloneTests(unittest.TestCase):
                         except RemoteError:
                             return False
                     until(ready, seconds=10)
+                    self.assertEqual(Path(client.health()['root']),copied/'.local/state'/str(port))
                     initial_pid = client.health()['pid']
                     with Pool([client]) as pool, center(pool, root/'center') as (_, hub):
                         machine = hub.machine('node1', cwd=str(copied))
@@ -110,7 +111,10 @@ class StandaloneTests(unittest.TestCase):
                                 return health['pid'] != initial_pid and health.get('revision') == 'updated'
                             except RemoteError:
                                 return False
-                        until(reloaded, seconds=10)
+                        try:
+                            until(reloaded, seconds=10)
+                        except AssertionError:
+                            self.fail((root/'worker.log').read_text(encoding='utf-8',errors='replace'))
                         self.assertIn('old-project', client.health()['unavailable_shared'])
                         self.assertIn('still reachable', machine.python("print('still reachable')")['stdout'])
                 finally:

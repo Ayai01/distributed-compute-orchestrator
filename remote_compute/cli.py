@@ -66,8 +66,7 @@ def run_scheduler(args, local_client=None, restarting=None):
             if dispatch.health().get("role") != "scheduler":
                 dispatch = None  # existing direct-worker CLI calls retain their route
         else:
-            from .ramdisk import scratch
-            root = Path(args.root) / "scheduler" if args.root else scratch('Remote-Compute') / 'scheduler'
+            root = Path(args.root) / "scheduler" if args.root else ROOT / '.local/state/scheduler'
             coordinator = Coordinator(pool, root, token=args.local_token)
             port = args.center_port if args.center_port is not None else (args.port if args.port is not None else 26133)
             if args.mode == "scheduler" and args.port is not None and args.center_port is None:
@@ -223,7 +222,7 @@ def main(argv=None):
     parser.add_argument("--center-port", type=int, help="调度中心HTTP端口，默认26133")
     parser.add_argument("--cpus", type=lambda v: 0 if v == "auto" else int(v), help="本机算力预算")
     parser.add_argument("--memory-mb", type=int, dest="worker_memory_mb", help="本机提供者的任务内存总预算，MiB")
-    parser.add_argument("--root", help="节点任务/资产目录；默认使用现有内存盘或系统临时目录")
+    parser.add_argument("--root", help="持久任务/资产目录；默认工程内 .local/state，临时物单独使用RAM盘")
     parser.add_argument("--headless", action="store_true", help="启动后台服务，不打开交互终端；console=true可启用设备终端")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument('--on-port-conflict', choices=('ask', 'reuse', 'kill', 'admin-kill', 'cancel'),
@@ -352,8 +351,9 @@ def main(argv=None):
         if args.mode != "scheduler" and not existing_worker:
             port = args.port if args.port is not None else config.get("port", 26133)
             from .ramdisk import scratch
-            root = args.root or config.get("root") or scratch('Remote-Compute') / ('local' if args.mode == 'hybrid' else str(port))
+            root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
             options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root") if key in config}
+            options.setdefault('temp_root', scratch('Remote-Compute') / 'tmp')
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))

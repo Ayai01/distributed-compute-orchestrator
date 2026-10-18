@@ -37,11 +37,24 @@ class Coordinator:
         self.callback_address = None
         for path in (self.root / "jobs").glob("*/result.json"):
             value = json.loads(path.read_text(encoding="utf-8"))
-            if value["status"] not in TERMINAL:
-                value.update(status="interrupted", error="Coordinator restarted; original worker reference retained")
+            job = {"result": value, "directory": path.parent,
+                   "cancel": threading.Event(), "node": None}
+            self.jobs[value["id"]] = job
+            if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
+                with zipfile.ZipFile(path.parent/'request.zip') as archive:
+                    task=json.loads(archive.read('task.json'))
+                task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+                value.setdefault('max_retries',task.get('retries',2))
+                if value['status']=='queued' or not value.get('worker_url'):
+                    job.update(task=task,auto_cpus=task['cpus']==0)
+                    if value.get('worker_id'):job['worker_id']=value['worker_id']
+                    value.update(status='queued')
+                    self.queue.append(value['id'])
+                else:
+                    value.update(status='dispatching')
+                    job['recover']=True
+                value.pop('error',None)
                 atomic_json(path, value)
-            self.jobs[value["id"]] = {"result": value, "directory": path.parent,
-                                      "cancel": threading.Event(), "node": None}
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
 
@@ -140,7 +153,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -159,8 +172,10 @@ class Coordinator:
                     info["variants"].append({"node": node.name, **value})
         with self.condition:
             active = {}
+            known_ids = set(self.jobs)
             for job in self.jobs.values():
                 result = job['result']
+                known_ids.add(job.get('worker_id', result.get('worker_id', result['id'])))
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
                     item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb','started')}
                     item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
@@ -171,16 +186,18 @@ class Coordinator:
                 sampled={item['id']:item for item in node.get('active_jobs',[])}
                 owned=active.get(node['name'],[])
                 for item in owned:
-                    item['rss_mb']=sampled.get(item['id'],{}).get('rss_mb')
+                    job=self.jobs[item['id']]
+                    worker_id=job.get('worker_id',job['result'].get('worker_id',item['id']))
+                    item['rss_mb']=sampled.get(worker_id,{}).get('rss_mb')
                 for item in node.get('active_jobs',[]):
-                    if item['id'] not in self.jobs and 0 < item.get('cpus',0) <= remaining:
+                    if item['id'] not in known_ids and 0 < item.get('cpus',0) <= remaining:
                         external.append(item)
                         remaining -= item['cpus']
                 node['active_jobs'] = owned + external
             return {"protocol": PROTOCOL, "role": "scheduler", "node": socket.gethostname(), "tools": tools,
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','tool_sha256','job_file_version','retry_jobs']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -276,6 +293,7 @@ class Coordinator:
             job = {"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
                    "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
                               "single_thread_weight": task.get('single_thread_weight',1.0),
+                              "max_retries": task.get('retries',2), "attempts": [],
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
                               "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}}
@@ -320,7 +338,6 @@ class Coordinator:
                         budget['used'] += job['task']['cpus']
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              dispatched=time.time(), cpus=job['task']['cpus'])
-                        job['worker_pid']=node.health.get('pid')
                         self._save(job)
                         thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
                         self.threads.add(thread)
@@ -332,32 +349,32 @@ class Coordinator:
         with self.condition,self.pool.condition:
             pending=self.__dict__.get('_pending_recovery')
             if pending is None:
-                pending=self._pending_recovery={identity for identity,job in self.jobs.items()
-                    if job['result']['status']=='interrupted' and job['result'].get('finished') is None
-                    and job['result'].get('worker_url')}
+                pending=self._pending_recovery={identity for identity,job in self.jobs.items() if job.get('recover')}
             for identity in list(pending):
                 job=self.jobs.get(identity)
-                if job is None or job['result']['status']!='interrupted':
+                if job is None or job['result']['status'] in TERMINAL:
                     pending.discard(identity);continue
                 node=next((n for n in self.pool.nodes if n.client.url==job['result']['worker_url']),None)
                 worker_id=job['result'].get('worker_id',identity)
                 if node is None or node.error or worker_id in node.live_jobs:continue
                 remote=next((r for r in node.health.get('active_jobs') or [] if r['id']==worker_id),None)
-                if remote is None:continue
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
-                    task=validate_task(json.loads(archive.read('task.json')),
-                                       max(n.capacity for n in self.pool.nodes),allow_auto=True)
+                    task=json.loads(archive.read('task.json'))
+                task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
                 automatic=task['cpus']==0
-                task.update(cpus=remote['cpus'],memory_mb=remote['memory_mb'])
+                grant=remote or job['result']
+                task.update(cpus=grant['cpus'],memory_mb=grant['memory_mb'])
                 job.update(task=task,auto_cpus=automatic,node=node,reattach=True,worker_id=worker_id)
                 node.reserved+=task['cpus'];node.reserved_memory_mb+=task['memory_mb']
-                if worker_id not in node.known_jobs:
+                if remote and worker_id not in node.known_jobs:
                     node.external=max(0,node.external-(task['cpus'] if remote['status']=='running' else 0))
                     node.external_memory_mb=max(0,node.external_memory_mb-max(task['memory_mb'],remote.get('rss_mb',0)))
                 node.known_jobs.add(worker_id);node.live_jobs.add(worker_id)
                 job['result'].pop('error',None)
                 job['result'].setdefault('dispatched',job['result']['submitted'])
-                self._update(job,remote);self._save(job)
+                if remote:self._update(job,remote)
+                self._save(job)
+                job.pop('recover',None)
                 pending.discard(identity)
                 thread=threading.Thread(target=self._execute,args=(job,),name='central-reconnect',daemon=True)
                 self.threads.add(thread);thread.start()
@@ -407,7 +424,7 @@ class Coordinator:
                         remote = node.client.status(identity)
                 except RemoteError as error:
                     if (getattr(error,'transport_code',None) in (111,10061)
-                            or getattr(error,'status_code',None)==404 and node.health.get('pid')!=job.get('worker_pid')):
+                            or getattr(error,'status_code',None)==404):
                         retry=True
                         result=dict(status='interrupted',error='Worker unavailable: '+str(error),finished=time.time())
                         with self.pool.condition:node.error=str(error)
@@ -420,7 +437,9 @@ class Coordinator:
                     continue
                 with self.condition:
                     job['result'].pop('connection_error',None)
-                    self._update(job, remote)
+                    # Retry is one atomic state transition. A client must not
+                    # collect/delete a transient interrupted outcome mid-retry.
+                    if remote['status']!='interrupted':self._update(job, remote)
                 if remote["status"] in TERMINAL:
                     result = remote
                     retry=remote['status']=='interrupted'
@@ -435,8 +454,9 @@ class Coordinator:
                 retry=True;result=dict(status='interrupted',error=str(error),finished=time.time())
                 with self.pool.condition:node.error=str(error)
             with self.condition:
-                job["result"].update(status="interrupted", error=str(error), finished=time.time())
-                self._save(job)
+                if not retry:
+                    job["result"].update(status="interrupted", error=str(error), finished=time.time())
+                    self._save(job)
         finally:
             self.pool._release(node, task, result,job_id=identity)
             with self.condition:
@@ -471,12 +491,15 @@ class Coordinator:
                              status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished')))
         identity=job['result']['id']
         with zipfile.ZipFile(job['directory']/'request.zip') as archive:
-            task=validate_task(json.loads(archive.read('task.json')),max(n.capacity for n in self.pool.nodes),allow_auto=True)
+            task=json.loads(archive.read('task.json'))
+        task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
         job.update(task=task,auto_cpus=task['cpus']==0,node=None,worker_id=worker_id)
         job.pop('desired_cpus',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
-        job['result'].pop('error',None);job['result'].pop('connection_error',None)
+        for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_rss_mb','cpu_seconds'):
+            job['result'].pop(key,None)
+        job['result'].update(started=None,stdout='',stderr='',steps=[])
         self.queue.append(identity);self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])
         self._save(job)
         self.activity.notify('Worker stopped; retry original task ['+identity[:4]+']')
