@@ -67,7 +67,7 @@ def lock_root(root, role):
 
 def cpu_budget(value=0):
     count = os.cpu_count() or 1
-    limit = max(1, count - 1)
+    limit = max(1, count)
     if int(value) < 0 or int(value) > limit:
         raise ValueError(f'CPU budget must be in 1..{limit}, or 0/auto')
     return int(value) or limit
@@ -153,7 +153,7 @@ class Worker:
             self.temp_root/=hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
             self.temp_root.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.callback = {}
-        physical_limit = max(1, (os.cpu_count() or 1) - 1)
+        physical_limit = max(1, os.cpu_count() or 1)
         if cpu_limit is not None and (type(cpu_limit) is not int or not 1 <= cpu_limit <= physical_limit):
             raise ValueError(f'cpu_limit must be in 1..{physical_limit}')
         self.cpu_limit = physical_limit if cpu_limit is None else cpu_limit

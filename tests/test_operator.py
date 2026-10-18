@@ -64,8 +64,8 @@ print(Path('control.json').read_text(),flush=True)
                 self.assertIn('"stop":true', result['stdout'])
                 client.fetch(identity)
 
-    def test_cpu_default_and_ceiling_keep_one_thread_for_host(self):
-        for count, expected in ((28, 27), (32, 31), (1, 1)):
+    def test_cpu_default_and_ceiling_match_logical_threads(self):
+        for count, expected in ((28, 28), (32, 32), (1, 1)):
             with patch('remote_compute.worker.os.cpu_count', return_value=count):
                 self.assertEqual(cpu_budget(), expected)
                 self.assertEqual(cpu_budget(expected), expected)
