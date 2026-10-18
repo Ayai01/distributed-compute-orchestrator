@@ -3,6 +3,10 @@ setlocal
 cd /d "%~dp0"
 set "PYTHONUTF8=1"
 set "PYTHONDONTWRITEBYTECODE=1"
+rem DCO owns its visible cmd color mode; do not inherit Codex/CI NO_COLOR.
+set "NO_COLOR="
+set "DCO_NO_COLOR="
+set "TERM=windows"
 if exist "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" (
   "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" -B main.py %*
 ) else (
