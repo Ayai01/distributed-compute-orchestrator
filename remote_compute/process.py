@@ -14,17 +14,21 @@ _proc_sample = (0.0, {})
 
 
 def _proc_rows(fresh=False):
-    """Share monitoring scans; termination always takes a fresh snapshot."""
+    """Share scans, including overlapping termination requests."""
     global _proc_sample
+    requested = time.monotonic()
     with _proc_lock:
-        if not fresh and time.monotonic()-_proc_sample[0]<.25:
+        if _proc_sample[0] > requested or (not fresh and time.monotonic()-_proc_sample[0]<.25):
             return _proc_sample[1]
+        # A cleanup may reuse a scan that began after it requested freshness.
+        # Otherwise many simultaneous exits serialize two full /proc scans each.
+        started = time.monotonic()
         rows={}
         for entry in Path('/proc').iterdir():
             if not entry.name.isdigit():continue
             try:rows[int(entry.name)]=(entry/'stat').read_text().rsplit(')',1)[1].split()
             except (OSError,ValueError):continue
-        _proc_sample=(time.monotonic(),rows)
+        _proc_sample=(started,rows)
         return rows
 
 

@@ -17,7 +17,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
-from remote_compute import ramdisk, repository
+from remote_compute import process as process_module, ramdisk, repository
 from remote_compute.cli import ROOT, main
 from remote_compute.process import Process, keep_awake
 from test_center import center
@@ -25,6 +25,35 @@ from test_compute import provider, python, until, scratch
 
 
 class ServicePowerTests(unittest.TestCase):
+    def test_overlapping_cleanup_requests_share_only_new_process_snapshots(self):
+        ready=threading.Event()
+        class QueuedLock:
+            def __init__(self):
+                self.lock=threading.Lock();self.count_lock=threading.Lock();self.count=0
+            def __enter__(self):
+                with self.count_lock:
+                    self.count+=1
+                    if self.count==8:ready.set()
+                self.lock.acquire()
+            def __exit__(self,*args):self.lock.release()
+        class Entry:
+            name='123'
+            def __truediv__(self,_):return SimpleNamespace(read_text=lambda:'123 (stub) S 1 2')
+        scans=[]
+        def entries():
+            scans.append(1)
+            if len(scans)==1:self.assertTrue(ready.wait(3))
+            return [Entry()]
+        with patch.object(process_module,'_proc_lock',QueuedLock()), \
+                patch.object(process_module,'_proc_sample',(0.0,{})), \
+                patch.object(process_module,'Path',return_value=SimpleNamespace(iterdir=entries)):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results=list(pool.map(lambda _:process_module._proc_rows(fresh=True),range(8)))
+            self.assertEqual(len(scans),2)
+            self.assertTrue(all(result=={123:['S','1','2']} for result in results))
+            process_module._proc_rows(fresh=True)
+            self.assertEqual(len(scans),3)  # A later cleanup still gets a new scan.
+
     def test_reloaded_child_hands_old_supervisor_to_preferred_runtime_by_normal_exit(self):
         with patch('remote_compute.setup_tools.preferred_python',return_value=Path('C:/preferred314/python.exe')), \
                 patch('remote_compute.cli.subprocess.Popen') as launch, \
