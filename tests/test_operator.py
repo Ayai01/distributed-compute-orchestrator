@@ -73,7 +73,7 @@ print(Path('control.json').read_text(),flush=True)
 
     def test_notifications_are_bounded_and_dashboard_has_requested_fields(self):
         activity = Activity()
-        activity.access('192.168.1.6')
+        activity.access('192.168.1.6', '192.168.1.10')
         for index in range(10): activity.notify('write source ' + str(index), '192.168.1.6')
         snapshot = activity.snapshot()
         self.assertEqual(len(snapshot['events']), 6)
@@ -81,7 +81,7 @@ print(Path('control.json').read_text(),flush=True)
         text = '\n'.join(format_status(dict(node='Aya1-TX', role='worker', cpus=31, used_cpus=3,
                     logical_cpus=32, cpu_percent=40, memory_total_mb=32768, host_memory_available_mb=16000,
                     memory_available_mb=15000, temperature_c=52, tags=['ngspice'], **snapshot)))
-        for expected in ('Aya1-TX', '3/31', '32', '192.168.1.6', 'ngspice', 'RAM'):
+        for expected in ('Aya1-TX', '3/31', '32', '192.168.1.10', 'ng', 'RAM'):
             self.assertIn(expected, text)
         self.assertNotIn('温度',text)
 

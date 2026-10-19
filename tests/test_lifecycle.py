@@ -91,6 +91,7 @@ class ServicePowerTests(unittest.TestCase):
 
                     with patch('remote_compute.cli.require_visible'), \
                             patch('remote_compute.cli.keep_awake', awake), \
+                            patch('remote_compute.cli.supervise', side_effect=running), \
                             patch('remote_compute.cli.run_scheduler', side_effect=running), \
                             patch('remote_compute.cli.WorkerShell.loop', side_effect=running):
                         args = ['--mode', mode, '--config', str(config), '--root', str(root/'worker'),

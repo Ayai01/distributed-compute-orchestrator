@@ -17,32 +17,47 @@ class Cancelled(RuntimeError):
 
 
 @contextmanager
-def single_instance(name):
-    """Hold one operator-console instance for a local DCO endpoint."""
+def single_instance(name, *, wait=0.0):
+    """Hold one operator-console instance for a local DCO endpoint.
+
+    A code reload briefly hands the terminal to a replacement supervisor. That
+    process waits for the old supervisor to release the same endpoint lock.
+    """
     token = hashlib.sha256(str(name).encode('utf-8')).hexdigest()[:24]
     handle = None
     lock_fd = None
+    deadline = time.monotonic() + max(0.0, wait)
     if os.name == 'nt':
         import ctypes
         kernel = ctypes.WinDLL('kernel32', use_last_error=True)
         kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
         kernel.CreateMutexW.restype = ctypes.c_void_p
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        handle = kernel.CreateMutexW(None, False, 'Local\\DCO-' + token)
-        if not handle:
-            raise OSError('无法创建 DCO 单实例锁')
-        if ctypes.get_last_error() == 183:
+        while True:
+            handle = kernel.CreateMutexW(None, False, 'Local\\DCO-' + token)
+            if not handle:
+                raise OSError('无法创建 DCO 单实例锁')
+            if ctypes.get_last_error() != 183:
+                break
             kernel.CloseHandle(handle)
-            raise Cancelled('DCO 已在运行；请使用现有窗口（端口固定为 26133）。')
+            handle = None
+            if time.monotonic() >= deadline:
+                raise Cancelled('DCO 已在运行；请使用现有窗口（端口固定为 26133）。')
+            time.sleep(.05)
     else:
         import fcntl
         lock_path = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / ('dco-' + token + '.lock')
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(lock_fd)
-            raise Cancelled('DCO 已在运行；请使用现有窗口（端口固定为 26133）。') from None
+        while True:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                os.close(lock_fd)
+                lock_fd = None
+                if time.monotonic() >= deadline:
+                    raise Cancelled('DCO 已在运行；请使用现有窗口（端口固定为 26133）。') from None
+                time.sleep(.05)
     try:
         yield
     finally:
