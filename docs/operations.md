@@ -148,6 +148,9 @@ policy adaptive
 spice examples/spice/divider.spice --output results/divider
 rtl examples/rtl --top tb --sources tb.sv --output results/rtl
 batch examples/batch.json results/batch
+sync_cache all
+sync_cache aop
+sync_cache ARH-DSE --kind research
 jobs
 logs Aya1-TX 任务ID
 cancel Aya1-TX 任务ID
@@ -162,6 +165,16 @@ quit
 ```
 
 `192.168.1.10` 替换为目标设备 IP。`save` 保存节点、权重、限额和策略到 `nodes.local.json`，下次自动加载。
+
+`sync_cache all` 手动同步 AOP、RGCN、ARH-DSE、Bench 的科研缓存及源码/模型内容资产；也可用 `sync_cache aop`、`sync_cache rgcn`、`sync_cache arh`、`sync_cache bench` 选择一个工程。`--kind research` 只同步科研缓存，`--kind assets` 只同步内容资产，默认 `all` 同时处理两者。科研记录沿各工程的身份校验和合并规则处理，只向已配置该工程共享目录的实际消费者传播；内容资产按哈希复用，预热到具备对应工具的节点。未配置或只有一个科研消费者时跳过科研传输；空缓存交换摘要后无需传数据。
+
+在现有调度控制台直接输入即可，Tab 补全工程与选项；操作在后台进行，`wait` 等待本终端操作完成。也可执行 `python main.py sync_cache all`，默认连接本机已有中心；远端中心用 `python main.py --url 中心地址 sync_cache all`。该命令只在手动输入后启动，日常任务保留执行所需的按需资产传送和结果取回。退出控制台时收尾本次同步持有的任务。
+
+同步任务以低优先级、单线程进入原调度队列；先比摘要，再分批补缺。暂时断连继续查询原任务 ID，离线节点不阻止其他设备完成。持续断连和记录冲突显示部分完成；未领取回执列在 `pending_jobs`，可沿原 ID 领取。再次运行同一命令按现有摘要续补，不重复发送已一致的记录或已有内容资产。
+
+科研同步中，AOP 传播原始角点记录，聚合缓存由各设备按当前配置重算；RGCN 传播观测记录及其视图、历史和角色来源，任务认领、批次执行状态和数据库 WAL 保留在原设备。
+
+内容资产预热复用各工程正常提交时的分包：AOP 当前 `AO_cfg_*` 配置引用的模型闭包和源码、RGCN 原生/研究源码及配置 PDK、Bench 源码与模型静态包、ARH 源码。预热使用与正常消费者相同的工具要求：AOP 模型区分 HSPICE/ngspice，RGCN PDK 同时覆盖原生仿真与研究运行；同一哈希只传缺失的一份。ARH 工具与模型保留现有共享部署；RGCN 每次研究请求选定的训练模型、检查点和数据视图，以及 Bench 每次运行额外提供的参考文件，仍在请求时按哈希补齐，手动命令不遍历历史模型和实验目录。
 
 `set 节点 limit=N memory_limit_mb=M` 控制**本调度器**向该节点分配的 CPU 和内存，0 跟随节点预算；`cpus 节点 N` 和 `memory 节点 MiB` 调整**提供者总预算**。`enabled=false` 暂停本调度器向该节点分配；`pause` 暂停提供者启动新任务。在途任务继续运行。
 

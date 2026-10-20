@@ -111,12 +111,24 @@ def prepare(kind, args):
     return task, {"inputs": inputs, "output_dir": output, "keep": args.keep}
 
 
+def cache_parser():
+    parser = argparse.ArgumentParser(prog="sync_cache")
+    aliases = {'aop_v2': 'aop', 'rgcn-v2': 'rgcn', 'arh-dse': 'arh',
+               'arh-dse-v2': 'arh', 'analog-opt-bench-v2': 'bench'}
+    parser.add_argument("project", choices=('all', 'aop', 'rgcn', 'arh', 'bench'),
+                        type=lambda value: aliases.get(value.casefold(), value.casefold()),
+                        help="同步全部工程或指定工程")
+    parser.add_argument("--kind", choices=('all', 'research', 'assets'), default='all',
+                        help="all同时同步科研缓存和内容资产；research仅科研缓存，assets仅源码/模型")
+    return parser
+
+
 MACHINE_ACTIONS = {"exec", "python", "ls", "read", "put", "get"}
 
 COMMAND_TREE = (
     ('查看', ('status', 'nodes', 'jobs')),
     ('资源', ('cpus', 'memory', 'calibrate', 'pause', 'resume', 'policy', 'set')),
-    ('任务', ('run', 'spice', 'rtl', 'batch', 'logs', 'cancel', 'fetch', 'wait')),
+    ('任务', ('run', 'spice', 'rtl', 'batch', 'sync_cache', 'logs', 'cancel', 'fetch', 'wait')),
     ('设备与文件', ('add', 'save', 'exec', 'python', 'ls', 'read', 'put', 'get', 'restart')),
     ('终端', ('help', 'quit')),
 )
@@ -248,6 +260,10 @@ class Shell(cmd.Cmd):
             choices = names
         elif command == 'policy' and index == 1:
             choices = ['adaptive', 'balanced', 'round_robin']
+        elif command == 'sync_cache' and previous == '--kind':
+            choices = ['all', 'research', 'assets']
+        elif command == 'sync_cache' and index == 1:
+            choices = ['all', 'aop', 'rgcn', 'arh', 'bench']
         elif command == 'set' and index >= 2:
             choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
         elif scheduler and index == 1 and command in {'cpus','memory','calibrate','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
@@ -258,7 +274,8 @@ class Shell(cmd.Cmd):
                 choices.append('all')
         if prefix.startswith('-') or not prefix:
             parser = (submission_parser(command) if command in {'run','spice','rtl'} else
-                      machine_parser(command) if command in MACHINE_ACTIONS else None)
+                      machine_parser(command) if command in MACHINE_ACTIONS else
+                      cache_parser() if command == 'sync_cache' else None)
             if parser:
                 action = parser._option_string_actions.get(previous)
                 if action is None or action.nargs == 0:
@@ -277,7 +294,7 @@ class Shell(cmd.Cmd):
         allowed = {command for _title, commands in self.command_groups for command in commands.split()}
         for title, tree_commands in COMMAND_TREE:
             selected = [command for command in tree_commands if command in allowed and (all_commands or command in {
-                'status','jobs','cpus','memory','calibrate','pause','resume','logs','cancel','fetch','restart','help','quit'})]
+                'status','jobs','cpus','memory','calibrate','pause','resume','logs','cancel','fetch','sync_cache','restart','help','quit'})]
             if not selected:
                 continue
             print('\n'+title)
@@ -295,6 +312,7 @@ class Shell(cmd.Cmd):
             print('  memory 8G               将本机任务 RAM 预算设为8 GiB')
             print('  logs ab12               查看4位任务ID的日志')
             print('  fetch ab12 "D:/结果"     保存结果并清理该任务')
+            print('  sync_cache all          手动同步所有工程的科研缓存和源码/模型')
             print('  restart --wait          空闲后重新加载本机中心')
         else:
             print('  cpus 16                 将本设备预算设为16线程')
@@ -370,7 +388,7 @@ class Shell(cmd.Cmd):
 class SchedulerShell(Shell):
     prompt = "调度> "
     command_groups = (('查看','status nodes jobs'),('调资源','cpus memory calibrate pause resume'),
-                      ('任务','logs cancel fetch wait run spice rtl batch'),
+                      ('任务','logs cancel fetch wait run spice rtl batch sync_cache'),
                       ('维护','restart policy set add save exec python ls read put get'),('帮助','help quit'))
 
     def __init__(self, pool, center=None):
@@ -552,6 +570,26 @@ class SchedulerShell(Shell):
         """batch 清单.json 结果目录：按优先级和可用算力并行分配。"""
         source, output = words(line)
         self._start(batch, self.dispatch, source, output, on_submit=self._accepted, stop_event=self.closing)
+
+    def do_sync_cache(self, line):
+        """sync_cache all|aop|rgcn|arh|bench [--kind all|research|assets]：手动同步工程缓存。"""
+        args = cache_parser().parse_args(words(line))
+        if self.center is None:
+            raise ValueError("sync_cache 需要连接调度中心；使用 main.py --url 中心地址 sync_cache all")
+        self._start(self._sync_cache, args.project, args.kind)
+
+    def _sync_cache(self, project, kind):
+        from .cache_sync import sync_cache
+        owned = set()
+        def accepted(client, identity):
+            owned.add(identity)
+            self._accepted(client, identity)
+        try:
+            return sync_cache(self.center, project, kind=kind,
+                              on_submit=accepted, stop_event=self.closing)
+        finally:
+            for identity in owned:
+                self.handles.pop(identity, None)
 
     def do_policy(self, line):
         """policy adaptive|balanced|round_robin：切换自适应、均衡或轮询。"""

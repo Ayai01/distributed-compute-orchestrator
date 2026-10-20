@@ -25,7 +25,7 @@ DEFAULT_PORT = 26133
 # Preserve the existing Python imports while command ownership lives in commands.
 from .commands import (Shell, SchedulerShell, WorkerShell, MACHINE_ACTIONS, read_json,
                        words, display, table, submission_parser, prepare, machine_parser,
-                       machine_action, batch)
+                       machine_action, batch, cache_parser)
 
 
 def load_nodes(path=None, url=None, local_client=None, operator_token=None):
@@ -129,6 +129,21 @@ def run_scheduler(args, local_client=None, restarting=None):
             results = batch(dispatch or pool, args.source, args.output)
             display([{k: x.get(k) for k in ("id", "status", "assigned_node", "elapsed", "output_dir")} for x in results])
             return 0 if all(x["status"] == "succeeded" for x in results) else 1
+        if args.action == "sync_cache":
+            if dispatch is None:
+                raise ValueError("sync_cache 需要连接调度中心")
+            from .cache_sync import sync_cache
+            closing = threading.Event()
+            def accepted(client, identity):
+                print(f"已接单 {client.url}  {identity}", flush=True)
+            try:
+                result = sync_cache(dispatch, args.project, kind=args.kind,
+                                    on_submit=accepted, stop_event=closing)
+            except KeyboardInterrupt:
+                closing.set()
+                raise
+            display(result)
+            return 0 if result["status"] == "succeeded" else 1
         if args.action == "nodes":
             display(dispatch.nodes() if dispatch else pool.snapshot())
         elif args.action == "jobs":
@@ -276,6 +291,7 @@ def main(argv=None):
     item = sub.add_parser("batch")
     item.add_argument("source")
     item.add_argument("output")
+    sub.add_parser("sync_cache", parents=[cache_parser()], add_help=False)
     item = sub.add_parser("sync")
     item.add_argument("source")
     for action in ("cancel", "logs", "fetch", "delete"):
@@ -298,6 +314,10 @@ def main(argv=None):
         if args.config and not path.exists():
             raise ValueError("Missing worker config: " + str(path))
         config = read_json(path) if path.exists() else {}
+        if args.action == "sync_cache" and not args.url:
+            port = args.center_port if args.center_port is not None else (
+                args.port if args.port is not None else DEFAULT_PORT)
+            args.url = f"http://{args.host or '127.0.0.1'}:{port}"
         args.mode = args.mode or ('scheduler' if args.url else config.get('mode', 'hybrid'))
         if args.mode not in {'scheduler', 'hybrid', 'worker'}:
             raise ValueError('mode must be scheduler, hybrid or worker')
