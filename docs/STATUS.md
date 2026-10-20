@@ -16,6 +16,8 @@ Linux 实测补齐首个进程扫描尚未覆盖新进程时的处理：零 RSS 
 
 ku26s 已增加独立 Python 3.12.15、OpenCV 4.13.0、ONNX Runtime 1.22.1 推理环境；ARH 原生 CPU Add 图与自动发现检查通过，`onnx_cpu` 已在线注册并保存。解除提供方历史 Windows 执行限制后，新 Rocket 和 BOOM 均实际派发至 ku26s；构建和数值回执由 ARH 所属会话继续维护。生产远程执行器的 Linux 冷编译/热缓存、1000 次原生运算、空格路径及临时目录回收检查通过，证据保存在本机 `results/repair-20261020/`。
 
+Windows 固定 INT8 依赖也已补齐：Aya1-PC 使用独立 Python 3.12.14 环境，Aya1-TX 修复旧 venv 指向退役 Remote-Compute 基址的问题并复用 Python 3.12.10 及全部原包。两台均通过 OpenCV、ORT 1.22.1 CPU Add 图和自动发现检查，`onnx_cpu` 在线绑定精确解释器并持久化。ARH/AOP/RGCN 的进程内 WMI 回退统一使用查询抛 OSError，兼容 3.12 与 3.14；系统 3.14 和在途训练环境保持原样。
+
 ## 当前代码与部署记录
 
 源码版本 `0.8.7`，本轮入口核对的源码基线为 `887daf4`。实际运行版本由操作员 health 的 version/pid 查看；本轮文档整理保持现有服务与在途任务。
