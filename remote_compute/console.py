@@ -57,6 +57,8 @@ def _paint_row(row):
                for match in title_pattern.finditer(row, 0, paint_end)]
     if task:
         matches.append((*task.span('id'), '\x1b[36m'))
+    for match in re.finditer(r'\[([0-9a-f]{4})\]', row[:paint_end], re.I):
+        matches.append((*match.span(1), '\x1b[36m'))
     for pattern in (hash_pattern, number_pattern, state_pattern, device_pattern):
         for match in pattern.finditer(row, 0, paint_end):
             token = match.group()

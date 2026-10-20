@@ -348,6 +348,18 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(all('Aya1-TX 192.168.1.6' in row for row in rows[:2]))
         self.assertTrue(all('[aafe]' in row for row in rows[:2]))
 
+    def test_notification_numeric_short_hash_keeps_identifier_color(self):
+        import remote_compute.console as console
+        from remote_compute.view import format_notices
+        with patch.object(console,'_COLOR_ENABLED',True):
+            for prefix in ('1234','0010','9876','1a34'):
+                message='submit ['+prefix+'a'*28+'] CPU 12 RAM 4096'
+                row=format_notices(dict(node='Aya1-PC',events=[dict(time=10,ip='local',message=message)]))[0]
+                painted=_paint_row(row)
+                self.assertIn('[\x1b[36m'+prefix+'\x1b[0m]',painted)
+                self.assertIn('RAM \x1b[33m4096\x1b[0m',painted)
+                self.assertEqual(re.sub(r'\x1b\[[0-9;]*m','',painted),row)
+
     def test_jobs_prefix_selects_one_record_and_lists_colliding_ids(self):
         from remote_compute.commands import SchedulerShell
         identities=['1234'+'a'*28,'1234'+'b'*28]
