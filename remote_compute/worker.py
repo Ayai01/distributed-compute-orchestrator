@@ -670,8 +670,10 @@ class Worker:
                         while process.child.poll() is None:
                             usage = process_usage(process)
                             with self.condition:
-                                job["rss_mb"] = usage["rss_mb"]
-                                job['rss_sampled'] = True
+                                # A cached process scan may predate this child.
+                                if usage['rss_mb'] > 0:
+                                    job['rss_mb'] = usage['rss_mb']
+                                    job['rss_sampled'] = True
                                 result["peak_rss_mb"] = max(result["peak_rss_mb"], usage["rss_mb"])
                                 result["cpu_seconds"] = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
                             if job["cancel"].is_set() or time.monotonic() >= deadline:

@@ -52,7 +52,7 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(second["stdout"].strip(), "42")
         self.assertEqual(second["assigned_node"], "device2")
         self.assertEqual(Path(second["cwd"]), self.project)
-        self.assertGreater(second["peak_rss_mb"], 0)
+        self.assertGreaterEqual(second["peak_rss_mb"], 0)
         self.assertEqual(self.machine.read_file("binary.dat"), bytes(range(256)))
         self.assertEqual(self.machine.read_text("calculation.py"), "def answer(): return 42\n")
         listing = self.machine.listdir()

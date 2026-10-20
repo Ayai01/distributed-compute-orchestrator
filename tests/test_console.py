@@ -35,6 +35,9 @@ class Keyboard:
             raise KeyboardInterrupt
         return key
 
+    def close(self):
+        pass
+
 
 class OperatorShell(Shell):
     prompt = 'test> '
@@ -58,6 +61,10 @@ class OperatorShell(Shell):
 
 
 class ConsoleTests(unittest.TestCase):
+    def setUp(self):
+        keyboard=patch('remote_compute.console._PosixKeyboard',side_effect=lambda:sys.modules['msvcrt'])
+        keyboard.start();self.addCleanup(keyboard.stop)
+
     def test_dashboard_colors_are_width_neutral_and_respect_no_color(self):
         import remote_compute.console as console
         with patch.object(console, '_COLOR_ENABLED', True):
@@ -298,7 +305,7 @@ class ConsoleTests(unittest.TestCase):
             info.window.left,info.window.top,info.window.right,info.window.bottom=0,8,119,31
             return True
         kernel.GetConsoleScreenBufferInfo.side_effect=fill
-        with patch.dict(os.environ,LINES='9000',COLUMNS='180'), patch.object(ctypes,'WinDLL',return_value=kernel):
+        with patch.dict(os.environ,LINES='9000',COLUMNS='180'), patch.object(ctypes,'WinDLL',create=True,return_value=kernel):
             probe=_console_size_probe()
             self.assertEqual(probe(),os.terminal_size((120,24)))
             kernel.GetConsoleScreenBufferInfo.assert_called_with(kernel.GetStdHandle.return_value,unittest.mock.ANY)
@@ -522,7 +529,7 @@ class ConsoleTests(unittest.TestCase):
             return True
         kernel.GetConsoleScreenBufferInfo.side_effect=information
         kernel.GetLargestConsoleWindowSize.side_effect=lambda _handle: kernel.GetLargestConsoleWindowSize.restype(150,44)
-        with patch.object(ctypes,'WinDLL',side_effect=lambda name:kernel if name=='kernel32' else user):
+        with patch.object(ctypes,'WinDLL',create=True,side_effect=lambda name:kernel if name=='kernel32' else user):
             self.assertTrue(_initial_size())
         size=kernel.SetConsoleScreenBufferSize.call_args.args[1]
         window=kernel.SetConsoleWindowInfo.call_args.args[2]._obj
@@ -530,7 +537,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual((window.right,window.bottom),(149,43))
         user.IsWindowVisible.return_value=False
         kernel.SetConsoleScreenBufferSize.reset_mock()
-        with patch.object(ctypes,'WinDLL',side_effect=lambda name:kernel if name=='kernel32' else user):
+        with patch.object(ctypes,'WinDLL',create=True,side_effect=lambda name:kernel if name=='kernel32' else user):
             self.assertFalse(_initial_size())
         kernel.SetConsoleScreenBufferSize.assert_not_called()
 
@@ -704,7 +711,7 @@ class ConsoleTests(unittest.TestCase):
         kernel.GetStdHandle.return_value = handle
         kernel.GetConsoleMode.side_effect = mode
         kernel.SetConsoleMode.return_value = True
-        with patch.object(ctypes, 'WinDLL', create=True, return_value=kernel):
+        with patch('remote_compute.console.os.name','nt'),patch.object(ctypes, 'WinDLL', create=True, return_value=kernel):
             restore = _enable_ansi()
             self.assertEqual(kernel.GetConsoleMode.argtypes[0], wintypes.HANDLE)
             self.assertEqual(kernel.SetConsoleMode.argtypes[0], wintypes.HANDLE)
