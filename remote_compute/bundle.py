@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import tempfile
 import zipfile
 
 from .compat import is_relative_to
@@ -96,8 +97,21 @@ def task_bundle(task, inputs=None, files=None):
     return pack(contents)
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, private=False):
+    """Publish JSON atomically; private configs use an owner-only temporary file."""
     path = Path(path)
+    data = json_bytes(value)
+    if private:
+        descriptor, name = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
+        pending = Path(name)
+        try:
+            with os.fdopen(descriptor, 'wb') as output:
+                output.write(data)
+            pending.replace(path)
+        finally:
+            if pending.exists():
+                pending.unlink()
+        return
     pending = path.with_suffix(".tmp")
-    pending.write_bytes(json_bytes(value))
+    pending.write_bytes(data)
     pending.replace(path)

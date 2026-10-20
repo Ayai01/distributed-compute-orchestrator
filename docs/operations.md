@@ -248,6 +248,8 @@ machine.download("./results", "./results/Aya1-TX")
 
 `worker.local.json`、`nodes.local.json`、`worker.standalone.json`、`.tools/`、`.projects/`、`.runtime/` 和 `results/` 都不上传仓库。`.tools/` 放实际Python科学环境、ngspice、RTL编译链和内存盘驱动；任务源码与小模型按内容资产同步。只有确需常驻的大工程才放 `.projects/` 并写本机shared配置。
 
+`setup`、CPU/RAM 设置和节点列表保存均使用私密配置原子写入。在 Linux/macOS 上，临时文件自创建起即为 `0600`，替换后的配置继续仅供所有者读写；Windows 沿用配置目录的访问控制。任务结果、报告和普通 JSON 的权限规则保持原样。
+
 ### 从当前中心更新 Aya1-TX
 
 ```python

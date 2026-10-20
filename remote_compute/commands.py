@@ -16,6 +16,7 @@ import time
 import uuid
 
 from .client import Client, Pool, RemoteError
+from .bundle import atomic_json
 from .tasks import ngspice, verilator
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -613,7 +614,7 @@ class SchedulerShell(Shell):
             if token:
                 node["token"] = token
             value["nodes"].append(node)
-        path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_json(path, value, private=True)
         print("已保存:", path)
 
     def do_pause(self, line):

@@ -326,7 +326,7 @@ def main(argv=None):
                 result['env'].update(copy_rtl(args.rtl_source)['env'])
             saved = {**config, 'tools': {**config.get('tools', {}), **result['tools']},
                      'env': {**config.get('env', {}), **result['env']}}
-            atomic_json(path, saved)
+            atomic_json(path, saved, private=True)
             display(result)
             return 0
         if args.test or args.test_native:
@@ -408,7 +408,7 @@ def main(argv=None):
             def save_settings(changes):
                 if changes:
                     saved = read_json(path) if path.exists() else {}
-                    atomic_json(path, {**saved, **changes})
+                    atomic_json(path, {**saved, **changes}, private=True)
             if args.config or port != 0:
                 worker.save_settings = save_settings
                 initial = {}
