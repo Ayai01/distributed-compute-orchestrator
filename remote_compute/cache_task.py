@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -46,6 +47,9 @@ def execute(request, output):
     if action == 'export':
         return adapter.export(root, request['keys'])
     if action == 'merge':
+        if project == 'arh':
+            return adapter.merge(root, request['records'],
+                                 producer_root=os.environ.get('DCO_CACHE_PRODUCER'))
         return adapter.merge(root, request['records'])
     raise ValueError('Unknown cache operation: ' + action)
 

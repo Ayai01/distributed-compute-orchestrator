@@ -60,6 +60,8 @@ class _RPC:
                 files={'remote_op/request.json': data},
                 outputs=['remote_op/result/*'], wait=False, job_id=identity,
                 on_submit=self.on_submit, assets=assets, requires=requires,
+                env={'DCO_CACHE_PRODUCER': '${asset:cache_producer}'}
+                    if 'cache_producer' in assets else {},
                 cpus=1, memory_mb=512, priority=-100, timeout=900,
                 retries=0, project='DCO-cache', label='sync_cache/' + project + '/' + action)
         except RemoteError as error:
@@ -146,7 +148,7 @@ def _chunks(keys, manifest):
         yield batch
 
 
-def _research(rpc, project, nodes):
+def _research(rpc, project, nodes, producer_asset=None):
     result = dict(consumers=[node['name'] for node in nodes], added=0, updated=0,
                   unchanged=0, conflicts=0, rejected=0, exported_records=0,
                   errors=[])
@@ -160,14 +162,23 @@ def _research(rpc, project, nodes):
             available.append(node)
         except (RemoteError, OSError, ValueError, KeyError) as error:
             result['errors'].append(dict(node=node['name'], action='manifest', error=str(error)))
+    blocked_targets = set()
     for source in available:
         inventory = inventories[source['name']]
-        targets = [node for node in available if node is not source]
+        targets = [node for node in available if node is not source and node['name'] not in blocked_targets]
         keys = [key for key, value in inventory.items() if any(
             inventories[target['name']].get(key, {}).get('digest') != value['digest']
             for target in targets)]
         for keys in _chunks(keys, inventory):
             rpc.check()
+            targets = [node for node in targets if node['name'] not in blocked_targets]
+            if not targets:
+                break
+            keys = [key for key in keys if any(
+                inventories[target['name']].get(key, {}).get('digest') != inventory[key]['digest']
+                for target in targets)]
+            if not keys:
+                continue
             try:
                 records = rpc.call(source, project, 'export', keys=keys)
                 # Export may observe new writes after inventory. Its validated
@@ -188,20 +199,22 @@ def _research(rpc, project, nodes):
                 if not wanted:
                     continue
                 try:
-                    merged = rpc.call(target, project, 'merge', records=wanted)
+                    options = {'_assets': {'cache_producer': producer_asset}} if producer_asset else {}
+                    merged = rpc.call(target, project, 'merge', records=wanted, **options)
                     for field in ('added', 'updated', 'unchanged', 'conflicts', 'rejected'):
                         result[field] += merged.get(field, 0)
                     for key, digest in merged.get('digests', {}).items():
                         inventories[target['name']][key] = dict(digest=digest,
                             bytes=inventory.get(key, {}).get('bytes', 0))
                 except (RemoteError, OSError, ValueError, KeyError) as error:
+                    blocked_targets.add(target['name'])
                     result['errors'].append(dict(node=target['name'], action='merge', error=str(error)))
     result['status'] = 'partial' if result['errors'] or result['conflicts'] or result['rejected'] else 'succeeded'
     return result
 
 
 def _assets(rpc, project, sources, nodes):
-    result = dict(groups=0, uploaded_bytes=0, reused_groups=0, warmed=[],
+    result = dict(groups=0, uploaded_bytes=0, reused_groups=0, warmed=[], identities={},
                   errors=[])
     if not sources:
         result.update(status='skipped', reason='No registered source project')
@@ -227,6 +240,7 @@ def _assets(rpc, project, sources, nodes):
             else:
                 result['reused_groups'] += 1
             present[name] = group
+            result['identities'][name] = digest
         except (RemoteError, OSError, ValueError, KeyError) as error:
             result['errors'].append(dict(group=name, error=str(error)))
     result['groups'] = len(groups)
@@ -277,9 +291,17 @@ def sync_cache(client, project='all', *, kind='all', on_submit=None, stop_event=
             sources = [node for node in nodes if node.get('shared_paths', {}).get(name)
                        and name + '_python' in node.get('tags', ())]
             item = report['projects'][name] = {}
+            producer = None
+            if name == 'arh' and len(sources) > 1 and kind in ('all', 'research'):
+                # Shared ARH roots can intentionally contain only tools and
+                # caches. Run the producer from its ordinary immutable source
+                # asset, without installing source into those shared roots.
+                prepared = _assets(rpc, name, sources, nodes if kind == 'all' else [])
+                item['assets' if kind == 'all' else 'producer_assets'] = prepared
+                producer = prepared['identities'].get('arh_source')
             if kind in ('all', 'research'):
-                item['research'] = _research(rpc, name, sources)
-            if kind in ('all', 'assets'):
+                item['research'] = _research(rpc, name, sources, producer)
+            if kind in ('all', 'assets') and 'assets' not in item:
                 item['assets'] = _assets(rpc, name, sources, nodes)
         if report['unavailable'] or any(value['status'] == 'partial'
                 for item in report['projects'].values() for value in item.values()):

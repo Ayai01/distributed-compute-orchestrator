@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -55,6 +56,63 @@ def local_producer(root, path, schema):
     path.with_name(path.name+'.arh-cache-owner.json').write_text(
         json.dumps(dict(token=root.name)), encoding='utf-8')
     return connection
+
+
+def storage_fixture(root, *, legacy=True, wal=False):
+    """Old/new producer signatures with real local ownership and SQLite."""
+    storage = SimpleNamespace(__file__=str(root/'framework/storage.py'),
+                              SQLITE_MARKER_SUFFIX='.arh-cache-owner.json')
+    def cache_manifest(project, marker, path, kind):
+        data = json.loads(marker.read_text())
+        if (data['owner'] != 'arh-dse-regenerable-cache' or data['version'] != 1
+                or data['kind'] != kind or data['unit'] != path.relative_to(project).as_posix()):
+            raise RuntimeError('Cache ownership does not match its declared unit')
+        return data
+    def register(project, path, connection):
+        token = hashlib.sha256(str(project).encode()).hexdigest()[:32]
+        connection.execute('CREATE TABLE _arh_cache_owner (id INTEGER PRIMARY KEY, token TEXT NOT NULL)')
+        connection.execute('INSERT INTO _arh_cache_owner VALUES (1,?)', (token,))
+        connection.commit()
+        path.with_name(path.name+storage.SQLITE_MARKER_SUFFIX).write_text(json.dumps(dict(
+            owner='arh-dse-regenerable-cache', version=1, kind='sqlite',
+            unit=path.relative_to(project).as_posix(), token=token)))
+    def old_open(project, path):
+        existed = path.exists()
+        connection = sqlite3.connect(path)
+        marker = path.with_name(path.name+storage.SQLITE_MARKER_SUFFIX)
+        if not existed:
+            register(project, path, connection)
+        elif marker.exists():
+            data = cache_manifest(project, marker, path, 'sqlite')
+            if connection.execute('SELECT token FROM _arh_cache_owner WHERE id=1').fetchone() != (data['token'],):
+                connection.close()
+                raise RuntimeError('SQLite cache ownership token mismatch')
+        # The old producer preserves unrecognized unmarked stores.
+        return connection
+    def new_open(project, path, *, legacy_schema=None):
+        storage.received_schema = legacy_schema
+        connection = old_open(project, path)
+        marker = path.with_name(path.name+storage.SQLITE_MARKER_SUFFIX)
+        if not marker.exists():
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            exact = tables == set(legacy_schema or {})
+            for table, columns in (legacy_schema or {}).items():
+                exact &= tuple(row[1] for row in connection.execute('PRAGMA table_info('+table+')')) == columns
+            if exact:
+                if wal:
+                    connection.execute('PRAGMA journal_mode=WAL')
+                    connection.execute('PRAGMA wal_autocheckpoint=0')
+                register(project, path, connection)
+                if wal:
+                    # The ownership row exists only in WAL until this writer closes.
+                    with closing(sqlite3.connect(path.as_uri()+'?mode=ro&immutable=1', uri=True)) as old:
+                        storage.immutable_owner_visible = bool(old.execute(
+                            "SELECT 1 FROM sqlite_master WHERE name='_arh_cache_owner'").fetchone())
+        return connection
+    storage.open_owned_sqlite = old_open if legacy else new_open
+    storage._cache_manifest = cache_manifest
+    return storage
 
 
 def snapshot(root, name, value):
@@ -183,17 +241,94 @@ class ArhCacheTests(unittest.TestCase):
         with scratch() as directory:
             target = Path(directory).resolve()
             key, row = observation('riscv', ('full-key',), '{"cycles":10}')
-            producer = SimpleNamespace(__file__=str(target/'framework/storage.py'),
-                                       _owned_sqlite=lambda root, path: None)
+            producer = storage_fixture(target, legacy=False)
             with patch.object(arh.importlib, 'import_module', return_value=producer):
-                with patch.object(producer, 'open_owned_sqlite', create=True,
-                                  side_effect=lambda root, path, legacy_schema:
-                                  local_producer(root, path, legacy_schema)) as opened:
-                    self.assertEqual(arh.merge(target, {key: row})['added'], 1)
-                    args, kwargs = opened.call_args
-                    self.assertEqual(args[0], target)
-                    self.assertEqual(kwargs['legacy_schema'],
-                                     {'riscv_evaluations': ('key', 'data', 'touched')})
+                self.assertEqual(arh.merge(target, {key: row})['added'], 1)
+                self.assertEqual(producer.received_schema,
+                                 {'riscv_evaluations': ('key', 'data', 'touched')})
+
+    def test_old_signature_creates_owned_store_and_preserves_existing_science(self):
+        with scratch() as directory:
+            target = Path(directory).resolve()
+            producer = storage_fixture(target)
+            key, row = observation('mac', ('full-key',), '{"score":1}')
+            with patch.object(arh.importlib, 'import_module', return_value=producer):
+                self.assertEqual(arh.merge(target, {key: row})['added'], 1)
+                self.assertEqual(arh.merge(target, {key: row})['unchanged'], 1)
+                other = observation('mac', ('full-key',), '{"score":2}')[1]
+                self.assertEqual(arh.merge(target, {key: other})['conflicts'], 1)
+            self.assertEqual(arh.export(target, [key])[key], row)
+
+    def test_old_signature_does_not_adopt_unknown_store_or_replace_owner(self):
+        with scratch() as directory:
+            target = Path(directory).resolve()
+            producer = storage_fixture(target)
+            key = seed(target, 'mac', ('full-key',), '{"score":1}')
+            records = arh.export(target, [key])
+            with patch.object(arh.importlib, 'import_module', return_value=producer):
+                with self.assertRaises(FileNotFoundError):
+                    arh.merge(target, records)
+            self.assertEqual(arh.export(target, [key]), records)
+            self.assertFalse((target/(arh.STORES['mac'][0]+producer.SQLITE_MARKER_SUFFIX)).exists())
+
+    def test_new_signature_verifies_adopted_owner_using_live_wal_connection(self):
+        with scratch() as directory:
+            target = Path(directory).resolve()
+            key = seed(target, 'mac', ('full-key',), '{"score":1}')
+            records = arh.export(target, [key])
+            producer = storage_fixture(target, legacy=False, wal=True)
+            with patch.object(arh.importlib, 'import_module', return_value=producer):
+                self.assertEqual(arh.merge(target, records)['unchanged'], 1)
+            self.assertFalse(producer.immutable_owner_visible)
+            self.assertEqual(arh.export(target, [key]), records)
+
+    def test_old_signature_rejects_conflicting_local_ownership(self):
+        with scratch() as directory:
+            target = Path(directory).resolve()
+            producer = storage_fixture(target)
+            key, row = observation('mac', ('full-key',), '{"score":1}')
+            with patch.object(arh.importlib, 'import_module', return_value=producer):
+                arh.merge(target, {key: row})
+                marker = target/(arh.STORES['mac'][0]+producer.SQLITE_MARKER_SUFFIX)
+                conflicting = json.loads(marker.read_text())
+                conflicting['token'] = 'f'*32
+                marker.write_text(json.dumps(conflicting))
+                with self.assertRaisesRegex(RuntimeError, 'ownership token mismatch'):
+                    arh.merge(target, {key: row})
+            self.assertEqual(arh.export(target, [key])[key], row)
+            self.assertEqual(json.loads(marker.read_text())['token'], 'f'*32)
+
+    def test_cache_only_root_uses_separate_read_only_producer(self):
+        with scratch() as directory:
+            target = Path(directory).resolve()/'shared-cache'
+            producer = Path(directory).resolve()/'source-asset'
+            package = producer/'framework'
+            package.mkdir(parents=True)
+            (package/'__init__.py').write_text('')
+            source = package/'storage.py'
+            source.write_text(
+                "from pathlib import Path\n"
+                "from test_cache_arh_bench import storage_fixture\n"
+                "_producer=storage_fixture(Path(__file__).resolve().parents[1])\n"
+                "open_owned_sqlite=_producer.open_owned_sqlite\n"
+                "_cache_manifest=_producer._cache_manifest\n"
+                "SQLITE_MARKER_SUFFIX=_producer.SQLITE_MARKER_SUFFIX\n")
+            before = source.read_bytes()
+            source.chmod(0o444)
+            (package/'__init__.py').chmod(0o444)
+            package.chmod(0o555)
+            producer.chmod(0o555)
+            key, row = observation('mac', ('full-key',), '{"score":1}')
+            with patch.dict(sys.modules), patch.object(sys, 'dont_write_bytecode', True):
+                for name in list(sys.modules):
+                    if name == 'framework' or name.startswith('framework.'):
+                        del sys.modules[name]
+                self.assertEqual(arh.merge(target, {key: row}, producer_root=producer)['added'], 1)
+            self.assertEqual(arh.export(target, [key])[key], row)
+            self.assertFalse((target/'framework').exists())
+            self.assertEqual(source.read_bytes(), before)
+            self.assertEqual(sorted(path.relative_to(producer).as_posix() for path in producer.rglob('*')
+                                    if path.is_file()), ['framework/__init__.py', 'framework/storage.py'])
 
     def test_unowned_store_is_closed_before_merge(self):
         with scratch() as directory:
@@ -201,8 +336,9 @@ class ArhCacheTests(unittest.TestCase):
             path = target/'store.sqlite3'
             connection = sqlite3.connect(path)
             producer = SimpleNamespace(__file__=str(target/'framework/storage.py'),
+                                       SQLITE_MARKER_SUFFIX='.arh-cache-owner.json',
                                        open_owned_sqlite=lambda *args, **kwargs: connection)
-            with patch.object(producer, '_owned_sqlite', create=True,
+            with patch.object(producer, '_cache_manifest', create=True,
                               side_effect=RuntimeError('unregistered database')):
                 with patch.object(arh.importlib, 'import_module', return_value=producer):
                     with self.assertRaisesRegex(RuntimeError, 'unregistered database'):

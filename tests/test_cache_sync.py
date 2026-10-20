@@ -27,6 +27,7 @@ def local_calls(log, before=None):
             response = before(target, action, arguments)
             if response is not None:
                 return response
+        arguments.pop('_assets', None)
         adapter = {'arh': arh, 'bench': bench}[project]
         return getattr(adapter, action)(target['shared_paths'][project], **arguments)
     return call
@@ -47,6 +48,8 @@ class ResearchSyncTests(unittest.TestCase):
             client.nodes.return_value = dict(nodes=nodes)
             calls = []
             with patch.object(sync._RPC, 'call', new=local_calls(calls)), \
+                    patch.object(sync, '_assets', return_value=dict(
+                        status='succeeded', identities={'arh_source': 'fixture-source'})), \
                     patch.object(arh, '_open_store', side_effect=local_producer):
                 first = sync.sync_cache(client, 'arh', kind='research')
                 inventories = [arh.manifest(root) for root in roots]
@@ -121,6 +124,23 @@ class ResearchSyncTests(unittest.TestCase):
             self.assertEqual(research['errors'][0]['node'], 'B')
             self.assertEqual((roots[2]/key).read_bytes(), (roots[0]/key).read_bytes())
             self.assertFalse((roots[1]/key).exists())
+
+    def test_failed_receiver_gets_one_batch_while_other_receiver_finishes(self):
+        with scratch() as directory:
+            roots = [Path(directory)/name for name in ('A', 'B', 'C')]
+            for index in range(4):
+                snapshot(roots[0], 'snapshot-'+str(index)+'.npz', bytes([index])*600000)
+            client, calls = Mock(), []
+            client.nodes.return_value = dict(nodes=[node(root.name, root, 'bench') for root in roots])
+            def before(target, action, arguments):
+                if target['name'] == 'B' and action == 'merge':
+                    raise RemoteError('receiver producer is incompatible')
+            with patch.object(sync._RPC, 'call', new=local_calls(calls, before)):
+                report = sync.sync_cache(client, 'bench', kind='research')
+            self.assertEqual(report['status'], 'partial')
+            self.assertEqual(sum(name == 'B' and action == 'merge' for name, action, args in calls), 1)
+            self.assertEqual(sum(action == 'export' for name, action, args in calls), 4)
+            self.assertEqual(bench.manifest(roots[0]), bench.manifest(roots[2]))
 
     def test_export_digest_supersedes_inventory_when_source_publishes(self):
         with scratch() as directory:

@@ -3,16 +3,55 @@
 from contextlib import ExitStack
 from pathlib import Path
 import sys
+import shutil
 import unittest
 from unittest.mock import patch
 
 from remote_compute import Pool
 from remote_compute.cache_sync import sync_cache
+from remote_compute import cache_arh
+from test_cache_arh_bench import seed
 from test_center import center
 from test_compute import provider, scratch
 
 
 class CacheTransportTests(unittest.TestCase):
+    def test_arh_cache_only_worker_imports_producer_from_normal_source_asset(self):
+        installed = Path(__file__).resolve().parents[2] / 'ARH-DSE-v2'
+        if not (installed / 'framework/storage.py').is_file():
+            self.skipTest('Installed ARH producer fixture')
+        with scratch() as directory, ExitStack() as stack:
+            root = Path(directory)
+            source, target = root/'source', root/'cache-only'
+            (source/'framework').mkdir(parents=True)
+            target.mkdir()
+            (source/'framework/__init__.py').write_text('', encoding='utf-8')
+            for name in ('framework/storage.py', 'framework/artifact_store.py', 'python_compat.py'):
+                shutil.copyfile(installed/name, source/name)
+            (source/'framework/source_snapshot.py').write_text(
+                "def files(root):"
+                "\n    return {p.relative_to(root).as_posix():p for p in root.rglob('*.py')}\n",
+                encoding='utf-8')
+            key = seed(source, 'mac', ('native-measurement',), '{"score":7}')
+            endpoints = []
+            for name, project in (('A-source', source), ('B-cache', target)):
+                _, node = stack.enter_context(provider(root/(name+'-worker'), cpus=1,
+                    memory_mb=2048, tools={'arh_python': sys.executable}, shared={'arh': str(project)}))
+                endpoints.append(dict(name=name, url=node.url))
+            pool = Pool(endpoints)
+            stack.callback(pool.close)
+            _, client = stack.enter_context(center(pool, root/'center'))
+            first = sync_cache(client, 'arh', kind='research')
+            self.assertEqual(first['status'], 'succeeded', first)
+            self.assertIn(key, cache_arh.manifest(target))
+            self.assertFalse((target/'framework').exists())
+            self.assertTrue((target/'build/evaluations.sqlite3.arh-cache-owner.json').exists())
+            second = sync_cache(client, 'arh', kind='research')
+            self.assertEqual(second['status'], 'succeeded', second)
+            self.assertEqual(second['projects']['arh']['research']['exported_records'], 0)
+            self.assertEqual(second['projects']['arh']['producer_assets']['uploaded_bytes'], 0)
+            self.assertEqual(client.status(), [])
+
     def test_manual_union_asset_prewarm_and_repeat_use_existing_transport(self):
         with scratch() as directory, ExitStack() as stack:
             root = Path(directory)

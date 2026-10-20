@@ -3,9 +3,11 @@
 import base64
 import hashlib
 import importlib
+import inspect
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import zlib
@@ -103,24 +105,36 @@ def export(root, keys):
     return {key: _record(store, row) for key, store, row in _read(root, keys)}
 
 
-def _open_store(root, path, schema):
+def _open_store(root, path, schema, *, producer_root=None):
     """Let the installed ARH producer create/verify this machine's ownership."""
-    sys.path.insert(0, str(root))
+    producer_root = Path(producer_root or root).resolve()
+    sys.path.insert(0, str(producer_root))
     try:
         storage = importlib.import_module('framework.storage')
-        if Path(storage.__file__).resolve() != (root/'framework/storage.py').resolve():
+        if Path(storage.__file__).resolve() != (producer_root/'framework/storage.py').resolve():
             raise ValueError('Loaded ARH storage belongs to a different project root')
-        connection = storage.open_owned_sqlite(root, path, legacy_schema=schema)
+        parameters = inspect.signature(storage.open_owned_sqlite).parameters
+        supports_schema = ('legacy_schema' in parameters or
+                           any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()))
+        options = {'legacy_schema': schema} if supports_schema else {}
+        connection = storage.open_owned_sqlite(root, path, **options)
         try:
             # Existing unknown databases may be opened by the producer without
-            # adoption. Only its verified owned stores participate in exchange.
-            storage._owned_sqlite(root, path)
+            # adoption. Verify its manifest against this live connection: an
+            # immutable second connection cannot see ownership just added in WAL.
+            marker = path.with_name(path.name + storage.SQLITE_MARKER_SUFFIX)
+            owner = storage._cache_manifest(root, marker, path, 'sqlite')
+            token = owner.get('token')
+            if not isinstance(token, str) or not re.fullmatch('[0-9a-f]{32}', token):
+                raise RuntimeError('Invalid SQLite cache ownership token')
+            if connection.execute('SELECT token FROM _arh_cache_owner WHERE id=1').fetchone() != (token,):
+                raise RuntimeError('SQLite cache ownership token mismatch')
         except BaseException:
             connection.close()
             raise
         return connection
     finally:
-        sys.path.remove(str(root))
+        sys.path.remove(str(producer_root))
 
 
 def _validated(key, record):
@@ -165,7 +179,7 @@ def _create(connection, store):
         raise ValueError('ARH cache schema differs from the installed producer')
 
 
-def merge(root, records):
+def merge(root, records, *, producer_root=None):
     root = Path(root).resolve()
     result = dict(added=0, updated=0, unchanged=0, conflicts=0, rejected=0, digests={})
     groups = {}
@@ -181,7 +195,8 @@ def merge(root, records):
         path.parent.mkdir(parents=True, exist_ok=True)
         members = [store for store, spec in STORES.items() if spec[0] == relative]
         schema = {STORES[store][1]: _columns(store) for store in members}
-        connection = _open_store(root, path, schema)
+        options = {'producer_root': producer_root} if producer_root is not None else {}
+        connection = _open_store(root, path, schema, **options)
         connection.row_factory = sqlite3.Row
         try:
             with connection:
