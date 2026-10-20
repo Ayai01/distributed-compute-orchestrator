@@ -14,7 +14,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from remote_compute import Client, Pool, RemoteError
 from remote_compute import process as process_module, ramdisk, repository
@@ -110,7 +110,7 @@ class ServicePowerTests(unittest.TestCase):
         awake.assert_not_called()
 
     @unittest.skipUnless(os.name == 'nt', 'Windows execution-state ownership')
-    def test_native_request_restores_previous_thread_state_after_exception(self):
+    def test_native_request_preserves_caller_thread_state_after_exception(self):
         import ctypes as c
         from ctypes import wintypes as w
         state = c.WinDLL('kernel32').SetThreadExecutionState
@@ -121,11 +121,52 @@ class ServicePowerTests(unittest.TestCase):
         try:
             with self.assertRaisesRegex(RuntimeError, 'service stopped'):
                 with keep_awake():
-                    self.assertEqual(state(continuous | system), continuous | system)
+                    self.assertEqual(state(continuous | display), continuous | display)
                     raise RuntimeError('service stopped')
             self.assertEqual(state(continuous | display), continuous | display)
         finally:
             state(continuous | previous)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows power request ownership')
+    def test_power_requests_are_auditable_and_released_on_failure(self):
+        kernel = Mock()
+        kernel.PowerCreateRequest.return_value = 123
+        kernel.PowerSetRequest.return_value = True
+        with patch('ctypes.WinDLL', return_value=kernel):
+            with self.assertRaisesRegex(RuntimeError, 'service stopped'):
+                with keep_awake():
+                    self.assertEqual(kernel.PowerSetRequest.call_args_list, [call(123,1),call(123,3)])
+                    raise RuntimeError('service stopped')
+        self.assertEqual(kernel.PowerClearRequest.call_args_list, [call(123,3),call(123,1)])
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows power request ownership')
+    def test_partial_power_request_setup_releases_its_owned_handle(self):
+        kernel = Mock()
+        kernel.PowerCreateRequest.return_value = 123
+        kernel.PowerSetRequest.side_effect = [True, False]
+        with patch('ctypes.WinDLL', return_value=kernel), self.assertRaises(OSError):
+            with keep_awake():
+                self.fail('A failed power request must not enter the service')
+        kernel.PowerClearRequest.assert_called_once_with(123,1)
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and shutil.which('systemd-inhibit'),
+                         'Linux logind idle inhibitor')
+    def test_linux_inhibitor_is_owned_and_released_with_context(self):
+        def inhibitors():
+            result=subprocess.run(['systemd-inhibit','--list','--no-pager'],
+                                  capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return [line for line in result.stdout.splitlines() if
+                    line.startswith('DCO ') and 'DCO compute service is running' in line]
+        before=inhibitors()
+        with keep_awake():
+            during=inhibitors()
+            self.assertEqual(len(during),len(before)+1)
+            self.assertIn('idle',during[-1])
+            self.assertIn('block',during[-1])
+        self.assertEqual(inhibitors(),before)
 
 
 class LinuxWorkerScratchTests(unittest.TestCase):

@@ -4,7 +4,9 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -34,24 +36,67 @@ def _proc_rows(fresh=False):
 
 @contextmanager
 def keep_awake():
-    """Keep Windows services available while allowing the display to turn off."""
+    """Own a sleep inhibitor for the service lifetime, including reloads."""
     if os.name != 'nt':
+        inhibitor = shutil.which('systemd-inhibit') if sys.platform.startswith('linux') else None
+        if inhibitor:
+            import select
+            command = [inhibitor, '--what=idle', '--mode=block', '--who=DCO',
+                       '--why=DCO compute service is running', sys.executable, '-B', '-u', '-c',
+                       'import sys;print("DCO_POWER_READY",flush=True);sys.stdin.buffer.read()']
+            with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as helper:
+                try:
+                    ready = select.select([helper.stdout], [], [], 5)[0]
+                    if not ready or helper.stdout.readline() != b'DCO_POWER_READY\n':
+                        raise OSError('DCO could not acquire the Linux idle inhibitor')
+                    yield
+                finally:
+                    helper.stdin.close()
+                    try:
+                        helper.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        helper.terminate()
+                        helper.wait(timeout=5)
+            return
         yield
         return
     import ctypes as c
     from ctypes import wintypes as w
 
-    set_state = c.WinDLL('kernel32').SetThreadExecutionState
-    set_state.argtypes = [w.DWORD]
-    set_state.restype = w.DWORD
-    continuous = 0x80000000
-    previous = set_state(continuous | 0x1)  # ES_SYSTEM_REQUIRED
-    if not previous:
-        raise OSError('Windows refused the service sleep prevention request')
+    class Detailed(c.Structure):
+        _fields_ = [('module', w.HMODULE), ('reason', w.ULONG),
+                    ('count', w.ULONG), ('strings', c.POINTER(w.LPWSTR))]
+    class Reason(c.Union):
+        _fields_ = [('text', w.LPWSTR), ('details', Detailed)]
+    class Context(c.Structure):
+        _anonymous_ = ('reason',)
+        _fields_ = [('version', w.ULONG), ('flags', w.DWORD), ('reason', Reason)]
+    kernel = c.WinDLL('kernel32', use_last_error=True)
+    kernel.PowerCreateRequest.argtypes = [c.POINTER(Context)]
+    kernel.PowerCreateRequest.restype = w.HANDLE
+    kernel.PowerSetRequest.argtypes = kernel.PowerClearRequest.argtypes = [w.HANDLE, c.c_int]
+    kernel.PowerSetRequest.restype = kernel.PowerClearRequest.restype = w.BOOL
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    reason = Context()
+    reason.flags = 1  # POWER_REQUEST_CONTEXT_SIMPLE_STRING
+    reason.text = 'DCO compute service is running'
+    handle = kernel.PowerCreateRequest(c.byref(reason))
+    if not handle or handle == w.HANDLE(-1).value:
+        raise c.WinError(c.get_last_error())
+    requests = []
     try:
+        # SystemRequired and ExecutionRequired cover idle sleep and execution
+        # suspension. Neither requests DisplayRequired, so monitors may sleep.
+        for kind in (1, 3):
+            if not kernel.PowerSetRequest(handle, kind):
+                raise c.WinError(c.get_last_error())
+            requests.append(kind)
         yield
     finally:
-        set_state(continuous | previous)
+        for kind in reversed(requests):
+            kernel.PowerClearRequest(handle, kind)
+        kernel.CloseHandle(handle)
 
 
 def low_integrity_directory(path):
