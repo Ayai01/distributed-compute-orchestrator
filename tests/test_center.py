@@ -526,7 +526,7 @@ class CenterTests(unittest.TestCase):
                         client.wait(identity)
                         with coordinator.condition:
                             coordinator.jobs[identity]['result'].update(status='interrupted',error='connection lost')
-                        with patch.object(worker,'request',side_effect=RemoteError('still unavailable')):
+                        with patch.object(worker,'artifacts',side_effect=RemoteError('still unavailable')):
                             with self.assertRaises(RemoteError) as raised:client.fetch(identity,delete=False)
                             self.assertEqual(raised.exception.status_code,502)
                         result=client.fetch(identity,delete=False)
@@ -1023,6 +1023,40 @@ class CenterTests(unittest.TestCase):
                     finally:
                         release.set();blocked.result(timeout=3)
                 self.assertTrue({large,small}.issubset(node.known_assets))
+
+    def test_asset_revision_preserves_the_inflight_hash_lock_and_releases_it_afterward(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                asset=client.sync_files({'model.npz':bytes(range(256))*8192})
+                node=pool.nodes[0]
+                original=node.client.request
+                entered,release=threading.Event(),threading.Event()
+                uploads=[]
+                def delayed(path,data=None,**options):
+                    if path=='/assets/'+asset and data is not None:
+                        uploads.append(len(data))
+                        entered.set();release.wait(5)
+                    return original(path,data,**options)
+                with patch.object(node.client,'request',side_effect=delayed),ThreadPoolExecutor(max_workers=2) as transfers:
+                    first=transfers.submit(state._ensure_assets,node,[asset])
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        with node.asset_lock:
+                            transfer=node._asset_upload_locks[asset]
+                            revision=node.health.get('asset_revision',0)+1
+                            node.health['asset_revision']=revision
+                        second=transfers.submit(state._ensure_assets,node,[asset])
+                        until(lambda:node.asset_session[-1]==revision)
+                        with node.asset_lock:
+                            self.assertIs(node._asset_upload_locks[asset],transfer)
+                    finally:
+                        release.set()
+                    first.result(timeout=3);second.result(timeout=3)
+                self.assertEqual(uploads,[(state.root/'assets'/(asset+'.zip')).stat().st_size])
+                self.assertIn(asset,node.known_assets)
+                del transfer
+                self.assertFalse(node._asset_upload_locks)
 
     def test_concurrent_jobs_check_and_upload_an_asset_once(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,node):

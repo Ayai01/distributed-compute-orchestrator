@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool
+from remote_compute.bundle import pack
 from remote_compute.client import PoolBusy, _ConnectionPool
 from remote_compute.worker import Handler
 from test_center import center
@@ -29,6 +30,12 @@ def slow_upload_server(*, interrupt=False):
             self.connection.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,16384)
         def log_message(self,*args):
             pass
+        def do_GET(self):
+            reply=json.dumps(dict(exists=False)).encode()
+            self.send_response(200)
+            self.send_header('Content-Length',str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
         def do_POST(self):
             length=int(self.headers['Content-Length'])
             content=bytearray()
@@ -87,6 +94,26 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(len(received),2)
             self.assertEqual(received[0],('/assets/'+identity,payload[:65536],None))
             self.assertEqual(received[1],('/assets/'+identity,payload,None))
+
+    def test_lost_asset_reply_checks_publication_without_reuploading_the_body(self):
+        payload=pack({'model.npz':bytes(range(256))*8192})
+        identity=hashlib.sha256(payload).hexdigest()
+        original=Handler._reply
+        requests=[]
+        def reply(handler,value,status=200):
+            if handler.path=='/assets/'+identity:
+                requests.append((handler.command,int(handler.headers.get('Content-Length',0))))
+                if handler.command=='POST' and len(requests)==1:
+                    self.assertTrue(value['exists'])
+                    handler.close_connection=True
+                    return
+            return original(handler,value,status)
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            with patch.object(Handler,'_reply',reply):
+                result=client.request('/assets/'+identity,payload)
+            self.assertEqual(result,dict(id=identity,exists=True))
+            self.assertEqual(requests,[('POST',len(payload)),('GET',0)])
+            self.assertEqual((worker.root/'assets'/identity/'model.npz').read_bytes(),bytes(range(256))*8192)
 
     def test_connection_slots_are_fifo_and_timeout_never_sends_a_request(self):
         pool=_ConnectionPool()
@@ -188,6 +215,45 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(result.result(timeout=2)['status'],'succeeded')
             self.assertEqual(len(downloads),1)
 
+    def test_center_download_uses_long_header_timeout_and_caches_original_zip(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,node):
+            with Pool([node]) as pool,center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python("print('executed once')"))['id'];client.wait(identity)
+                backend=pool.nodes[0].client
+                backend.timeout=.05
+                control_pool=backend._transport
+                entered,release=threading.Event(),threading.Event()
+                original=Handler._reply;downloads=[]
+                def delayed(handler,value,status=200):
+                    if handler.server.worker is worker and handler.path=='/jobs/'+identity+'/artifacts':
+                        downloads.append(handler.path);entered.set();release.wait(2)
+                    return original(handler,value,status)
+                with patch.object(Handler,'_reply',delayed),ThreadPoolExecutor(max_workers=1) as transfers:
+                    pending=transfers.submit(client.fetch,identity,delete=False)
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        time.sleep(.1)
+                        self.assertEqual(client.health(brief=True)['role'],'scheduler')
+                        self.assertEqual(backend.health(brief=True)['role'],'worker')
+                        self.assertFalse(pending.done())
+                    finally:
+                        release.set()
+                    result=pending.result(timeout=3)
+                    cached=(state.jobs[identity]['directory']/'worker-artifacts.zip').read_bytes()
+                    again=client.fetch(identity,delete=False)
+                self.assertEqual(len(downloads),1)
+                self.assertEqual(result['stdout'].strip(),'executed once')
+                self.assertEqual(again,result)
+                self.assertEqual((state.jobs[identity]['directory']/'worker-artifacts.zip').read_bytes(),cached)
+                self.assertEqual(list(worker.jobs),[identity])
+                self.assertEqual(backend.timeout,.05)
+                self.assertIs(backend._transport,control_pool)
+                self.assertGreaterEqual(backend._result_client.timeout,120)
+                self.assertIsNot(backend._result_client._transport,control_pool)
+                client.delete(identity)
+                self.assertNotIn(identity,worker.jobs)
+                self.assertNotIn(identity,state.jobs)
+
     def test_idle_keep_alive_is_reclaimed_and_the_same_client_reconnects(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client),patch.object(Handler,'idle_timeout',.05):
             client.health();previous=client._transport.idle[0].sock
@@ -245,19 +311,18 @@ class TransportTests(unittest.TestCase):
             with Pool([node]) as pool,center(pool,Path(root)/'center') as (state,client):
                 identities=[client.submit(python('pass'))['id'] for _ in range(2)]
                 for identity in identities:client.wait(identity)
-                original=pool.nodes[0].client.request
+                original=pool.nodes[0].client.artifacts
                 mutex=threading.Lock();active=peak=0;calls=[]
-                def request(path,*args,**kwargs):
+                def artifacts(identity,*args,**kwargs):
                     nonlocal active,peak
-                    if not path.endswith('/artifacts'):return original(path,*args,**kwargs)
                     with mutex:
-                        active+=1;peak=max(peak,active);calls.append(path)
+                        active+=1;peak=max(peak,active);calls.append(identity)
                     try:
                         time.sleep(.04)
-                        return original(path,*args,**kwargs)
+                        return original(identity,*args,**kwargs)
                     finally:
                         with mutex:active-=1
-                with patch.object(pool.nodes[0].client,'request',side_effect=request),ThreadPoolExecutor(max_workers=4) as transfers:
+                with patch.object(pool.nodes[0].client,'artifacts',side_effect=artifacts),ThreadPoolExecutor(max_workers=4) as transfers:
                     results=list(transfers.map(state.artifacts,identities*2))
                 self.assertEqual(peak,1)
                 self.assertEqual(len(calls),2)
@@ -273,7 +338,7 @@ class TransportTests(unittest.TestCase):
         with scratch() as root,provider(Path(root)/'worker') as (worker,node):
             with Pool([node]) as pool,center(pool,Path(root)/'center') as (state,client):
                 identity=client.submit(python('pass'))['id'];client.wait(identity)
-                with patch.object(pool.nodes[0].client,'request',wraps=pool.nodes[0].client.request) as calls:
+                with patch.object(pool.nodes[0].client,'artifacts',wraps=pool.nodes[0].client.artifacts) as calls:
                     with self.assertRaises(ConnectionAbortedError):state.artifacts(identity,is_connected=lambda:False)
                     calls.assert_not_called()
                 self.assertEqual(worker.get(identity)['status'],'succeeded')

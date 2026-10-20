@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import threading
 import time
+import weakref
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
@@ -688,7 +689,7 @@ class Coordinator:
         self.activity.notify('Worker stopped; retry original task ['+identity[:4]+']')
 
     def _ensure_assets(self, node, assets, *, force=False):
-        # One upload per content id and worker session, including concurrent jobs.
+        # Cache changes invalidate presence, but keep same-hash uploads serialized.
         assets=set(assets)
         if not assets:return
         with node.asset_lock:
@@ -696,9 +697,9 @@ class Coordinator:
             if node.asset_session != session:
                 node.known_assets.clear()
                 node.asset_session = session
-                node._asset_upload_locks={}
             if force:node.known_assets.difference_update(assets)
-            locks=node.__dict__.setdefault('_asset_upload_locks',{})
+            # Pending callers keep strong references; idle locks disappear.
+            locks=node.__dict__.setdefault('_asset_upload_locks',weakref.WeakValueDictionary())
             pending=[(asset,locks.setdefault(asset,threading.Lock())) for asset in assets-node.known_assets]
         for asset,transfer in pending:
             with transfer:
@@ -907,7 +908,7 @@ class Coordinator:
                         try:
                             if is_connected and not is_connected():
                                 raise ConnectionAbortedError('Result download caller disconnected while queued')
-                            raw=client.request("/jobs/" + worker_id + "/artifacts", binary=True)
+                            raw=client.artifacts(worker_id)
                         finally:
                             transfer_lock.release()
                         with zipfile.ZipFile(io.BytesIO(raw)) as archive:

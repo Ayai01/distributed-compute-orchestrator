@@ -140,7 +140,18 @@ class Client:
         attempts = 4 if binary and method == 'GET' else 2
         retryable=(method=='GET' or method=='POST' and (path=='/admission' or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/(?:resize|cancel))?|assets/[0-9a-f]{64})',path))))
+        asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         for attempt in range(attempts):
+            if attempt and asset_upload:
+                # A lost reply can follow a fully validated upload. Probe within
+                # this pool slot before sending the same content again.
+                try:
+                    published=self._request(path,method='GET')
+                except RemoteError:
+                    pass
+                else:
+                    if published['exists']:
+                        return json_bytes(published) if binary else published
             connection = getattr(self.connections, 'connection', None)
             if connection is None:
                 factory = http.client.HTTPSConnection if self.endpoint.scheme == 'https' else http.client.HTTPConnection
@@ -343,7 +354,7 @@ class Client:
                 raise RemoteError(f"Wait limit reached; query {self.url}/jobs/{identity}")
             time.sleep(poll)
 
-    def fetch(self, identity, output_dir=None, *, delete=True):
+    def artifacts(self, identity):
         # A center may first need to retrieve the complete remote ZIP. Keep
         # that header wait and its connections separate from status/control.
         backend=self
@@ -352,7 +363,10 @@ class Client:
             if backend is None:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token))
             backend.timeout=max(120,self.timeout)
-        raw = backend.request("/jobs/" + identity + "/artifacts", binary=True)
+        return backend.request("/jobs/" + identity + "/artifacts", binary=True)
+
+    def fetch(self, identity, output_dir=None, *, delete=True):
+        raw = self.artifacts(identity)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             result = json.loads(archive.read("result.json"))
             result["files"] = {name[6:]: archive.read(name) for name in archive.namelist() if name.startswith("files/")}
