@@ -1,12 +1,27 @@
-# 调度、任务接口与工程接入
+# DCO 设计与接入契约
 
-[返回首页](../README.md) · [启动与维护](operations.md)
+[运行与CLI](../README.md) · [当前状态](STATUS.md) · [协作约定](../AGENTS.md)
 
-## 算力分配与提前排队
+## 责任与代码入口
+
+DCO 管调度、授权、任务与传输；调用工程管测量、评分、唯一设计预算、模型和科研缓存。任务中声明能力和资源，中心选择执行设备；运维显式选设备并使用操作员令牌。
+
+| 模块 | 责任 |
+| --- | --- |
+| `cli.py` / `startup.py` / `terminal.py` | 参数、可见终端检查、服务托管与重载 |
+| `commands.py` / `console.py` / `view.py` | 命令语义、键盘交互、看板格式 |
+| `coordinator.py` / `allocation.py` / `admission.py` | 中心队列、份额/资源授予、有限提交窗口 |
+| `worker.py` / `process.py` / `resources.py` | 执行端任务、进程树所有权、CPU/RAM资源 |
+| `client.py` / `tasks.py` / `machine.py` | SDK、任务构造、操作员机器接口 |
+| `bundle.py` / `cleanup.py` / `cache_*.py` | 内容资产、生命周期回收、手动科研缓存同步 |
+
+入口顺序为可见终端检查 → 加载设备配置 → 托管服务；一次性命令和测试走对应短路径。中心和 worker 的本地配置、运行状态各自持有，源码更新不覆盖它们。
 
 ## 工程接口边界
 
 工程客户端只表达通用算力需求：`requires` 能力标签、`cpus/max_cpus`、`memory_mb`、`resource_share`，以及有界的 `priority`、`queue_ratio` 和 `single_thread_weight`。`resource_share` 为 `(0,16]`，`queue_ratio` 为 `[0,4]`，`single_thread_weight` 为 `(0,8]`，`priority` 为 `-1000..1000`。`node`、IP、节点权重、节点预算和完整 `/health` 只属于 DCO 操作端；操作端令牌保存在中心状态目录，普通工程令牌不能提升权限。
+
+CLI 的本机操作员令牌只适用于 `127.0.0.0/8`、`::1` 和字面主机名 `localhost`；其他主机名即使解析到本机也按远端处理。该边界同时约束设备配置的 `operator_token` 和 `--root`/默认状态目录自动读取的令牌。远端使用显式 `REMOTE_COMPUTE_OPERATOR_TOKEN` 或 SDK 参数 `operator_token`，令牌归属该目标中心；本机启动新服务继续使用其配置令牌。
 
 工程查看能力时使用：
 
@@ -27,13 +42,18 @@ GPU 和其他加速器使用同一套汇总能力协议。`capabilities()['accel
 任务声明语义需求，不指定卡号或设备名：
 
 ```python
+from remote_compute import command
+
 task = command(["${tool:python}", "train.py"], cpus=4, memory_mb=8192,
                project="rgcn", accelerator={"kind":"cuda", "memory_mb":8192,
                                              "requires":["gpu:training"]})
 ```
 
-调度器按加速器类型、显存和标签分配并锁定对应单元，运行环境提供 `DCO_ACCELERATOR_KIND`、`DCO_ACCELERATOR_COUNT`、`DCO_ACCELERATOR_MEMORY_MB`、`DCO_ACCELERATOR_IDS`；CUDA 任务同时得到 `CUDA_VISIBLE_DEVICES`。这些变量只描述已获授权的执行资源，工程不读取节点清单。训练、GPU 仿真和通用 GPU 任务可用不同的标签表达偏好；无 GPU 设备配置空档案，CPU 任务照常使用。
+调度器按配置档案中的类型、每卡容量与标签匹配，并以整卡单元独占预留；`memory_mb` 表示每张卡须满足的最低容量，计账按占用卡数，实际显存用量由执行后端管理。卡号来自设备配置的 `ids`，同一物理卡只登记一次。运行环境提供 `DCO_ACCELERATOR_KIND`、`DCO_ACCELERATOR_COUNT`、`DCO_ACCELERATOR_MEMORY_MB`、`DCO_ACCELERATOR_IDS`；CUDA 任务同时得到 `CUDA_VISIBLE_DEVICES`。worker 每次执行都从本次授权重写这些变量：无授权时分别为空、0、0、空，并将 `CUDA_VISIBLE_DEVICES` 置空，避免继承调用者或设备环境中的GPU权限。工程依据本任务授权选择后端。训练、GPU 仿真和通用 GPU 任务可用不同标签；无GPU设备配置空档案，CPU任务照常使用。
 
+兼容CPU执行的任务先检查中心是否声明 `accelerator_fallback`，再在同一份 admission/任务 `accelerator` 对象中加入 `fallback_after_seconds`（有限非负秒数）。该字段由调用方显式提供；省略时保持强制加速器。无匹配在线GPU时立即改为CPU；仍未派发的任务到达队列阈值时改为CPU，同一任务ID、请求包和输入摘要保持不变。首次派发后执行选择冻结，重试和恢复沿用该选择。CPU回退回执含 `accelerator: null`、原需求 `requested_accelerator`，以及 `accelerator_fallback: {"reason":"unavailable"或"queue_timeout","at":Unix秒}`。admission 的 `fallback_capable_cpus` 表示CPU路径匹配的在线预算。
+
+ARH 的 `tensor_backend=auto` 声明一张CUDA卡和30秒阈值；旧中心未声明上述能力时，ARH提示并以CPU执行。显式 `torch_cuda` 省略阈值、保持强制GPU。DCO负责授予资源，调用工程负责CPU/GPU计算路径及结果身份。
 
 默认部署中，科研工程运行在 Aya1-PC，向本机中心 `http://127.0.0.1:26133` 提交任务。Aya1-TX 的同一端口提供 worker 服务；在该设备运行科研工程时，auto 会检查服务角色，未检测到本地中心便独立计算，需要接入 Aya1-PC 时显式填写其中心地址。中心模式下，工程原有 workers / 并发上限不参与 CPU 准入；有限的提交窗口用于提前准备任务，实际 CPU 和内存由中心统一分配。
 
@@ -64,17 +84,17 @@ task = command(["${tool:python}", "train.py"], cpus=4, memory_mb=8192,
 {"resource_share": 1.0, "queue_ratio": 1.0}
 ```
 
-AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。调用方按窗口上界创建线程池，按当前窗口限制 pending；长任务等待期间也定期补位，其他工程结束后可扩大在途窗口。窗口缩小时已接受任务继续完成。RGCN 按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
+AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。调用方按窗口上界创建线程池，按当前窗口限制已送中心且未收齐回执的任务；本地准备future另有队列界限，AOP为2×maximum。长任务等待期间也定期补位，其他工程结束后可扩大在途窗口。窗口缩小时已接受任务继续完成。RGCN 按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
 
 Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 workers 限制。同步Class-AB物理批次和方向输出内核在计算前借线程、finally归还至1；任务尾部可继续借用其他任务释放的线程。`remote_compute.max_task_cpus`可设单任务借用上界；异步求值池在启动前申请固定额度，pending收齐后归还。`remote_compute.task_cpus`指定初始额度，0表示中心初始自动授予；关闭顶层`adaptive_threads`后保持固定额度。取消批次会停止后续提交、取消并收齐已接受任务。
 
-节点 CPU 预算、硬上限和内存配置见[算力控制](operations.md#设备预算与配置文件)。看板同时显示各工程的权重、目标份额、已分配线程和排队数。焦点刷新只影响终端展示，后台调度和资源探测持续工作。SDK首次借还资源用`health(brief=True)`协商协议和能力，省去设备历史与看板内容；旧服务忽略该请求头时仍可使用完整响应。
+节点 CPU 预算、硬上限和内存配置见[算力控制](../README.md#设备预算与配置文件)。看板同时显示各工程的权重、目标份额、已分配线程和排队数。焦点刷新只影响终端展示，后台调度和资源探测持续工作。SDK首次借还资源用`health(brief=True)`协商协议和能力，省去设备历史与看板内容；旧服务忽略该请求头时仍可使用完整响应。
 
 调度思路参考 [Dask 排队与负载选择](https://distributed.dask.org/en/stable/scheduling-policies.html)、[Ray 有限待处理任务](https://docs.ray.io/en/latest/ray-core/patterns/limit-pending-tasks.html)、[Slurm 资源预留与回填](https://slurm.schedmd.com/sched_config.html)。实现使用 Python 标准库。
 
 ## 分配策略
 
-- `adaptive`：先满足线程、内存、工具与工程份额，优先选择预计CPU负载较低的设备。候选负载相差不足一个逻辑线程时，用相同版本启动基准的单线程/总吞吐组合先验，再以同类任务真实耗时校准和替代，结合节点权重与未采样节点。基准组成与持久化的一分钟校准见[启动基准](operations.md#终端操作)。
+- `adaptive`：先满足线程、内存、工具与工程份额，优先选择预计CPU负载较低的设备。候选负载相差不足一个逻辑线程时，用相同版本启动基准的单线程/总吞吐组合先验，再以同类任务真实耗时校准和替代，结合节点权重与未采样节点。基准组成与持久化见下文“启动算力校准”。
 - `balanced`：使用相同的 CPU 负载优先规则，接近时使用单线程/总吞吐组合先验及节点权重，不采用同标签的历史耗时。
 - `round_robin`：在满足资源条件的节点之间轮询，便于固定分配实验。
 
@@ -85,11 +105,11 @@ Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 w
 预计负载 = (背景占用线程 + 当前预留线程 + 外部任务线程 + 新任务线程) / 逻辑线程数
 ```
 
-同设备的多个 worker 合并计算主机占用，避免重复计入 CPU。尚未取得CPU样本时，直接按当前授权账本估算负载。整轮 `cpus: 0` 比较节点时按一个启动线程计价，选定后仍按可用线程和工程份额授予。采样中的在途任务已包含在 CPU 使用率内，用当前账本替换其旧授予；连续提交不用等待下一次采样才更新负载。CPU 使用率参与节点选择，线程和内存预算决定准入；其余设备已满且该设备仍有可用额度时，可继续派发。指定 `node` 保持约束，已运行任务保持原节点。
+同设备的多个 worker 合并计算主机占用，避免重复计入 CPU。尚未取得CPU样本时，直接按当前授权账本估算负载。整轮 `cpus: 0` 比较节点时按一个启动线程计价，选定后仍按可用线程和工程份额授予。采样中的在途任务已包含在 CPU 使用率内，用当前账本替换其旧授予；连续提交不用等待下一次采样才更新负载。CPU 使用率参与节点选择，线程和内存预算决定准入；其余设备已满且该设备仍有可用额度时，可继续派发。`node` 仅供操作员运维和设备验收使用；科研任务按能力选点，已运行任务保持原节点。
 
 任务可设置 `single_thread_weight`（有限正数，默认1），也可用 `run/spice/rtl --single-thread-weight`。这项设置只决定负载接近时选哪台主机：1对单线程延迟和并行总吞吐无明显偏向；2适合串行仿真占主导的任务；0.5适合大量独立评价的搜索。它与工程份额 `resource_share`、排队顺序 `priority` 分开，不增加线程、不改变正在运行任务的节点。单线程占比为 `w/(1+w)`，按该占比组合归一化的单线程分数与配置线程下总分的几何均值；节点weight保持生效，adaptive的同标签实测耗时校准该先验。balanced使用相同负载和算力先验、不学习历史；round_robin保持轮转。缺少同版本原生总分时仅按可用配置槽数估计总量；单线程分数不全时该分量保持中性，旧哈希/解释器分数始终不参与比较。
 
-中心 `/health.capabilities` 包含 `single_thread_weight` 时，适配器可传此字段；旧中心省略它。普通默认1任务保持原请求格式；中心保留偏好元数据，并在派发时移除该中心提示，已有worker无需重启即可执行。启动原生估算的单线程结果位于 `benchmark.single`，使用同一混合工作单位；CLI以“单/总 Miter/s”展示。
+中心 `Client.capabilities()["capabilities"]` 包含 `single_thread_weight` 时，适配器可传此字段；旧中心省略它。普通默认1任务保持原请求格式；中心保留偏好元数据，并在派发时移除该中心提示，已有worker无需重启即可执行。启动原生估算的单线程结果位于 `benchmark.single`，使用同一混合工作单位；CLI以“单/总 Miter/s”展示。
 
 中心直接连接设备IP的26133端口；HTTPS节点同时配置`ca_file`。worker通过本地lease接口提交CPU/RAM请求，由中心现有连接取回并授权，无需worker反向访问中心。可用`center.control(add={"name":"compute-linux","url":"https://203.0.113.42:26133","token":worker_token,"ca_file":"worker.crt"})`加入。节点配置和令牌保存在本机`nodes.local.json`，不放入聊天或Git。旧反向回调入口已退役。
 
@@ -107,7 +127,7 @@ worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`�
 
 任务还可设置 `priority` 和 `requires`。较大的 `priority` 先启动；`requires` 要求汇总能力标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选供给。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
 
-中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度，内存同时扣除本方任务的预留或实际 RSS。任务取消只向 worker 发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
+中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度。新 worker 声明 `memory_accounting=rss`：首次进程树采样前及未反映到健康快照的派发按申报量预留，采样后按当前 RSS 记账；设备预算与系统实时 8GiB 可用余量共同约束新任务准入。旧 worker 沿用其预留规则，允许逐节点在空闲边界更新。任务取消只向 worker 发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
 
 用 `label` 区分电路、保真度或相近工作量的批次，使同类耗时具有可比性。执行中的任务保留原节点。短暂断连时保留原任务ID和资源预留，状态中的 `connection_error` 显示连接问题；重连后继续查询该任务，不重新执行。已知节点暂时离线时，匹配该节点的待执行工作继续排队，其余在线节点照常服务。
 
@@ -124,7 +144,7 @@ Client.fetch与中心向worker取回原ZIP统一调用Client.artifacts，复用�
 工程份额按各请求实际可运行的节点计算加权整数最大最小分配，含固定节点、工具、共享目录和CPU需求上限；同一节点的线程不会同时算给多个工程，不把Linux额度当作Windows额度。单节点沿用最大余数，多个节点用逐线程增广补齐可行份额。admission、排队分配和阶段增借使用同一份额；任务在关闭旧池后的cpus=0请求会按当前份额重新授予，包括归还超额CPU。已运行池保持原授权直至调用方发起安全阶段协商。
 
 Windows新建作业目录设置可继承的Low完整性标签，允许现有带Low标签的firtool、GSIM等工具写入本作业的输出和TEMP。处理发生在解包和创建子目录之前，使用Windows原生API；原DACL及继承标记保持不变，现有作业、父目录、共享盘根和工具文件保持原样。Linux沿用普通目录逻辑。
-中心的工具变体包含节点名和可执行文件摘要，调用工程可核对固定节点的引擎身份。
+操作员视图中的工具变体包含节点名和可执行文件摘要；普通工程的工具摘要只表示可用性，科学引擎身份从任务输出中的实际执行回执取得。
 
 ## 现有工程接入
 
@@ -134,26 +154,16 @@ Windows新建作业目录设置可继承的Low完整性标签，允许现有带L
 | --- | --- | --- |
 | AOP_v2 | `--compute-center URL` 或 `compute.center`；网页选本地调度器 / 本地工程 | 每角点任务；源码、模型按内容同步，沿用原测量与解析。 |
 | RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | PRE/POST使用`rgcn_python`；神经训练使用已验证Torch/PyG及检查点续跑的`rgcn_train`。源码和模型闭包同步，保留后仿恢复与原任务ID。 |
-| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；`run_remote`提交冻结源码资产，执行与源码校验使用同一资产。需要`arh_python`与`shared.arh`复用预部署工具、模型和持久统计缓存。Aya1-TX部署见[工具部署](operations.md#工程内工具安装)；声明`shared:arh`及相应编译器能力，由中心自动匹配。 |
+| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务；`run_remote`提交冻结源码资产，执行与源码校验使用同一资产。需要`arh_python`与`shared.arh`复用预部署工具、模型和持久统计缓存。Aya1-TX部署见[工具部署](../README.md#工程内工具安装)；声明`shared:arh`及相应编译器能力，由中心自动匹配。 |
 | Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码同步，需要 bench_python 科学环境。 |
 
-仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告；本次验证使用该隔离方式，正式结果与已有报告保持原样。日常正式运行仍按各工程规则更新当前成功报告。
+仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告，将验证结果与正式结果分开。日常正式运行仍按各工程规则更新当前成功报告。
 
 ONNX CPU推理任务额外声明`onnx_cpu`：此工具别名指向已验证同时具备OpenCV、ONNX Runtime及CPUExecutionProvider的Python。模型、输入数据与descriptor另作为内容资产同步。GPU硬件存在不等于CUDA推理后端可用；需要GPU的工程必须同时声明`accelerator`和对应的已验证工具标签。
 
-## 脚本与 Python 接口
+## Python 接口
 
-```text
-python main.py --mode hybrid --cpus 2 batch examples/batch.json results/demo
-python main.py --mode scheduler --nodes nodes.local.json run examples/spice/task.json --input examples/spice --output results/divider
-python main.py --mode scheduler --url http://192.168.1.10:26133 jobs
-python main.py --mode scheduler --url http://192.168.1.10:26133 fetch 任务ID --output results/recovered
-python main.py --check
-python main.py --test
-python main.py --test-native
-```
-
-全局 `--cpus` / `--memory-mb` 是本机提供者预算；任务命令后面的同名选项是该任务的资源预留。单任务命令成功返回 0，执行失败返回 1，配置或通信错误返回 2。
+CLI、退出码和自动化示例集中在 [README](../README.md#cli-与自动化)。
 
 ```python
 from remote_compute import Client, ngspice
@@ -173,7 +183,7 @@ print(result["files"]["ngspice.log"].decode(errors="replace"))
 from remote_compute import Client, command
 
 center = Client()
-window = center.window("my-project", resource_share=1.0, queue_ratio=1.0, cpus=1)
+window = center.window("my-project", resource_share=1.0, queue_ratio=1.0, cpus=0, max_cpus=8)
 print(window.maximum, window.current())
 task = command(["${tool:python}", "runner.py", "--workers", "${cpus}"],
                cpus=0, max_cpus=8, memory_mb=1024, project="my-project", resource_share=1.0,
@@ -186,7 +196,7 @@ print(result["status"], result["cpus"])
 
 ### 同步内核在阶段边界借还资源
 
-worker 任务环境提供 `REMOTE_COMPUTE_URL`、`REMOTE_COMPUTE_JOB_ID`、`REMOTE_COMPUTE_TOKEN`、`REMOTE_COMPUTE_HOME`，支持时 `REMOTE_COMPUTE_RESIZE=1`。SDK 路径指向执行设备上的本工具，回调指向所属调度中心；独立 worker 任务回调自身。中心默认监听 LAN 的26133，hybrid 的本机 worker 仍为进程内私有调用。指定中心仅监听回环时，远端任务保持静态授予。
+worker 任务环境提供 `REMOTE_COMPUTE_URL`、`REMOTE_COMPUTE_JOB_ID`、`REMOTE_COMPUTE_TOKEN`、`REMOTE_COMPUTE_HOME`，支持时 `REMOTE_COMPUTE_RESIZE=1`。SDK 使用执行设备的 DCO 包；远端请求先到本机 worker 的 lease 接口，再由中心的既有轮询连接转交授权。SDK 根据 `REMOTE_COMPUTE_LEASE` 和 worker 任务 ID 路由，调用工程直接使用下面的 Client 接口。中心仅监听回环时，已配置 worker 仍可通过这条单向通路借还资源。
 
 ```python
 import os
@@ -205,7 +215,7 @@ finally:
 
 DCO负责跨工程份额、CPU/内存准入、实际授予和原ID资源账本；调用工程负责判断是否有可伸缩内核，并在并行池/子进程已收齐的安全边界借还。YOLO包审计默认每包1CPU；对约50毫秒的串行尾段增加线程会增加通信和调度开销，较大通道块才按实测启用多核。Rocket/BOOM可在编译结束后按实际仿真并发和DDR规模同时收缩CPU/内存，ARH常驻池保持初始授予直到池关闭。工程资源配置不参与科学结果缓存身份。
 
-RAM预留对应当前阶段仍需承载的对象和并发子进程。编译器/并行池退出且其对象释放后，联合归还CPU和RAM；下一阶段增加峰值前先申请并检查实际授予。付费账本、模型和数据仍常驻时保留其需求，DCO不按瞬时低RSS自动下调任务申报。`/health`的节点`active_jobs`同时提供`memory_mb`与worker最近采样的`rss_mb`（尚未采样为null），可用于检查阶段预留；真实RSS始终参与设备内存准入。
+RAM申报对应当前阶段仍需承载的对象和并发子进程。编译器/并行池退出且其对象释放后，联合归还CPU和RAM；下一阶段增加峰值前先申请并检查实际授予。付费账本、模型和数据仍常驻时保留其需求；DCO 保留任务申报与原请求身份，已运行任务按实际 RSS 计入设备占用，空预留可供其他就绪任务使用。`/health`的节点`active_jobs`同时提供`memory_mb`与worker最近采样的`rss_mb`，`memory_requested_mb`与`memory_reserved_mb`分别表示申报合计和当前计账量。
 
 ## 任务文件与结果
 
@@ -250,18 +260,18 @@ result = client.run(task, files={
 
 资产按文件内容生成 ID；模型变动产生新 ID。节点部署路径分别配置，任务保持同一份逻辑输入。`shared` 中的预部署内容版本由调用工程维护。
 
-默认工作目录优先使用已有 `Z:` 内存盘，否则使用系统临时目录；`--root` 可指定。输入、构建中间物和日志均在任务独立目录内。客户端收齐结果后自动删除节点任务目录，`--keep` 可显式保留。用户选择的结果保存在输出目录；同步资产保留供后续复用。
+任务输入和输出位于普通磁盘的持久状态根，`root/--root` 与任务 TMP 的 `temp_root` 分开。编译或仿真可重建临时物使用任务独立 TMP；客户端收齐结果后默认清理节点任务目录，显式 keep 可保留。共享资产按引用和缓存策略复用；目录参数及迁移方式见 [README](../README.md#设备预算与配置文件)。
 
 普通计算任务继续使用独立工作目录。指定 `cwd` 的任务在目标机该目录中执行，`cwd` 接受绝对路径、`~` 或 `${shared:工程名}`；`${work}` 和 `outputs` 始终指向任务输入目录，可将需要回收的文件明确写入 `${work}`。任务 JSON 的 `stdin` 是输入包中的相对文件路径，逐步作为标准输入传入。
 
-每份结果包含任务 ID、输入摘要、命令、退出码、CPU 数、时间和工具文件摘要。接受后的任务通过原节点和 ID 查询；相同 ID 在节点保留期间重复提交只执行一次。测量解析、科学评分、唯一设计预算与研究缓存由原工程管理。
+中心内部回执包含任务 ID、输入摘要、命令、退出码、资源、时间和工具文件摘要。普通工程视图保留任务状态与本任务资源，去掉设备名、URL、工具路径和命令路径；`tools` 仅保留可用性。需要数值引擎身份的工程在任务输出中记录实际 SHA（AOP 使用 `aop-result.json.compute_engine`），再按该身份分区科学缓存。接受后的任务通过原 ID 查询，相同 ID 和输入在保留期间只执行一次。
 
 ## 传输与本地执行
 
 - hybrid 本机 worker 进程内调用，不经过第二层 HTTP；本机结果直接附加中心记录后打包一次。外部调用者仍统一访问中心 26133。
 - 普通固定线程任务保持原始输入包直接转发；整轮自动线程任务仅在派发时写入实际授予的线程数。输入身份与重复提交语义保持。
 - 模型和源码按内容标识同步；同一节点缓存版本内每份资产只检查/上传一次，并发任务共用同步锁。worker 重启或回收旧资产后重新确认；命中回收与派发的交错时，中心重新同步缺失资产并沿用原任务ID。
-- HTTP 使用持久连接。状态轮询只返回进度字段，完成后取完整资源与来源记录；支持 gzip 的客户端接收压缩 JSON，旧客户端继续接收普通 JSON。
+- HTTP 使用持久连接。状态轮询只返回进度字段，完成后取本任务资源和科学结果；支持 gzip 的客户端接收压缩 JSON，旧客户端继续接收普通 JSON。
 - 文本包采用低开销压缩；已经压缩的 gz/npz/zip/7z 直接封装。仿真器构建和中间文件留在执行端，按任务 outputs 回收必要结果。
 
 | 工程 | 默认回传内容 |
@@ -281,31 +291,13 @@ worker的可重建资产按LRU管理，启动、任务取回和退出时回收�
 
 `Client.run`、`Client.fetch`和`machine`默认在成功取回后清理服务端任务；有意保留时才使用`keep=True`或`delete=False`。任务由调用工程收齐并持久化输出后，服务端副本即可回收。服务退出负责清理自有TMP和过期缓存，未领取结果继续留在普通磁盘，重开后用原ID领取。DCO不会因任务结束或超时而自动丢弃研究回执；“不保存实验记录”应由调用工程控制正式报告，并继续正常取回清理DCO任务。
 
-本轮传输回归：8 个并发任务引用同一资产，只产生 1 次检查和 1 次上传；示例任务的完整状态为 1340 字节、精简进度为 187 字节，示例 worker 健康信息由 1693 字节压缩至 1043 字节。看板在 3 秒微测中获取状态 3 次，空闲循环复用已缓存画面。
-
-## 验证入口
-
-```text
-python main.py --check
-python main.py --test
-python main.py --test-native
-```
-
-核心回归覆盖份额、预取窗口、整轮线程授予、CPU/内存准入、连接复用、取消、文件操作、重启与结果回收。原生检查需要节点的 ngspice 和 Verilator。
-
-2026-10-17 的隔离实测：三工程持续提交 300 秒，AOP 完成 1188 个角点任务、RGCN 完成 638 个候选、ARH 完成 13 轮，均无错误；当时预算为 27+31，暖机后平均分配 51.8/58 线程，平均 CPU 为本机 95.4%、Aya1-TX 86.4%。随后按新预算 24+30 复查，达到 54/54 分配，AOP 125 个角点、RGCN 108 个候选、ARH 2 轮均无错误。两次检查保护的 16,252 个原结果/报告文件保持不变。Aya1-TX 的 RTL 编译与 4096 周期断言通过；Bench 的四个 ZDT1/Class-AB 配对任务、每任务 128 次评价，关键科学数组逐项一致。实测临时文件在完成后清理。
-
-随后使用正式 Class-AB 模型核对两台实际设备：ZDT1 全字段逐位一致；Class-AB 的制造设计、前沿索引、128 次预算、可行性与完整性掩码一致。Aya1-TX 的 float64 目标、约束、物理指标最大绝对差分别为 2.29e-10、3.29e-8、5.92e-7，原始浮点值保留。24+30 预算下的另一次 90 秒提交检查完成 AOP 256 个角点、RGCN 216 个候选、ARH 6 轮，峰值 54/54；18,764 个原结果/报告文件未变。CLI 实时帧在两端各检查 90 帧，覆盖 44–140 列和 24–48 行，92 字符原始标签通过缩写与明细完整保留。
-
-工具参数：[ngspice 文档](https://ngspice.sourceforge.io/docs.html)、[Verilator 参数](https://verilator.org/guide/latest/exe_verilator.html)。
-
 原生HTTPS worker支持单向资源协商：任务访问本机lease接口，中心按节点合并轮询待处理请求。存在此类在途任务时约每0.2秒检查一次，空闲节点沿用常规采样周期，避免每任务各建高频轮询连接。网络短暂中断保留原授权。
 
 ## 接入与传输约定
 
 - `requires`声明实际工具及`shared:<别名>`数据位置能力，步骤以`${shared:别名}`引用；同名工程目录不代表数据已同步。冻结数据与模型作为内容资产，结果取回后由工程发布到持久目录。
 - 固定引擎数据集使用 `requires` 声明能力名称；中心不按工具 SHA 拒绝设备。实际引擎回执决定缓存分区，新请求无需绑定设备或OS。
-- 科研工程不另建节点池、反向代理或隧道。来源设备保留在结果回执，用于追溯；调度不依赖特定主机名称。
+- 科研工程不另建节点池、反向代理或隧道。中心内部回执保留来源设备；工程任务输出保留科学输入和实际引擎身份，调度不依赖特定主机名称。
 - 只提交已就绪、能消费结果的工作；源码/模型每内容版本同步一次，重复候选复用工程现有科学缓存。连续小内核合并阶段授权，阶段结束及时归还；等待/借还耗时与CPU计算分开统计。
 - `read_job_file_changed(id,path,version=None)`返回`version/data/changed`；后续传回版本，未更新返回304且data为None，中心与worker两跳都不重传文件。需要恢复状态时按原子发布批次更新，不反复下载未改变的检查点。
 - 节点动态资源独立采样，慢节点不阻塞其他设备；首次连接/worker换PID取完整工具元数据，日常采样只取动态资源、活动任务和有界通知。简要健康查询直接返回身份与协议能力。
@@ -314,3 +306,23 @@ python main.py --test-native
 `client.sync_files(files_or_factory, content_id=摘要)`。摘要覆盖包内相对路径、内容和执行权限；
 SDK 先确认已有资产，命中时不生成文件、不压缩，缺失时才调用零参数工厂并重新上传。
 索引只存最近128个摘要与资产ID，不保留ZIP副本；不改变中心资产引用/回收规则。
+
+## 启动算力校准
+
+固定 `native-mixed-v4` 负载包含批量 FP64 Newton、uint32 逻辑/访存和 512×512 矩阵乘法。启动采样 CPU≤20% 且没有匹配缓存时，分别测 60 秒单线程、60 秒预算线程；导入/分配/预热不计分，BLAS 内层固定 1。CPU 身份、可见 CPU、线程预算匹配时复用 `.local/benchmarks/<线程数>.json`，`DCO_BENCHMARK_DIR` 可改位置；繁忙时保留业务任务，待空闲启动或手动 calibrate。
+
+Miter/s 是该固定混合负载的工作单位，不是 FLOPS。只有同版本基准参与比较；同标签真实任务耗时用指数移动平均逐步替代先验。AVX 等指令集差异由实测反映，不套人为倍率。
+
+## 生命周期与终端实现
+
+持久状态根保存输入、回执、检查点、资产和未领取输出；可重建 TMP 放共享 RAM 或显式磁盘 temp_root。任务成功、异常、取消及服务退出都按进程/任务所有权清理；待领取结果与中断恢复引用继续保留。迁移前核对 reparse point，普通文件与链接元数据分别处理，不沿链接目标移动共享工具。
+
+Windows 外部任务 TMP 设置与输入相同的低完整性写入标签，父目录 ACL 保持。Linux 进程监控共用 250ms 快照，退出/取消使用请求后开始的新扫描并跟踪另建会话的原生子进程。连接槽按 FIFO 排队，本地 PoolBusy 表示尚未发出请求：保留原 ID 和授权等待，取消时释放。
+
+看板宽度达到 120 列时左侧资源/份额、右侧逐任务，窄窗改上下分区；每任务独立一行，4位ID仅作展示。底部固定用法/候选/分隔/输入四行，极矮窗口优先输入。使用真实视口高度、ASCII 边框、实际字符单元宽度，按绝对坐标只画变化行。Windows 经典控制台启动尝试 160×50，并尊重屏幕上限、已有大窗口及 ConPTY 宿主尺寸。
+
+Windows 的 CPU 校准缓存身份通过本机注册表和 `GetNativeSystemInfo` 读取，终端可见性与焦点识别共用 Toolhelp 进程快照。两条启动路径不查询 WMI，避免 Python 3.14 的 `platform.machine()` 或 PowerShell CIM 等待阻塞初始化与首帧；架构名称保持与已有校准缓存一致。
+
+托管父进程和服务子进程各自持有防休眠请求，覆盖子进程重载边界。Windows 使用 `PowerCreateRequest` 持有 SystemRequired/ExecutionRequired，操作员可用 `powercfg /requests` 核对具名 DCO 原因；Linux 的 systemd-logind 环境使用 `systemd-inhibit --what=idle --mode=block`，由随上下文退出的标准输入管道管理辅助进程。异常路径归还已取得的请求与句柄，显示器不要求常亮，一次性客户端操作不持有抑制请求。
+
+耗时命令和文件操作后台执行，完成后及时释放 future/句柄；补全只读快照，Enter 才执行。键位与实际操作集中在 README。

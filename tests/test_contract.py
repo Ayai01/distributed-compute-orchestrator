@@ -81,6 +81,101 @@ class ContractTests(unittest.TestCase):
                 request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
                 self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 0)
 
+    def test_optional_accelerator_wait_is_validated(self):
+        from remote_compute.policy import normalize_accelerator_requirement
+        for value in (True, -1, float('nan'), float('inf'), '30', None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'fallback_after_seconds'):
+                normalize_accelerator_requirement(dict(kind='cuda', fallback_after_seconds=value))
+        for value in (0, .25, 30):
+            self.assertEqual(normalize_accelerator_requirement(
+                dict(kind='cuda', fallback_after_seconds=value))['fallback_after_seconds'], value)
+
+    def test_worker_accelerator_environment_comes_only_from_its_reservation(self):
+        forged = dict(DCO_ACCELERATOR_KIND='cuda', DCO_ACCELERATOR_COUNT='99',
+                      DCO_ACCELERATOR_MEMORY_MB='999999', DCO_ACCELERATOR_IDS='forged',
+                      CUDA_VISIBLE_DEVICES='forged')
+        code = 'import json,os;print(json.dumps({key:os.environ[key] for key in ' + repr(list(forged)) + '}))'
+        supplied = {**forged, **{key.lower(): value for key, value in forged.items()}}
+        with scratch() as directory, patch.dict(os.environ, supplied), provider(
+                Path(directory)/'gpu', env=supplied,
+                accelerators=[dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])]) as (_, remote):
+            cpu = remote.run(python(code, env=supplied))
+            self.assertEqual(cpu['status'], 'succeeded', cpu)
+            self.assertEqual(json.loads(cpu['stdout']), dict(
+                DCO_ACCELERATOR_KIND='', DCO_ACCELERATOR_COUNT='0',
+                DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='', CUDA_VISIBLE_DEVICES=''))
+            gpu = remote.run(python(code, env=supplied, accelerator=dict(kind='cuda')))
+            self.assertEqual(gpu['status'], 'succeeded', gpu)
+            self.assertEqual(json.loads(gpu['stdout']), dict(
+                DCO_ACCELERATOR_KIND='cuda', DCO_ACCELERATOR_COUNT='1',
+                DCO_ACCELERATOR_MEMORY_MB='8192', DCO_ACCELERATOR_IDS='0', CUDA_VISIBLE_DEVICES='0'))
+
+    def test_optional_accelerator_without_gpu_runs_cpu_under_original_identity(self):
+        with scratch() as directory, provider(Path(directory)/'cpu', cpus=2) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory)/'center') as (_, operator):
+                project = Client(operator.url)
+                request = dict(kind='cuda', fallback_after_seconds=30)
+                self.assertIn('accelerator_fallback', project.capabilities()['capabilities'])
+                grant = project.admission('optional', accelerator=request)
+                self.assertEqual((grant['capable_cpus'], grant['fallback_capable_cpus']), (0, 2))
+                accepted = project.submit(python(
+                    "import os;print(os.environ['DCO_ACCELERATOR_COUNT'])", accelerator=request))
+                result = project.wait(accepted['id'])
+                self.assertEqual(result['status'], 'succeeded', result)
+                self.assertEqual(result['id'], accepted['id'])
+                self.assertEqual(result['request_sha256'], accepted['request_sha256'])
+                self.assertEqual(result['stdout'].strip(), '0')
+                self.assertIsNone(result['accelerator'])
+                self.assertEqual(result['requested_accelerator']['fallback_after_seconds'], 30)
+                self.assertEqual(result['accelerator_fallback']['reason'], 'unavailable')
+                self.assertFalse(result['attempts'])
+
+    def test_busy_optional_accelerator_falls_back_while_mandatory_request_stays_queued(self):
+        with scratch() as directory, provider(Path(directory)/'gpu', cpus=2,
+                accelerators=[dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])]) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory)/'center') as (_, client):
+                hold = "from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+                first = client.submit(python(hold, accelerator=dict(kind='cuda')))['id']
+                until(lambda: client.status(first)['status'] == 'running')
+                mandatory = client.submit(python('print(1)', accelerator=dict(kind='cuda')))['id']
+                accepted = client.submit(python(
+                    "import os;print(os.environ['DCO_ACCELERATOR_COUNT'])",
+                    accelerator=dict(kind='cuda', fallback_after_seconds=.25)))
+                optional = accepted['id']
+                self.assertEqual(client.status(optional)['status'], 'queued')
+                result = client.wait(optional, wait_timeout=5)
+                self.assertEqual(result['status'], 'succeeded', result)
+                self.assertEqual(result['accelerator_fallback']['reason'], 'queue_timeout')
+                self.assertGreaterEqual(result['accelerator_fallback']['at'] - accepted['submitted'], .25)
+                self.assertEqual(result['request_sha256'], accepted['request_sha256'])
+                self.assertEqual(result['stdout'].strip(), '0')
+                self.assertEqual(client.status(first)['status'], 'running')
+                self.assertEqual(client.status(mandatory)['status'], 'queued')
+                client.write_job_file(first, 'release', 'done')
+                self.assertEqual(client.wait(first)['status'], 'succeeded')
+                self.assertEqual(client.wait(mandatory)['status'], 'succeeded')
+
+    def test_dispatched_optional_accelerator_keeps_gpu_after_wait_expires(self):
+        with scratch() as directory, provider(Path(directory)/'gpu',
+                accelerators=[dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])]) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                hold = "from pathlib import Path;import time,os\nwhile not Path('release').exists():time.sleep(.02)\nprint(os.environ['DCO_ACCELERATOR_COUNT'])"
+                identity = client.submit(python(hold, accelerator=dict(
+                    kind='cuda', fallback_after_seconds=30)))['id']
+                until(lambda: client.status(identity)['status'] == 'running')
+                with state.condition:
+                    job = state.jobs[identity]
+                    with patch('remote_compute.coordinator.time.time',
+                               return_value=job['result']['submitted'] + 60):
+                        state._fallback_accelerator(job)
+                    self.assertEqual(job['task']['accelerator']['kind'], 'cuda')
+                    self.assertNotIn('accelerator_fallback', job['result'])
+                client.write_job_file(identity, 'release', 'done')
+                result = client.wait(identity)
+                self.assertEqual(result['status'], 'succeeded', result)
+                self.assertEqual(result['stdout'].strip(), '1')
+                self.assertNotIn('accelerator_fallback', result)
+
     def test_tool_info_is_availability_only_and_shared_alias_route_without_device_names(self):
         with scratch() as directory:
             root=Path(directory);data=root/'data';data.mkdir()

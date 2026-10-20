@@ -464,9 +464,23 @@ class Node:
 
     @property
     def memory_free(self):
+        if self.health.get('memory_accounting')=='rss':
+            return min(self.memory_capacity-self.health.get('memory_reserved_mb',0)-self.memory_unreported,
+                       self.health.get('memory_available_mb',0)-self.memory_unreported)
         unreported = max(0, self.reserved_memory_mb - self.health.get("memory_reserved_mb", 0))
         return min(self.memory_capacity - self.reserved_memory_mb - self.external_memory_mb,
                    self.health.get("memory_available_mb", 0) - unreported)
+
+    @property
+    def memory_unreported(self):
+        reported=sum(job.get('memory_mb',0) for job in self.health.get('active_jobs',()) if job['id'] in self.live_jobs)
+        return max(0,self.reserved_memory_mb-reported)
+
+    @property
+    def memory_accounted(self):
+        if self.health.get('memory_accounting')=='rss':
+            return self.health.get('memory_reserved_mb',0)+self.memory_unreported
+        return self.reserved_memory_mb+self.external_memory_mb
 
     def accelerator_units(self):
         units=[]
@@ -508,9 +522,13 @@ class Node:
     def refresh_external_accelerators(self, jobs):
         """Rebuild reservations for work accepted outside this scheduler."""
         self.external_accelerator_reservations=[]
-        known=self.known_jobs | self.live_jobs
         for job in jobs or ():
-            if job.get('status') != 'running' or job.get('id') in known:
+            identity=job.get('id')
+            # Reattachment can own CPU credits before a GPU profile returns.
+            # Keep that GPU external until a real local reservation exists;
+            # completed known jobs still ignore delayed running snapshots.
+            if (job.get('status') != 'running' or identity in self.accelerator_reservations
+                    or (identity in self.known_jobs and identity not in self.live_jobs)):
                 continue
             selected=self._select_accelerator(job.get('accelerator'))
             if selected:
@@ -612,7 +630,8 @@ class Pool:
                 running=[job for job in jobs if job['status']=='running']
                 node.external=sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
                 node.refresh_external_accelerators(running)
-                owned_memory=sum(max(job['memory_mb'],job.get('rss_mb',0)) for job in running if job['id'] in node.known_jobs)
+                owned_memory=sum(((job.get('rss_mb') or job['memory_mb']) if value.get('memory_accounting')=='rss' else
+                                  max(job['memory_mb'],job.get('rss_mb',0))) for job in running if job['id'] in node.known_jobs)
                 node.external_memory_mb=max(0,value.get('memory_reserved_mb',0)-owned_memory)
                 node.known_jobs.intersection_update({job['id'] for job in jobs}|node.live_jobs)
             self.condition.notify_all()
@@ -862,8 +881,10 @@ class Pool:
         machine = node.health.get("machine_id", node.client.url)
         siblings = [n for n in self.nodes if n.health.get("machine_id", n.client.url) == machine and not n.error]
         # One physical memory pool per machine, even with several worker ports.
-        physical = min(n.health.get("host_memory_available_mb", 0) - n.health.get("memory_reserve_mb", 0) for n in siblings)
-        unallocated = sum(max(0, n.reserved_memory_mb + n.external_memory_mb - n.health.get("rss_mb", 0)) for n in siblings)
+        physical = min(n.health.get("host_memory_available_mb", 0) - n.health.get("memory_headroom_mb",n.health.get("memory_reserve_mb", 0)) for n in siblings)
+        unallocated = sum((n.memory_unreported+max(0,n.health.get('memory_reserved_mb',0)-n.health.get('rss_mb',0))
+                           if n.health.get('memory_accounting')=='rss' else
+                           max(0,n.reserved_memory_mb+n.external_memory_mb-n.health.get('rss_mb',0))) for n in siblings)
         return physical - unallocated
 
     def _release(self, node, task, result=None, *, job_id=None):

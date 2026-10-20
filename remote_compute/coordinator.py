@@ -54,6 +54,7 @@ class Coordinator:
                 with zipfile.ZipFile(path.parent/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+                self._restore_accelerator(task, value)
                 value.setdefault('max_retries',task.get('retries',2))
                 if value['status']=='queued' or not value.get('worker_url'):
                     job.update(task=task,auto_cpus=task['cpus']==0)
@@ -105,6 +106,8 @@ class Coordinator:
                 resource=self.project_resources()[project]
                 advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
                                   resource['target']-resource['used']+old,node.capacity-node.reserved-node.external+old))
+                if job.get('auto_cpus'):
+                    advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,{project:resource}))
                 advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
                             current_cpus=old,current_memory_mb=old_memory,
                             available_memory_mb=old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
@@ -136,8 +139,10 @@ class Coordinator:
                   and n.capacity>=max(1,cpus)
                   and (not node_name or n.name==node_name)
                   and set(requires).issubset(canonical_capabilities(n.health.get('tags',())))
-                   and n.supports_accelerator(accelerator)
                   ]
+        fallback_capable = (sum(n.capacity for n in eligible)
+                            if accelerator is not None and 'fallback_after_seconds' in accelerator else 0)
+        eligible = [n for n in eligible if n.supports_accelerator(accelerator)]
         capable=sum(n.capacity for n in eligible)
         names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
         shares[project], demands[project] = share, capable+sum(held.values())
@@ -181,7 +186,7 @@ class Coordinator:
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
-                    accelerator=accelerator,
+                    accelerator=accelerator,fallback_capable_cpus=fallback_capable,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
@@ -198,7 +203,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -312,6 +317,8 @@ class Coordinator:
                     item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb','started')}
                     item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
                     item['project'] = job.get('task',{}).get('project','')
+                    item.update({key:job['task'].get(key,default) for key,default in
+                                 (('priority',0),('resource_share',1.0))})
                     active.setdefault(result['assigned_node'],[]).append(item)
             for node in snapshot['nodes']:
                 external, remaining = [], node['external_cpus']
@@ -331,7 +338,7 @@ class Coordinator:
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': sum(j['result']['status'] in TERMINAL for j in self.jobs.values()),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -339,9 +346,15 @@ class Coordinator:
                                                    group[0].health.get("memory_total_mb", 0)) for group in machines.values()),
                     "memory_available_mb": sum(max(0, min(self.pool._host_memory_free(group[0]),
                                                           sum(n.memory_free for n in group))) for group in machines.values()),
-                    "memory_reserved_mb": sum(n.reserved_memory_mb + n.external_memory_mb for n in online),
+                    "memory_reserved_mb": sum(n.memory_accounted for n in online),
+                    "memory_requested_mb": sum(n.reserved_memory_mb+n.external_memory_mb for n in online),
                     "paused": self.paused, "queued": len(self.queue), "tags": sorted(tags),
                     "policy": snapshot["policy"], "nodes": snapshot["nodes"],
+                    'queued_jobs':[{**{key:self.jobs[identity]['result'].get(key) for key in
+                        ('id','label','status','cpus','memory_mb','started')},
+                        **{key:self.jobs[identity]['task'].get(key,default) for key,default in
+                           (('project','default'),('priority',0),('resource_share',1.0))}}
+                        for identity in self.queue],
                     'projects': self.project_resources(), **self.activity.snapshot()}
 
     def project_resources(self):
@@ -416,6 +429,31 @@ class Coordinator:
     def _save(self, job):
         atomic_json(job["directory"] / "result.json", job["result"])
 
+    @staticmethod
+    def _restore_accelerator(task, result):
+        # The input bundle is immutable; the receipt owns a queued fallback
+        # decision across restart, retry and reattachment to an accepted job.
+        if 'requested_accelerator' in result:
+            task['accelerator'] = result['accelerator']
+
+    def _fallback_accelerator(self, job):
+        requirement = job['task'].get('accelerator')
+        result = job['result']
+        if (requirement is None or 'fallback_after_seconds' not in requirement
+                or result['status'] != 'queued' or result.get('attempts')
+                or result.get('dispatched') is not None or job.get('node') is not None):
+            return
+        now = time.time()
+        with self.pool.condition:
+            online = any(not node.error and node.enabled and not node.health.get('paused')
+                         for node in self.pool._matching(job['task']))
+        reason = ('unavailable' if not online else
+                  'queue_timeout' if now - result['submitted'] >= requirement['fallback_after_seconds'] else None)
+        if reason is not None:
+            job['task']['accelerator'] = None
+            result.update(accelerator=None, accelerator_fallback=dict(reason=reason, at=now))
+            self._save(job)
+
     def submit(self, identity, payload, *, operator=False):
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
@@ -445,6 +483,8 @@ class Coordinator:
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
                               "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}}
+            if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
+                job['result']['requested_accelerator'] = task['accelerator']
             self._save(job)
             self.jobs[identity] = job
             self.queue.append(identity)
@@ -452,20 +492,36 @@ class Coordinator:
             self.condition.notify_all()
             return dict(job["result"])
 
+    def _queued_candidates(self,budgets):
+        """Within a priority, serve the least CPU per resource-share first."""
+        from collections import deque
+        counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
+                        for node in self.pool._matching(self.jobs[key]['task'])) for key in self.queue}
+        for borrowing in (False,True):
+            for priority in sorted({self.jobs[key]['task']['priority'] for key in self.queue},reverse=True):
+                groups={}
+                for key in sorted(self.queue,key=lambda key:(self.jobs[key]['task']['cpus']==0,counts[key])):
+                    task=self.jobs[key]['task']
+                    if task['priority']==priority:groups.setdefault(task.get('project') or 'default',deque()).append(key)
+                while groups:
+                    group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'],
+                        self.jobs[groups[group][0]]['task']['cpus']==0,counts[groups[group][0]]))
+                    key=groups[group].popleft()
+                    if not groups[group]:del groups[group]
+                    yield key,borrowing
+
     def _schedule(self):
         with self.condition:
             while not self.stopping:
                 self._recover_running()
                 if not self.paused:
+                    for identity in self.queue:
+                        self._fallback_accelerator(self.jobs[identity])
                     budgets = self.project_resources()
-                    ordered = sorted(self.queue, key=lambda key: (-self.jobs[key]['task']['priority'],
-                                     self.jobs[key]['task']['cpus'] == 0,
-                                     sum(not node.error and node.enabled and not node.health.get('paused')
-                                         for node in self.pool._matching(self.jobs[key]['task']))))
                     # Within the same priority and CPU mode, place constrained
                     # work first so flexible jobs retain the other devices.
                     # First honor weighted targets, then lend otherwise idle slots.
-                    for identity, borrowing in [(key, False) for key in ordered] + [(key, True) for key in ordered]:
+                    for identity, borrowing in self._queued_candidates(budgets):
                         if identity not in self.queue:
                             continue
                         job = self.jobs[identity]
@@ -513,6 +569,7 @@ class Coordinator:
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+                self._restore_accelerator(task, job['result'])
                 automatic=task['cpus']==0
                 grant=remote or job['result']
                 task.update(cpus=grant['cpus'],memory_mb=grant['memory_mb'])
@@ -551,7 +608,8 @@ class Coordinator:
             if not job.pop('reattach',False):
                 payload = (job['directory'] / 'request.zip').read_bytes()
                 if (job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task
-                        or 'retries' in task or task.get('node') is not None):
+                        or 'retries' in task or task.get('node') is not None
+                        or 'requested_accelerator' in job['result']):
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                         files = {name: archive.read(name) for name in archive.namelist()}
                     worker_task = dict(task)
@@ -559,6 +617,10 @@ class Coordinator:
                     worker_task.pop('node',None)
                     worker_task.pop('single_thread_weight',None)
                     worker_task.pop('retries',None)
+                    if worker_task.get('accelerator') is not None:
+                        worker_task['accelerator'] = {
+                            key: value for key, value in worker_task['accelerator'].items()
+                            if key != 'fallback_after_seconds'}
                     if 'max_cpus' not in node.health.get('capabilities',[]):
                         worker_task.pop('max_cpus',None)
                     files['task.json'] = json_bytes(worker_task)
@@ -677,6 +739,7 @@ class Coordinator:
         with zipfile.ZipFile(job['directory']/'request.zip') as archive:
             task=json.loads(archive.read('task.json'))
         task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+        self._restore_accelerator(task, job['result'])
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
         job.update(task=task,auto_cpus=task['cpus']==0,node=None,worker_id=worker_id)
         job.pop('desired_cpus',None);job.pop('lease_answered',None)
@@ -718,6 +781,7 @@ class Coordinator:
         if job.get('task'):
             assigned['cpus']=job['task']['cpus']
             assigned['memory_mb']=job['task']['memory_mb']
+            assigned['accelerator']=job['task'].get('accelerator')
         job["result"].update(remote, **assigned, center_submitted=submitted)
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
@@ -730,6 +794,55 @@ class Coordinator:
         host,port=self.callback_address[:2]
         host='127.0.0.1' if host=='0.0.0.0' else host
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
+
+    def _cooperative_cpu_target(self, identity, desired, resources):
+        """Share a project's node budget at a drained automatic phase boundary.
+
+        Running peers keep their grants until their own boundary. Fixed-width
+        ready work is placed whole before dividing the remaining automatic work.
+        """
+        current=self.jobs[identity];group=current['task'].get('project') or 'default'
+        resource=resources[group];priority=current['task'].get('priority',0)
+        members={key:job for key,job in self.jobs.items()
+                 if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
+                 and (job['task'].get('project') or 'default')==group}
+        nodes={node.name:node for node in self.pool.nodes
+               if node.enabled and not node.error and not node.health.get('paused')}
+        capacities={}
+        for name,node in nodes.items():
+            held=sum(job['task']['cpus'] for job in members.values() if job.get('node') is node)
+            capacities[name]=max(0,min(resource['node_targets'].get(name,0),
+                node.capacity-node.external-node.reserved+held))
+        fixed=[];demands={};rooms={}
+        for key,job in members.items():
+            task=job['task'];held=job.get('node')
+            automatic=key==identity or job.get('auto_cpus')
+            if held is not None and (not automatic or task.get('priority',0)<priority):
+                if held.name in capacities:capacities[held.name]=max(0,capacities[held.name]-task['cpus'])
+                continue
+            if task.get('priority',0)<priority:continue
+            wanted={**task,'cpus':0} if automatic else task
+            eligible=[]
+            for node in self.pool._matching(wanted):
+                if node.name not in capacities or (held is not None and held is not node):continue
+                if held is None:
+                    if task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node))):continue
+                    if task.get('accelerator') and node._select_accelerator(task['accelerator']) is None:continue
+                eligible.append(node.name)
+            if not eligible:continue
+            if not automatic:
+                fixed.append((key,task,eligible,job['result'].get('submitted',0)))
+                continue
+            demand=desired if key==identity else job.get('desired_cpus',max(nodes[n].capacity for n in eligible))
+            demands[key]=min(demand,task.get('max_cpus',demand))
+            rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
+        for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-row[1].get('priority',0),len(row[2]),row[3])):
+            choices=[name for name in eligible if capacities[name]>=task['cpus']]
+            if choices:
+                selected=max(choices,key=lambda name:capacities[name])
+                capacities[selected]-=task['cpus']
+        plan=weighted_node_threads(capacities,{key:1. for key in demands},demands,rooms)
+        return max(1,plan.get(identity,{}).get(current['node'].name,0))
 
     def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:
@@ -763,6 +876,8 @@ class Coordinator:
                     available=node.capacity-node.reserved-node.external+old
                     floor=1 if cpus==0 else old
                     granted=max(floor,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
+                    if cpus==0 and node.enabled and not node.health.get('paused'):
+                        granted=min(granted,self._cooperative_cpu_target(identity,desired,resources))
                 granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
                     old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
                 memory=old_memory if memory is None else memory

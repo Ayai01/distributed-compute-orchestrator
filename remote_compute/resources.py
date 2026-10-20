@@ -12,6 +12,8 @@ import subprocess
 import time
 
 MIB = 1024 * 1024
+DEFAULT_MEMORY_RESERVE_MB = 16 * 1024
+DEFAULT_MEMORY_HEADROOM_MB = 8 * 1024
 MACHINE_ID = socket.gethostname() + ":" + f"{uuid.getnode():012x}"
 @lru_cache(maxsize=None)
 def cpu_benchmark(cpus, executable=None, environment=(), *, force=False):

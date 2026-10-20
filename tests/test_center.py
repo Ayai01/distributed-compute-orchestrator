@@ -27,7 +27,7 @@ class AdmissionPlanningTests(unittest.TestCase):
         for index,capacity in enumerate(capacities):
             node=Node(str(index),SimpleNamespace(url=str(index)))
             node.health=dict(cpus=capacity,cpu_limit=capacity,tags=['ngspice47'],
-                             memory_capacity_mb=8192)
+                             memory_capacity_mb=8192,memory_available_mb=8192,host_memory_available_mb=8192)
             pool.nodes.append(node)
         state=Coordinator.__new__(Coordinator)
         state.pool,state.condition,state.jobs=pool,threading.Condition(),{}
@@ -74,6 +74,50 @@ class AdmissionPlanningTests(unittest.TestCase):
         state.pool.nodes[0].health['paused']=True
         window=state.admission(dict(project='A',queue_ratio=0))
         self.assertEqual((window['capable_cpus'],window['target_cpus']),(0,0))
+
+    def test_cooperative_target_fits_fixed_work_before_dividing_automatic_jobs(self):
+        state=self.center([16]);node=state.pool.nodes[0];node.reserved=16
+        def job(cpus,automatic,held=None,requires=()):
+            return dict(task=dict(steps=[['echo']],cpus=cpus,memory_mb=64,project='RGCN',requires=list(requires)),
+                auto_cpus=automatic,node=held,cancel=threading.Event(),result=dict(status='running' if held else 'queued'))
+        state.jobs={'active':job(16,True,node),'waiting':job(0,True),'freeze':job(1,False)}
+        resources=state.project_resources()
+        self.assertEqual(state._cooperative_cpu_target('active',16,resources),8)
+        # An indivisible twelve-CPU task must receive its full width, rather
+        # than an unusable eight-CPU fraction of a max-min division.
+        state.jobs['freeze']['task']['cpus']=12
+        self.assertEqual(state._cooperative_cpu_target('active',16,state.project_resources()),2)
+
+    def test_cooperative_target_ignores_unready_or_incompatible_waiters(self):
+        state=self.center([4]);node=state.pool.nodes[0];node.reserved=4
+        active=dict(task=dict(steps=[['echo']],cpus=4,memory_mb=64,project='A'),auto_cpus=True,node=node,
+            cancel=threading.Event(),result=dict(status='running'))
+        state.jobs={'active':active}
+        for key,changes in (('incompatible',{'requires':['missing']}),('too_large',{'memory_mb':99999}),
+                            ('lower_priority',{'priority':-1}),('cancelled',{})):
+            state.jobs[key]=dict(task=dict(active['task'],cpus=0,**changes),auto_cpus=True,node=None,
+                cancel=threading.Event(),result=dict(status='queued'))
+        state.jobs['cancelled']['cancel'].set()
+        self.assertEqual(state._cooperative_cpu_target('active',4,state.project_resources()),4)
+
+    def test_cooperative_target_places_flexible_waiter_on_another_node(self):
+        state=self.center([4,4]);node=state.pool.nodes[0];node.reserved=4
+        state.jobs={key:dict(task=dict(steps=[['echo']],cpus=4 if key=='active' else 0,memory_mb=64,project='A'),
+            auto_cpus=True,node=node if key=='active' else None,cancel=threading.Event(),
+            result=dict(status='running' if key=='active' else 'queued')) for key in ('active','waiting')}
+        self.assertEqual(state._cooperative_cpu_target('active',4,state.project_resources()),4)
+
+    def test_queue_rechecks_used_threads_per_share_after_each_allocation(self):
+        state=self.center([16]);state.queue=['A1','A2','B1','urgent']
+        for key in state.queue:
+            state.jobs[key]=dict(task=dict(steps=[['echo']],cpus=1,project=key[0],priority=3 if key=='urgent' else 0))
+        budgets={'A':dict(used=0,resource_share=1.),'B':dict(used=2,resource_share=1.),'u':dict(used=8,resource_share=1.)}
+        iterator=state._queued_candidates(budgets)
+        self.assertEqual(next(iterator),('urgent',False))
+        self.assertEqual(next(iterator),('A1',False))
+        budgets['A']['used']=4
+        self.assertEqual(next(iterator),('B1',False))
+        self.assertEqual(next(iterator),('A2',False))
 
 
 @contextmanager
@@ -339,6 +383,26 @@ class CenterTests(unittest.TestCase):
         self.assertEqual((grant['cpus'],grant['memory_mb']),(1,256))
         self.assertEqual(client.request.call_count,1)
         self.assertNotIn('resize',client.request.call_args.args[0])
+
+    def test_cooperative_boundary_admits_same_project_auto_and_fixed_jobs(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                first=client.submit(python('import time;time.sleep(30)',cpus=0,project='RGCN'))['id']
+                until(lambda:client.status(first)['status']=='running')
+                before=client.status(first)['request_sha256']
+                second=client.submit(python('import time;time.sleep(30)',cpus=0,project='RGCN'))['id']
+                fixed=client.submit(python('import time;time.sleep(30)',cpus=1,project='RGCN'))['id']
+                grant=client.resize(first,0,base_memory_mb=64,memory_per_cpu_mb=32)
+                self.assertLess(grant['cpus'],4)
+                until(lambda:client.status(second)['status']=='running' and client.status(fixed)['status']=='running')
+                self.assertEqual(client.status(first)['request_sha256'],before)
+                self.assertEqual(pool.nodes[0].reserved,4)
+                for identity in (fixed,second):
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
+                self.assertEqual(client.resize(first,0)['cpus'],4)
+                client.cancel(first);client.wait(first);client.fetch(first)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_node_public_ip_override_survives_load_configure_snapshot_and_save(self):
         from types import SimpleNamespace

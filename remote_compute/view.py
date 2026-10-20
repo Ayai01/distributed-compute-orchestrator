@@ -282,7 +282,8 @@ class StatusRows(list):
         if center:
             for name,a in value.get('projects',{}).items():
                 count=sum(job.get('project')==name for _,job in self.jobs)
-                self.projects.append([_project(name),f"{a['resource_share']:g}",f"{count}/{a['used']}",a['target'],a['queued']])
+                self.projects.append([_project(name),str(float(a['resource_share'])),f"{count}/{a['used']}",a['target'],a['queued']])
+            self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         now=time.time()
         self.records=[]
@@ -291,7 +292,8 @@ class StatusRows(list):
             started=job.get('started')
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"1/{job.get('cpus',0)}",
                                  _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),_label(job),
-                                 str(max(0,int(now-started))) if started is not None else '-'])
+                                 str(max(0,int(now-started))) if started is not None else '-',
+                                 f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}"])
 
     def _resources(self, width):
         records=[r for _,r in self.devices]
@@ -374,7 +376,11 @@ class StatusRows(list):
         self.task_page%=self.page_count
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         records=[r if len(r)>7 else [*r,'-'] for r in records]
-        if width>=80:
+        if width>=110:
+            table=_table(['ID','设备','工程','份额/优先级','任务/线程','RAM','运行秒','状态','标签'],
+                         [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5,6)] for r in records],
+                         [4,7,6,11,9,4,6,4,None],width,right=(3,4,5,6))
+        elif width>=80:
             table=_table(['ID','设备','工程','任务/线程','RAM','运行秒','状态','标签'],
                          [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
                          [4,7,6,9,4,6,4,None],width,right=(3,4,5))

@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -118,15 +119,17 @@ class CacheCommandTests(unittest.TestCase):
         finally:
             shell.close()
 
-    def _invoke_cli(self, argv, *, status='succeeded', role='scheduler'):
+    def _invoke_cli(self, argv, *, status='succeeded', role='scheduler',
+                    local_operator=None, configured_operator=None, operator=''):
         client = Mock(url='http://center')
         client.health.return_value = dict(node='center', role=role)
         client.nodes.return_value = dict(nodes=[])
+        client.status.return_value = dict(jobs=[])
         pool = Mock(closed=False)
         sync = Mock(return_value=dict(status=status, projects=[]))
         with scratch() as directory, \
                 patch.dict(sys.modules, {'remote_compute.cache_sync': SimpleNamespace(sync_cache=sync)}), \
-                patch.dict(os.environ, {'REMOTE_COMPUTE_TOKEN':'', 'REMOTE_COMPUTE_OPERATOR_TOKEN':''}), \
+                patch.dict(os.environ, {'REMOTE_COMPUTE_TOKEN':'', 'REMOTE_COMPUTE_OPERATOR_TOKEN':operator}), \
                 patch('remote_compute.cli.ROOT', Path(directory)), \
                 patch('remote_compute.cli.Client', return_value=client) as clients, \
                 patch('remote_compute.cli.Pool', return_value=pool), \
@@ -134,11 +137,47 @@ class CacheCommandTests(unittest.TestCase):
                 patch('remote_compute.cli.Coordinator') as coordinator, \
                 patch('remote_compute.cli.Server') as server, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            if local_operator is not None:
+                token_file = Path(directory)/'.local/state/scheduler/operator.token'
+                token_file.parent.mkdir(parents=True)
+                token_file.write_text(local_operator, encoding='utf8')
+            if configured_operator is not None:
+                config_file = Path(directory)/'device.json'
+                config_file.write_text(json.dumps({'operator_token':configured_operator}), encoding='utf8')
+                argv = ['--config', str(config_file), *argv]
             code = main(argv)
             worker.assert_not_called()
             coordinator.assert_not_called()
             server.assert_not_called()
         return code, client, clients, sync
+
+    def test_local_operator_token_is_never_sent_to_a_remote_url(self):
+        for url in ('http://example.test:26133', 'http://192.0.2.1:26133',
+                    'http://localhost.example.test:26133'):
+            with self.subTest(url=url):
+                code, _, clients, _ = self._invoke_cli(
+                    ['--url', url, 'jobs'], local_operator='local-secret',
+                    configured_operator='local-config-secret')
+                self.assertEqual(code, 0)
+                self.assertTrue(clients.call_args_list)
+                self.assertTrue(all(not call.kwargs.get('operator_token')
+                                    for call in clients.call_args_list))
+
+    def test_loopback_operator_token_and_explicit_remote_token(self):
+        for url in ('http://127.0.0.1:26133', 'http://localhost:26133', 'http://[::1]:26133'):
+            with self.subTest(url=url):
+                code, _, clients, _ = self._invoke_cli(
+                    ['--url', url, 'jobs'], local_operator='local-secret')
+                self.assertEqual(code, 0)
+                self.assertTrue(all(call.kwargs.get('operator_token') == 'local-secret'
+                                    for call in clients.call_args_list))
+        code, _, clients, _ = self._invoke_cli(
+            ['--url', 'http://example.test:26133', 'jobs'],
+            local_operator='local-secret', configured_operator='local-config-secret',
+            operator='explicit-remote-secret')
+        self.assertEqual(code, 0)
+        self.assertTrue(all(call.kwargs.get('operator_token') == 'explicit-remote-secret'
+                            for call in clients.call_args_list))
 
     def test_cli_defaults_to_existing_local_center_and_both_cache_kinds(self):
         code, client, clients, sync = self._invoke_cli(['sync_cache', 'all'])

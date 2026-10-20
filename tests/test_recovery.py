@@ -15,6 +15,84 @@ from test_compute import provider,python,scratch,until
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_reconnected_gpu_without_local_reservation_stays_accounted_after_profile_returns(self):
+        from types import SimpleNamespace
+        from remote_compute.client import Node
+        node = Node('worker', SimpleNamespace(url='test'))
+        node.known_jobs.add('recovered')
+        node.live_jobs.add('recovered')
+        job = dict(id='recovered', status='running', accelerator=dict(kind='cuda'))
+        node.refresh_external_accelerators([job])
+        self.assertFalse(node.external_accelerator_reservations)
+        node.health['accelerators'] = [dict(kind='cuda', count=1, memory_mb=8192)]
+        for _ in range(2):
+            node.refresh_external_accelerators([job])
+            self.assertEqual(len(node.external_accelerator_reservations), 1)
+            self.assertFalse(node.can_match_accelerator(dict(kind='cuda')))
+        node.live_jobs.remove('recovered')
+        node.refresh_external_accelerators([job])  # A stale sample after completion.
+        self.assertFalse(node.external_accelerator_reservations)
+        self.assertTrue(node.can_match_accelerator(dict(kind='cuda')))
+        node.reserve_accelerator(dict(kind='cuda'), 'owned')
+        node.live_jobs.add('owned')
+        node.refresh_external_accelerators([dict(job, id='owned')])
+        self.assertFalse(node.external_accelerator_reservations)
+
+    def test_cpu_fallback_survives_retry_when_gpu_becomes_an_available_destination(self):
+        with scratch() as temporary:
+            root = Path(temporary)
+            with provider(root/'lost') as (_, lost), provider(root/'gpu',
+                    accelerators=[dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])]) as (_, healthy):
+                with Pool([lost, healthy], policy='round_robin') as pool, center(pool, root/'center') as (_, client):
+                    def unavailable(*args, **kwargs):
+                        pool.nodes[0].enabled = False
+                        return dict(status='interrupted', error='Worker stopped', finished=time.time())
+                    with patch.object(lost, 'submit_bundle', return_value={}), patch.object(
+                            lost, 'status', side_effect=unavailable):
+                        accepted = client.submit(python(
+                            "import os;print(os.environ['DCO_ACCELERATOR_COUNT'])",
+                            accelerator=dict(kind='cuda', fallback_after_seconds=0)))
+                        result = client.wait(accepted['id'], wait_timeout=10)
+                    self.assertEqual(result['status'], 'succeeded', result)
+                    self.assertEqual(result['id'], accepted['id'])
+                    self.assertEqual(result['request_sha256'], accepted['request_sha256'])
+                    self.assertEqual(len(result['attempts']), 1)
+                    self.assertIsNone(result['accelerator'])
+                    self.assertEqual(result['stdout'].strip(), '0')
+                    self.assertEqual(result['accelerator_fallback']['reason'], 'queue_timeout')
+
+    def test_cpu_fallback_survives_queued_restart_and_running_reattachment(self):
+        with scratch() as temporary, provider(Path(temporary)/'worker') as (worker, remote):
+            root = Path(temporary)
+            task = python("import os;print(os.environ['DCO_ACCELERATOR_COUNT'])",
+                          accelerator=dict(kind='cuda', fallback_after_seconds=30))
+            with Pool([remote]) as pool, center(pool, root/'center') as (state, client):
+                finished = client.submit(task)
+                self.assertEqual(client.wait(finished['id'])['status'], 'succeeded')
+                client.control(paused=True)
+                queued = client.submit(task)
+                with state.condition:
+                    state._fallback_accelerator(state.jobs[queued['id']])
+                for accepted in (finished, queued):
+                    self.assertIsNone(client.status(accepted['id'])['accelerator'])
+            for accepted, status in ((finished, 'running'), (queued, 'queued')):
+                path = root/'center/jobs'/accepted['id']/'result.json'
+                result = json.loads(path.read_text())
+                result.update(status=status, finished=None)
+                path.write_text(json.dumps(result))
+            from remote_compute.policy import normalize_accelerators
+            worker.accelerators = normalize_accelerators([
+                dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])])
+            with Pool([remote]) as pool, center(pool, root/'center') as (_, client):
+                for accepted in (finished, queued):
+                    result = client.wait(accepted['id'], wait_timeout=10)
+                    self.assertEqual(result['status'], 'succeeded', result)
+                    self.assertEqual(result['request_sha256'], accepted['request_sha256'])
+                    self.assertIsNone(result['accelerator'])
+                    self.assertEqual(result['accelerator_fallback']['reason'], 'unavailable')
+                    self.assertEqual(result['stdout'].strip(), '0')
+                    self.assertFalse(result['attempts'])
+
     def test_lost_worker_retries_original_request_on_healthy_worker(self):
         for failure in ('missing','interrupted'):
             with self.subTest(failure=failure),scratch() as temporary:

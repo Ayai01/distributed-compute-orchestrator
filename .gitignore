@@ -8,3 +8,12 @@ results/
 .vscode/
 .local/
 worker.standalone.json
+
+# Six maintained project documents; local reports stay local.
+*.md
+!/README.md
+!/AGENTS.md
+!/docs/DESIGN.md
+!/docs/HISTORY.md
+!/docs/STATUS.md
+!/docs/ROADMAP.md

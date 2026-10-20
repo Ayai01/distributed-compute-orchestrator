@@ -5,6 +5,8 @@ needs and semantic capabilities; these bounds keep optional scheduling hints
 from becoming a second placement API.
 """
 
+import math
+
 MAX_RESOURCE_SHARE = 16.0
 MAX_QUEUE_RATIO = 4.0
 MAX_SINGLE_THREAD_WEIGHT = 8.0
@@ -52,8 +54,15 @@ def normalize_accelerator_requirement(value):
             or any(not isinstance(tag, str) or not tag or len(tag) > MAX_REQUIREMENT_LENGTH
                    for tag in requires)):
         raise ValueError('accelerator requires kind, count 1..16, memory_mb and short capability tags')
-    return dict(kind=kind, count=count, memory_mb=memory_mb,
-                requires=canonical_capabilities(requires))
+    normalized = dict(kind=kind, count=count, memory_mb=memory_mb,
+                      requires=canonical_capabilities(requires))
+    if 'fallback_after_seconds' in value:
+        wait = value['fallback_after_seconds']
+        if (isinstance(wait, bool) or not isinstance(wait, (int, float))
+                or not math.isfinite(wait) or wait < 0):
+            raise ValueError('accelerator fallback_after_seconds must be finite and nonnegative')
+        normalized['fallback_after_seconds'] = wait
+    return normalized
 
 
 def normalize_accelerators(value):
@@ -109,4 +118,5 @@ def public_capabilities():
         "single_thread_weight",
         "asset_cache",
         "accelerators",
+        "accelerator_fallback",
     ]

@@ -35,6 +35,29 @@ def _windows_processes():
     return processes
 
 
+def _windows_command_line(pid):
+    """Read a process command line without entering a WMI provider."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    kernel=c.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];kernel.OpenProcess.restype=w.HANDLE
+    kernel.CloseHandle.argtypes=[w.HANDLE]
+    handle=kernel.OpenProcess(0x1000,False,pid)
+    if not handle:return ''
+    try:
+        query=c.WinDLL('ntdll').NtQueryInformationProcess
+        query.argtypes=[w.HANDLE,w.ULONG,c.c_void_p,w.ULONG,c.POINTER(w.ULONG)]
+        class String(c.Structure):
+            _fields_=[('length',w.USHORT),('maximum',w.USHORT),('buffer',c.c_void_p)]
+        size=w.ULONG();query(handle,60,None,0,c.byref(size))
+        if not size.value:return ''
+        buffer=c.create_string_buffer(size.value)
+        if query(handle,60,buffer,size,c.byref(size))!=0:return ''
+        value=String.from_buffer(buffer)
+        return c.wstring_at(value.buffer,value.length//2) if value.length else ''
+    finally:kernel.CloseHandle(handle)
+
+
 def _windows_visible():
     import ctypes as c
     from ctypes import wintypes as w

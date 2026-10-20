@@ -1,6 +1,6 @@
 """Startup handles occupied ports before touching service state."""
 from pathlib import Path
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, nullcontext
 import io
 import os
 import socket
@@ -136,7 +136,8 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
         child = subprocess.Popen([sys.executable, '-u', '-c', code], stdout=subprocess.PIPE, text=True)
         try:
             port = int(child.stdout.readline())
-            self.assertIn(child.pid, [p['pid'] for p in startup.owners(port)])
+            with patch.object(startup.subprocess,'run',side_effect=AssertionError('WMI/subprocess in listener inspection')) if os.name=='nt' else nullcontext():
+                self.assertIn(child.pid, [p['pid'] for p in startup.owners(port)])
             self.assertIsNone(startup.resolve('127.0.0.1', port, policy='kill'))
             child.wait(timeout=5)
             self.assertTrue(startup.available('127.0.0.1', port))

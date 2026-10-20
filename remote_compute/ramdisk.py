@@ -1,4 +1,4 @@
-"""One shared 8 GiB scratch volume per host, coordinated across all projects."""
+"""One configured shared scratch volume per host, coordinated across projects."""
 from contextlib import contextmanager
 import ctypes as c
 from ctypes import wintypes as w
@@ -87,39 +87,53 @@ def shared_volume():
     return None
 
 
-def ensure_shared(size_gib=8):
+def ensure_shared(size_gib=None, *, create=False):
     """Reuse/extend the marked volume; never create a second disk after a failed resize."""
-    if size_gib != 8:
-        raise ValueError('Shared RAM disk capacity is fixed at 8 GiB')
+    settings=json.loads((ROOT/'worker.local.json').read_text(encoding='utf-8-sig')) if (ROOT/'worker.local.json').is_file() else {}
+    size_gib=settings.get('ramdisk_gib',8) if size_gib is None else size_gib
+    if type(size_gib) is not int or size_gib not in (8,16):
+        raise ValueError('Shared RAM disk capacity must be 8 or 16 GiB')
+    size=size_gib*1024**3
     if os.name != 'nt':
         if os.environ.get('REMOTE_COMPUTE_WORKER')=='1':
             return None  # Linux jobs follow their configured ordinary-disk TMPDIR.
-        root = Path('/dev/shm')
-        return root if root.is_dir() else None
+        root=Path(settings.get('ramdisk_root',Path.home()/'.cache/codex-shared-ramdisk')).expanduser().absolute()
+        if not os.path.ismount(root):
+            if not create:return None
+            root.mkdir(parents=True,exist_ok=True)
+            _run(['mount','-t','tmpfs','-o',f'size={size_gib}G,mode=1777','tmpfs',root])
+        entries=[line.split() for line in Path('/proc/mounts').read_text().splitlines()]
+        if not any(row[1]==root.as_posix() and row[2]=='tmpfs' for row in entries):
+            raise OSError('Configured shared RAM root must be a dedicated tmpfs mount')
+        if abs(shutil.disk_usage(root).total-size)>32*1024**2:
+            if not create:raise OSError('Shared tmpfs size differs from configured capacity; run ramdisk during maintenance')
+            _run(['mount','-o',f'remount,size={size_gib}G',root])
+        (root/MARKER).write_text(json.dumps(dict(version=1,kind='ramdisk',shared=True,capacity_bytes=size)),encoding='utf8')
+        return root
     with creation_lock():
         root = shared_volume()
         executable = driver()
         if root:
-            if shutil.disk_usage(root).total > SIZE + 32 * 1024**2:
-                raise OSError('Shared RAM disk exceeds 8 GiB; preserve its files and resize it during maintenance')
-            if shutil.disk_usage(root).total < SIZE - 32 * 1024**2:
+            if shutil.disk_usage(root).total > size + 32 * 1024**2:
+                raise OSError(f'Shared RAM disk exceeds {size_gib} GiB; preserve its files and resize it during maintenance')
+            if shutil.disk_usage(root).total < size - 32 * 1024**2:
                 if not executable:
-                    raise OSError('Install ImDisk to extend the existing shared RAM disk to 8 GiB')
+                    raise OSError(f'Install ImDisk to extend the existing shared RAM disk to {size_gib} GiB')
                 details = _run([executable, '-l', '-m', str(root)[:2]])
                 current = int(re.search(r'Size:\s*(\d+) bytes', details)[1])
-                _run([executable, '-e', '-m', str(root)[:2], '-s', str(SIZE - current)])
-            if shutil.disk_usage(root).total < SIZE - 32 * 1024**2:
-                raise OSError('Existing shared RAM disk still needs extension to 8 GiB')
+                _run([executable, '-e', '-m', str(root)[:2], '-s', str(size - current)])
+            if shutil.disk_usage(root).total < size - 32 * 1024**2:
+                raise OSError(f'Existing shared RAM disk still needs extension to {size_gib} GiB')
         else:
             if not executable:
                 return None
             occupied = {str(p)[0].upper() for p in volumes()}
             letter = next(x for x in 'ZYXWVUTSRQPONMLKJIHGFED' if x not in occupied)
             root = Path(letter + ':/')
-            _run([executable, '-a', '-t', 'vm', '-s', '8G', '-m', letter + ':',
+            _run([executable, '-a', '-t', 'vm', '-s', f'{size_gib}G', '-m', letter + ':',
                   '-p', '/fs:ntfs /q /y /v:SHARED_RAM'])
         (root / MARKER).write_text(json.dumps(dict(version=1, kind='ramdisk', shared=True,
-            capacity_bytes=SIZE, purpose='Shared simulation scratch for all local projects'), indent=2), encoding='utf-8')
+            capacity_bytes=size, purpose='Shared simulation scratch for all local projects'), indent=2), encoding='utf-8')
         return root
 
 

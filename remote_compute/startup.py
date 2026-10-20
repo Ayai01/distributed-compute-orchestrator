@@ -87,16 +87,27 @@ def available(host, port):
 
 def owners(port):
     if os.name == 'nt':
-        script = (
-            f"Get-NetTCPConnection -State Listen -LocalPort {int(port)} -ErrorAction SilentlyContinue | "
-            "Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { "
-            "Get-CimInstance Win32_Process -Filter ('ProcessId=' + $_) | "
-            "Select-Object @{n='pid';e={$_.ProcessId}},Name,CommandLine } | ConvertTo-Json -Compress"
-        )
-        result = subprocess.run(['powershell', '-NoProfile', '-Command', script],
-                                capture_output=True, text=True, errors='replace')
-        rows = json.loads(result.stdout.strip() or '[]')
-        return rows if isinstance(rows, list) else [rows]
+        import ctypes as c
+        from ctypes import wintypes as w
+        import struct
+        from .terminal import _windows_processes, _windows_command_line
+        query=c.WinDLL('iphlpapi').GetExtendedTcpTable
+        query.argtypes=[c.c_void_p,c.POINTER(w.ULONG),w.BOOL,w.ULONG,c.c_int,w.ULONG]
+        pids=set()
+        for family,layout in ((2,'<IIIIII'),(23,'<16sII16sIIII')):
+            size=w.ULONG()
+            status=query(None,c.byref(size),False,family,3,0)  # OWNER_PID_LISTENER
+            while status==122:  # The OS supplies the current table buffer size.
+                buffer=c.create_string_buffer(size.value)
+                status=query(buffer,c.byref(size),False,family,3,0)
+            if status:raise c.WinError(status)
+            count=struct.unpack_from('<I',buffer)[0];stride=struct.calcsize(layout)
+            for index in range(count):
+                row=struct.unpack_from(layout,buffer,4+index*stride)
+                if socket.ntohs(row[2]&0xffff)==int(port):pids.add(row[-1])
+        processes=_windows_processes()
+        return [dict(pid=pid,Name=processes.get(pid,('', ''))[1],
+                     CommandLine=_windows_command_line(pid)) for pid in sorted(pids)]
     inodes = set()
     for name in ('tcp', 'tcp6'):
         for line in Path('/proc/net', name).read_text().splitlines()[1:]:
@@ -130,7 +141,27 @@ def terminate(pids, *, admin=False):
                       "exit $p.ExitCode } catch { Write-Error $_; exit 1 }")
             command = ['powershell', '-NoProfile', '-Command', script]
         else:
-            command = ['taskkill', *argv]
+            import ctypes as c
+            from ctypes import wintypes as w
+            from .terminal import _windows_processes
+            processes=_windows_processes();family=set(pids);ordered=list(pids)
+            while True:
+                children=[pid for pid,(parent,_) in processes.items() if parent in family and pid not in family]
+                if not children:break
+                family.update(children);ordered.extend(children)
+            kernel=c.WinDLL('kernel32',use_last_error=True)
+            kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];kernel.OpenProcess.restype=w.HANDLE
+            kernel.TerminateProcess.argtypes=[w.HANDLE,w.UINT];kernel.CloseHandle.argtypes=[w.HANDLE]
+            for pid in reversed(ordered):
+                handle=kernel.OpenProcess(1,False,pid)
+                if not handle:
+                    if c.get_last_error()==87:continue  # Already exited.
+                    raise c.WinError(c.get_last_error())
+                try:
+                    if not kernel.TerminateProcess(handle,1):raise c.WinError(c.get_last_error())
+                finally:kernel.CloseHandle(handle)
+            print('已结束端口占用进程。')
+            return
     else:
         # Include descendants so interrupted compilers cannot keep working alone.
         family = set(pids)

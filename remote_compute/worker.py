@@ -25,7 +25,8 @@ from urllib.parse import unquote
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
 from . import __version__
 from .process import Process, low_integrity_directory
-from .resources import Host, process_usage, cpu_benchmark, service_usage
+from .resources import (Host, process_usage, cpu_benchmark, service_usage,
+                        DEFAULT_MEMORY_RESERVE_MB, DEFAULT_MEMORY_HEADROOM_MB)
 from .telemetry import Activity
 from .client import RemoteError
 from .cleanup import AssetCache, remove_owned
@@ -146,7 +147,7 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=512, cpu_limit=None, temp_root=None, accelerators=None):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, accelerators=None):
         self.root = Path(root).expanduser().resolve()
         self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
         if self.temp_root:
@@ -170,10 +171,12 @@ class Worker:
         self.paused = False
         self.host = Host()
         total_mb = self.host.sample()["memory_total_mb"]
-        if type(memory_mb) is not int or memory_mb < 0 or type(memory_reserve_mb) is not int or memory_reserve_mb < 0:
+        if any(type(value) is not int or value<0 for value in (memory_mb,memory_reserve_mb,memory_headroom_mb)):
             raise ValueError("Memory budget and headroom must be nonnegative integer MiB")
-        self.memory_capacity = memory_mb or max(1, total_mb - memory_reserve_mb)
+        self.memory_budget = memory_mb
+        self.memory_capacity = memory_mb or max(0, total_mb - memory_reserve_mb)
         self.memory_reserve = memory_reserve_mb
+        self.memory_headroom = memory_headroom_mb
         self.env = dict(env or {})
         self.shared, self.unavailable_shared = {}, {}
         for name, value in (shared or {}).items():
@@ -275,6 +278,17 @@ class Worker:
         return None
 
     def _accelerator_environment(self, job_id, environment):
+        # Only reservations grant access; inherited or task-supplied values
+        # must not make a CPU job appear to own an accelerator.
+        denied = dict(DCO_ACCELERATOR_KIND='', DCO_ACCELERATOR_COUNT='0',
+                      DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='',
+                      CUDA_VISIBLE_DEVICES='')
+        # Windows treats environment names case-insensitively, even when
+        # the Python input mapping contains both upper- and lower-case keys.
+        for key in list(environment):
+            if key.upper() in denied:
+                environment.pop(key)
+        environment.update(denied)
         units=self.accelerator_reservations.get(job_id, [])
         if not units:
             return
@@ -362,16 +376,17 @@ class Worker:
             return {'status': self.benchmark_state, 'benchmark': self.benchmark, 'benchmark_state': self.benchmark_state}
 
     def control(self, value):
-        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "tools", "benchmark"}:
-            raise ValueError("Control accepts cpus, memory_mb, paused, tools and benchmark")
+        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "tools", "benchmark"}:
+            raise ValueError("Control accepts cpus, memory_mb, memory_reserve_mb, memory_headroom_mb, paused, tools and benchmark")
         if value.get('benchmark'):
             return self.calibrate()
         if "cpus" in value and (type(value["cpus"]) is not int or not 1 <= value["cpus"] <= self.cpu_limit):
             raise ValueError(f"cpus must be in 1..{self.cpu_limit}")
         if "paused" in value and not isinstance(value["paused"], bool):
             raise ValueError("paused must be true or false")
-        if "memory_mb" in value and (type(value["memory_mb"]) is not int or value["memory_mb"] < 1):
-            raise ValueError("memory_mb must be a positive integer")
+        for key in ('memory_mb','memory_reserve_mb','memory_headroom_mb'):
+            if key in value and (type(value[key]) is not int or value[key]<0):
+                raise ValueError(key+' must be a nonnegative integer')
         tools=value.get('tools',{})
         if not isinstance(tools,dict):raise ValueError('tools must map names to argv or null')
         removed={name for name,argv in tools.items() if argv is None}
@@ -393,9 +408,13 @@ class Worker:
             if "paused" in value:
                 self.paused = value["paused"]
             if "memory_mb" in value:
-                self.memory_capacity = value["memory_mb"]
+                self.memory_budget = value["memory_mb"]
+            if "memory_reserve_mb" in value:self.memory_reserve=value['memory_reserve_mb']
+            if "memory_headroom_mb" in value:self.memory_headroom=value['memory_headroom_mb']
+            if any(key in value for key in ('memory_mb','memory_reserve_mb')):
+                self.memory_capacity=self.memory_budget or max(0,self.host.sample()['memory_total_mb']-self.memory_reserve)
             if self.save_settings:
-                self.save_settings({key: value[key] for key in ('cpus', 'memory_mb') if key in value})
+                self.save_settings({key: value[key] for key in ('cpus', 'memory_mb','memory_reserve_mb','memory_headroom_mb') if key in value})
             self.activity.notify('Resources ' + json.dumps(value, ensure_ascii=False))
             self.condition.notify_all()
             return self.health()
@@ -403,12 +422,15 @@ class Worker:
     def _memory_state(self):
         host = self.host.sample()
         running = [j for j in self.jobs.values() if j["result"]["status"] == "running"]
-        reserved = sum(max(j["task"]["memory_mb"], j.get("rss_mb", 0)) for j in running)
-        unallocated = sum(max(0, j["task"]["memory_mb"] - j.get("rss_mb", 0)) for j in running)
+        reserved = sum(j['rss_mb'] if j.get('rss_sampled') else j['task']['memory_mb'] for j in running)
+        unallocated = sum(j['task']['memory_mb'] for j in running if not j.get('rss_sampled'))
         available = max(0, min(self.memory_capacity - reserved,
-                               host["host_memory_available_mb"] - self.memory_reserve - unallocated))
+                               host["host_memory_available_mb"] - self.memory_headroom - unallocated))
         return {**host, "memory_capacity_mb": self.memory_capacity, "memory_reserved_mb": round(reserved, 2),
                 "memory_available_mb": int(available), "memory_reserve_mb": self.memory_reserve,
+                "memory_headroom_mb": self.memory_headroom, "memory_budget_mb":self.memory_budget,
+                "memory_effective_mb":int(min(self.memory_capacity,reserved+available)),
+                "memory_accounting":"rss", "memory_requested_mb":sum(j['task']['memory_mb'] for j in running),
                 "rss_mb": round(sum(j.get("rss_mb", 0) for j in running), 2)}
 
     def _save(self, job):
@@ -637,6 +659,8 @@ class Worker:
                         break
                     step = {"argv": argv, "started": time.time(), "returncode": None}
                     with self.condition:
+                        job['rss_sampled'] = False
+                        job['rss_mb'] = 0
                         result["steps"].append(step)
                         self._save(job)
                     source = inside(work, task["stdin"]).open("rb") if "stdin" in task else nullcontext(None)
@@ -647,6 +671,7 @@ class Worker:
                             usage = process_usage(process)
                             with self.condition:
                                 job["rss_mb"] = usage["rss_mb"]
+                                job['rss_sampled'] = True
                                 result["peak_rss_mb"] = max(result["peak_rss_mb"], usage["rss_mb"])
                                 result["cpu_seconds"] = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
                             if job["cancel"].is_set() or time.monotonic() >= deadline:

@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import ExitStack
+import ipaddress
 import os
 from pathlib import Path
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import socket
+from urllib.parse import urlsplit
 
 from .client import Client, Pool, RemoteError
 from .coordinator import Coordinator
@@ -47,18 +49,33 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
     return value
 
 
+def _operator_token(args, configured_token=''):
+    operator_token = getattr(args, 'operator_token', '')
+    if operator_token or not args.url:
+        return operator_token or configured_token
+    host = urlsplit(args.url).hostname
+    try:
+        local = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = host == 'localhost'
+    # A local credential belongs to the local center, not an arbitrary --url.
+    if not local:
+        return ''
+    if configured_token:
+        return configured_token
+    candidates = []
+    if args.root:
+        candidates.append(Path(args.root) / 'scheduler' / 'operator.token')
+    candidates.append(ROOT / '.local' / 'state' / 'scheduler' / 'operator.token')
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.read_text(encoding='utf-8').strip()
+    return ''
+
+
 def run_scheduler(args, local_client=None, restarting=None):
     restarting = restarting or threading.Event()
-    operator_token = getattr(args, 'operator_token', '')
-    if args.url and not operator_token:
-        candidates = []
-        if args.root:
-            candidates.append(Path(args.root) / 'scheduler' / 'operator.token')
-        candidates.append(ROOT / '.local' / 'state' / 'scheduler' / 'operator.token')
-        for candidate in candidates:
-            if candidate.is_file():
-                operator_token = candidate.read_text(encoding='utf-8').strip()
-                break
+    operator_token = _operator_token(args)
     config = load_nodes(args.nodes, args.url, local_client, operator_token=operator_token or None)
     if local_client:
         if not args.nodes and not args.url and not (ROOT / "nodes.local.json").exists():
@@ -268,7 +285,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="action")
     sub.add_parser("nodes")
     sub.add_parser("jobs")
-    item = sub.add_parser('ramdisk', help='检查/创建每设备唯一8GiB共享盘')
+    item = sub.add_parser('ramdisk', help='检查/创建本设备配置的共享内存盘（默认8GiB）')
     item.add_argument('--install', action='store_true', help='管理员安装已放入.tools/imdisk的签名驱动')
     item = sub.add_parser('update', help='从统一GitHub仓库快进更新当前工程')
     item.add_argument('--check', action='store_true', dest='update_check')
@@ -333,7 +350,7 @@ def main(argv=None):
                 lifetime.enter_context(single_instance(endpoint, wait=30.0 if handoff else 0.0))
         if args.action == 'ramdisk':
             from .ramdisk import ensure_shared, install_driver
-            print(install_driver() if args.install else ensure_shared())
+            print(install_driver() if args.install else ensure_shared(create=True))
             return 0
         if args.action == 'update':
             from .repository import update
@@ -372,16 +389,8 @@ def main(argv=None):
         if getattr(args, "detach", False) and not args.url:
             raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
-        args.operator_token = os.environ.get("REMOTE_COMPUTE_OPERATOR_TOKEN", config.get("operator_token", ""))
-        if not args.operator_token and args.url:
-            candidates = []
-            if args.root:
-                candidates.append(Path(args.root) / 'scheduler' / 'operator.token')
-            candidates.append(ROOT / '.local' / 'state' / 'scheduler' / 'operator.token')
-            for candidate in candidates:
-                if candidate.is_file():
-                    args.operator_token = candidate.read_text(encoding='utf-8').strip()
-                    break
+        args.operator_token = os.environ.get("REMOTE_COMPUTE_OPERATOR_TOKEN", "")
+        args.operator_token = _operator_token(args, config.get("operator_token", ""))
         if args.url and args.mode=='worker' and args.action is None:
             from .commands import RemoteWorker
             client=Client(args.url,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'),operator=True)
@@ -417,7 +426,7 @@ def main(argv=None):
             port = args.port if args.port is not None else DEFAULT_PORT
             from .ramdisk import scratch
             root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root", "accelerators") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "temp_root", "accelerators") if key in config}
             if 'temp_root' not in options:
                 options['temp_root'] = scratch('DCO') / 'tmp'
             if args.worker_memory_mb is not None:
@@ -435,7 +444,7 @@ def main(argv=None):
                 if args.cpus is not None:
                     initial['cpus'] = worker.capacity
                 if args.worker_memory_mb is not None:
-                    initial['memory_mb'] = worker.memory_capacity
+                    initial['memory_mb'] = args.worker_memory_mb
                 save_settings(initial)
             def restart_worker(*, check=False):
                 if check:
