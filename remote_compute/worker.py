@@ -613,6 +613,7 @@ class Worker:
                     environment[key] = str(task["cpus"])
             temporary = self._temporary(job)
             temporary.mkdir()
+            low_integrity_directory(temporary)
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])

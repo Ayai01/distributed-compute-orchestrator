@@ -98,9 +98,9 @@ class ExecutionTests(unittest.TestCase):
     @unittest.skipUnless(os.name=='nt','Windows mandatory labels')
     def test_low_integrity_tool_writes_job_outputs_and_temp_without_changing_parent_acl(self):
         from remote_compute.process import low_integrity_directory
-        def permissions(path):
+        def permissions(path, *, labels=False):
             raw=subprocess.check_output(['icacls.exe',str(path)],creationflags=subprocess.CREATE_NO_WINDOW).decode(errors='replace')
-            return '\n'.join(line for line in raw.splitlines() if '(NW)' not in line)
+            return raw if labels else '\n'.join(line for line in raw.splitlines() if '(NW)' not in line)
         low_tool=self.root/'low-tool'
         low_tool.mkdir()
         original=permissions(low_tool)
@@ -114,17 +114,24 @@ class ExecutionTests(unittest.TestCase):
                               capture_output=True,creationflags=subprocess.CREATE_NO_WINDOW,timeout=5)
         self.assertNotEqual(denied.returncode,0)
         self.assertFalse((ordinary/'denied.txt').exists())
-        parent=self.worker.root/'jobs'
-        before=permissions(parent)
         task=command([str(executable),'/d','/c','run.cmd'],outputs=['value.txt'])
         script=b'@echo off\r\necho result>value.txt\r\necho temp>"%TEMP%\\value.txt"\r\ntype "%TEMP%\\value.txt"\r\n'
-        identity=self.client.submit(task,files={'run.cmd':script})['id']
-        self.client.wait(identity)
-        result=self.client.fetch(identity)
-        self.assertEqual(result['status'],'succeeded',result.get('stderr'))
-        self.assertEqual(result['files']['value.txt'].strip(),b'result')
-        self.assertEqual(result['stdout'].strip(),'temp')
-        self.assertEqual(permissions(parent),before)
+        for external in (False,True):
+            with self.subTest(external_temp=external), provider(
+                    self.root/('external' if external else 'default'),
+                    temp_root=self.root/'scratch' if external else None) as (worker,client):
+                parents=[worker.root/'jobs', *([worker.temp_root] if external else [])]
+                before={parent:permissions(parent,labels=True) for parent in parents}
+                identity=client.submit(task,files={'run.cmd':script})['id']
+                client.wait(identity)
+                temporary=worker._temporary(worker.jobs[identity])
+                result=client.fetch(identity)
+                self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                self.assertEqual(result['files']['value.txt'].strip(),b'result')
+                self.assertEqual(result['stdout'].strip(),'temp')
+                self.assertFalse(temporary.exists())
+                for parent in parents:
+                    self.assertEqual(permissions(parent,labels=True),before[parent])
 
     def test_explicit_numerical_threads_survive_worker_defaults(self):
         keys=('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS')
@@ -411,7 +418,9 @@ class NativeTests(unittest.TestCase):
         config_path = os.environ.get("REMOTE_COMPUTE_TEST_CONFIG")
         config = json.loads(Path(config_path).read_text(encoding="utf-8-sig")) if config_path else {}
         options = {key: config[key] for key in ("tools", "shared", "env", "tags") if key in config}
-        with scratch() as directory, provider(Path(directory) / "one", **options) as (_, one), provider(Path(directory) / "two", **options) as (_, two):
+        with scratch() as directory, \
+                provider(Path(directory) / "one", temp_root=Path(directory)/'scratch', **options) as (_, one), \
+                provider(Path(directory) / "two", temp_root=Path(directory)/'scratch', **options) as (_, two):
             with Pool([one, two], policy="round_robin") as pool:
                 results = pool.map([ngspice("divider.spice") for _ in range(4)], inputs=ROOT / "examples/spice")
                 self.assertEqual({x["assigned_node"] for x in results}, {"node1", "node2"})
