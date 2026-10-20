@@ -827,9 +827,12 @@ class Pool:
         siblings = [n for n in self.nodes if not n.error
                     and n.health.get('machine_id', n.client.url) == machine]
         logical = max(n.health.get('logical_cpus') or n.capacity for n in siblings)
-        sampled = max(n.health.get('cpu_percent') or 0 for n in siblings) * logical / 100
-        reported = sum(n.health.get('used_cpus', 0) for n in siblings)
+        samples=[n.health.get('cpu_percent') for n in siblings if n.health.get('cpu_percent') is not None]
         committed = sum(n.reserved + n.external for n in siblings)
+        if not samples:
+            return (committed + cpus) / logical
+        sampled = max(samples) * logical / 100
+        reported = sum(n.health.get('used_cpus', 0) for n in siblings)
         # The sample already includes running work. Replace its reported grants
         # with today's ledger, including dispatches and resizes not sampled yet.
         return (max(0, sampled + committed - reported) + cpus) / logical

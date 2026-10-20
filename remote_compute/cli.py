@@ -398,7 +398,8 @@ def main(argv=None):
             from .ramdisk import scratch
             root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
             options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "cpu_limit", "temp_root", "accelerators") if key in config}
-            options.setdefault('temp_root', scratch('DCO') / 'tmp')
+            if 'temp_root' not in options:
+                options['temp_root'] = scratch('DCO') / 'tmp'
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))

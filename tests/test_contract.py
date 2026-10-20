@@ -1,6 +1,7 @@
 """Generic capability routing, bounded sampling and reusable calibration."""
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 import unittest
@@ -14,7 +15,8 @@ from test_center import center
 
 class ContractTests(unittest.TestCase):
     def test_project_view_is_aggregate_and_rejects_node_selection(self):
-        with scratch() as directory, provider(Path(directory) / 'worker', cpus=2, tags=['rtl']) as (_, remote):
+        with scratch() as directory, provider(Path(directory) / 'worker', cpus=2,
+                tools={'verilator': sys.executable}, tags=['rtl']) as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
                 project = Client(operator.url)
                 capabilities = project.capabilities()

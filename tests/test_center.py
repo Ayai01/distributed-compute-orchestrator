@@ -17,6 +17,49 @@ from remote_compute.worker import Conflict, Server
 from test_compute import provider, python, scratch, until
 
 
+class AdmissionPlanningTests(unittest.TestCase):
+    def center(self, capacities):
+        from types import SimpleNamespace
+        from remote_compute.client import Node
+        pool=Pool.__new__(Pool)
+        pool.condition=threading.Condition()
+        pool.nodes=[]
+        for index,capacity in enumerate(capacities):
+            node=Node(str(index),SimpleNamespace(url=str(index)))
+            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=['ngspice47'],
+                             memory_capacity_mb=8192)
+            pool.nodes.append(node)
+        state=Coordinator.__new__(Coordinator)
+        state.pool,state.condition,state.jobs=pool,threading.Condition(),{}
+        return state
+
+    def test_admission_matches_legacy_capability_aliases_like_dispatch(self):
+        state=self.center([2,4])
+        for tag in ('ngspice47','ng47'):
+            self.assertEqual(state.admission(dict(project='A',requires=[tag]))['capable_cpus'],6)
+
+    def test_capped_auto_window_covers_each_nodes_partial_grant(self):
+        for capacities,cap,expected in (([2,2,2],8,3),([3,3,3],2,6),([24,30,96],96,3)):
+            with self.subTest(capacities=capacities,cap=cap):
+                window=self.center(capacities).admission(dict(project='A',cpus=0,max_cpus=cap,queue_ratio=1))
+                self.assertEqual((window['running_tasks'],window['queued_tasks']),(expected,expected))
+                self.assertEqual(window['max_in_flight'],sum(capacities)+expected)
+
+    def test_fixed_cpu_admission_excludes_nodes_below_the_task_width(self):
+        window=self.center([2,8]).admission(dict(project='A',cpus=4,queue_ratio=0))
+        self.assertEqual((window['capable_cpus'],window['target_cpus'],window['running_tasks']),(8,8,2))
+
+    def test_fixed_cpu_window_does_not_combine_remainders_from_separate_devices(self):
+        window=self.center([3,3]).admission(dict(project='A',cpus=2,queue_ratio=0))
+        self.assertEqual((window['running_tasks'],window['max_in_flight']),(2,2))
+
+    def test_paused_workers_do_not_inflate_ready_project_share(self):
+        state=self.center([2,8])
+        state.pool.nodes[1].health['paused']=True
+        window=state.admission(dict(project='A',queue_ratio=0))
+        self.assertEqual((window['capable_cpus'],window['target_cpus'],window['running_tasks']),(2,2,2))
+
+
 @contextmanager
 def center(pool, root):
     state = Coordinator(pool, root)
@@ -43,6 +86,49 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_uncertain_submission_recovers_original_id_without_releasing_grant(self):
+        for failure in ('accepted','not_received','query_disconnected','cancel_disconnected'):
+            with self.subTest(failure=failure),scratch() as root,provider(Path(root)/'worker') as (_,remote):
+                with Pool([remote],refresh=60) as pool,center(pool,Path(root)/'center') as (_,client):
+                    original_submit,original_status=remote.submit_bundle,remote.status
+                    calls=[];disconnected=threading.Event();restored=threading.Event()
+                    def submit(identity,payload,**options):
+                        calls.append(identity)
+                        if len(calls)==1:
+                            if failure!='not_received':original_submit(identity,payload,**options)
+                            raise RemoteError('submission reply timed out')
+                        return original_submit(identity,payload,**options)
+                    def status(*args,**kwargs):
+                        if failure.endswith('disconnected') and not restored.is_set():
+                            disconnected.set()
+                            error=RemoteError('worker port temporarily unavailable')
+                            error.transport_code=10061
+                            raise error
+                        return original_status(*args,**kwargs)
+                    hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)\nprint('executed once')"
+                    with patch.object(remote,'submit_bundle',side_effect=submit),patch.object(remote,'status',side_effect=status):
+                        identity=client.submit(python(hold))['id']
+                        try:
+                            if failure.endswith('disconnected'):
+                                self.assertTrue(disconnected.wait(3))
+                                self.assertEqual(client.status(identity)['status'],'dispatching')
+                                self.assertEqual(pool.nodes[0].reserved,1)
+                                if failure=='cancel_disconnected':client.cancel(identity)
+                            restored.set()
+                            if failure!='cancel_disconnected':
+                                until(lambda:client.status(identity)['status']=='running')
+                                remote.write_job_file(identity,'release','done')
+                            result=client.wait(identity,wait_timeout=5)
+                            self.assertEqual(result['status'],'cancelled' if failure=='cancel_disconnected' else 'succeeded',result)
+                            self.assertEqual(result['attempts'],[])
+                            self.assertEqual(set(calls),{identity})
+                            self.assertEqual(len(calls),2 if failure=='not_received' else 1)
+                            self.assertNotIn('connection_error',result)
+                            client.fetch(identity)
+                            until(lambda:pool.nodes[0].reserved==0)
+                        finally:
+                            restored.set()
+
     def test_submission_pool_backpressure_keeps_id_and_can_be_cancelled(self):
         for cancel in (False,True):
             with self.subTest(cancel=cancel),scratch() as root,provider(Path(root)/'worker') as (worker,remote):
@@ -491,6 +577,35 @@ class CenterTests(unittest.TestCase):
                 until(lambda:client.health()['used_cpus']==4)
                 self.assertEqual(len({client.status(i)['assigned_node'] for i in ids}),2)
                 for identity in ids:
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
+    def test_overlapping_auto_projects_start_the_restricted_job_before_flexible_work(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as root,provider(Path(root)/'one',cpus=2,tags=['special']) as (_,one), \
+                provider(Path(root)/'two',cpus=2) as (_,two):
+            with Pool([one,two]) as pool,center(pool,Path(root)/'center') as (_,client):
+                client.control(paused=True)
+                flexible=client.submit(python(hold,project='A',cpus=0))['id']
+                restricted=client.submit(python(hold,project='B',cpus=0,requires=['special']))['id']
+                client.control(paused=False)
+                until(lambda:all(client.status(identity)['status']=='running' for identity in (flexible,restricted)))
+                self.assertEqual(client.status(restricted)['assigned_node'],'node1')
+                self.assertEqual(client.status(flexible)['assigned_node'],'node2')
+                self.assertEqual(client.health()['used_cpus'],4)
+                for identity in (flexible,restricted):
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
+    def test_capped_auto_window_starts_every_device_without_prefetch(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as root,provider(Path(root)/'one',cpus=2) as (_,one), \
+                provider(Path(root)/'two',cpus=2) as (_,two),provider(Path(root)/'three',cpus=2) as (_,three):
+            with Pool([one,two,three]) as pool,center(pool,Path(root)/'center') as (_,client):
+                window=client.window('automatic',cpus=0,max_cpus=8,queue_ratio=0)
+                identities=[client.submit(python(hold,cpus=0,max_cpus=8,project='automatic'))['id']
+                            for _ in range(window.current())]
+                until(lambda:client.health()['used_cpus']==6)
+                self.assertEqual(len({client.status(identity)['assigned_node'] for identity in identities}),3)
+                for identity in identities:
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
 
     def test_auto_window_refills_after_running_tasks_return_cpu_credits(self):

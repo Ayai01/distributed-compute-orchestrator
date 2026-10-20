@@ -166,7 +166,7 @@ class Worker:
         self.token = token
         self.accelerators = normalize_accelerators(accelerators)
         self.accelerator_reservations = {}
-        self.tags = list(tags)
+        self.configured_tags = set(canonical_capabilities(tags))
         self.paused = False
         self.host = Host()
         total_mb = self.host.sample()["memory_total_mb"]
@@ -185,12 +185,8 @@ class Worker:
         for name, value in (tools or {}).items():
             self.tools[name] = [value] if isinstance(value, str) else list(value)
         self.tools,self.tool_info=self._probe_tools(self.tools)
-        self.tags = sorted(set(self.tags) | {sys.platform} | {'shared:'+name for name in self.shared}
-                           | set(canonical_capabilities(k for k, v in self.tool_info.items() if v["available"])))
-        if self.accelerators:
-            self.tags = sorted(set(self.tags) | {'gpu', *{tag for item in self.accelerators for tag in item['tags']}})
-        if self.tool_info['verilator']['available']:
-            self.tags = sorted(set(self.tags) | {'rtl'})
+        self.tool_tags = set(canonical_capabilities(self.tools)) | {'rtl'}
+        self._refresh_tags()
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
         benchmark_python=next((self.tools[name][0] for name in ('bench_python','aop_python','arh_python','rgcn_python','python')
@@ -291,6 +287,20 @@ class Worker:
         if kind == 'cuda':
             environment['CUDA_VISIBLE_DEVICES']=','.join(ids)
 
+    def _refresh_tags(self):
+        # Tool and shared-path labels follow the current probes, including
+        # removals; a stale configured label must not restore a missing tool.
+        tags = {tag for tag in self.configured_tags - self.tool_tags
+                if not tag.startswith('shared:')}
+        tags.update({sys.platform, *('shared:'+name for name in self.shared)})
+        tags.update(canonical_capabilities(name for name, item in self.tool_info.items()
+                                           if item['available']))
+        if self.tool_info.get('verilator', {}).get('available'):
+            tags.add('rtl')
+        if self.accelerators:
+            tags.update({'gpu', *{tag for item in self.accelerators for tag in item['tags']}})
+        self.tags = sorted(tags)
+
     def _probe_tools(self, tools):
         resolved,info={},{}
         search_path=self.env.get('PATH',os.environ.get('PATH',''))
@@ -305,9 +315,15 @@ class Worker:
             resolved[name]=argv
             info[name]=dict(argv=argv,available=executable is not None)
             if name=='verilator' and argv[1:]==[str(Path(__file__).with_name('rtl.py'))]:
-                msys=self.env.get('MSYS2_ROOT',os.environ.get('MSYS2_ROOT'))
-                engine=(str(Path(msys)/'ucrt64/bin/verilator_bin.exe') if os.name=='nt' and msys else shutil.which('verilator',path=search_path))
-                ready=bool(engine and Path(engine).is_file())
+                if os.name == 'nt':
+                    msys=self.env.get('MSYS2_ROOT',os.environ.get('MSYS2_ROOT'))
+                    bash=str(Path(msys)/'usr/bin/bash.exe') if msys else shutil.which('bash.exe',path=search_path)
+                    base=Path(bash).resolve().parents[2] if bash and Path(bash).is_file() else None
+                    engine=str(base/'ucrt64/bin/verilator_bin.exe') if base else None
+                else:
+                    configured=self.env.get('VERILATOR',os.environ.get('VERILATOR','verilator'))
+                    engine=shutil.which(configured,path=search_path)
+                ready=bool(executable and engine and Path(engine).is_file() and Path(argv[1]).is_file())
                 info[name].update(available=ready,engine=engine)
         return resolved,info
 
@@ -369,11 +385,8 @@ class Worker:
                 self.tools={k:v for k,v in self.tools.items() if k not in removed}
                 self.tool_info={k:v for k,v in self.tool_info.items() if k not in removed}
                 self.tools.update(additions);self.tool_info.update(info)
-                tags=(set(self.tags)-removed)|set(additions)
-                if 'verilator' in tools:
-                    if self.tool_info.get('verilator',{}).get('available'):tags.add('rtl')
-                    else:tags.discard('rtl')
-                self.tags=sorted(tags)
+                self.tool_tags.update(canonical_capabilities(tools))
+                self._refresh_tags()
                 self.configuration_revision += 1
             if "cpus" in value:
                 self.capacity = value["cpus"]

@@ -34,13 +34,20 @@ def preferred_python():
     """Resolve an installed system 3.14, falling back to the current interpreter."""
     if sys.version_info[:2] == (3,14):
         return Path(sys.executable)
+    native=shutil.which('python3.14')
+    if native:
+        return Path(native).absolute()
     launcher=shutil.which('py')
     if launcher:
-        installed=_run([launcher,'-0p'],capture_output=True,text=True).stdout
-        if '3.14' in installed:
-            selected=_run([launcher,'-3.14','-B','-c','import sys; print(sys.executable)'],
-                          capture_output=True,text=True).stdout.strip()
-            return Path(selected)
+        try:
+            installed=_run([launcher,'-0p'],capture_output=True,text=True,timeout=10).stdout
+            if '3.14' in installed:
+                selected=_run([launcher,'-3.14','-B','-c','import sys; print(sys.executable)'],
+                              capture_output=True,text=True,timeout=10).stdout.strip()
+                if selected and Path(selected).is_file():
+                    return Path(selected)
+        except (OSError, subprocess.SubprocessError):
+            pass  # The currently running Python remains a usable worker runtime.
     return Path(sys.executable)
 
 
@@ -141,6 +148,8 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
               'env':{'PYTHONNOUSERSITE':'1', 'ARH_INFERENCE_PYTHON':python.as_posix()},
               'runtime':runtime, 'ngspice':simulator}
     result['tools']['ngspice'] = ngspice.as_posix()
+    if re.search(r'\bngspice-47\b', simulator['version'], re.IGNORECASE):
+        result['tools']['ngspice47'] = ngspice.as_posix()
     msys = tools/'msys64'
     if (msys/'usr/bin/bash.exe').is_file():
         for name in ('tmp','dev/shm','dev/mqueue','home'):

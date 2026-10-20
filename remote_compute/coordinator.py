@@ -129,8 +129,10 @@ class Coordinator:
         resources = self.project_resources()
         shares = {name: row['resource_share'] for name,row in resources.items()}
         demands = {name: min(row['demand'],row['capacity']) for name,row in resources.items()}
-        eligible=[n for n in self.pool.nodes if not n.error and n.enabled
-                  and (not node_name or n.name==node_name) and set(requires).issubset(n.health.get('tags',()))
+        eligible=[n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')
+                  and n.capacity>=max(1,cpus)
+                  and (not node_name or n.name==node_name)
+                  and set(requires).issubset(canonical_capabilities(n.health.get('tags',())))
                    and n.supports_accelerator(accelerator)
                   ]
         capable=sum(n.capacity for n in eligible)
@@ -141,12 +143,18 @@ class Coordinator:
         grants=weighted_node_threads({n.name:n.capacity for n in self.pool.nodes if n.name in names
                                      and not n.error and n.enabled},shares,demands,rooms)
         target=sum(grants[project].values())
-        maximum=sum(min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible)
+        ceilings=[min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible]
+        maximum=sum(ceilings)
         target = min(target, capable)
         unit = cpus or maximum_cpus
-        wave = max(1, math.ceil(target / unit)) if unit else max(1,min(len(eligible),target))
+        # Grants on different devices cannot share one task. Count each
+        # device's partial automatic grant instead of merging their CPUs.
+        def slots(values):
+            return sum(math.ceil(value/unit) if unit else bool(value) for value in values)
+        wave = max(1,slots(grants[project].values()) if cpus==0
+                   else sum(value//unit for value in grants[project].values()))
         ready = wave
-        ceiling_wave=max(1,math.ceil(maximum/unit)) if unit else max(1,len(eligible))
+        ceiling_wave=max(1,slots(ceilings) if cpus==0 else sum(value//unit for value in ceilings))
         ceiling=ceiling_wave
         if cpus==0:
             # An automatic task can return most of its CPUs after compilation.
@@ -160,9 +168,12 @@ class Coordinator:
                 if running:
                     room=max(0,target-resources.get(project,{}).get('used',0))
                     free=[max(0,node.capacity-node.reserved-node.external) for node in eligible]
-                    slots=sum(math.ceil(value/unit) if unit else bool(value) for value in free)
-                    extra=(min(math.ceil(room/unit) if unit else min(len(eligible),room),slots or 1)
-                           if room else 0)
+                    credits=[]
+                    remaining=room
+                    for value in free:
+                        credits.append(min(value,remaining))
+                        remaining-=credits[-1]
+                    extra=slots(credits) or int(room>0)
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
@@ -331,8 +342,8 @@ class Coordinator:
 
     def project_resources(self):
         shares, demands, used, queued, rooms = {}, {}, {}, {}, {}
-        online={n.name:n for n in self.pool.nodes if not n.error and n.enabled}
-        largest = max((n.capacity for n in self.pool.nodes if not n.error and n.enabled), default=1)
+        online={n.name:n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')}
+        largest = max((n.capacity for n in online.values()), default=1)
         with self.condition,self.pool.condition:
             for job in self.jobs.values():
                 if job['result']['status'] in TERMINAL:
@@ -434,7 +445,11 @@ class Coordinator:
                 if not self.paused:
                     budgets = self.project_resources()
                     ordered = sorted(self.queue, key=lambda key: (-self.jobs[key]['task']['priority'],
-                                     self.jobs[key]['task']['cpus'] == 0))
+                                     self.jobs[key]['task']['cpus'] == 0,
+                                     sum(not node.error and node.enabled and not node.health.get('paused')
+                                         for node in self.pool._matching(self.jobs[key]['task']))))
+                    # Within the same priority and CPU mode, place constrained
+                    # work first so flexible jobs retain the other devices.
                     # First honor weighted targets, then lend otherwise idle slots.
                     for identity, borrowing in [(key, False) for key in ordered] + [(key, True) for key in ordered]:
                         if identity not in self.queue:
@@ -560,8 +575,7 @@ class Coordinator:
                     if remote['status'] in TERMINAL:
                         remote = node.client.status(identity)
                 except RemoteError as error:
-                    if (getattr(error,'transport_code',None) in (111,10061)
-                            or getattr(error,'status_code',None)==404):
+                    if getattr(error,'status_code',None)==404:
                         retry=True
                         result=dict(status='interrupted',error='Worker unavailable: '+str(error),finished=time.time())
                         with self.pool.condition:node.error=str(error)
@@ -587,9 +601,6 @@ class Coordinator:
                 else:
                     job['cancel'].wait(interval)
         except Exception as error:
-            if isinstance(error,RemoteError) and getattr(error,'transport_code',None) in (111,10061):
-                retry=True;result=dict(status='interrupted',error=str(error),finished=time.time())
-                with self.pool.condition:node.error=str(error)
             with self.condition:
                 if not retry:
                     job["result"].update(status="interrupted", error=str(error), finished=time.time())
@@ -602,7 +613,7 @@ class Coordinator:
                 self.condition.notify_all()
 
     def _submit(self, job, identity, payload, callback):
-        node, force = job['node'], False
+        node, force, uncertain = job['node'], False, False
         while True:
             try:
                 self._ensure_assets(node, job['task']['assets'].values(), force=force)
@@ -613,11 +624,33 @@ class Coordinator:
                 # local transport queue drains, rather than ending the task.
                 if self.stopping:raise
                 with self.condition:job['result']['connection_error']=str(error)
-                if job['cancel'].wait(.1):return False
+                if uncertain:
+                    time.sleep(.1)
+                elif job['cancel'].wait(.1):
+                    return False
             except RemoteError as error:
-                if force or getattr(error,'status_code',None)!=400 or 'Synchronize missing asset first:' not in str(error):
+                if not force and getattr(error,'status_code',None)==400 and 'Synchronize missing asset first:' in str(error):
+                    force=True
+                    continue
+                if self.stopping or getattr(error,'status_code',None) is not None:
                     raise
-                force=True
+                uncertain=True
+                # A missing POST reply says nothing about acceptance. Keep the
+                # original worker, ID and grant while querying that same job.
+                while True:
+                    with self.condition:job['result']['connection_error']=str(error)
+                    try:
+                        node.client.status(identity,brief=True)
+                        return True
+                    except RemoteError as observed:
+                        if getattr(observed,'status_code',None)==404:
+                            # The first POST may still arrive later. Repeating
+                            # its exact ID and payload remains worker-idempotent.
+                            break
+                        if self.stopping or getattr(observed,'status_code',None) is not None:
+                            raise
+                        error=observed
+                        time.sleep(.5)
 
     def _retry(self, job, outcome):
         job['result'].update(status='interrupted',error=outcome.get('error','Worker stopped'),finished=outcome.get('finished',time.time()))

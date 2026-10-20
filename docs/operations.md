@@ -10,6 +10,8 @@ Windows 双击 `start.cmd`，或在可见 cmd 窗口输入 `start.cmd`；Linux �
 
 两台Windows设备日常环境统一为标准GIL x64 CPython 3.14.8，`python`、`py`、`pip`、Codium与worker科学别名指向各机系统环境。包安装使用`python -m pip`绑定实际解释器。`setup`优先复用已装3.14并补齐所需科学包，原生ngspice/MSYS2继续位于忽略的`.tools/`；不会再下载一套3.12解释器。标准库控制与接入层保持Python3.7–3.15的语法/API兼容，科学依赖由所选Python安装对应可用版本；运行验收集中3.14。Linux worker复用设备已有CPython 3.14及工程依赖环境，跨系统结果按工程核对后登记能力，任务临时物遵循配置的工作目录和job TMPDIR。
 
+Python重载优先选择已安装的3.14；`py`启动器查询失败或超时时继续使用当前可运行的解释器。
+
 启动终端保持运行，中心和 worker 随之持续工作。`python main.py --url http://127.0.0.1:26133` 只连接已经运行的中心；提示连接拒绝时先用上述启动脚本启动服务。
 
 所有系统和启动方式都在`main.py`统一检查可见终端，检查先于解释器交接、服务托管、端口监听、状态目录写入和算力校准。输入和输出必须连接终端：Windows检查真实控制台窗口，ConPTY检查可见的终端或编辑器宿主；Linux/macOS检查TTY前台进程组，tmux/screen还须有附着客户端。失败返回退出码2及启动提示，不在后台继续运行。Windows Terminal的伪控制台窗口与真正宿主不同，按[微软的控制台说明](https://learn.microsoft.com/en-us/windows/console/getconsolewindow)分别处理。
@@ -75,13 +77,13 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --calibrate
 
 ## 设备预算与配置文件
 
-当前设备配置如下。它们是各机的本地配置，不随 Git 更新覆盖。
+2026-10-20核对的设备配置如下。它们是各机的本地配置，不随 Git 更新覆盖；运行中的预算以看板和各机配置为准。
 
 | 设备 | 模式 | 地址 | 默认预算 | 硬上限 |
 | --- | --- | --- | --- | --- |
-| Aya1-PC | hybrid | 中心 `127.0.0.1:26133`；本机 worker 进程内调用 | 16 | 24 |
-| Aya1-TX | worker | `192.168.1.10:26133` | 30 | 31 |
-| ku26s | worker | `https://1.191.212.42:26133` | 96 | 96 |
+| Aya1-PC | hybrid | 中心 `127.0.0.1:26133`；本机 worker 进程内调用 | 12 | 28 |
+| Aya1-TX | worker | `192.168.1.10:26133` | 16 | 32 |
+| ku26s | worker | `https://1.191.212.42:26133` | 20 | 104 |
 
 新设备的通用默认预算和硬上限等于逻辑线程数 `CPU_COUNT`。`cpu_limit` 在设备配置中设置硬上限，`cpus` 设置当前预算。在线 `cpus` 控制会写回当前使用的配置文件；调低预算后，在途任务自然结束，后续派发按新预算执行。改硬上限需要更新配置并重启。
 
@@ -104,7 +106,7 @@ python main.py --url http://127.0.0.1:26133 control --node Aya1-TX --calibrate
 
 `--config 路径` 选择其他配置；命令行显式选项覆盖配置。worker 模式读取设备配置中的 host/port；hybrid / scheduler 的中心默认监听 `0.0.0.0:26133`，CLI 使用本机127.0.0.1地址。`--host 127.0.0.1` 可限定中心为本机入口；远端任务仍通过中心到worker的已有连接申请/归还线程。本机 worker 始终为进程内私有调用。仅运行 `worker.example.json` 不会自动变成下一次默认配置，可先复制为 `worker.local.json`。worker 不依赖其他科研工程；缺失共享目录记录为 `unavailable_shared`，引用该目录的任务只匹配具备它的节点。
 
-任务状态默认在工程`.local/state`：中心为`scheduler`，hybrid本机worker为`local`，独立worker以端口命名。`root`与`--root`可指定其他普通磁盘目录，`--root`下的中心使用`scheduler`子目录。资产、回执、输入与声明输出持久保留到领取；不要把root设置到重启即消失的RAM盘。
+任务状态默认在工程`.local/state`：中心为`scheduler`，hybrid本机worker为`local`，独立worker以端口命名。`root`与`--root`可指定其他普通磁盘目录，`--root`下的中心使用`scheduler`子目录。资产、回执、输入与声明输出持久保留到领取；不要把root设置到重启即消失的RAM盘。部署目录改名后须同步核对`worker.local.json`中的tools/shared/env、`.tools/science.json`、`.tools/rtl.json`以及目录联接的目标；Git更新不改这些本机配置。状态root单独按实际回执与引用迁移，不随工具路径批量替换。
 
 设备JSON中的`root`指定worker状态目录；中心默认仍为工程`.local/state/scheduler`，显式`--root`同时影响worker与中心的根目录。迁移旧RAM状态前核对任务ID、领取/恢复状态及实际引用：已经消费的临时验证和无引用的缓存副本可以退役；仍标为`recovery_pending`的中断回执、输入身份与引用资产继续保留。目录名或任务已结束本身不是删除依据。
 
@@ -280,6 +282,8 @@ python main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source "D
 
 Windows 的 `setup` 优先复用本机系统Python3.14科学环境，验证Numba JIT、OpenCV与ONNX Runtime CPU推理后写入本机工具配置；ngspice可下载或复用已有安装。`--rtl-source` 提取现有MSYS2中GCC/Verilator的实际依赖，排除编译链无关组件与下载缓存。
 
+实测ngspice版本为47时，`setup`同时登记`ngspice`和`ngspice47`；工具添加、移除和启动探测统一更新规范能力标签，失效工具与缺失共享目录对应的旧标签随之清除。
+
 AOP/RGCN SPICE、Bench优化、ARH CPU推理在各设备均优先使用本机系统CPython 3.14.8，通过`aop_python`、`rgcn_python`、`bench_python`和`arh_python`登记到tools。RGCN神经训练单独使用`rgcn_train`能力；两端已通过Torch/PyG加载和检查点续跑验证，沿用同一系统解释器。`.tools/ngspice`约38MiB，GCC/Verilator基础环境约608MiB；ARH的GSIM另用公共MSYS中的Clang/Flex/Bison。需要GPU的独立训练保留调用工程的指定环境。跨机复制后用`setup`校验版本和本机路径，配置随worker自然启动或空闲重载加载。
 
 Chisel、CIRCT和C++是三台设备的共同能力，必须在每台 worker 的本地配置中登记可执行文件：`java`、`scala-cli`、`firtool`、`circt-translate`，以及通用 C++ 别名`cxx`。Windows 使用本机 `.tools` 下的 JDK、Scala CLI、firtool 和 MSYS2，Linux 使用系统 Java/Clang 与 worker 工具目录中的 firtool/Scala CLI；路径只写该设备真实存在且已通过版本检查的文件。失效路径不保留在配置中，也不会通过标签伪造能力。GPU 硬件不自动登记为 DCO 加速器，只有 CUDA 运行时、框架后端和最小计算样例全部通过后，才在 `accelerators` 中增加对应档案。
@@ -291,6 +295,8 @@ Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/DCO/.project
 ## 部署到其他设备
 
 Linux 使用普通磁盘时，在设备配置中显式指定 `root` 为用户可写的磁盘绝对路径，例如 `~` 展开后的 `/home/user/.local/state/dco/worker`，并将进程 `TMPDIR` 指向普通磁盘；不运行 `ramdisk`。例如 `mode=worker`、`cpus=96`、`cpu_limit=96`、`memory_mb=98304`、`memory_reserve_mb=4096`，然后执行 `python3 -B main.py --config worker.local.json`。节点使用系统 hostname，跨平台任务按实际工具和 `requires` 标签匹配；Linux 节点不会声明 `win32`。
+
+显式配置`temp_root`时直接使用该目录，启动不会调用共享内存盘初始化；普通磁盘Linux worker将其指向例如`/home/user/.local/state/dco/tmp`。
 
 设备统一按 IP:26133 直连。公网 worker 在本机配置设置 host="0.0.0.0"、certfile、keyfile，中心节点使用 https://设备IP:26133 及 ca_file 信任该设备证书，私钥只留提供者；不修改全局证书信任、不依赖 SSH 或转发端口。计算进程在 worker 本地提出 CPU/RAM 请求，中心通过已有状态轮询处理并返回实际授权，提供者无需反向访问中心。旧反向callback_url入口已退役，配置只保存实际直连URL。令牌与设备配置放在忽略目录。
 

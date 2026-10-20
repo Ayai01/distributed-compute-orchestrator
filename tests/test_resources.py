@@ -201,6 +201,14 @@ class CalibrationTests(unittest.TestCase):
         second.health.update(cpu_percent=40)
         self.assertEqual(self.choose(pool),'one')
 
+    def test_missing_cpu_sample_uses_current_grants_until_first_measurement(self):
+        pool=self.pool()
+        first,second=pool.nodes
+        first.reserved=3
+        first.health.update(cpu_percent=None,used_cpus=3)
+        first.health['benchmark'].update(score=400)
+        self.assertEqual(self.choose(pool),'two')
+
     def test_different_native_workloads_are_not_compared(self):
         pool=self.pool()
         pool.nodes[0].health['benchmark'].update(name='numpy-mixed-v2',score=1000)

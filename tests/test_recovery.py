@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ from test_compute import provider,python,scratch,until
 
 class RecoveryTests(unittest.TestCase):
     def test_lost_worker_retries_original_request_on_healthy_worker(self):
-        for failure in ('refused','missing','interrupted'):
+        for failure in ('missing','interrupted'):
             with self.subTest(failure=failure),scratch() as temporary:
                 root=Path(temporary)
                 with provider(root/'lost') as (_,lost),provider(root/'healthy') as (_,healthy):
@@ -26,8 +27,7 @@ class RecoveryTests(unittest.TestCase):
                             if failure=='interrupted':
                                 return dict(status='interrupted',error='Worker stopped before completion',finished=time.time())
                             error=RemoteError('worker unavailable')
-                            if failure=='refused':error.transport_code=10061
-                            else:error.status_code=404
+                            error.status_code=404
                             raise error
                         with patch.object(lost,'submit_bundle',return_value={}),patch.object(lost,'status',side_effect=unavailable):
                             task=python("from pathlib import Path;Path('answer').write_text('42')",outputs=['answer'])
@@ -50,6 +50,37 @@ class RecoveryTests(unittest.TestCase):
                                 self.assertEqual([j['id'] for j in client.health()['nodes'][1]['active_jobs']],['direct'])
                             self.assertEqual(client.fetch(accepted['id'])['files']['answer'],b'42')
                             until(lambda:sum(n.reserved for n in pool.nodes)==0)
+
+    def test_temporarily_refused_worker_keeps_the_original_process_and_grant(self):
+        for code in (111,10061):
+            with self.subTest(code=code),scratch() as temporary,provider(Path(temporary)/'worker') as (_,remote):
+                with Pool([remote],refresh=60) as pool,center(pool,Path(temporary)/'center') as (_,client):
+                    original=remote.status
+                    disconnected=threading.Event();restored=threading.Event()
+                    def status(*args,**kwargs):
+                        if not restored.is_set():
+                            disconnected.set()
+                            error=RemoteError('worker port temporarily refused connection')
+                            error.transport_code=code
+                            raise error
+                        return original(*args,**kwargs)
+                    with patch.object(remote,'status',side_effect=status):
+                        identity=client.submit(python("from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)\nprint('original')"))['id']
+                        try:
+                            self.assertTrue(disconnected.wait(3))
+                            until(lambda:'connection_error' in client.status(identity))
+                            self.assertNotIn(client.status(identity)['status'],('interrupted','queued'))
+                            self.assertEqual(pool.nodes[0].reserved,1)
+                            self.assertEqual(client.status(identity)['attempts'],[])
+                            remote.write_job_file(identity,'release','done')
+                            restored.set()
+                            result=client.wait(identity,wait_timeout=5)
+                            self.assertEqual(result['status'],'succeeded',result)
+                            self.assertEqual(result['attempts'],[])
+                            self.assertEqual(client.fetch(identity)['stdout'].strip(),'original')
+                            until(lambda:pool.nodes[0].reserved==0)
+                        finally:
+                            restored.set()
 
     def test_retry_limit_and_machine_operation_opt_out(self):
         with scratch() as temporary,provider(Path(temporary)/'worker') as (_,node):
