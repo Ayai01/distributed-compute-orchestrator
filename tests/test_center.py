@@ -53,11 +53,27 @@ class AdmissionPlanningTests(unittest.TestCase):
         window=self.center([3,3]).admission(dict(project='A',cpus=2,queue_ratio=0))
         self.assertEqual((window['running_tasks'],window['max_in_flight']),(2,2))
 
+    def test_fixed_cpu_window_can_repack_fractional_project_node_targets(self):
+        state=self.center([12,12])
+        for project in ('A','B'):
+            for index in range(3):
+                state.jobs[project+str(index)]=dict(
+                    task=dict(steps=[['echo']],cpus=4,memory_mb=64,project=project),
+                    auto_cpus=False,node=None,result=dict(status='queued'))
+        resources=state.project_resources()
+        for project in ('A','B'):
+            self.assertEqual(sorted(resources[project]['node_targets'].values()),[6,6])
+            window=state.admission(dict(project=project,cpus=4,queue_ratio=0))
+            self.assertEqual((window['target_cpus'],window['running_tasks'],window['in_flight']),(12,3,3))
+
     def test_paused_workers_do_not_inflate_ready_project_share(self):
         state=self.center([2,8])
         state.pool.nodes[1].health['paused']=True
         window=state.admission(dict(project='A',queue_ratio=0))
         self.assertEqual((window['capable_cpus'],window['target_cpus'],window['running_tasks']),(2,2,2))
+        state.pool.nodes[0].health['paused']=True
+        window=state.admission(dict(project='A',queue_ratio=0))
+        self.assertEqual((window['capable_cpus'],window['target_cpus']),(0,0))
 
 
 @contextmanager
@@ -594,6 +610,32 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.health()['used_cpus'],4)
                 for identity in (flexible,restricted):
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
+    def test_paused_workers_keep_running_grants_in_project_fairness(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as root,provider(Path(root)/'one',cpus=12) as (_,one), \
+                provider(Path(root)/'two',cpus=12) as (_,two):
+            with Pool([one,two]) as pool,center(pool,Path(root)/'center') as (_,client):
+                existing=client.submit(python(hold,project='A',cpus=0,node='node1'))['id']
+                until(lambda:client.status(existing)['status']=='running')
+                client.control(node='node1',worker=dict(paused=True))
+                client.control(paused=True)
+                queued=client.submit(python(hold,project='A',cpus=0))['id']
+                other=client.submit(python(hold,project='B',cpus=0))['id']
+                self.assertEqual(client.admission('A',cpus=0,queue_ratio=0)['target_cpus'],12)
+                self.assertEqual(client.admission('B',cpus=0,queue_ratio=0)['target_cpus'],12)
+                client.control(paused=False)
+                until(lambda:client.status(other)['status']=='running')
+                self.assertEqual(client.status(other)['cpus'],12)
+                self.assertEqual(client.status(queued)['status'],'queued')
+                resources=client.health()['projects']
+                self.assertEqual({name:(row['target'],row['used']) for name,row in resources.items()},
+                                 {'A':(12,12),'B':(12,12)})
+                for identity in (existing,other):
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+                until(lambda:client.status(queued)['status']=='running')
+                self.assertEqual(client.status(queued)['assigned_node'],'node2')
+                client.write_job_file(queued,'release','done');client.wait(queued);client.fetch(queued)
 
     def test_capped_auto_window_starts_every_device_without_prefetch(self):
         hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"

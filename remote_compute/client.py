@@ -130,7 +130,10 @@ class Client:
             headers['X-DCO-Role'] = 'operator'
         else:
             headers.pop('X-DCO-Role', None)
-        if data is not None and not isinstance(data, bytes):
+        stream_body=isinstance(data,bytes)
+        if stream_body:
+            headers['Content-Length']=str(len(data))
+        elif data is not None:
             data = json_bytes(data)
         method = method or ('POST' if data is not None else 'GET')
         partial, etag = bytearray(), None
@@ -152,7 +155,11 @@ class Client:
                     headers.update(Range='bytes='+str(len(partial))+'-', **{'If-Range':etag})
                 else:
                     headers.pop('Range',None);headers.pop('If-Range',None)
-                connection.request(method, self.endpoint.path.rstrip('/') + path, body=data, headers=headers)
+                # A bytes body uses one sendall with a whole-body deadline.
+                # The reader loop sends bounded blocks, so active uploads can
+                # outlast the socket timeout. Each retry starts at byte zero.
+                body=io.BytesIO(data) if stream_body else data
+                connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
                 response = connection.getresponse()
                 self.connections.response_status=response.status
                 self.connections.etag=response.getheader("ETag")

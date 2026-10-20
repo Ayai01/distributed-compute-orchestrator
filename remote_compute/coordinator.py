@@ -129,6 +129,8 @@ class Coordinator:
         resources = self.project_resources()
         shares = {name: row['resource_share'] for name,row in resources.items()}
         demands = {name: min(row['demand'],row['capacity']) for name,row in resources.items()}
+        paused={node.name for node in self.pool.nodes if node.health.get('paused')}
+        held={name:cpus for name,cpus in resources.get(project,{}).get('node_demands',{}).items() if name in paused}
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')
                   and n.capacity>=max(1,cpus)
                   and (not node_name or n.name==node_name)
@@ -137,22 +139,23 @@ class Coordinator:
                   ]
         capable=sum(n.capacity for n in eligible)
         names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
-        shares[project], demands[project] = share, capable
+        shares[project], demands[project] = share, capable+sum(held.values())
         rooms={name:row['node_demands'] for name,row in resources.items()}
-        rooms[project]={node.name:node.capacity for node in eligible}
-        grants=weighted_node_threads({n.name:n.capacity for n in self.pool.nodes if n.name in names
+        rooms[project]={**held,**{node.name:node.capacity for node in eligible}}
+        grants=weighted_node_threads({n.name:n.reserved if n.health.get('paused') else n.capacity for n in self.pool.nodes if n.name in names
                                      and not n.error and n.enabled},shares,demands,rooms)
         target=sum(grants[project].values())
-        ceilings=[min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible]
+        ceilings=[min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible]+list(held.values())
         maximum=sum(ceilings)
-        target = min(target, capable)
         unit = cpus or maximum_cpus
         # Grants on different devices cannot share one task. Count each
         # device's partial automatic grant instead of merging their CPUs.
+        # Fixed jobs can repack the fair plan's node shares; only physical
+        # device remainders impose a per-node limit on their task count.
         def slots(values):
             return sum(math.ceil(value/unit) if unit else bool(value) for value in values)
         wave = max(1,slots(grants[project].values()) if cpus==0
-                   else sum(value//unit for value in grants[project].values()))
+                   else min(math.ceil(target/unit),sum(node.capacity//unit for node in eligible)+sum(value//unit for value in held.values())))
         ready = wave
         ceiling_wave=max(1,slots(ceilings) if cpus==0 else sum(value//unit for value in ceilings))
         ceiling=ceiling_wave
@@ -161,7 +164,7 @@ class Coordinator:
             # Keep those running tasks and admit another wave into the freed
             # credits; prefetch still covers only a full-width wave.
             with self.condition,self.pool.condition:
-                names={node.name for node in eligible}
+                names={node.name for node in eligible}|set(held)
                 running=sum(job.get('auto_cpus',False) and (job.get('task',{}).get('project') or 'default')==project
                             and job['result'].get('assigned_node') in names
                             and job['result']['status'] not in TERMINAL for job in self.jobs.values())
@@ -342,8 +345,10 @@ class Coordinator:
 
     def project_resources(self):
         shares, demands, used, queued, rooms = {}, {}, {}, {}, {}
-        online={n.name:n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')}
-        largest = max((n.capacity for n in online.values()), default=1)
+        online={n.name:n for n in self.pool.nodes if not n.error and n.enabled
+                and (not n.health.get('paused') or n.reserved)}
+        capacities={name:node.reserved if node.health.get('paused') else node.capacity for name,node in online.items()}
+        largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
         with self.condition,self.pool.condition:
             for job in self.jobs.values():
                 if job['result']['status'] in TERMINAL:
@@ -353,17 +358,25 @@ class Coordinator:
                 shares[name] = task.get('resource_share', 1.0)
                 demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
                 demand=min(demand,task.get('max_cpus',demand))
+                held=job.get('node')
+                paused=held is not None and held.health.get('paused')
+                if paused:demand=task.get('cpus',0)
                 demands[name] = demands.get(name, 0) + demand
                 available=rooms.setdefault(name,{})
                 wanted={**task,'cpus':0} if job.get('auto_cpus') else task
-                for node in self.pool._matching(wanted):
-                    if node.name in online and (not job.get('node') or node is job['node']):
-                        available[node.name]=available.get(node.name,0)+min(demand,node.capacity)
+                if paused and held.name in online:
+                    # Pausing stops new work; existing grants still occupy
+                    # their project's share until their tasks release them.
+                    available[held.name]=available.get(held.name,0)+demand
+                else:
+                    for node in self.pool._matching(wanted):
+                        if node.name in online and not node.health.get('paused') and (not held or node is held):
+                            available[node.name]=available.get(node.name,0)+min(demand,node.capacity)
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
         names={node for available in rooms.values() for node in available}
-        ceilings={name:sum(min(online[node].capacity,demand) for node,demand in rooms[name].items()) for name in shares}
-        grants=weighted_node_threads({name:online[name].capacity for name in names},shares,demands,rooms)
+        ceilings={name:sum(min(capacities[node],demand) for node,demand in rooms[name].items()) for name in shares}
+        grants=weighted_node_threads({name:capacities[name] for name in names},shares,demands,rooms)
         quotas={name:sum(grants[name].values()) for name in shares}
         return {name: dict(resource_share=shares[name], target=quotas[name], demand=demands[name], used=used[name], queued=queued[name],
                            capacity=ceilings[name],eligible_nodes=sorted(rooms[name]),node_demands=rooms[name],

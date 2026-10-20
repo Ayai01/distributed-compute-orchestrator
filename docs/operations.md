@@ -209,12 +209,14 @@ python main.py --url http://127.0.0.1:26133 fetch 任务ID --output results/oper
 
 远程命令与计算任务共用 CPU／内存预算、排队、优先级、超时和进程树取消。`--stdin 本地文件` 传入标准输入，`--env NAME=VALUE` 设置环境，`--output 目录` 保存完整日志。结果和实时日志包含末尾16KiB；完整日志随结果回收。长任务加 `--detach` 立即返回 ID，退出连接后可用相同中心地址和 ID 查询、取消或回收。
 
-Codex 或其他 Python 调用者只需这一个接口：
+Codex 或其他 Python 运维调用者使用中心的操作员身份；下面示例在本机 DCO 目录运行：
 
 ```python
+from pathlib import Path
 from remote_compute import Client
 
-center = Client("http://127.0.0.1:26133")
+center = Client("http://127.0.0.1:26133", operator=True,
+                operator_token=Path(".local/state/scheduler/operator.token").read_text().strip())
 machine = center.machine("Aya1-TX", cwd="D:/Projects/MyProject")
 
 print(machine.listdir())
@@ -238,7 +240,7 @@ machine.download("./results", "./results/Aya1-TX")
 
 `execute` 和 `python` 接受 `job_id`，在结果保留期间用相同 ID 和相同请求重提交只执行一次。操作固定到显式选择的节点；源码更新、工程环境安装、Git 操作和检查可沿用同一接口。
 
-所有服务模式均保留一个轻量 Python 启动进程，支持在原终端重新加载代码和设备配置。源码写完后，`Client().restart(wait=True)` 重载中心，`Client().restart('Aya1-TX', wait=True)` 重载远端；中心终端使用 `restart --wait` / `restart Aya1-TX --wait`，CLI 使用 `python main.py --url 中心地址 restart --node Aya1-TX --wait`。`machine.restart(wait=True)` 同样可用。省略 wait 时，忙碌服务返回409；wait 模式等待在途任务结束再重载，已完成未领取结果保留。`health` 返回 `pid`、`version`、`tool_root` 和 `restart` 能力，可核对生效版本。运行时保存的CPU/内存配置在重载后继续使用。
+所有服务模式均保留一个轻量 Python 启动进程，支持在原终端重新加载代码和设备配置。源码写完后，使用上述操作员连接，`center.restart(wait=True)` 重载中心，`center.restart('Aya1-TX', wait=True)` 重载远端；中心终端使用 `restart --wait` / `restart Aya1-TX --wait`，CLI 使用 `python main.py --url 中心地址 restart --node Aya1-TX --wait`。`machine.restart(wait=True)` 同样可用。省略 wait 时，忙碌服务返回409；wait 模式等待在途任务结束再重载，已完成未领取结果保留。操作员 `health` 返回 `pid`、`version`、`tool_root` 和 `restart` 能力，可核对生效版本。运行时保存的CPU/内存配置在重载后继续使用。
 
 ## 同一仓库、设备独立配置
 
@@ -249,9 +251,11 @@ machine.download("./results", "./results/Aya1-TX")
 ### 从当前中心更新 Aya1-TX
 
 ```python
+from pathlib import Path
 from remote_compute import Client
 
-center = Client()
+center = Client(operator=True,
+                operator_token=Path(".local/state/scheduler/operator.token").read_text().strip())
 node = next(n for n in center.nodes()["nodes"] if n["name"] == "Aya1-TX")
 if node["active_jobs"] or node["queued"]:
     raise RuntimeError("Aya1-TX 仍有任务，待空闲后更新")
@@ -262,7 +266,7 @@ if result["status"] == "succeeded":
     print(machine.restart())
 ```
 
-`update` 仅允许 main 快进更新；本地源码改动先提交再更新。更新后检查两端 `git rev-parse HEAD` 一致，`nodes` 中设备重新在线。先重载独立 worker，再 `Client().restart(wait=True)` 重载本机中心；两边均保持原终端，无需手动关闭再启动。
+`update` 仅允许 main 快进更新；本地源码改动先提交再更新。更新后检查两端 `git rev-parse HEAD` 一致，`nodes` 中设备重新在线。先重载独立 worker，再 `center.restart(wait=True)` 重载本机中心；两边均保持原终端，无需手动关闭再启动。
 
 `Client.fetch`自动使用独立长超时连接（至少120秒），状态与提交继续原短超时，无需逐个工程设置。中心每节点同时取回一份结果，同ID重复领取复用中心原ZIP缓存；缓存随作业领取清理。现代HTTP连接空闲10秒释放，每连接池共享最多8条连接，避免闲置连接耗尽；二进制GET支持校验身份的断线续传。详情见[差网络处理](integration.md)。
 
@@ -290,7 +294,7 @@ Chisel、CIRCT和C++是三台设备的共同能力，必须在每台 worker 的�
 
 Aya1-TX的完整ARH源码与CPU运行环境持久放在 `D:/Desktop/DCO/.projects/arh`，Python复用 `arh_python`。该目录的 `.tools` 保存Java、Scala CLI、firtool/circt-translate、模型、Coursier缓存和Rocket/GSIM必要资产；`.tools/msys64`是指向DCO公共MSYS的目录联接，GCC、Verilator与Clang共用一份。`run_remote`提交时冻结小型源码资产，入口、执行和摘要校验均使用该版本；新旧源码任务可同时存在。工具与模型继续共享，已有原生小产物经过原编译指纹决定能否复用，科研统计缓存留在shared.arh。重连使用原ID及原源码资产，取消取回中的结果时保留最近成功报告。
 
-`worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过 `Client().machine('Aya1-TX', cwd=上述目录)` 或指定 `node='Aya1-TX'` 的普通任务按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。生产任务声明`shared:arh`及编译器能力，由中心筛选；工程不查询`shared_paths`选择设备。
+`worker.local.json` 的 `shared.arh` 指向此目录，新增配置随worker自然启动加载。服务运行期间可先通过上述操作员连接的 `center.machine('Aya1-TX', cwd=上述目录)` 按绝对目录验证；任务仍经过中心CPU/内存准入。验证使用独立 `artifact_root`，部署目录不放正式报告。生产任务声明`shared:arh`及编译器能力，由中心筛选；工程不查询`shared_paths`选择设备。
 
 ## 部署到其他设备
 

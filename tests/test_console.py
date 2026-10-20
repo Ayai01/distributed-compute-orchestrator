@@ -6,6 +6,7 @@ import ctypes
 from ctypes import wintypes
 import io
 import os
+import re
 import sys
 import threading
 import unittest
@@ -69,6 +70,45 @@ class ConsoleTests(unittest.TestCase):
         with patch.object(console, '_COLOR_ENABLED', True):
             painter.frame(['任务运行'], 40, 1, 0)
         self.assertNotIn('\x1b[', painter.rows[0])
+
+    def test_two_column_section_color_stops_before_task_content(self):
+        import remote_compute.console as console
+        jobs = [dict(id=f'a{i:03x}'+'b'*28, project='Bench', label='probe',
+                     cpus=2, memory_mb=512, status='running') for i in range(20)]
+        value = dict(role='scheduler', node='Aya1-PC', cpus=24, used_cpus=20,
+                     nodes=[dict(name='Aya1-PC', capacity=24, active_jobs=jobs)],
+                     projects={'Bench':dict(resource_share=1, used=20, target=24, queued=0)})
+        blue, reset = '\x1b[34;1m', '\x1b[0m'
+        with patch.object(console, '_COLOR_ENABLED', True):
+            for width in (120, 160, 200):
+                rows = format_status(value, width=width).fit(28)
+                for title in ('启动基准', '工程份额', '运行能力'):
+                    row = next(row for row in rows if row.startswith('+ '+title))
+                    self.assertIn('probe', row)
+                    boundary = len(_clip(row, 56))
+                    painted = _paint_row(row)
+                    self.assertEqual(painted, blue+row[:boundary]+reset+_paint_row(row[boundary:]))
+                    self.assertNotIn(blue, painted[len(blue)+boundary+len(reset):])
+                    self.assertIn('\x1b[35;1mAya1-PC'+reset, painted)
+                    self.assertIn('probe', painted)
+                    if width >= 160:
+                        self.assertIn('\x1b[32m运行'+reset, painted)
+                    self.assertEqual(re.sub(r'\x1b\[[0-9;]*m', '', painted), row)
+
+    def test_adjacent_panel_titles_keep_their_own_color_spans(self):
+        import remote_compute.console as console
+        from remote_compute.view import _line, _rule
+        blue, reset = '\x1b[34;1m', '\x1b[0m'
+        right = _rule('当前任务 20 个 | Ctrl+Tab 翻页', 80)
+        with patch.object(console, '_COLOR_ENABLED', True):
+            left = _rule('设备资源', 56)
+            row = left+right[1:]
+            self.assertEqual(_paint_row(row), blue+left+reset+blue+right[1:]+reset)
+            left = _line('Aya1-PC 运行', 56)[:-1]
+            row = left+right
+            self.assertEqual(_paint_row(row), _paint_row(left)+blue+right+reset)
+            clipped = _rule('当前任务 20 个 | Ctrl+Tab 翻页', 20)
+            self.assertEqual(_paint_row(clipped), blue+clipped+reset)
 
     def test_command_suggestions_use_cached_nodes_ids_and_real_parser_options(self):
         shell = object.__new__(SchedulerShell)

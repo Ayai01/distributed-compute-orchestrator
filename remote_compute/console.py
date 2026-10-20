@@ -27,42 +27,43 @@ def _paint_row(row):
     text = row.strip()
     if not text:
         return row
-    # Keep prose at the terminal's normal white.  Panel structure and the
-    # command prompt may span a whole row; task state/value colors below are
-    # applied to individual tokens so a right-hand task never tints a left
-    # resource panel in the two-column layout.
+    # Rows may join a left section title to a right task.  Scope title color to
+    # its own rule, including the shared corner, instead of tinting that task.
     if text.startswith(('调度>', '算力>', 'worker>', 'scheduler>')):
-        color = '\x1b[36;1m'          # command input
-    elif text.startswith('+ ') and any(char.isalpha() or '\u4e00' <= char <= '\u9fff' for char in text):
-        color = '\x1b[34;1m'          # panel/section title
+        return '\x1b[36;1m' + row + _RESET
     elif set(text) <= set('+-|='):
-        color = '\x1b[90m'            # separators
-    else:
-        hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
-        number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?)(?![\w.])')
-        state_pattern = re.compile(r'运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
-        device_pattern = re.compile(r'(?<![\w])(?:Aya1-[A-Za-z0-9_-]+|ku26s|Server(?:-[A-Za-z0-9_-]+)?|device)(?![\w])')
-        state_colors = {
-            '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
-            '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
-            '派发':'\x1b[36m', '校准中':'\x1b[36m',
-            '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
-            'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
-        result, position = [], 0
-        matches = [*hash_pattern.finditer(row), *number_pattern.finditer(row), *state_pattern.finditer(row), *device_pattern.finditer(row)]
-        for match in sorted(matches, key=lambda m: (m.start(), -m.end())):
-            if match.start() < position:
-                continue
-            result.append(row[position:match.start()])
+        return '\x1b[90m' + row + _RESET
+    # Leave the closing '+' available to match the adjacent panel's title.
+    # A clipped standalone title may end at the corner without dash padding.
+    title_pattern = re.compile(r'\+ .+?(?:-+(?=\+)|(?=\+$))')
+    hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
+    number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?)(?![\w.])')
+    state_pattern = re.compile(r'运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
+    device_pattern = re.compile(r'(?<![\w])(?:Aya1-[A-Za-z0-9_-]+|ku26s|Server(?:-[A-Za-z0-9_-]+)?|device)(?![\w])')
+    state_colors = {
+        '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
+        '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
+        '派发':'\x1b[36m', '校准中':'\x1b[36m',
+        '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
+        'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
+    matches = [(match.start(), match.end()+1, '\x1b[34;1m')
+               for match in title_pattern.finditer(row)]
+    for pattern in (hash_pattern, number_pattern, state_pattern, device_pattern):
+        for match in pattern.finditer(row):
             token = match.group()
-            token_color = ('\x1b[36m' if hash_pattern.fullmatch(token) else
-                           '\x1b[35;1m' if device_pattern.fullmatch(token) else
-                           state_colors.get(token.casefold(), '\x1b[33m'))
-            result.extend((token_color, match.group(), _RESET))
-            position = match.end()
-        result.append(row[position:])
-        return ''.join(result)
-    return color + row + _RESET
+            color = ('\x1b[36m' if hash_pattern.fullmatch(token) else
+                     '\x1b[35;1m' if device_pattern.fullmatch(token) else
+                     state_colors.get(token.casefold(), '\x1b[33m'))
+            matches.append((match.start(), match.end(), color))
+    result, position = [], 0
+    for start, end, color in sorted(matches, key=lambda m: (m[0], -m[1])):
+        if end <= position:
+            continue
+        start = max(start, position)
+        result.extend((row[position:start], color, row[start:end], _RESET))
+        position = end
+    result.append(row[position:])
+    return ''.join(result)
 
 
 def _input_view(prompt, line, cursor, width):

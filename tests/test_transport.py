@@ -1,8 +1,13 @@
 """Real HTTP regressions for slow and interrupted result transfers."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import json
 from pathlib import Path
+import socket
 import threading
 import time
 import unittest
@@ -15,7 +20,74 @@ from test_center import center
 from test_compute import provider, python, scratch, until
 
 
+@contextmanager
+def slow_upload_server(*, interrupt=False):
+    received=[]
+    class Receiver(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,16384)
+        def log_message(self,*args):
+            pass
+        def do_POST(self):
+            length=int(self.headers['Content-Length'])
+            content=bytearray()
+            while len(content)<length:
+                chunk=self.rfile.read(min(32768,length-len(content)))
+                if not chunk:break
+                content.extend(chunk)
+                if interrupt and not received and len(content)>=65536:
+                    received.append((self.path,bytes(content),self.headers.get('Transfer-Encoding')))
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.close_connection=True
+                    return
+                time.sleep(.02)
+            received.append((self.path,bytes(content),self.headers.get('Transfer-Encoding')))
+            reply=json.dumps(dict(bytes=len(content),sha256=hashlib.sha256(content).hexdigest())).encode()
+            try:
+                self.send_response(200)
+                self.send_header('Content-Length',str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+            except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError):
+                pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Receiver)
+    server.daemon_threads=False
+    thread=threading.Thread(target=server.serve_forever,kwargs=dict(poll_interval=.02))
+    thread.start()
+    original=http.client.HTTPConnection.connect
+    def connect(connection):
+        original(connection)
+        connection.sock.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,16384)
+    try:
+        with patch.object(http.client.HTTPConnection,'connect',connect):
+            yield Client('http://127.0.0.1:'+str(server.server_port),timeout=.3),received
+    finally:
+        server.shutdown();thread.join();server.server_close()
+
+
 class TransportTests(unittest.TestCase):
+    def test_slow_binary_upload_keeps_progress_past_the_socket_timeout(self):
+        payload=b'asset-content'*160000
+        identity=hashlib.sha256(payload).hexdigest()
+        with slow_upload_server() as (client,received):
+            started=time.monotonic()
+            result=client.request('/assets/'+identity,payload)
+            self.assertGreater(time.monotonic()-started,client.timeout)
+            self.assertEqual(client.timeout,.3)
+            self.assertEqual(result,dict(bytes=len(payload),sha256=identity))
+            self.assertEqual(received,[('/assets/'+identity,payload,None)])
+
+    def test_interrupted_binary_upload_restarts_same_hash_from_first_byte(self):
+        payload=b'asset-content'*160000
+        identity=hashlib.sha256(payload).hexdigest()
+        with slow_upload_server(interrupt=True) as (client,received):
+            result=client.request('/assets/'+identity,payload)
+            self.assertEqual(result,dict(bytes=len(payload),sha256=identity))
+            self.assertEqual(len(received),2)
+            self.assertEqual(received[0],('/assets/'+identity,payload[:65536],None))
+            self.assertEqual(received[1],('/assets/'+identity,payload,None))
+
     def test_connection_slots_are_fifo_and_timeout_never_sends_a_request(self):
         pool=_ConnectionPool()
         for _ in range(8):self.assertTrue(pool.acquire(0))
