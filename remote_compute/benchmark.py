@@ -135,12 +135,22 @@ def measure(cpus, *, executable=None, environment=(), duration=60):
 def cpu_identity(cpus):
     import platform
     if os.name=='nt':
+        import ctypes
         import winreg
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as key:
             model=winreg.QueryValueEx(key,'ProcessorNameString')[0].strip()
+        # platform.machine() enters WMI on Python 3.14, before cache lookup.
+        # SYSTEM_INFO starts with the native processor architecture WORD.
+        info=ctypes.create_string_buffer(64)
+        native=ctypes.WinDLL('kernel32').GetNativeSystemInfo
+        native.argtypes=[ctypes.c_void_p];native.restype=None
+        native(info)
+        architecture={0:'x86',5:'ARM',6:'IA64',9:'AMD64',12:'ARM64'}.get(
+            ctypes.c_ushort.from_buffer(info).value,'unknown')
     else:
         model=sorted({line.split(':',1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')})
-    return dict(kernel=NAME,model=model,architecture=platform.machine(),logical_cpus=os.cpu_count(),
+        architecture=platform.machine()
+    return dict(kernel=NAME,model=model,architecture=architecture,logical_cpus=os.cpu_count(),
                 affinity=sorted(os.sched_getaffinity(0)) if hasattr(os,'sched_getaffinity') else None,threads=cpus)
 
 

@@ -1,5 +1,6 @@
 """Generic capability routing, bounded sampling and reusable calibration."""
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -143,6 +144,23 @@ class ContractTests(unittest.TestCase):
                 updated=client.read_job_file_changed(identity,'state.json',first['version'])
                 self.assertTrue(updated['changed']);self.assertEqual(updated['data'],b'next'*1000)
                 client.wait(identity);client.fetch(identity)
+
+    @unittest.skipUnless(os.name == 'nt', 'Native Windows CPU identity')
+    def test_windows_cached_calibration_starts_without_wmi(self):
+        from remote_compute.benchmark import cpu_identity
+        with scratch() as directory, \
+                patch('platform.machine', side_effect=AssertionError('WMI must not run')):
+            identity=cpu_identity(12)
+            self.assertIn(identity['architecture'], ('AMD64','ARM64','x86','ARM','IA64'))
+            self.assertEqual(identity['logical_cpus'], os.cpu_count())
+            path=Path(directory)/'calibration.json'
+            result=dict(name=NAME,available=True,threads=12,score=5)
+            path.write_text(json.dumps(dict(identity=identity,benchmark=result)))
+            with patch('remote_compute.benchmark.measure') as measure, \
+                    patch('remote_compute.resources.cpu_ticks') as ticks:
+                self.assertEqual(calibrated(12,cache_file=path), result)
+                measure.assert_not_called()
+                ticks.assert_not_called()
 
     def test_saved_calibration_reused_without_load_probe_or_new_kernel(self):
         with scratch() as directory:

@@ -5,7 +5,6 @@ import sys
 import threading
 import time
 import os
-import subprocess
 import re
 
 from .view import _width, _clip, _rule, _line, _layout, StatusRows, format_status, format_notices, set_width_probe
@@ -46,10 +45,20 @@ def _paint_row(row):
         '派发':'\x1b[36m', '校准中':'\x1b[36m',
         '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
         'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
+    # Locate fields in the wide, reduced-column and compact task layouts.
+    # Numeric IDs are identifiers; the trailing label is opaque user text.
+    task = re.search(
+        r'[|+] (?P<id>[0-9a-f]{4}) (?:'
+        r'\| (?:(?:[^|]*\| ){2} *1/\d+ *\|[^|]*\|[^|]*\|[^|]*\|'
+        r'|(?:[^|]*\| )? *1/\d+ *\|[^|]*\|)'
+        r'|1/\d+(?: +(?:\d+|-))?)(?P<label>.*)', row, re.I)
+    paint_end = task.start('label') if task else len(row)
     matches = [(match.start(), match.end()+1, '\x1b[34;1m')
-               for match in title_pattern.finditer(row)]
+               for match in title_pattern.finditer(row, 0, paint_end)]
+    if task:
+        matches.append((*task.span('id'), '\x1b[36m'))
     for pattern in (hash_pattern, number_pattern, state_pattern, device_pattern):
-        for match in pattern.finditer(row):
+        for match in pattern.finditer(row, 0, paint_end):
             token = match.group()
             color = ('\x1b[36m' if hash_pattern.fullmatch(token) else
                      '\x1b[35;1m' if device_pattern.fullmatch(token) else
@@ -302,13 +311,16 @@ def _focus_probe():
     if user.IsWindowVisible(console):
         return lambda: user.GetForegroundWindow() == console
     # ConPTY consoles are hidden; match the foreground editor/terminal host.
-    # Resolve its process ancestors once, never on the refresh path.
-    script = (f'$nextId={os.getpid()}; $seen=@{{}}; while ($nextId -gt 0 -and !$seen.ContainsKey($nextId)) {{ '
-              '$seen[$nextId]=$true; $p=Get-CimInstance Win32_Process -Filter ("ProcessId="+$nextId); '
-              'if (!$p -or $p.Name -eq "explorer.exe") { break }; $nextId; $nextId=$p.ParentProcessId }')
-    result = subprocess.run(['powershell','-NoProfile','-Command',script], capture_output=True, text=True,
-                            creationflags=subprocess.CREATE_NO_WINDOW)
-    hosts = {int(line) for line in result.stdout.splitlines() if line.strip().isdigit()}
+    # Reuse the visibility check's native snapshot; WMI can stall before a frame.
+    from .terminal import _windows_processes
+    processes = _windows_processes()
+    hosts, pid = set(), os.getpid()
+    while pid and pid not in hosts:
+        parent, name = processes.get(pid, (0, ''))
+        if name.casefold() == 'explorer.exe':
+            break
+        hosts.add(pid)
+        pid = parent
     def focused():
         process = wintypes.DWORD()
         user.GetWindowThreadProcessId(user.GetForegroundWindow(), ctypes.byref(process))

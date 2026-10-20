@@ -6,6 +6,35 @@ import subprocess
 import sys
 
 
+def _windows_processes():
+    """Read the local process ancestry without a WMI provider round trip."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    kernel = c.WinDLL('kernel32', use_last_error=True)
+    class Entry(c.Structure):
+        _fields_ = [('size', w.DWORD), ('usage', w.DWORD), ('pid', w.DWORD),
+                    ('heap', c.c_size_t), ('module', w.DWORD), ('threads', w.DWORD),
+                    ('parent', w.DWORD), ('priority', w.LONG), ('flags', w.DWORD),
+                    ('exe', w.WCHAR * 260)]
+    kernel.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = w.HANDLE
+    kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = [w.HANDLE, c.POINTER(Entry)]
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+    if snapshot == w.HANDLE(-1).value:
+        raise c.WinError(c.get_last_error())
+    processes, entry = {}, Entry()
+    entry.size = c.sizeof(entry)
+    try:
+        more = kernel.Process32FirstW(snapshot, c.byref(entry))
+        while more:
+            processes[entry.pid] = (entry.parent, entry.exe)
+            more = kernel.Process32NextW(snapshot, c.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return processes
+
+
 def _windows_visible():
     import ctypes as c
     from ctypes import wintypes as w
@@ -25,27 +54,7 @@ def _windows_visible():
 
     # ConPTY's own HWND is hidden. Check its actual terminal/editor ancestors,
     # rather than trusting inherited WT_SESSION / TERM_PROGRAM variables.
-    class Entry(c.Structure):
-        _fields_ = [('size', w.DWORD), ('usage', w.DWORD), ('pid', w.DWORD),
-                    ('heap', c.c_size_t), ('module', w.DWORD), ('threads', w.DWORD),
-                    ('parent', w.DWORD), ('priority', w.LONG), ('flags', w.DWORD),
-                    ('exe', w.WCHAR * 260)]
-    kernel.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
-    kernel.CreateToolhelp32Snapshot.restype = w.HANDLE
-    kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = [w.HANDLE, c.POINTER(Entry)]
-    kernel.CloseHandle.argtypes = [w.HANDLE]
-    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
-    if snapshot == w.HANDLE(-1).value:
-        return False
-    parents, entry = {}, Entry()
-    entry.size = c.sizeof(entry)
-    try:
-        more = kernel.Process32FirstW(snapshot, c.byref(entry))
-        while more:
-            parents[entry.pid] = entry.parent
-            more = kernel.Process32NextW(snapshot, c.byref(entry))
-    finally:
-        kernel.CloseHandle(snapshot)
+    parents = {pid: parent for pid, (parent, _) in _windows_processes().items()}
     user.GetWindowThreadProcessId.argtypes = [w.HWND, c.POINTER(w.DWORD)]
     owner = w.DWORD()
     user.GetWindowThreadProcessId(window, c.byref(owner))

@@ -535,6 +535,26 @@ class ConsoleTests(unittest.TestCase):
         for expected in ('task-Aya1-PC','task-Aya1-TX','notice 5','output 9','设备资源','工程份额','当前任务'):
             self.assertIn(expected,text)
 
+    @unittest.skipUnless(os.name == 'nt', 'Native Windows terminal ancestry')
+    def test_hidden_console_focus_uses_native_snapshot_without_powershell(self):
+        from remote_compute.console import _focus_probe
+        kernel, user = Mock(), Mock()
+        kernel.GetConsoleWindow.return_value = 100
+        user.IsWindowVisible.return_value = False
+        foreground = [40]
+        def owner(window, process):
+            process._obj.value = foreground[0]
+        user.GetWindowThreadProcessId.side_effect = owner
+        processes = {os.getpid():(40,'python.exe'),40:(9,'WindowsTerminal.exe'),9:(0,'explorer.exe')}
+        with patch('ctypes.WinDLL', side_effect=lambda name, **kwargs: kernel if name=='kernel32' else user), \
+                patch('remote_compute.terminal._windows_processes', return_value=processes) as snapshot, \
+                patch('subprocess.run', side_effect=AssertionError('WMI must not run')):
+            focused = _focus_probe()
+            self.assertTrue(focused())
+            foreground[0] = 9
+            self.assertFalse(focused())
+            snapshot.assert_called_once_with()
+
     def test_focus_refresh_uses_one_or_five_seconds_and_updates_on_return(self):
         refresh=FocusRefresh()
         self.assertTrue(refresh.due(0,True))
