@@ -183,6 +183,40 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_single_node_isolation_drains_keeps_receipts_and_maintenance_path(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)\nprint('original-result')"
+        with scratch() as root,provider(Path(root)/'one',cpus=1) as (_,one), \
+                provider(Path(root)/'two',cpus=1) as (_,two):
+            with Pool([one,two]) as pool,center(pool,Path(root)/'center') as (_,client):
+                name=pool.nodes[0].name
+                original=client.submit(python(hold,node=name,project='original'))['id']
+                until(lambda:client.status(original)['status']=='running')
+                before=client.status(original)
+                try:
+                    client.control(node=name,routing=dict(enabled=False))
+                    waiting=client.submit(python("print('after-resume')",node=name,project='waiting'))['id']
+                    other=client.run(python("print('other-node')",project='other'))
+                    self.assertEqual(other['status'],'succeeded')
+                    self.assertNotEqual(other['assigned_node'],name)
+                    self.assertEqual(client.status(waiting)['status'],'queued')
+                    self.assertEqual(client.status(original)['started'],before['started'])
+                    client.write_job_file(original,'release','done')
+                    client.wait(original)
+                    result=client.fetch(original)
+                    self.assertEqual((result['id'],result['status'],result['stdout'].strip()),
+                                     (original,'succeeded','original-result'))
+                    self.assertFalse(result.get('attempts'))
+                    self.assertGreater(result['cpu_seconds'],0)
+                    # The existing direct worker connection remains usable
+                    # after its production routing has drained.
+                    maintenance=one.run(python("print('isolated-maintenance')"))
+                    self.assertEqual(maintenance['stdout'].strip(),'isolated-maintenance')
+                    self.assertEqual(client.status(waiting)['status'],'queued')
+                finally:
+                    client.control(node=name,routing=dict(enabled=True))
+                client.wait(waiting)
+                self.assertEqual(client.fetch(waiting)['assigned_node'],name)
+
     def test_global_pause_blocks_dispatch_but_allows_existing_phase_growth(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
             with center(pool,Path(root)/'center') as (_,client):

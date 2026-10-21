@@ -26,7 +26,7 @@ DCO 负责能力、调度、资源、任务和传输；电路测量、科学评�
 
 CLI 生命周期在 cli/startup/terminal，命令语义在 commands，交互在 console，格式在 view；中心调度在 coordinator/allocation/admission，执行所有权在 worker/process/resources。维护一条责任清晰的调用链，跨层参数变化同时核对实际调用方。
 
-看板 Tab 在空输入显示候选、有输入时补全；Ctrl+Tab 翻页，空输入 Shift+Tab 反翻。补全只读快照，Enter 才执行。保留实际视口、固定输入行、ASCII 边框及变化行重画，耗时操作后台完成并释放结果引用。
+看板 Tab 在空输入显示候选、有输入时补全；Ctrl+Tab 翻页，空输入 Shift+Tab 反翻。补全只读快照，Enter 才执行。保留实际视口、固定输入行、ASCII 边框及变化行重画，耗时操作后台完成并释放结果引用。设备名8字符及以下完整显示，列宽按终端单元格计算。
 
 注释解释所有权、准入/授权差别、原 ID 恢复和非直观边界，不复述直白实现。验证按改动选现有隔离单测；核心改动入口 `python -B main.py --test`，原生执行链变化用 `--test-native`。测试夹具隔离状态及校准缓存，避免改变运行中的设备。交付写清实际入口、验证及生效范围。
 

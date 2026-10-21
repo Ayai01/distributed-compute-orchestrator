@@ -336,6 +336,7 @@ class StatusRows(list):
                 self.projects.append([_project(name),str(float(a['resource_share'])),f"{count}/{a['used']}",a['target'],a['queued']])
             self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
+        self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
         now=time.time()
         self.records=[]
         for name,job in self.jobs:
@@ -351,10 +352,10 @@ class StatusRows(list):
         if width>=100:
             table=_table(['Node','CPU U/B','CPU%','1T/All','RAM U/T','Avail','GPU','RSS/Res'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
-                         [11,10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
+                         [max([11]+[_width(f'#{r[10]} ')+self.node_width for r in records]),10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
             table=_table(['Node','CPU U/B','CPU%','RAM U/T','Avail'],[r[:5] for r in records],
-                         [7,10,6,None,5],width,right=(1,2,3,4))
+                         [self.node_width,10,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
         for node,r in self.devices:
@@ -367,11 +368,11 @@ class StatusRows(list):
             details=_table(['Node','1T/All','RSS/Res','IP','Net'],
                            [[r[0],r[7],r[5],r[9],
                              _network_text(node.get('network'))] for node,r in self.devices],
-                           [7,11,9,15,None],width,right=(1,2,3,4))
+                           [self.node_width,11,9,15,None],width,right=(1,2,3,4))
         elif width>=54:
             details=_table(['Node','1T/All','RSS/Res','IP'],
                            [[r[0],r[7],r[5],r[9]] for _,r in self.devices],
-                           [7,11,9,None],width,right=(1,2,3))
+                           [self.node_width,11,9,None],width,right=(1,2,3))
         else:
             details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
             details.extend(_line(f'#{r[10]} {r[0]} GPU {r[11]}',width) for r in records)
@@ -432,14 +433,14 @@ class StatusRows(list):
         if width>=110:
             table=_table(['ID','Node','Proj','Share/Pri','Jobs/CPU','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5,6)] for r in records],
-                         [4,7,6,11,9,4,6,4,None],width,right=(3,4,5,6))
+                         [4,self.node_width,6,11,9,4,6,4,None],width,right=(3,4,5,6))
         elif width>=80:
             table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
-                         [4,7,6,9,4,6,4,None],width,right=(3,4,5))
+                         [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
         elif width>=54:
             table=_table(['ID','Node','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,1,3,7,6)] for r in records],
-                         [4,7,9,6,None],width,right=(2,3))
+                         [4,self.node_width,9,6,None],width,right=(2,3))
         elif width>=38:
             table=_table(['ID','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,3,7,6)] for r in records],
                          [4,9,6,None],width,right=(1,2))

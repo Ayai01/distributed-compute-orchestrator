@@ -326,6 +326,22 @@ class ConsoleTests(unittest.TestCase):
         self.assertNotIn('本机',text)
         self.assertIn('203.0.113.42',text)
 
+    def test_eight_character_device_names_stay_complete_in_resource_and_task_columns(self):
+        names=('Aya1-ITX','abcdefgh','设备一二三四五六')
+        value=dict(role='scheduler',node='center',nodes=[
+            dict(name=name,capacity=24,active_jobs=[dict(id=f'{i:04d}',project='Bench',cpus=1)])
+            for i,name in enumerate(names)])
+        for width in (54,56,79,80,100,109,110,159,219):
+            with self.subTest(width=width):
+                status=format_status(value,width=width)
+                sections=status._resources(56 if width>=120 else width)
+                for section in sections[:2]:
+                    text='\n'.join(section[1])
+                    for name in names:self.assertIn(name,text)
+                task_width=width-55 if width>=120 else width
+                tasks='\n'.join(status._tasks(task_width))
+                for name in names:self.assertIn(name,tasks)
+                self.assertTrue(all(_width(row)<=width for row in status))
     def test_device_ip_is_distinct_from_visitors_and_keeps_complete_ipv4(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
             dict(name='Aya1-PC',url='local://Aya1-PC',capacity=24,peers=[dict(ip='local')]),
