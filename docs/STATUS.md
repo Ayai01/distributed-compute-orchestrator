@@ -12,7 +12,9 @@
 
 生产验收中，两个各申请 10GiB 的任务在 16GiB 预算内同时运行，实际计费 RSS 合计 44.31MiB；有限阶段自动任务由 14 核退至 11 核后，原排队 3 核任务开始运行。离线 TX 不再拖住本机控制，该操作耗时 0.00335 秒。纯数字四位通知 ID 着色、RSS 计费、阶段公平和启动探测修复均已在上述两个设备加载。ku26s 重载后的具名 Linux idle 抑制锁已实测取得。
 
-Aya1-TX 已同步至 `e682adf`，空闲时接受重载后局域网接口持续失联，待用户核对设备状态；当前不计入健康供给。原机工具和状态根保留。维护及验收证据为 `results/repair-20261020/maintenance-reload-state.json`、`production-policy-canaries.json`、`live-linux-power-after-reload.json`。
+Aya1-TX 在用户唤醒后恢复在线，已核验重载后的 worker PID 12280、RSS 计费、16GiB 计算预算和 8GiB 实时余量；健康供给恢复为 14+16+32 共 62 核。Windows 具名 SYSTEM/EXECUTION 请求存在且无覆盖规则。设备仅支持断网式 S0 待机，事件记录确认此前曾进入睡眠；本次再次熄屏后，服务保持在线并运行 16 核任务。9,343 字节增量包已将 TX 与 ku26s 快进至 `0695da0`，与本机可执行源码一致，工作区均干净；同步过程中未重启或暂停活动任务。原机工具和状态根保留。新增满载增长保护仍待中心后续自然维护加载。
+
+维护及验收证据为 `results/repair-20261020/maintenance-reload-state.json`、`production-policy-canaries.json`、`live-linux-power-after-reload.json`、`tx-wake-verified.json`、`tx-modern-standby-events.json`、`ku-pending-policy-sync-job.json`。
 
 ## 本轮资源与 Linux 接入修复
 
