@@ -163,6 +163,18 @@ setup 复用系统 Python 3.14，验证科学依赖后写本机 tools/env；Wind
 
 已验证工具可用操作员 `center.control(node=名称, worker={"tools": {别名: [可执行路径]}})` 在线登记，None 移除；后续任务用新别名。该操作更新运行进程，部署同时更新设备 `worker.local.json` 以便重载。临时能力验收后再登记正式别名。
 
+显式冻结 ngspice 数值引擎时，操作员先核验实际可执行文件的完整 SHA-256，再登记对应精确能力别名：
+
+```python
+import base64
+
+engine_capability = 'ng47_sha256_' + base64.urlsafe_b64encode(
+    bytes.fromhex(engine_sha256)).decode('ascii').rstrip('=')
+center.control(node=名称, worker={'tools': {engine_capability: [可执行路径]}})
+```
+
+别名包含完整 256 位摘要，长度 55 字符，适用于现有 `requires` 长度限制。科研任务声明 `requires=['rgcn_train', 'ngspice47', engine_capability]`，由中心自动选择已登记该身份的兼容节点；科研 worker 在测量前再核验完整摘要，并在结果中记录实际身份。普通任务继续声明语义能力。运维登记与科研测量前复核分别负责兼容池和执行时身份，重载后由设备保存的工具配置恢复登记。
+
 ## 部署到其他设备
 
 源码和 Python 即可启动独立 worker；能力按实际任务补齐。设备使用系统 hostname，配置 host/port、CPU/RAM、tools/shared/env。Linux 普通磁盘示例为 `root=/home/user/.local/state/dco/worker`、`temp_root=/home/user/.local/state/dco/tmp`，在可见终端运行 `python3 -B main.py --config worker.local.json`。

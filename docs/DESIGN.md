@@ -65,6 +65,8 @@ ARH 的 `tensor_backend=auto` 声明一张CUDA卡和30秒阈值；旧中心未�
 
 调用工程通过`capabilities()`或`health(brief=True)`识别汇总协议能力，再用`admission`/`window`按requires声明工具及实验环境。能力名称在请求与设备两侧统一转换，例如`ngspice47`与`ng47`等价。`capable_cpus`是匹配能力且可接单的在线预算，排除暂停设备及线程数不足以承接固定任务的设备（0表示暂无供给）；`target_cpus`是当前工程份额，查询不登记活跃需求。实际工具身份由任务结果回执提供，缓存按工程自己的物理输入和回执分区。工程不枚举nodes、不绑定设备名，也不读取分配详情，设备配置与选择由中心管理。
 
+显式固定数值引擎时，操作员可通过现有工具热注册接口，在已核验该文件身份的节点登记 `ng47_sha256_` 加完整 SHA-256 的无填充 Base64URL 别名；任务把它加入 `requires`，准入、窗口和派发复用同一能力匹配。科研 worker 在任何测量前复核完整 SHA，结果继续记录实际身份。应用 `request.json` 中的 `execution_constraints` 属于科研协议，由科研 worker 校验；中心通过任务的精确能力声明选择兼容节点。登记步骤见 [README](../README.md#工程内工具安装)。
+
 中心声明`admission_job`时，`admission(project, job_id=原任务ID)`返回该任务的`recommended_cpus`、`current_cpus`、`current_memory_mb`和`available_memory_mb`，供阶段边界先判断是否值得调整工作池。此查询不改变授权；需要调整时排空当前池，再调用`resize`并按实际回执建池。运行中的worker任务通过同一lease通路查询。
 
 `queue_ratio`（默认 1.0）控制提前排队比例。`Client.admission()` 返回当前窗口及 `max_in_flight` 安全上界；`Client.window()` 每秒至多刷新一次当前份额和上界，节点新增、能力登记和预算变化都会反映到窗口：
@@ -264,7 +266,7 @@ result = client.run(task, files={
 
 普通计算任务继续使用独立工作目录。指定 `cwd` 的任务在目标机该目录中执行，`cwd` 接受绝对路径、`~` 或 `${shared:工程名}`；`${work}` 和 `outputs` 始终指向任务输入目录，可将需要回收的文件明确写入 `${work}`。任务 JSON 的 `stdin` 是输入包中的相对文件路径，逐步作为标准输入传入。
 
-中心内部回执包含任务 ID、输入摘要、命令、退出码、资源、时间和工具文件摘要。普通工程视图保留任务状态与本任务资源，去掉设备名、URL、工具路径和命令路径；`tools` 仅保留可用性。需要数值引擎身份的工程在任务输出中记录实际 SHA（AOP 使用 `aop-result.json.compute_engine`），再按该身份分区科学缓存。接受后的任务通过原 ID 查询，相同 ID 和输入在保留期间只执行一次。
+中心内部回执包含任务 ID、输入摘要、命令、退出码、资源、时间和工具登记快照。普通工程视图保留任务状态与本任务资源，去掉设备名、URL、工具路径和命令路径；`tools` 仅保留可用性。需要数值引擎身份的工程在任务输出中记录实际 SHA（AOP 使用 `aop-result.json.compute_engine`），再按该身份分区科学缓存。接受后的任务通过原 ID 查询，相同 ID 和输入在保留期间只执行一次。
 
 ## 传输与本地执行
 

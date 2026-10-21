@@ -20,6 +20,8 @@ ku26s 已增加独立 Python 3.12.15、OpenCV 4.13.0、ONNX Runtime 1.22.1 推�
 
 Windows 固定 INT8 依赖也已补齐：Aya1-PC 使用独立 Python 3.12.14 环境，Aya1-TX 修复旧 venv 指向退役 Remote-Compute 基址的问题并复用 Python 3.12.10 及全部原包。两台均通过 OpenCV、ORT 1.22.1 CPU Add 图和自动发现检查，`onnx_cpu` 在线绑定精确解释器并持久化。ARH/AOP/RGCN 的进程内 WMI 回退统一使用查询抛 OSError，兼容 3.12 与 3.14；系统 3.14 和在途训练环境保持原样。
 
+显式冻结 ngspice 引擎的现行热注册链已实测：PC/TX 文件 SHA 均为 `dc31be5d2f1095e4777b7ec6c462dfdc66737da9688ae211fe5020c80f5fcb67`，ku26s 为独立 Linux 构建 `9160c7cb8ff7712d07e8015befb296992c5d721b9aa572618d85617791fcd6be`。在两个摘要一致的节点在线登记并持久化完整摘要能力；准入只计入这两个节点，未登记摘要返回零供给。无选点的实际任务经中心路由至 TX，测量前摘要校验成功；运维回执已领取清理，在途任务保持原工具快照。证据 `results/repair-20261020/ngspice-exact-capability.json`。
+
 ## 当前代码与部署记录
 
 源码版本 `0.8.7`，本轮入口核对的源码基线为 `887daf4`。实际运行版本由操作员 health 的 version/pid 查看；本轮文档整理保持现有服务与在途任务。
