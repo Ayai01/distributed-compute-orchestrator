@@ -6,13 +6,15 @@
 
 ## 运行环境整理与 DSH 二次核对
 
-三机现有解释器逐项实测后，在线登记 `python_numpy/python_scientific/python_torch_pyg/onnx`，各环境的准入供给均为60核；每机使用四个规范模板及 CIRCT 实际执行通过。完整 ML 环境的 Torch/PyG 和四项数值依赖位于同一解释器，未把 ku 的两套环境拼成一个就绪条件；固定 INT8 仍使用原3.12环境。布局 Python、Magic、Netgen、HSPICE 及编译器按实际工具分别保留。未安装或替换依赖、未重启服务，预算与原绑定保持。原始模块报告、绑定与已领取任务见 `results/repair-20261020/capability-profiles-live-proof.json`。
+三机现有解释器逐项实测后，在线登记 `python_numpy/python_scientific/python_torch_pyg/onnx`，各环境的准入供给均为60核；每机使用四个规范模板及 CIRCT 实际执行通过。完整 ML 环境的 Torch/PyG 和四项数值依赖位于同一解释器，未把 ku 的两套环境拼成一个就绪条件；固定 INT8 仍使用原3.12环境。布局 Python、Magic、Netgen、HSPICE 及编译器按实际工具分别保留。此次环境整理未安装或替换依赖，预算与原绑定保持。原始模块报告、绑定与已领取任务见 `results/repair-20261020/capability-profiles-live-proof.json`。
 
 隔离真实 HTTP 检查复现并修复两个缺口：工具模板曾按原始键查找，误排除同语义的可用节点；缓存同步曾按工程旧标签筛选，环境名称规范化后漏掉消费者。匹配现覆盖命令、参数与环境中的工具变量，缓存继续走原传输与增量边界。滚动升级时保留实际登记的旧绑定，旧中心与新worker可继续协作，能力汇总仍去重。最终全量401项完成、4项环境跳过，其余通过，207.660秒；包含真实缓存传输、原ID保持和混合命名节点共同接单。完整日志 `.local/maintenance/capability-unification-release-full.log`。
 
-Python 工程名与 `rgcn_fiber` 只保留为兼容别名，SDK 能力汇总已使用规范名称；在途旧请求、源码和实际回执名称不改写。运行实例仍保留旧绑定，匹配修复源码随仓库更新，服务在后续自然空闲重载时加载，不中断当前科研任务。
+Python 工程名与 `rgcn_fiber` 只保留为请求和原绑定的兼容别名；在途旧请求、源码和实际回执名称不改写。功能修复 `4b81437` 已以每机18,871字节增量同步到三设备，并分别在实际空闲边界完成重载；中心/TX/ku的新PID为21572/19504/3437191。公共原始 `/capabilities` 已直接发布规范名称，无需客户端去重补偿。重载验收快照为三机12/16/32核全部授予、15项排队，原科研继续，无任务取消。证据 `results/repair-20261020/capability-idle-reload.json`、`capability-unification-after-reload.json`。
 
-DSH 的历史“当前64核/旧别名已清除”文字已按原时间线修正，软件版本与源码提交分别表述。其“GSIM仅远端”已由本机暖缓存及104项原生自检纠正；布局与 HSPICE 的当前工具供给不变成固定设备策略。ARH 生成RTL内容摘要不属于引擎哈希；安装清单参与校准摘要的实际问题及各工程文档歧义由所属活跃会话核对整改，原科学数据和失败诊断保留。
+另发现PC/TX已有GNU Make但未登记，导致ARH一组包含make的完整要求只匹配ku的32核。两机现有Make4.4.1均通过实际最小构建后在线登记，TX现有GCC16.2亦通过版本检查；同组新准入已恢复60核，原任务不迁移。证据 `results/repair-20261020/make-unification-admission.json` 与两机readiness回执。
+
+DSH 的历史“当前64核/旧别名已清除”文字已按原时间线修正，软件版本与源码提交分别表述。其“GSIM仅远端”已由本机暖缓存及104项原生自检纠正；显式GSIM冷构建的make/clang++/bison/flex/m4仍有实际用途。布局与HSPICE的当前工具供给不变成固定设备策略。ARH生成RTL内容摘要属于设计输入，继续保留；安装清单混入校准摘要的问题由所属会话修正为 `unit_source_sha256`。根会话独立夹具通过安装/引擎字节不影响、真实源码变化影响、旧测量点/耗时/费用保持三类检查。RGCN的无哈希约定、EDA解释器示例及布局缓存中的安装路径限制已由所属会话修正，607项通过、2项环境跳过；Bench文档分层与源码摘要措辞已核对整理。具体判定与原证据入口见 `results/repair-20261020/dsh-cross-check-current.json`，原科学数据和失败诊断保留。
 
 ## 公共 CLI/Web 与 Rocket 正式入口验收
 
@@ -26,7 +28,7 @@ Rocket 原 64 个吞吐任务已全部成功，共 1,728 次新原生调用。�
 
 Rocket 后续 auto 运行 `9ada8e99cd0c` 完成 425 个完整搜索设计；发布恢复复用原账本得到 4 个正式设计、768 样本、2 个正式前沿，新增原生调用为零。追加公共运行 `317094f10a22` 收齐 31 个正式设计、5,952 样本，27 个搜索前沿全部补验。PC 原先因缺少冷编译工具回退 Verilator，现只从 TX 取回四模式成品及源模型 marker：8 文件压缩 2,877,685 字节，未携带大对象或重新编译。PC 四模式缓存全部命中，104 项实际原生自检通过，回执为 17.076 秒墙钟、16.844 CPU 秒。三机默认 auto 优先有效 GSIM 缓存，Verilator 保留独立参考与回退；8002 已收尾并持续可访问。证据 `results/repair-20261020/pc-gsim-runtime-transfer-proof.json` 及 ARH `.local/rocket-focus/pc-gsim-runtime-proof/`。
 
-RGCN 的 FIBER 四项依赖已在三机原 `rgcn_train` 解释器中实测，覆盖 60 核。PC/TX 原包齐备；ku 仅补齐 SciPy 1.17.1、Numba 0.65.1、moocore 0.3.2、threadpoolctl 3.6.0 及缺失依赖，原 NumPy 2.4.4、Torch 2.14.1+cpu 保持。先前增设的 `rgcn_fiber` 与原解释器完全重复，现已收束为训练环境完整性校验；未来优化入口和窗口只声明 `rgcn_train/ng47`，所属工程 20 项定向检查通过。已接受的 30 组研究保留原请求、源码和 ID，旧别名只用于这些任务及恢复，收齐后退役；未重启现有计算。证据 `results/repair-20261020/rgcn-fiber-capability-acceptance.json` 及 RGCN `runs/fidelity-hv-20261021/semantic-admission-tests.log`。
+RGCN 的 FIBER 四项依赖已在三机原 `rgcn_train` 解释器中实测，覆盖 60 核。PC/TX 原包齐备；ku 仅补齐 SciPy 1.17.1、Numba 0.65.1、moocore 0.3.2、threadpoolctl 3.6.0 及缺失依赖，原 NumPy 2.4.4、Torch 2.14.1+cpu 保持。先前增设的 `rgcn_fiber` 与原解释器完全重复，已收束为训练环境完整性校验；该阶段以 `rgcn_train/ng47` 兼容，现有入口与窗口进一步统一为 `python_torch_pyg/ng47`。原30组研究及8项POST均已收齐并回收，三个期限到达的研究保持原终态并复用已付费前缀。原ID、源码、回执和费用保持。证据 `results/repair-20261020/rgcn-fiber-capability-acceptance.json`、RGCN `runs/fidelity-hv-20261021/delivery-complete.json`。
 
 RGCN 布局链按真实工具单独核对，PC 现有 Magic 8.3.684、Netgen 1.5.272 与布局 Python 3.10.11 已通过所需 GLayout 符号、SKY130 技术加载及独立纯电阻 LVS 夹具检查。`magic/netgen/layout_python` 已在线登记并持久化；PDK 布局材料由调用工程内容资产复用，不新增算法或伪目录工具能力。TX/ku 当前登记环境缺少完整布局依赖，其现有训练和优化任务保持；后续 POST 由中心按实际能力选点。此次核对零科研测量、零安装，两个远端原 ID 已领取回收。证据 `results/repair-20261020/rgcn-layout-pc-readiness.json`、`rgcn-layout-pc-registration.json` 及两机 inventory 回执。
 
