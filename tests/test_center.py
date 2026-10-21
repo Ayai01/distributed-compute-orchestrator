@@ -147,6 +147,25 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_missing_asset_rejects_before_acceptance_then_accepts_the_same_id(self):
+        import hashlib
+        from remote_compute.bundle import pack
+        reference={'reference.txt':b'frozen comparison reference'}
+        asset=hashlib.sha256(pack(reference)).hexdigest()
+        identity='b'*32
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                task=python("from pathlib import Path;print(Path(r'${asset:reference}/reference.txt').read_text())",
+                    assets={'reference':asset})
+                with self.assertRaisesRegex(RemoteError,'Synchronize missing asset first: '+asset):
+                    client.submit(task,job_id=identity)
+                self.assertNotIn(identity,state.jobs)
+                self.assertFalse((state.root/'jobs'/identity).exists())
+                self.assertEqual(client.sync_files(reference),asset)
+                self.assertEqual(client.submit(task,job_id=identity)['id'],identity)
+                self.assertEqual(client.wait(identity)['status'],'succeeded')
+                self.assertEqual(client.fetch(identity)['stdout'].strip(),'frozen comparison reference')
+
     def test_uncertain_submission_recovers_original_id_without_releasing_grant(self):
         for failure in ('accepted','not_received','query_disconnected','cancel_disconnected'):
             with self.subTest(failure=failure),scratch() as root,provider(Path(root)/'worker') as (_,remote):

@@ -472,6 +472,10 @@ class Coordinator:
                     raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
+            for asset in set(task['assets'].values()):
+                if not (self.root/'assets'/(asset+'.zip')).is_file():
+                    raise ValueError('Synchronize missing asset first: '+asset)
+                self.asset_cache.touch(asset)
             directory = self.root / "jobs" / identity
             directory.mkdir()
             (directory / "request.zip").write_bytes(payload)
