@@ -14,7 +14,11 @@ Rocket 原 64 个吞吐任务已全部成功，共 1,728 次新原生调用。�
 
 原 GSIM 与 reference Verilator 对照定位到 SET 接收相位的一周期差异，原对照与诊断成本保留。上述正式运行使用 reference Verilator；后续修正适配器的接收相位，私有与正式源码两批各 512 次新原生对照均通过，包含 104 项自检及 8 设计×24 样本的完整指标/PPA/统计一致，复用原大模型对象，后续入口恢复 auto。两批证据分别为 ARH `.local/rocket-focus/receiver-phase-proof/comparison.json` 和 `phase-release-proof/comparison.json`。语义能力覆盖三节点全部 60 核，不加入平台或引擎哈希路由。ARH 已从公共 `main.py run ... --no-browser` 经同一 8002 JobManager 启动上述正式运行，种群与评估并发均为 64。首波实际观测为 52 运行、184 排队；PC 12 个所属原生进程的 2 秒双采样合计 11.882 个忙核。运行中 ARH/RGCN/Bench 的阶段借还与自然公平回收保持，预算未调整。证据 `rocket-reference-public-first-wave.json`、`rocket-reference-public-cpu-proof.json`。此前两个长 SoC 帧也已自然收齐，所属工程 `soc-full/result.json` 为 `passed:true`。
 
-RGCN 的 FIBER 依赖已在三机实际 `rgcn_train` 解释器中核对，统一新增语义能力 `rgcn_fiber` 并持久化、在线生效。PC/TX 原四包齐备；ku 仅补齐缺少的 SciPy 1.17.1、Numba 0.65.1、moocore 0.3.2、threadpoolctl 3.6.0 及其缺失依赖，原 NumPy 2.4.4、Torch 2.14.1+cpu 保持。三机均用新能力实际执行导入并核对相同解释器，准入覆盖 60 核；未重启服务或现有训练。证据 `results/repair-20261020/rgcn-fiber-capability-acceptance.json`。
+Rocket 后续 auto 运行 `9ada8e99cd0c` 完成 425 个完整搜索设计；发布恢复复用原账本得到 4 个正式设计、768 样本、2 个正式前沿，新增原生调用为零。追加公共运行 `317094f10a22` 收齐 31 个正式设计、5,952 样本，27 个搜索前沿全部补验。PC 原先因缺少冷编译工具回退 Verilator，现只从 TX 取回四模式成品及源模型 marker：8 文件压缩 2,877,685 字节，未携带大对象或重新编译。PC 四模式缓存全部命中，104 项实际原生自检通过，回执为 17.076 秒墙钟、16.844 CPU 秒。三机默认 auto 优先有效 GSIM 缓存，Verilator 保留独立参考与回退；8002 已收尾并持续可访问。证据 `results/repair-20261020/pc-gsim-runtime-transfer-proof.json` 及 ARH `.local/rocket-focus/pc-gsim-runtime-proof/`。
+
+RGCN 的 FIBER 四项依赖已在三机原 `rgcn_train` 解释器中实测，覆盖 60 核。PC/TX 原包齐备；ku 仅补齐 SciPy 1.17.1、Numba 0.65.1、moocore 0.3.2、threadpoolctl 3.6.0 及缺失依赖，原 NumPy 2.4.4、Torch 2.14.1+cpu 保持。先前增设的 `rgcn_fiber` 与原解释器完全重复，现已收束为训练环境完整性校验；未来优化入口和窗口只声明 `rgcn_train/ng47`，所属工程 20 项定向检查通过。已接受的 30 组研究保留原请求、源码和 ID，旧别名只用于这些任务及恢复，收齐后退役；未重启现有计算。证据 `results/repair-20261020/rgcn-fiber-capability-acceptance.json` 及 RGCN `runs/fidelity-hv-20261021/semantic-admission-tests.log`。
+
+RGCN 布局链按真实工具单独核对，PC 现有 Magic 8.3.684、Netgen 1.5.272 与布局 Python 3.10.11 已通过所需 GLayout 符号、SKY130 技术加载及独立纯电阻 LVS 夹具检查。`magic/netgen/layout_python` 已在线登记并持久化；PDK 布局材料由调用工程内容资产复用，不新增算法或伪目录工具能力。TX/ku 当前登记环境缺少完整布局依赖，其现有训练和优化任务保持；后续 POST 由中心按实际能力选点。此次核对零科研测量、零安装，两个远端原 ID 已领取回收。证据 `results/repair-20261020/rgcn-layout-pc-readiness.json`、`rgcn-layout-pc-registration.json` 及两机 inventory 回执。
 
 ## 本次内存归因与临时迁移
 
