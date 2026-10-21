@@ -784,7 +784,7 @@ class Pool:
                 and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)
                 and n.supports_accelerator(task.get('accelerator'))]
 
-    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, node_headroom=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
@@ -805,8 +805,10 @@ class Pool:
                     # Automatic jobs can start with a partial grant. Waiting for
                     # an entire target reserved idle CPUs behind long-running jobs.
                     return min(cpu_limit,node.capacity,task.get('max_cpus',node.capacity)) if automatic and cpu_limit and not partial_cpus else cpus
+                def available(node):
+                    return node.capacity-node.reserved-node.external-(node_headroom or {}).get(node.name,0)
                 ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
-                         and n.capacity - n.reserved - n.external >= needed(n)
+                         and available(n) >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0
                          and n.can_match_accelerator(task.get('accelerator'))]
@@ -832,7 +834,7 @@ class Pool:
                         unexplored = [n for n in close if label not in n.durations] if self.policy == "adaptive" else []
                         node = min(unexplored or close, key=score)
                     if automatic:
-                        cpus = node.capacity - node.reserved - node.external
+                        cpus = available(node)
                         if cpu_limit is not None:
                             cpus = min(cpus, cpu_limit)
                         cpus = min(cpus, task.get('max_cpus',node.capacity))

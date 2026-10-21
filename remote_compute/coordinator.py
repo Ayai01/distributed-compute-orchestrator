@@ -514,6 +514,38 @@ class Coordinator:
                     if not groups[group]:del groups[group]
                     yield key,borrowing
 
+    def _growth_headroom(self, task, resources):
+        """Keep newly freed slots for acknowledged, unfilled phase demand.
+
+        This holds no worker lease and never changes an active pool. Its owner
+        claims the slots with the next drained resize; lowering demand or
+        finishing makes them available to queued work immediately.
+        """
+        protected,groups={},{}
+        for identity,job in sorted(self.jobs.items(),key=lambda row:-row[1].get('task',{}).get('priority',0)):
+            held=job.get('node');current=job.get('task',{})
+            desired=job.get('desired_cpus',0);old=current.get('cpus',0)
+            if (held is None or not job.get('auto_cpus') or desired<=old
+                    or job['result']['status']!='running' or job['cancel'].is_set()
+                    or current.get('priority',0)<task.get('priority',0)
+                    or held.error or not held.enabled or held.health.get('paused')):
+                continue
+            group=current.get('project') or 'default';resource=resources[group]
+            room=max(0,resource['target']-resource['used']-groups.get(group,0))
+            free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
+            if not room or not free:continue
+            target=self._cooperative_cpu_target(identity,desired,resources)
+            available_memory=current['memory_mb']+max(0,min(held.memory_free,self.pool._host_memory_free(held)))
+            model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
+            model.update(job.get('phase_memory',dict(memory_mb=current['memory_mb'])))
+            target,memory=plan_resize(target,available_mb=available_memory,**model)
+            if memory is not None and memory>available_memory:continue
+            count=max(0,min(target-old,room,free))
+            if count:
+                protected[held.name]=protected.get(held.name,0)+count
+                groups[group]=groups.get(group,0)+count
+        return protected
+
     def _schedule(self):
         with self.condition:
             while not self.stopping:
@@ -522,6 +554,7 @@ class Coordinator:
                     for identity in self.queue:
                         self._fallback_accelerator(self.jobs[identity])
                     budgets = self.project_resources()
+                    growth = {}
                     # Within the same priority and CPU mode, place constrained
                     # work first so flexible jobs retain the other devices.
                     # First honor weighted targets, then lend otherwise idle slots.
@@ -535,9 +568,13 @@ class Coordinator:
                         if not borrowing and (room <= 0 or (job['task']['cpus'] or 1) > room):
                             continue
                         try:
+                            priority=job['task']['priority']
+                            if priority not in growth:
+                                growth[priority]=self._growth_headroom(job['task'],budgets)
                             node = self.pool._acquire(job["task"], block=False,
                                 cpu_limit=room if room > 0 else None,
-                                partial_cpus=time.time()-job['result']['submitted']>=1,job_id=job.get('worker_id',identity))
+                                partial_cpus=time.time()-job['result']['submitted']>=1,job_id=job.get('worker_id',identity),
+                                node_headroom=growth[priority])
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -548,6 +585,7 @@ class Coordinator:
                         self.queue.remove(identity)
                         job["node"] = node
                         budget['used'] += job['task']['cpus']
+                        growth.clear()
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              dispatched=time.time(), cpus=job['task']['cpus'])
                         self._save(job)
@@ -746,7 +784,7 @@ class Coordinator:
         self._restore_accelerator(task, job['result'])
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
         job.update(task=task,auto_cpus=task['cpus']==0,node=None,worker_id=worker_id)
-        job.pop('desired_cpus',None);job.pop('lease_answered',None)
+        job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
         for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_rss_mb','cpu_seconds'):
             job['result'].pop(key,None)
@@ -871,6 +909,7 @@ class Coordinator:
                 desired,_=plan_resize(desired,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,node.memory_capacity)
                 if desired<1:raise Conflict('Insufficient RAM for one phase worker; existing grant retained')
                 previous_desired=job.get('desired_cpus')
+                previous_memory=job.get('phase_memory')
                 job['desired_cpus']=desired
                 granted=desired
                 cooperative=cpus==0 or job.get('auto_cpus',False)
@@ -894,6 +933,9 @@ class Coordinator:
                     if previous_desired is None:job.pop('desired_cpus',None)
                     else:job['desired_cpus']=previous_desired
                     raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                job['phase_memory']=(dict(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,
+                                         memory_limit_mb=memory_limit_mb) if modeled else
+                                     dict(memory_mb=old_memory if memory_mb is None else memory_mb))
                 if granted==old and memory==old_memory and not job.get('resize_uncertain'):
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
                 # Reserve increases before the RPC; return decreases after its ack.
@@ -924,6 +966,8 @@ class Coordinator:
                     with self.condition:
                         if previous_desired is None:job.pop('desired_cpus',None)
                         else:job['desired_cpus']=previous_desired
+                        if previous_memory is None:job.pop('phase_memory',None)
+                        else:job['phase_memory']=previous_memory
                     commit(old,old_memory)
                     raise
                 try:

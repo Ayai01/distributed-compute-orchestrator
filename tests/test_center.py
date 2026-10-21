@@ -108,6 +108,42 @@ class AdmissionPlanningTests(unittest.TestCase):
             result=dict(status='running' if key=='active' else 'queued')) for key in ('active','waiting')}
         self.assertEqual(state._cooperative_cpu_target('active',4,state.project_resources()),4)
 
+    def test_growth_headroom_respects_priority_memory_lifecycle_and_node(self):
+        state=self.center([4,4]);node=state.pool.nodes[0];node.reserved=3
+        def job(project,cpus,held=None,automatic=False):
+            return dict(task=dict(steps=[['echo']],cpus=cpus,memory_mb=64,project=project),
+                node=held,auto_cpus=automatic,cancel=threading.Event(),
+                result=dict(status='running' if held else 'queued'))
+        active=job('A',1,node,True);active['desired_cpus']=4
+        state.jobs={'active':active,'borrower':job('B',2,node),'waiting':job('B',1)}
+        candidate=state.jobs['waiting']['task']
+        def headroom():return state._growth_headroom(candidate,state.project_resources())
+        self.assertEqual(headroom(),{'0':1})
+        # Higher priority work can use the free slot, without changing A's demand.
+        candidate['priority']=1
+        self.assertEqual(headroom(),{})
+        candidate['priority']=0
+        active['phase_memory']=dict(base_memory_mb=64,memory_per_cpu_mb=1024)
+        node.health['memory_available_mb']=100
+        self.assertEqual(headroom(),{})
+        node.health['memory_available_mb']=8192
+        self.assertEqual(headroom(),{'0':1})
+        active['desired_cpus']=1
+        self.assertEqual(headroom(),{})
+        active['desired_cpus']=4;active['cancel'].set()
+        self.assertEqual(headroom(),{})
+        active['cancel'].clear();active['result']['status']='succeeded'
+        self.assertEqual(headroom(),{})
+
+    def test_growth_headroom_leaves_a_slot_for_same_project_ready_work(self):
+        state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
+        active=dict(task=dict(steps=[['echo']],cpus=1,memory_mb=64,project='A'),
+            auto_cpus=True,node=node,cancel=threading.Event(),result=dict(status='running'),desired_cpus=4)
+        waiting=dict(task=dict(active['task'],cpus=0),auto_cpus=True,node=None,
+            cancel=threading.Event(),result=dict(status='queued'))
+        state.jobs={'active':active,'waiting':waiting}
+        self.assertEqual(state._growth_headroom(waiting['task'],state.project_resources()),{'0':1})
+
     def test_queue_rechecks_used_threads_per_share_after_each_allocation(self):
         state=self.center([16]);state.queue=['A1','A2','B1','urgent']
         for key in state.queue:
@@ -147,6 +183,28 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_freed_cpu_waits_for_running_phase_growth_before_lending_again(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
+            with center(pool,Path(root)/'center') as (state,client):
+                sleep="import time;time.sleep(30)"
+                borrowers=[client.submit(python(sleep,cpus=1,memory_mb=64,project='Bench'))['id'] for _ in range(3)]
+                until(lambda:all(client.status(i)['status']=='running' for i in borrowers))
+                active=client.submit(python(sleep,cpus=0,memory_mb=64,project='ARH'))['id']
+                until(lambda:client.status(active)['status']=='running')
+                original=client.status(active)['request_sha256']
+                self.assertEqual(client.resize(active,2)['cpus'],1)
+                waiting=client.submit(python(sleep,cpus=1,memory_mb=64,project='Bench'))['id']
+                client.cancel(borrowers[0]);client.wait(borrowers[0]);client.fetch(borrowers[0])
+                time.sleep(.3)
+                self.assertEqual(client.status(waiting)['status'],'queued')
+                self.assertEqual(pool.nodes[0].reserved,3)
+                self.assertEqual(client.resize(active,2)['cpus'],2)
+                self.assertEqual(client.status(active)['request_sha256'],original)
+                self.assertEqual(client.resize(active,1)['cpus'],1)
+                until(lambda:client.status(waiting)['status']=='running')
+                for identity in borrowers[1:]+[active,waiting]:
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
+
     def test_slow_initial_probe_does_not_delay_local_control(self):
         with scratch() as root,provider(Path(root)/'local') as (_,local),provider(Path(root)/'slow') as (_,slow):
             release=threading.Event();timer=threading.Timer(3,release.set)
@@ -366,6 +424,7 @@ class CenterTests(unittest.TestCase):
                 with self.assertRaises(RemoteError):client.resize(identity,0,base_memory_mb=1024,memory_per_cpu_mb=64)
                 self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(1,64))
                 self.assertNotIn('desired_cpus',state.jobs[identity])
+                self.assertNotIn('phase_memory',state.jobs[identity])
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_memory_model_legacy_fallback_and_validation(self):
@@ -568,6 +627,7 @@ class CenterTests(unittest.TestCase):
                     with self.assertRaises(RemoteError):client.resize(identity,4,memory_mb=512)
                 self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(1,256))
                 self.assertNotIn('desired_cpus',state.jobs[identity])
+                self.assertNotIn('phase_memory',state.jobs[identity])
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_uncertain_resize_keeps_budget_and_reconfirms_same_grant(self):
