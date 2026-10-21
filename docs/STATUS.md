@@ -20,7 +20,9 @@ DSH 的历史“当前64核/旧别名已清除”文字已按原时间线修正�
 
 ## 公共 CLI/Web 与 Rocket 正式入口验收
 
-正常科研 CLI 与 Web 按钮共用任务服务，默认地址为 AOP `http://127.0.0.1:8000/`、RGCN `http://127.0.0.1:8001/?page=research`、ARH `http://127.0.0.1:8002/#page-run`、Bench `http://127.0.0.1:8003/`。`--no-browser` 只关闭自动开页，任务完成后服务继续可访问；显式 `--headless` 用于直接执行。任务参数、预算、日志、结果和控制归各工程同一执行链，不另开科研计算队列。AOP 的共享服务及原 ID 控制 9 项回归通过；RGCN 与 ARH 原在途任务已实际显示，ARH 外部任务区域位于折叠日志之外。
+正常科研 CLI 与 Web 按钮共用任务服务，默认地址为 AOP `http://127.0.0.1:8000/`、RGCN `http://127.0.0.1:8001/?page=research`、ARH `http://127.0.0.1:8002/#page-run`、Bench `http://127.0.0.1:8003/`。按用户最新确认，普通人工启动自动弹Web；headless与no-browser同义，仅关闭弹页。Web手动任务自动导出/关服默认False，CLI预设默认True，运行中可调；自动关服后页面停止访问。DCO终端看板开关独立为no-dashboard。任务参数、预算、日志、结果和控制归各工程同一执行链，不另开科研计算队列。AOP本轮生命周期/配置24项通过，原服务和在途任务保持；RGCN与ARH由当前负责人落实同一语义，原任务不重启。
+
+DCO启动、独立服务和重载35项定向回归完成，34项通过、1项环境跳过，19.338秒；headless不关闭看板、no-dashboard日志服务、原ID结果跨重载与实时预算保持通过。测试复用独立校准夹具，未校准或重载生产节点。AOP既有58项核心回归通过；ARH所属会话34项通过，RGCN所属会话619项中617通过、2项环境跳过。原科研参数和算法副本保持，确认条目见 `results/repair-20261020/design-intent-confirmed.json`。
 
 Bench 新工作台已接入原科研任务 `c1432c57ced343a99a4a9f741cebff85`。根会话以正常 `main.py status --task-id ... --no-browser` 与 HTTP 独立对照，任务 ID、原协议、原中心 ID 及可用控制一致；浏览器实页显示运行中 70/72，随后同一任务 72/72 完成，服务保持。7 项隔离生命周期回归通过，覆盖共享参数校验、停止后恢复原身份、取消归属、旧任务只读接入、冻结协议、有界增量日志及按任务访问自定义输出。另以随机端口和模拟发布器完成真实公共 CLI→HTTP 的启动、参数、退出后服务保持、停止、取消、恢复原 ID，以及工程外报告和相对科学数据包验收，新增科研求值为零。增量状态实测 3,584 字节；所属会话已更新入口文档并将修复加载到 8003，当前研究继续。证据 `results/repair-20261020/bench-cli-web-parity-proof.json`、`bench-cli-http-lifecycle-proof.json`、`bench-workbench-browser.png` 及汇总 `cli-web-parity-current.json`。
 

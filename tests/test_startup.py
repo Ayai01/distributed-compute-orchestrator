@@ -52,7 +52,7 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
     def test_all_service_entry_modes_reject_redirects_before_startup_side_effects(self):
         from remote_compute.cli import main
         for mode in ('scheduler', 'hybrid', 'worker'):
-            for extra in ([], ['--headless'], ['--service-child'], ['--service-child', '--headless']):
+            for extra in ([], ['--headless'], ['--no-dashboard'], ['--service-child'], ['--service-child', '--headless']):
                 with self.subTest(mode=mode, extra=extra), \
                         patch.object(terminal.sys.stdin, 'isatty', return_value=False), \
                         patch('remote_compute.cli.Worker') as worker, \
@@ -82,6 +82,16 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
             visible.assert_not_called()
             self.assertEqual(main(['--url', 'http://127.0.0.1:26133']), 0)
             visible.assert_called_once_with()
+
+    def test_headless_does_not_disable_the_terminal_dashboard(self):
+        from remote_compute.cli import main
+        with patch('remote_compute.cli.require_visible'), \
+                patch('remote_compute.cli.run_scheduler', return_value=0) as run:
+            self.assertEqual(main(['--url', 'http://127.0.0.1:26133', '--headless']), 0)
+            self.assertTrue(run.call_args.args[0].no_browser)
+            self.assertFalse(run.call_args.args[0].no_dashboard)
+            self.assertEqual(main(['--url', 'http://127.0.0.1:26133', '--no-dashboard']), 0)
+            self.assertTrue(run.call_args.args[0].no_dashboard)
 
     def test_redirected_output_and_hidden_windows_are_rejected(self):
         with patch.object(terminal.sys.stdin, 'isatty', return_value=True), \

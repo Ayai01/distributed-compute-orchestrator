@@ -25,7 +25,7 @@ python -B main.py --help
 
 默认读取 `worker.local.json` 和 `nodes.local.json`，可用 `--config`、`--nodes` 指定。CLI 显式参数覆盖配置。独立 worker 只需 Python 和本工程，科研目录属于按需登记的共享能力。
 
-服务保持一个可见前台终端，窗口可失焦或最小化。`--headless` 只关闭看板，仍要求终端；隐藏窗口、重定向输入输出、nohup 和无终端 systemd/计划任务会在启动检查中退出。一次性 CLI、Python API 和测试支持管道。桌面自启动使用登录后终端快捷方式；Linux `.desktop` 使用 `Terminal=true`。旧隐藏服务先保留在途任务和未领取结果，排空后从可见入口迁回。
+服务保持一个可见前台终端，窗口可失焦或最小化。`--headless` / `--no-browser` 仅表示不弹浏览器；DCO本身为终端服务，这两个同义选项不改变看板或服务。只关闭交互看板使用 `--no-dashboard`，仍保留前台日志和终端要求。隐藏窗口、重定向输入输出、nohup 和无终端 systemd/计划任务会在启动检查中退出。一次性 CLI、Python API 和测试支持管道。桌面自启动使用登录后终端快捷方式；Linux `.desktop` 使用 `Terminal=true`。旧隐藏服务先保留在途任务和未领取结果，排空后从可见入口迁回。
 
 Windows 常驻服务通过具名的 SYSTEM/EXECUTION 电源请求阻止自动休眠和执行挂起，显示器仍按系统设置熄屏；Linux 在有 systemd-logind 的环境持有 idle 抑制锁。请求由托管父进程与服务子进程分别持有，随进程退出释放。每个端点只开一个交互窗口，重复启动保留原服务。端口冲突提示显示 PID/命令，可选择 `reuse/kill/admin-kill/cancel`；日常优先连接现有服务，结束进程前核对任务。
 

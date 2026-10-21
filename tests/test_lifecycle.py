@@ -351,7 +351,7 @@ class ControlLifecycleTests(unittest.TestCase):
                 probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
             client=Client(f'http://127.0.0.1:{port}',timeout=1,operator=True)
             with (root/'service.log').open('wb') as log:
-                process=Process([sys.executable,'-B',str(copied/'main.py'),'--headless','--port',str(port),
+                process=Process([sys.executable,'-B',str(copied/'main.py'),'--no-dashboard','--port',str(port),
                                  '--root',str(root/'state'),'--cpus=2'],copied,dict(os.environ,PYTHONPATH='',PYTHONUTF8='1'),log,log)
                 try:
                     def ready():
@@ -403,7 +403,7 @@ class ControlLifecycleTests(unittest.TestCase):
             client = Client(f'http://127.0.0.1:{port}', timeout=1)
             with (root / 'worker.log').open('wb') as log:
                 process = Process([sys.executable, '-B', str(copied / 'main.py'), '--mode', 'worker',
-                    '--headless', '--port', str(port), '--root', str(root / 'state'),
+                    '--no-dashboard', '--port', str(port), '--root', str(root / 'state'),
                     '--cpus=2', '--memory-mb', '512'], copied,
                     dict(os.environ, PYTHONPATH='', PYTHONUTF8='1'), log, log)
                 try:

@@ -79,7 +79,7 @@ class StandaloneTests(unittest.TestCase):
                 port = probe.getsockname()[1]
             client = Client(f'http://127.0.0.1:{port}', timeout=1)
             with (root/'worker.log').open('wb') as log:
-                process = Process([sys.executable, '-B', str(copied/'main.py'), '--mode', 'worker', '--headless',
+                process = Process([sys.executable, '-B', str(copied/'main.py'), '--mode', 'worker', '--no-dashboard',
                                    '--port', str(port)], copied,
                                   dict(os.environ, PYTHONPATH='', PYTHONUTF8='1'), log, log)
                 try:

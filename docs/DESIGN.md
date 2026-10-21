@@ -17,6 +17,8 @@ DCO 管调度、授权、任务与传输；调用工程管测量、评分、唯�
 
 入口顺序为可见终端检查 → 加载设备配置 → 托管服务；一次性命令和测试走对应短路径。中心和 worker 的本地配置、运行状态各自持有，源码更新不覆盖它们。
 
+headless/no-browser仅控制浏览器弹页，DCO没有浏览器入口，接受该统一选项时不改变终端看板。关闭看板由独立no-dashboard选项控制，日志、可见终端、服务与任务生命周期保持。
+
 ## 工程接口边界
 
 工程客户端只表达通用算力需求：`requires` 能力标签、`cpus/max_cpus`、`memory_mb`、`resource_share`，以及有界的 `priority`、`queue_ratio` 和 `single_thread_weight`。`resource_share` 为 `(0,16]`，`queue_ratio` 为 `[0,4]`，`single_thread_weight` 为 `(0,8]`，`priority` 为 `-1000..1000`。`node`、IP、节点权重、节点预算和完整 `/health` 只属于 DCO 操作端；操作端令牌保存在中心状态目录，普通工程令牌不能提升权限。

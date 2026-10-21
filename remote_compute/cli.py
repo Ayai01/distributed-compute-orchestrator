@@ -122,7 +122,7 @@ def run_scheduler(args, local_client=None, restarting=None):
             dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token, operator=True,
                               operator_token=coordinator.operator_token)
         if args.action is None:
-            if args.headless:
+            if args.no_dashboard:
                 try:
                     while api_thread is None or api_thread.is_alive():
                         time.sleep(0.5)
@@ -275,7 +275,9 @@ def main(argv=None):
     parser.add_argument("--cpus", type=lambda v: 0 if v == "auto" else int(v), help="本机算力预算")
     parser.add_argument("--memory-mb", type=int, dest="worker_memory_mb", help="本机提供者的任务内存总预算，MiB")
     parser.add_argument("--root", help="持久任务/资产目录；默认工程内 .local/state，临时物单独使用RAM盘")
-    parser.add_argument("--headless", action="store_true", help="仅关闭交互看板；仍须在可见终端前台运行")
+    parser.add_argument("--headless", "--no-browser", dest="no_browser", action="store_true",
+                        help="不弹浏览器；DCO为终端服务，该选项不关闭看板或服务")
+    parser.add_argument("--no-dashboard", action="store_true", help="关闭交互看板；仍在可见终端前台运行并输出日志")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument('--on-port-conflict', choices=('ask', 'reuse', 'kill', 'admin-kill', 'cancel'),
                         default='ask', help='端口冲突处理；交互终端默认询问，admin-kill请求管理员权限')
@@ -384,8 +386,6 @@ def main(argv=None):
             lifetime.enter_context(keep_awake())
         if not args.service_child and not args.url and args.action is None:
             return supervise(invocation)
-        if config.get('console') and sys.stdin.isatty():
-            args.headless = False
         if getattr(args, "detach", False) and not args.url:
             raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
         args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
@@ -468,7 +468,7 @@ def main(argv=None):
             else:
                 print(f"本机算力（进程内）CPU={worker.capacity}  工作目录={worker.root}", flush=True)
         if args.mode == "worker":
-            if args.headless:
+            if args.no_dashboard:
                 try:
                     while thread.is_alive():
                         thread.join(0.5)
