@@ -13,7 +13,8 @@ import zlib
 
 _CIRCUIT = r'[A-Za-z0-9][A-Za-z0-9_-]*'
 _META = re.compile(r'(' + _CIRCUIT + r')/0-metadata\Z')
-_VIEW = re.compile(r'(' + _CIRCUIT + r')/1-view/([0-9a-f]{64})/([0-9a-f]{64})\Z')
+_LEGACY = r'legacy-observation-[0-9a-f]{32}'
+_VIEW = re.compile(r'(' + _CIRCUIT + r')/1-view/([0-9a-f]{64})/([0-9a-f]{64}|' + _LEGACY + r')\Z')
 _VERSION = 'native-circuit-dataset-v1'
 
 
@@ -85,14 +86,27 @@ def _signatures(metadata):
     return signatures
 
 
-def _signature(api, metadata, view):
+def _signature(api, metadata, view, observation=None):
+    if re.fullmatch(_LEGACY, view['key']):
+        # Migrated unknown-protocol observations keep their UUID and physical
+        # dataset boundary. The producer excludes them from measurement reuse.
+        if (not isinstance(observation, dict) or observation.get('protocol_status') != 'legacy_unknown_protocol'
+                or any(observation.get(field) != view['key'] for field in ('id', 'observation_id', 'dataset_identity'))):
+            raise ValueError('Invalid RGCN retained observation identity')
+        signatures = _signatures(metadata)
+        signature = observation.get('observation_physical_signature')
+        if signature is None and len(signatures) == 1:
+            signature = next(iter(signatures))
+        if signature not in signatures:
+            raise ValueError('RGCN retained observation needs its original physical signature')
+        return signature
     for signature in sorted(_signatures(metadata)):
         if api.digest([signature, view['design_id'], view['pvt']]) == view['key']:
             return signature
     raise ValueError('RGCN view key is outside the recorded physical-signature history')
 
 
-def _view_record(store, row):
+def _view_record(store, row, observation=None):
     connection = store.connection()
     design = dict(connection.execute('SELECT * FROM designs WHERE id=?', (row['design_id'],)).fetchone())
     provenance = [dict(item) for item in connection.execute(
@@ -100,7 +114,11 @@ def _view_record(store, row):
     for item in provenance:
         item['details'] = json.loads(item['details'])
     view = dict(row)
-    payload = view.pop('payload')
+    view.pop('payload')
+    # Shared-layout payloads refer to a separate producer table. Exchange the
+    # complete logical observation so receivers never need that database.
+    observation = store.get(row['key']) if observation is None else observation
+    payload = zlib.compress(_canonical(observation).encode('utf-8'), 3)
     design['candidate'] = json.loads(design['candidate'])
     return {'kind': 'view', 'design': design, 'view': view, 'provenance': provenance,
             'payload': base64.b64encode(payload).decode('ascii')}
@@ -133,10 +151,11 @@ def _walk(root, wanted=None):
                 for row in rows:
                     if row is None:
                         continue
-                    signature = _signature(api, metadata, row)
+                    observation = store.get(row['key'])
+                    signature = _signature(api, metadata, row, observation)
                     key = circuit + '/1-view/' + signature + '/' + row['key']
                     if wanted is None or key in wanted:
-                        yield key, _view_record(store, row)
+                        yield key, _view_record(store, row, observation)
         finally:
             store.close()
 
@@ -184,7 +203,7 @@ def _validate_view(api, key, record, metadata):
             or observation['design_id'] != design['id']
             or observation['dataset_status'] != view['status']
             or api.pvt_key(observation) != view['pvt']
-            or _signature(api, metadata, view) != match[2]):
+            or _signature(api, metadata, view, observation) != match[2]):
         raise ValueError('RGCN observation identity or partition mismatch')
     for item in record['provenance']:
         if item['view_key'] != view['key']:

@@ -43,6 +43,10 @@ class Fixture(unittest.TestCase):
 @unittest.skipUnless((AOP / 'analog' / 'cache.py').is_file() and importlib.util.find_spec('numpy'),
                      'AOP checkout and its NumPy runtime are optional')
 class AopCacheTests(Fixture):
+    environment = dict(engine_family='ngspice', major_version=47,
+                       execution_protocol='ng47-transistor-v1',
+                       measurement_protocol='measurements-v1', tolerance_profile='ng47-numeric-v1')
+
     def setUp(self):
         super().setUp()
         for root in (self.source, self.target):
@@ -53,19 +57,23 @@ class AopCacheTests(Fixture):
         self.addCleanup(self.env.stop)
         os.environ.pop('AOP_CACHE_DIR', None)
 
-    def native(self, root, body):
+    def native(self, root, body, environment=None):
         env = dict(os.environ, AOP_CACHE_DIR=str(root / '.aop_cache'),
                    AOP_RECYCLE_DIR=str(root / 'recycled'), PYTHONDONTWRITEBYTECODE='1')
         code = ("from analog.cache import CornerCache\n"
                 "from config import get_cache_root\n"
-                "cache=CornerCache(get_cache_root(), 'science-v1', 2, memory_mb=1)\n"
+                "cache=CornerCache(get_cache_root(), 'science-v1', 2, memory_mb=1,environment=" +
+                repr(self.environment if environment is None else environment) + ")\n"
                 "try:\n" + '\n'.join('    ' + line for line in body.splitlines()) +
                 "\nfinally:\n    cache.close()\n")
         return subprocess.check_output([sys.executable, '-B', '-c', code], cwd=str(AOP), env=env,
                                        text=True, stderr=subprocess.STDOUT, timeout=20).strip()
 
-    def seed(self, root, values='[1., 2.]'):
-        self.native(root, "cache.put_many([('d1','tt', " + values + ", True, {'wave':[2.,3.]})])")
+    def seed(self, root, values='[1., 2.]', environment=None):
+        self.native(root, "cache.put_many([('d1','tt', " + values + ", True, {'wave':[2.,3.]})])", environment)
+
+    def journal(self, root):
+        return next((root / '.aop_cache').glob('semantic-v1/*/*/records.bin'))
 
     def test_native_roundtrip_retains_payload_namespace_and_samples(self):
         self.seed(self.source)
@@ -75,6 +83,8 @@ class AopCacheTests(Fixture):
         result = cache_aop.merge(self.target, records)
         self.assertEqual(result['added'], 1)
         self.assertEqual(cache_aop.manifest(self.target), source)
+        self.assertNotEqual(self.journal(self.source).parent.name, self.journal(self.target).parent.name)
+        self.assertEqual(json.loads(next(iter(source)))[2], self.environment)
         actual = json.loads(self.native(self.target,
             "import json\nv,s=cache.get('d1','tt',with_samples=True)\nprint(json.dumps([v.tolist(),s]))"))
         self.assertEqual(actual, [[1., 2.], {'wave': [2., 3.]}])
@@ -94,19 +104,19 @@ class AopCacheTests(Fixture):
         self.native(self.source,
                     "cache.put_evaluation([b'e'*32],[3.,4.])\ncache.invalidate_evaluations()\n"
                     "cache.put_many([('d1','tt',[1.,2.],True,None)])")
-        path = next((self.source / '.aop_cache').glob('fp32-v5-*/records.bin'))
+        path = self.journal(self.source)
         with path.open('ab') as stream:
             stream.write(b'\x04\x00')
         before = path.read_bytes()
         records = cache_aop.export(self.source, cache_aop.manifest(self.source))
         self.assertEqual(len(records), 1)
-        self.assertTrue(all('/0/' in key for key in records))
+        self.assertTrue(all(json.loads(key)[3] == 0 for key in records))
         self.assertEqual(path.read_bytes(), before)
 
     def test_merge_recovers_only_partial_tail_under_project_lock(self):
         self.seed(self.source)
         self.native(self.target, 'pass')
-        path = next((self.target / '.aop_cache').glob('fp32-v5-*/records.bin'))
+        path = self.journal(self.target)
         with path.open('ab') as stream:
             stream.write(b'\x04\x00')
         result = cache_aop.merge(self.target, cache_aop.export(self.source, cache_aop.manifest(self.source)))
@@ -149,7 +159,7 @@ class AopCacheTests(Fixture):
         self.seed(self.source)
         self.seed(self.target, '[4.,5.]')
         directory = self.target / '.aop_cache'
-        unit = next(directory.glob('fp32-v5-*'))
+        unit = self.journal(self.target).parent
         coordination = cache_aop._coordination(self.target, directory)
         records = cache_aop.export(self.source, cache_aop.manifest(self.source))
         before = cache_aop.manifest(self.target)
@@ -167,15 +177,63 @@ class AopCacheTests(Fixture):
                     "cache.put_evaluation([b'e'*32],[9.,10.])\ncache.invalidate_evaluations()")
         source = cache_aop.manifest(self.source)
         self.assertEqual(len(source), 1)
-        self.assertTrue(all('/0/' in key for key in source))
+        self.assertTrue(all(json.loads(key)[3] == 0 for key in source))
         result = cache_aop.merge(self.target, cache_aop.export(self.source, source))
         self.assertEqual(result['conflicts'], 1)
         self.assertEqual(self.native(self.target, "print(cache.get_evaluation(b'e'*32))"), 'None')
         aggregate = b'\x01' + b'e' * 32 + struct.pack('<ff', 3., 4.)
-        namespace = next(iter(source)).split('/')[0]
+        contract = cache_aop._identity(next(iter(source)))
         result = cache_aop.merge(self.target, {
-            namespace + '/1/' + (b'e' * 32).hex(): cache_aop._record(2, aggregate)})
+            cache_aop._key(contract, aggregate): cache_aop._record(2, aggregate)})
         self.assertEqual(result['rejected'], 1)
+
+    def test_readable_protocols_keep_distinct_units_and_only_data_is_digested(self):
+        changed = dict(self.environment, measurement_protocol='measurements-v2')
+        self.seed(self.source)
+        self.seed(self.source, '[5., 6.]', changed)
+        with patch.object(cache_aop.hashlib, 'sha256', wraps=cache_aop.hashlib.sha256) as digest:
+            source = cache_aop.manifest(self.source)
+            records = cache_aop.export(self.source, source)
+            self.assertEqual(len(source), 2)
+            self.assertTrue(all(json.loads(key)[2] in (self.environment, changed) for key in source))
+            for call in digest.call_args_list:
+                self.assertTrue(call.args[0].startswith(struct.pack('<I', 2) + b'\0'))
+        result = cache_aop.merge(self.target, records)
+        self.assertEqual(result['added'], 2)
+        self.assertEqual(cache_aop.manifest(self.target), source)
+        self.assertEqual(json.loads(self.native(self.target,
+            "import json\nprint(json.dumps(cache.get('d1','tt').tolist()))", changed)), [5., 6.])
+
+    def test_unknown_and_unvalidated_legacy_observations_are_not_reusable(self):
+        for environment in (dict(self.environment, major_version='unknown'),
+                            dict(self.environment, measurement_protocol='legacy-unvalidated')):
+            self.seed(self.source, environment=environment)
+        self.assertEqual(cache_aop.manifest(self.source), {})
+        legacy = self.source / '.aop_cache' / ('fp32-v5-' + 'a' * 64)
+        legacy.mkdir()
+        shutil.copyfile(self.journal(self.source), legacy / 'records.bin')
+        self.assertEqual(cache_aop.manifest(self.source), {})
+
+    def test_engine_hash_and_platform_environment_fields_are_rejected(self):
+        self.seed(self.source)
+        records = cache_aop.export(self.source, cache_aop.manifest(self.source))
+        key, record = next(iter(records.items()))
+        for value in ('sha256-' + 'a' * 64, 'a' * 64, 'linux-native-v1'):
+            parts = json.loads(key)
+            parts[2]['execution_protocol'] = value
+            invalid = json.dumps(parts, sort_keys=True, separators=(',', ':'))
+            result = cache_aop.merge(self.target, {invalid: record})
+            self.assertEqual(result['rejected'], 1)
+        self.assertEqual(cache_aop.manifest(self.target), {})
+
+    def test_semantic_directory_must_match_descriptor(self):
+        self.seed(self.source)
+        descriptor = self.journal(self.source).parent / 'contract.json'
+        value = json.loads(descriptor.read_text(encoding='utf-8'))
+        value['environment']['major_version'] = 48
+        descriptor.write_text(json.dumps(value), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'directory differs'):
+            cache_aop.manifest(self.source)
 
 
 @unittest.skipUnless((RGCN / 'src' / 'dataset_store.py').is_file(), 'RGCN checkout is optional')
@@ -211,6 +269,70 @@ class RgcnCacheTests(Fixture):
     def transfer(self):
         source = cache_rgcn.manifest(self.source)
         return cache_rgcn.merge(self.target, cache_rgcn.export(self.source, source))
+
+    def test_shared_layout_payload_transfers_without_layout_database(self):
+        store = self.store(self.source)
+        try:
+            store.payload_codec = 'shared-json-layout-v1'
+            store.set_meta('payload_codec', store.payload_codec)
+            row = {'candidate': {'w': 1}, 'metrics': {'gain': 20},
+                   'analyses': {'summary': {'status': 'complete'},
+                       'dense': {'long_device_name_' + str(j): {
+                           'long_parameter_' + str(k): (j + 1) * (k + 1) * .123456789012345
+                           for k in range(27)} for j in range(50)}}}
+            store.add(row, role='test', family='held-out', source='native-original')
+            self.assertTrue(any(row[0].startswith(self.api.dataset_payload.MAGIC)
+                                for row in store.connection().execute('SELECT payload FROM views')))
+            before = list(store.rows())
+        finally:
+            store.close()
+        self.assertEqual(self.transfer()['added'], 2)
+        target = self.api.DatasetStore(cache_rgcn._path(self.target, 'toy'), readonly=True)
+        try:
+            self.assertEqual(list(target.rows()), before)
+            self.assertEqual(target.connection().execute('SELECT count(*) FROM payload_layouts').fetchone()[0], 0)
+        finally:
+            target.close()
+        self.assertEqual(self.transfer()['unchanged'], 2)
+
+    def test_migrated_unknown_protocol_observation_keeps_identity_without_cache_hit(self):
+        self.seed(self.source)
+        subprocess.check_output([sys.executable, '-B', '-c',
+            'import sys;from src.native_metadata_migration import migrate_store;migrate_store(sys.argv[1])',
+            str(cache_rgcn._path(self.source, 'toy'))], cwd=RGCN, stderr=subprocess.STDOUT, timeout=30)
+        before = cache_rgcn.manifest(self.source)
+        original_key = next(key for key in before if '/1-view/' in key)
+        self.assertIn('/legacy-observation-', original_key)
+        result = self.transfer()
+        self.assertEqual(result['added'], 2)
+        self.assertEqual(cache_rgcn.manifest(self.target), before)
+        target = self.api.DatasetStore(cache_rgcn._path(self.target, 'toy'), readonly=True)
+        try:
+            row = next(target.rows())
+            self.assertEqual(row['id'], row['dataset_identity'])
+            self.assertEqual(row['id'], row['observation_id'])
+            self.assertEqual(row['dataset_role'], 'test')
+            self.assertEqual(row['protocol_status'], 'legacy_unknown_protocol')
+            self.assertIsNone(target.cached(row['id']))
+            self.assertIsNone(target.find(row['candidate'], row['corner']))
+            self.assertEqual(target.signature, self.signature)
+        finally:
+            target.close()
+
+    def test_unknown_observation_keeps_original_signature_after_compatible_upgrade(self):
+        self.seed(self.source, signature=self.legacy)
+        subprocess.check_output([sys.executable, '-B', '-c',
+            'import sys;from src.native_metadata_migration import migrate_store;migrate_store(sys.argv[1])',
+            str(cache_rgcn._path(self.source, 'toy'))], cwd=RGCN, stderr=subprocess.STDOUT, timeout=30)
+        before = cache_rgcn.manifest(self.source)
+        key = next(key for key in before if '/1-view/' in key)
+        store = self.store(self.source)
+        store.close()
+        self.assertIn('/' + self.legacy + '/legacy-observation-', key)
+        self.assertIn(key, cache_rgcn.manifest(self.source))
+        result = self.transfer()
+        self.assertEqual(result['added'], 2)
+        self.assertIn(key, cache_rgcn.manifest(self.target))
 
     def test_native_roundtrip_preserves_historical_key_and_test_role(self):
         self.seed(self.source, signature=self.legacy)

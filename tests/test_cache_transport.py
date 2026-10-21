@@ -1,7 +1,11 @@
 """Cache synchronization over real center/worker HTTP and Python processes."""
 
 from contextlib import ExitStack
+import importlib.util
+import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import shutil
 import unittest
@@ -16,6 +20,47 @@ from test_compute import provider, scratch
 
 
 class CacheTransportTests(unittest.TestCase):
+    def test_aop_semantic_units_roundtrip_and_repeat_export_nothing(self):
+        installed = Path(__file__).resolve().parents[2] / 'AOP_v2'
+        if not (installed / 'analog/cache.py').is_file() or not importlib.util.find_spec('numpy'):
+            self.skipTest('Installed AOP producer and NumPy runtime')
+        with scratch() as directory, ExitStack() as stack:
+            root = Path(directory)
+            source, target = root / 'source', root / 'target'
+            endpoints = []
+            for name, project in (('A-source', source), ('B-target', target)):
+                (project / 'utils').mkdir(parents=True)
+                shutil.copyfile(installed / 'utils/compat.py', project / 'utils/compat.py')
+                _, node = stack.enter_context(provider(root / (name + '-worker'), cpus=1,
+                    memory_mb=2048, tools={'aop_python': sys.executable}, shared={'aop': str(project)}))
+                endpoints.append(dict(name=name, url=node.url))
+
+            def native(project, body):
+                code = ("from analog.cache import CornerCache\n"
+                        "from config import get_cache_root\n"
+                        "cache=CornerCache(get_cache_root(),'science-v1',2,memory_mb=1)\ntry:\n" +
+                        '\n'.join('    ' + line for line in body.splitlines()) +
+                        '\nfinally:\n    cache.close()\n')
+                environment = dict(os.environ, AOP_CACHE_DIR=str(project / '.aop_cache'),
+                                   AOP_RECYCLE_DIR=str(root / 'recycled'))
+                return subprocess.check_output([sys.executable, '-B', '-c', code], cwd=installed,
+                                               env=environment, text=True, stderr=subprocess.STDOUT, timeout=20)
+
+            native(source, "cache.put_many([('d1','tt',[1.,2.],True,None)])")
+            pool = Pool(endpoints)
+            stack.callback(pool.close)
+            _, client = stack.enter_context(center(pool, root / 'center'))
+            first = sync_cache(client, 'aop', kind='research')
+            self.assertEqual(first['status'], 'succeeded', first)
+            self.assertEqual(first['projects']['aop']['research']['added'], 1)
+            self.assertEqual(json.loads(native(target,
+                "import json\nprint(json.dumps(cache.get('d1','tt').tolist()))")), [1., 2.])
+            second = sync_cache(client, 'aop', kind='research')
+            self.assertEqual(second['status'], 'succeeded', second)
+            self.assertEqual(second['projects']['aop']['research']['exported_records'], 0)
+            self.assertEqual(second['pending_jobs'], {})
+            self.assertEqual(client.status(), [])
+
     def test_arh_cache_only_worker_imports_producer_from_normal_source_asset(self):
         installed = Path(__file__).resolve().parents[2] / 'ARH-DSE-v2'
         if not (installed / 'framework/storage.py').is_file():
