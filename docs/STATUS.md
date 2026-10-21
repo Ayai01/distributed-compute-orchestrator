@@ -4,6 +4,18 @@
 
 最新按用户本机12核设置保存为Aya1-PC 12、Aya1-TX 16、ku26s 32，合计60核；三机系统可见逻辑CPU为28/32/104。此前64核预算阶段的吞吐实测继续保留原口径；短时TX/ku扩容已撤回，在途任务自然收尾。12:03 UTC历史快照为64核运行、193项排队，PC约7.24GiB实时可用，8GiB余量规则已阻止额外内存准入。最新内存维护另见下节，原预算时间线在`results/repair-20261020/cpu-budget-expansion.json`。
 
+## 公共 CLI/Web 与 Rocket 正式入口验收
+
+正常科研 CLI 与 Web 按钮共用任务服务，默认地址为 AOP `http://127.0.0.1:8000/`、RGCN `http://127.0.0.1:8001/?page=research`、ARH `http://127.0.0.1:8002/#page-run`、Bench `http://127.0.0.1:8003/`。`--no-browser` 只关闭自动开页，任务完成后服务继续可访问；显式 `--headless` 用于直接执行。任务参数、预算、日志、结果和控制归各工程同一执行链，不另开科研计算队列。AOP 的共享服务及原 ID 控制 9 项回归通过；RGCN 与 ARH 原在途任务已实际显示，ARH 外部任务区域位于折叠日志之外。
+
+Bench 新工作台已接入原科研任务 `c1432c57ced343a99a4a9f741cebff85`。根会话以正常 `main.py status --task-id ... --no-browser` 与 HTTP 独立对照，任务 ID、原协议、原中心 ID 及可用控制一致；浏览器实页显示运行中 70/72，随后同一任务 72/72 完成，服务保持。7 项隔离生命周期回归通过，覆盖共享参数校验、停止后恢复原身份、取消归属、旧任务只读接入、冻结协议、有界增量日志及按任务访问自定义输出。另以随机端口和模拟发布器完成真实公共 CLI→HTTP 的启动、参数、退出后服务保持、停止、取消、恢复原 ID，以及工程外报告和相对科学数据包验收，新增科研求值为零。增量状态实测 3,584 字节；所属会话已更新入口文档并将修复加载到 8003，当前研究继续。证据 `results/repair-20261020/bench-cli-web-parity-proof.json`、`bench-cli-http-lifecycle-proof.json`、`bench-workbench-browser.png` 及汇总 `cli-web-parity-current.json`。
+
+Rocket 原 64 个吞吐任务已全部成功，共 1,728 次新原生调用。慢构建包含约 5.85MB、20,060 行的 Verilator 符号注册单元，已通过复用完整四模式编译缓存避免重复成本；暖缓存完整命中先于全局构建锁检查，只有缺项进入锁内复查，marker 原子发布。公共正式运行 `0aec91981805` 的准备回执 `72adc9997efe4db0a6ce5090076a5fdb` 四模式均命中，内部准备 0.0112 秒、总执行 1.499 秒；自检原任务 `ab4183ae261040b49f8aa15a541fa559` 成功。
+
+原 GSIM 与 reference Verilator 对照定位到 SET 接收相位的一周期差异，原对照与诊断成本保留。上述正式运行使用 reference Verilator；后续修正适配器的接收相位，私有与正式源码两批各 512 次新原生对照均通过，包含 104 项自检及 8 设计×24 样本的完整指标/PPA/统计一致，复用原大模型对象，后续入口恢复 auto。两批证据分别为 ARH `.local/rocket-focus/receiver-phase-proof/comparison.json` 和 `phase-release-proof/comparison.json`。语义能力覆盖三节点全部 60 核，不加入平台或引擎哈希路由。ARH 已从公共 `main.py run ... --no-browser` 经同一 8002 JobManager 启动上述正式运行，种群与评估并发均为 64。首波实际观测为 52 运行、184 排队；PC 12 个所属原生进程的 2 秒双采样合计 11.882 个忙核。运行中 ARH/RGCN/Bench 的阶段借还与自然公平回收保持，预算未调整。证据 `rocket-reference-public-first-wave.json`、`rocket-reference-public-cpu-proof.json`。此前两个长 SoC 帧也已自然收齐，所属工程 `soc-full/result.json` 为 `passed:true`。
+
+RGCN 的 FIBER 依赖已在三机实际 `rgcn_train` 解释器中核对，统一新增语义能力 `rgcn_fiber` 并持久化、在线生效。PC/TX 原四包齐备；ku 仅补齐缺少的 SciPy 1.17.1、Numba 0.65.1、moocore 0.3.2、threadpoolctl 3.6.0 及其缺失依赖，原 NumPy 2.4.4、Torch 2.14.1+cpu 保持。三机均用新能力实际执行导入并核对相同解释器，准入覆盖 60 核；未重启服务或现有训练。证据 `results/repair-20261020/rgcn-fiber-capability-acceptance.json`。
+
 ## 本次内存归因与临时迁移
 
 本机最初约42.1/47.8GiB内存已用，可用约6.66GiB。4个RGCN训练进程合计约14GiB，ClassAB约6GiB；原始JSON、编译图及逐观测devices/provenance在训练期间同时驻留。实际VAL已经按64条分批，整VAL前向不是本轮主要来源。连续50秒采样的4个进程内存均围绕固定区间波动，DCO本身约84–128MiB。主要整改是释放已消费对象并控制峰值。原始文件、输入摘要、全部训练Tensor和验证聚合保持。
