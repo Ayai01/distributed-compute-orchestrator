@@ -175,6 +175,15 @@ def _network_text(network):
     return f"{rtt:.1f}ms/{loss:.0f}%" if isinstance(rtt,(int,float)) and isinstance(loss,(int,float)) else '--'
 
 
+def _tag_name(text):
+    names={'classab':'AB','class_ab':'AB','class-ab':'AB','classab-warm':'AB-warm',
+           'fiber_mo':'FIBER','fiber-mo':'FIBER','face-mo':'FACE','iicmo':'IICMO',
+           'rde26_cmop':'RDE26','maoea_hap':'MaOEA-HAP','agemoea2':'AGE2',
+           'nsga2':'NSGA2','nsga3':'NSGA3','disconnected-corridor':'split-cor',
+           'narrow-corridor':'narrow','evidence-folded-open':'fold-open'}
+    return names.get(text.casefold(),text)
+
+
 def _label(job):
     parts = job.get('label','').replace('\\','/').split('/')
     project = (job.get('project') or '').casefold()
@@ -216,7 +225,13 @@ def _label(job):
         head,sep,tail=tokens[0].partition('-')
         head={'ldo':'LDO','tsa':'TSA','fsa':'FSA','bgr':'BGR','classab':'ClassAB'}.get(head,head)
         tokens[0]=head+(' '+tail if sep else '')
-        return '/'.join(tokens)
+        text='/'.join(tokens)
+        text=re.sub(r'\bcomplete PVT\b','PVT',text,flags=re.IGNORECASE)
+        text=re.sub(r'\bphysics (False|True)\b',lambda m:'phy'+str(int(m[1].lower()=='true')),text)
+        text=re.sub(r'\b(\d+) PVT\b',r'\1PVT',text)
+        words={'rgcn':'nn','pre':'PRE','post':'POST'}
+        return '/'.join(words.get(word.casefold(),_tag_name(word))
+                        for word in re.split(r'[/\s]+',text) if word)
     if project in ('analog-opt-bench','bench') or parts and parts[0]=='Analog':
         if parts[0]=='Analog':parts=parts[1:]
         # This parent label repeats the total NFE after its count x budget.
@@ -229,12 +244,33 @@ def _label(job):
             if len(parts)>=2:
                 scenario=re.fullmatch(r'panda-(.+)-(\d+)',parts[-2])
                 if scenario:parts[-2]=scenario[1]+'#'+str(int(scenario[2]))
-        text='/'.join(parts[-3:])
-        return re.sub(r'\bb(\d{4,})\b',lambda m:'b'+format(int(m[1])/1000,'g')+'k',text)
+        compact=[]
+        for part in parts:
+            # The ID distinguishes replicas; CPUs have their own column. Keep
+            # the actual scenario, which used to disappear before this suffix.
+            if re.fullmatch(r'seed=\d+',part):continue
+            scenario=re.fullmatch(r'panda-(.+)-(\d+)',part)
+            if scenario:part=scenario[1]+'#'+str(int(scenario[2]))
+            parallel=re.fullmatch(r'(\d+) parallel methods on \d+ CPUs',part)
+            if parallel:part=parallel[1]+'alg'
+            part=re.sub(r'\bb(\d{4,})(?: each)?\b',lambda m:'b'+format(int(m[1])/1000,'g')+'k',part)
+            compact.append(_tag_name(part))
+        return '/'.join(compact)
     if project=='arh-dse':
-        text='/'.join(parts[-2:])
-        text=re.sub(r'\bunrolled native gate\b','展开验收',text)
-        return re.sub(r'\bnative gate\b','原生验收',text)
+        text='/'.join(parts)
+        text=re.sub(r'controller revision: immutable worker source comparison only','src-check',text)
+        text=re.sub(r'\bselected design\b','',text)
+        text=re.sub(r'\bunrolled native gate\b','unroll-check',text)
+        text=re.sub(r'\bnative gate\b','check',text)
+        names={'rocket_dma':'Rocket','rocket':'Rocket','boom_dma':'BOOM','boom':'BOOM',
+               'fir_stream':'FIR','mac':'MAC','conv_pool':'ConvPool','rv_dma_yolo':'RV-YOLO',
+               'evaluate':'eval','prepare':'prep','verify':'verify','directed':'dir',
+               'gsim':'GSIM','verilator':'VLT','engine':'NCNN','rtl':'RTL','isolated':''}
+        compact=[]
+        for word in re.split(r'[/\s·]+',text):
+            word=names.get(word.casefold(),word)
+            if word and (not compact or compact[-1]!=word):compact.append(word)
+        return '/'.join(compact) or '-'
     if project=='yolov8-quant-lab' and parts[-1]=='integer-range-and-cost':
         return 'INT4 range/cost'
     return '/'.join(parts[-2:]) or job.get('label','-')

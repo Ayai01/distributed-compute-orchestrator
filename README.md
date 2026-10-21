@@ -77,6 +77,8 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `sync_cache all` / `sync_cache arh --kind research` | 手动增量同步，详见下节 |
 | `wait` / `quit` | 等待本终端后台操作 / 退出 |
 
+任务表的Tag保留对象、阶段/方法和必要预算，例如 `AB-warm/4alg/b24k`、`fold-open/FACE/b12k`、`FSA/train/PVT/phy0`、`Rocket/prep`。工程、CPU和任务ID已有单独列，Tag不重复这些字段或长句；完整原标签继续由 `jobs ab12` 明细、API和回执保存。
+
 设备名换成 `nodes` 的实际名称，也可用 `#编号`。任务支持唯一的至少四位 ID 前缀，API 使用完整 ID。`memory` 无单位为 MiB，`8G/8GB/8GiB` 均为 8 GiB，0 自动预算。`set limit` 限制本中心派发量，`cpus` 修改提供者总预算。
 
 Tab 在空输入时显示根命令候选，有输入时补全；Ctrl+Tab 翻任务页，空输入 Shift+Tab 反向翻页，PgUp/PgDn 翻输出，↑/↓ 选历史，Esc/Ctrl+C 清空输入，Enter 执行。补全只读当前快照。看板聚焦每秒刷新、失焦每 5 秒刷新；任务运行秒数从实际执行开始，线程预留与 CPU 使用率分列。

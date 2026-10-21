@@ -6,6 +6,8 @@
 
 ## 运行环境整理与 DSH 二次核对
 
+任务Tag进一步收束为对象、阶段/方法与必要预算，修复Bench/ARH后缀裁剪丢失对象、重复prepare及并行长句；完整原标签不改写。39项终端回归通过，0.680秒，包含实际长标签、原请求保持和多宽度表格检查。证据 `results/repair-20261020/compact-task-tags-proof.json`。
+
 三机现有解释器逐项实测后，在线登记 `python_numpy/python_scientific/python_torch_pyg/onnx`，各环境的准入供给均为60核；每机使用四个规范模板及 CIRCT 实际执行通过。完整 ML 环境的 Torch/PyG 和四项数值依赖位于同一解释器，未把 ku 的两套环境拼成一个就绪条件；固定 INT8 仍使用原3.12环境。布局 Python、Magic、Netgen、HSPICE 及编译器按实际工具分别保留。此次环境整理未安装或替换依赖，预算与原绑定保持。原始模块报告、绑定与已领取任务见 `results/repair-20261020/capability-profiles-live-proof.json`。
 
 隔离真实 HTTP 检查复现并修复两个缺口：工具模板曾按原始键查找，误排除同语义的可用节点；缓存同步曾按工程旧标签筛选，环境名称规范化后漏掉消费者。匹配现覆盖命令、参数与环境中的工具变量，缓存继续走原传输与增量边界。滚动升级时保留实际登记的旧绑定，旧中心与新worker可继续协作，能力汇总仍去重。最终全量401项完成、4项环境跳过，其余通过，207.660秒；包含真实缓存传输、原ID保持和混合命名节点共同接单。完整日志 `.local/maintenance/capability-unification-release-full.log`。
