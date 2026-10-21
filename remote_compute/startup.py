@@ -205,11 +205,11 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
             raise RuntimeError('非交互启动已取消；使用 --on-port-conflict reuse|kill|admin-kill|cancel 选择处理方式。')
         options = '[r] reuse 复用已有服务 / ' if reusable else ''
         try:
-            choice = input(options + '[k] kill / [a] admin-kill 管理员结束 / [c] cancel 取消：').strip().lower()
+            choice = input(options + '[k] kill / [a] admin-kill 管理员结束 / [c] cancel 取消（默认）：').strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise Cancelled('已取消启动，已有进程继续运行。') from None
         choice = {'r': 'reuse', 'k': 'kill', 'a': 'admin-kill', 'c': 'cancel',
-                  '': 'reuse' if reusable else 'cancel'}.get(choice, choice)
+                  '': 'cancel'}.get(choice, choice)
     if choice == 'reuse' and reusable:
         print('复用已有服务：' + url)
         return url

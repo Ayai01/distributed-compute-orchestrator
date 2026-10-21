@@ -164,6 +164,9 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
                     port = int(hub.url.rsplit(':', 1)[1])
                     with patch.object(startup, 'owners', return_value=[]), patch.object(startup, 'terminate') as kill:
                         self.assertEqual(startup.resolve('127.0.0.1', port, policy='reuse', reuse_role='scheduler'), hub.url)
+                        with patch.object(startup.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value=''):
+                            with self.assertRaises(startup.Cancelled):
+                                startup.resolve('127.0.0.1', port, reuse_role='scheduler')
                         self.assertEqual(hub.health()['role'], 'scheduler')
                         kill.assert_not_called()
 

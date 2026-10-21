@@ -128,7 +128,7 @@ class TransportTests(unittest.TestCase):
             for index in range(3):
                 futures.append(executor.submit(waiter,index))
                 until(lambda:len(pool.waiting)==index+1)
-            client=Client(timeout=.01);client._transport=pool
+            client=Client(timeout=.01,pool_timeout=.01);client._transport=pool
             with patch.object(client,'_request') as request:
                 with self.assertRaises(PoolBusy):client.health()
                 request.assert_not_called()
@@ -268,6 +268,42 @@ class TransportTests(unittest.TestCase):
             self.assertTrue(all(row['role']=='worker' for row in rows))
             self.assertLessEqual(len(client._transport.idle),8)
             self.assertTrue(all(c.sock is not None for c in client._transport.idle))
+
+    def test_128_status_callers_wait_without_changing_original_work_or_socket_timeout(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            identity=client.submit(python("print('original retained work')"))['id']
+            client.wait(identity)
+            client.timeout=.5
+            lock=threading.Lock()
+            counts=dict(active=0,peak=0,requests=0)
+            original=Handler._reply
+            def delayed(handler,value,status=200):
+                if handler.server.worker is not worker or handler.path!='/jobs/'+identity:
+                    return original(handler,value,status)
+                with lock:
+                    counts['active']+=1
+                    counts['requests']+=1
+                    counts['peak']=max(counts['peak'],counts['active'])
+                try:
+                    time.sleep(.12)
+                    return original(handler,value,status)
+                finally:
+                    with lock:counts['active']-=1
+            def status(_):
+                started=time.monotonic()
+                row=client.status(identity,brief=True)
+                return row,time.monotonic()-started
+            with patch.object(Handler,'_reply',delayed),ThreadPoolExecutor(max_workers=128) as callers:
+                results=list(callers.map(status,range(128)))
+            self.assertTrue(all(row['id']==identity and row['status']=='succeeded' for row,_ in results))
+            self.assertGreater(max(elapsed for _,elapsed in results),client.timeout)
+            self.assertEqual(counts['requests'],128)
+            self.assertLessEqual(counts['peak'],8)
+            self.assertEqual(client.timeout,.5)
+            self.assertEqual(client._transport.available,8)
+            self.assertFalse(client._transport.waiting)
+            self.assertEqual(list(worker.jobs),[identity])
+            self.assertEqual(client.fetch(identity)['stdout'].strip(),'original retained work')
 
     def test_running_status_reuses_fresh_worker_snapshot_and_terminal_status_is_fresh(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client):

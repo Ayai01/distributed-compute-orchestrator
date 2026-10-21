@@ -44,13 +44,13 @@ class _ConnectionPool:
 
     def acquire(self, timeout):
         ticket = object()
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
             self.waiting.append(ticket)
             try:
                 while not self.available or self.waiting[0] is not ticket:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
                         return False
                     self.condition.wait(remaining)
                 self.available -= 1
@@ -70,13 +70,14 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None):
         self.url, self.token, self.operator = url.rstrip("/"), token, bool(operator)
         self.operator_token = operator_token if self.operator else None
         if timeout is None:
             timeout = (float(os.environ.get('REMOTE_COMPUTE_TIMEOUT',10))
                        if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else 10)
         self.timeout = timeout
+        self.pool_timeout = pool_timeout
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
         self._capabilities = None
@@ -89,7 +90,9 @@ class Client:
         pool=self.__dict__.get('_transport')
         if pool is None:
             pool=self.__dict__.setdefault('_transport',_ConnectionPool())
-        if not pool.acquire(self.timeout):
+        # Local FIFO backpressure is independent of a socket's network timeout.
+        # A busy client waits for its bounded slot without failing accepted work.
+        if not pool.acquire(getattr(self, 'pool_timeout', None)):
             raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         # Old live instances may still own a per-thread cached connection.
         previous=getattr(self.connections,'connection',None)
@@ -366,7 +369,7 @@ class Client:
         if self.endpoint.scheme in {'http','https'}:
             backend=self.__dict__.get('_result_client')
             if backend is None:
-                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token))
+                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None)))
             backend.timeout=max(120,self.timeout)
         return backend.request("/jobs/" + identity + "/artifacts", binary=True)
 
