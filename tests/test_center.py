@@ -147,6 +147,30 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_slow_initial_probe_does_not_delay_local_control(self):
+        with scratch() as root,provider(Path(root)/'local') as (_,local),provider(Path(root)/'slow') as (_,slow):
+            release=threading.Event();timer=threading.Timer(3,release.set)
+            original=slow.health
+            def delayed(**options):
+                release.wait(5)
+                return original(**options)
+            timer.start()
+            try:
+                with patch.object(slow,'health',side_effect=delayed):
+                    started=time.monotonic()
+                    with Pool([dict(name='slow',client=slow),dict(name='local',client=local)]) as pool:
+                        try:
+                            self.assertLess(time.monotonic()-started,2)
+                            self.assertTrue(pool.nodes[0].error)
+                            with center(pool,Path(root)/'center') as (_,client):
+                                started=time.monotonic()
+                                client.control(node='local',worker={'cpus':1})
+                                self.assertLess(time.monotonic()-started,1)
+                                self.assertEqual(client.run(python('print(42)'))['stdout'].strip(),'42')
+                        finally:release.set()
+            finally:
+                release.set();timer.cancel()
+
     def test_missing_asset_rejects_before_acceptance_then_accepts_the_same_id(self):
         import hashlib
         from remote_compute.bundle import pack

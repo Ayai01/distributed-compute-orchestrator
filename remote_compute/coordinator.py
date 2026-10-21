@@ -411,7 +411,7 @@ class Coordinator:
                     if getattr(error, 'status_code', None) == 400:
                         raise ValueError(str(error)) from None
                     raise Conflict(str(error)) from None
-                self.pool.refresh()
+                self.pool.refresh(nodes=[node])
             return self.health()
         if isinstance(changes, dict) and set(changes) == {"policy"}:
             self.pool.configure(policy=changes["policy"])

@@ -1,7 +1,7 @@
 """HTTP client and weighted, adaptive dispatch across independent workers."""
 
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
 import hashlib
 import gzip
@@ -584,6 +584,7 @@ class Pool:
                 node.host_ip = entry.get("host_ip", "")
                 node.aliases = entry.get('aliases',[])
             self._validate_node(node)
+            node.error = 'Checking worker'
             self.nodes.append(node)
         if not self.nodes or len({x.name for x in self.nodes}) != len(self.nodes):
             raise ValueError("Configure nodes with unique names")
@@ -591,7 +592,7 @@ class Pool:
             raise ValueError("Configure each worker URL once")
         self.probes=ThreadPoolExecutor(thread_name_prefix="node-sample")
         self.probe_futures={}
-        self.refresh()
+        self.refresh(timeout=1)
         self.monitor = threading.Thread(target=self._monitor, name="compute-nodes", daemon=True)
         self.monitor.start()
 
@@ -670,19 +671,22 @@ class Pool:
                       "packet_loss_pct": round(100*losses/attempts,1), "samples": attempts,
                       "measured_at": time.time()}
 
-    def refresh(self, *, monitor=False):
+    def refresh(self, *, monitor=False, nodes=None, timeout=None):
         # A slow/offline worker never stalls another worker's CPU or lease sample.
+        selected = self.nodes if nodes is None else nodes
         with self.refresh_lock:
-            for node in self.nodes:
+            for node in selected:
                 pending=self.probe_futures.get(node.name)
                 interval=min(self.sample_seconds,.2) if node.live_jobs else self.sample_seconds
                 if pending is not None and not pending.done():
-                    if monitor:continue
+                    if monitor or timeout is not None:continue
                     pending.result()
                 if monitor and time.monotonic()-getattr(node,'sampled_at',0)<interval:continue
                 self.probe_futures[node.name]=self.probes.submit(self._probe,node,not monitor)
-            pending=list(self.probe_futures.values())
+            pending=[self.probe_futures[node.name] for node in selected]
         if not monitor:
+            if timeout is not None:
+                pending,_=wait_futures(pending,timeout=timeout)
             for future in pending:future.result()
 
     def _monitor(self):
@@ -731,7 +735,7 @@ class Pool:
             if any(n.name == name or n.client.url == node.client.url for n in self.nodes):
                 raise ValueError("Node name or URL already exists")
             self.nodes.append(node)
-        self.refresh()
+        self.refresh(nodes=[node])
 
     def snapshot(self):
         with self.condition:
