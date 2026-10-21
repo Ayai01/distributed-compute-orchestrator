@@ -16,7 +16,7 @@ class CacheAssetTests(unittest.TestCase):
         with scratch() as directory:
             root = Path(directory)
             names = ('config.py', 'analog/core.py', 'compute/runner.py', 'utils/paths.py',
-                     '.tools/unused.py', 'results/old.py')
+                     '.tools/unused.py', 'results/old.py','analog/test_measurement.py','compute/tests/test_cli.py')
             for name in names:
                 path = root/name
                 path.parent.mkdir(parents=True, exist_ok=True)

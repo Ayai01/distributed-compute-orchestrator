@@ -9,15 +9,15 @@
 | Aya1-PC | 16 / 28 | 16GiB | 8GiB |
 | Aya1-TX | 24 / 32 | 16GiB | 8GiB |
 | ku26s | 52 / 104 | 64GiB | 16GiB |
-| Aya1-ITX | 16 / 24 | 总内存减16GiB，约15.8GiB | 8GiB |
+| Aya1-ITX | 8 / 24 | 总内存减16GiB，约15.8GiB | 8GiB |
 
-CPU合计108，按2026-10-21用户确认的16/24/52/16设置；调低额度保留在途任务并自然收敛。ku26s任务TMP目前使用普通磁盘；独立tmpfs列入空闲维护。RAM准入使用进程树RSS及系统实时8GiB余量，未采样派发暂按申报量预留。
+配置CPU合计100，按2026-10-21用户最新确认的16/24/52/8保存；ITX已按用户要求排空关机并经用户确认；下次上线仍使用8核，其他三机合计92核继续承接。调低额度保留在途任务并自然收敛。ku26s任务TMP目前使用普通磁盘；独立tmpfs列入空闲维护。RAM准入使用进程树RSS及系统实时8GiB余量，未采样派发暂按申报量预留。
 
 | 语义能力 / 工具 | 已验证供给 |
 | --- | --- |
-| python_numpy、python_scientific、python_torch_pyg、onnx | 四设备合计108核；各环境所需包位于实际执行的同一解释器 |
-| ng47、Verilator、CIRCT及相应编译器 | 按已登记工具匹配；包含make的ARH联合要求现覆盖108核 |
-| layout_python、Magic、Netgen及布局材料 | Aya1-PC、Aya1-ITX环境就绪，合计32核；材料仍由任务内容资产提供 |
+| python_numpy、python_scientific、python_torch_pyg、onnx | 四设备配置合计100核；ITX离线期间92核；各环境所需包位于实际执行的同一解释器 |
+| ng47、Verilator、CIRCT及相应编译器 | 按已登记工具匹配；包含make的ARH联合要求配置覆盖100核，ITX离线期间92核 |
+| layout_python、Magic、Netgen及布局材料 | Aya1-PC、Aya1-ITX环境就绪，配置合计24核；ITX离线期间本机16核；材料仍由任务内容资产提供 |
 | HSPICE | 当前ku26s环境就绪，52核 |
 
 以上为当前工具供给，不是设备或OS绑定策略。旧工程名和rgcn_fiber仅作原请求/模板兼容，公开能力使用规范环境名；已接受任务保持原绑定和回执。
@@ -29,7 +29,7 @@ CPU合计108，按2026-10-21用户确认的16/24/52/16设置；调低额度保�
 | 范围 | 当前结论 | 证据 |
 | --- | --- | --- |
 | TSA并发与单设备隔离 | 三机完成20个滚动观测点，1787个真实corner；排空尾部独立计时，原生产任务保留、节点恢复；CPU满线程可接近满载 | `results/tsa-pool-scaling-20261021/report.html`、`scaling.csv`、`isolation-ledger.json` |
-| ITX部署与真实执行 | 标准worker、24逻辑CPU；科学/神经/ONNX、真实TSA、原生RTL编译运行、SKY130几何及8GiB物理RAM盘均通过，按用户确认提供16核 | `itx-onboarding-current.json`、`.local/maintenance/itx-real-canary/`、`itx-sky130-geometry/` |
+| ITX部署与真实执行 | 标准worker、24逻辑CPU；科学/神经/ONNX、真实TSA、原生RTL编译运行、SKY130几何及8GiB物理RAM盘均通过，按用户最新确认保存8核，现排空下线 | `itx-onboarding-current.json`、`.local/maintenance/itx-real-canary/`、`itx-sky130-geometry/` |
 | 八字符设备名 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；看板与隔离针对性回归41项通过。运行中的看板在自然空闲重载时加载 | `tests/test_console.py`、`tests/test_center.py` |
 | 能力、工具模板、缓存消费者及混合版本 | 全量401项：397通过、4项环境跳过；原ID与数值保持 | `.local/maintenance/capability-unification-release-full.log`；`capability-profiles-live-proof.json` |
 | 规范能力部署与真实供给 | 三机自然空闲重载，60核授予及真实排队通过；Make联合要求60核 | `capability-idle-reload.json`、`capability-unification-after-reload.json`、`make-unification-admission.json` |

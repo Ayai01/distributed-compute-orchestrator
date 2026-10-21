@@ -32,7 +32,7 @@ def _aop(root):
     sources = {'config.py': root/'config.py'}
     for package in ('analog', 'compute', 'utils'):
         sources.update((path.relative_to(root).as_posix(), path)
-                       for path in (root/package).rglob('*.py'))
+                       for path in (root/package).rglob('*.py') if not path.name.startswith('test_'))
     result = {'aop_code': _group(sources, 'aop_python')}
     simulation_jobs = importlib.import_module('analog.simulators').simulation_jobs
     model_bundle = importlib.import_module('compute.models').model_bundle
