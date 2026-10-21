@@ -10,7 +10,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from remote_compute import setup_tools
+from remote_compute import setup_tools, command
 from remote_compute.cli import main
 from remote_compute.worker import Worker
 from remote_compute.policy import canonical_capabilities, clean_tool_snapshot
@@ -18,6 +18,43 @@ from test_compute import provider, scratch
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_semantic_and_legacy_templates_share_the_registered_binding(self):
+        aliases = (('ngspice47', 'ng47'), ('circt-translate', 'circt'),
+                   ('onnx_cpu', 'onnx'), ('aop_hspice_python', 'aop-hs'))
+        for legacy, semantic in aliases:
+            for configured, requested in ((legacy, semantic), (semantic, legacy)):
+                with self.subTest(configured=configured, requested=requested), scratch() as directory:
+                    with provider(Path(directory) / 'worker', tools={configured: sys.executable}) as (_, client):
+                        template = '${tool:' + requested + '}'
+                        result = client.run(command([template, '-c', 'import os;print(os.environ["SELECTED"])'],
+                            env={'SELECTED': template}, requires=[semantic]))
+                        self.assertEqual(result['status'], 'succeeded', result)
+                        self.assertEqual(Path(result['stdout'].strip()).resolve(), Path(sys.executable).resolve())
+
+    def test_semantic_template_retains_multi_argument_tool_prefix(self):
+        with scratch() as directory, provider(Path(directory) / 'worker',
+                tools={'ngspice47': [sys.executable, '-I']}) as (_, client):
+            result = client.run(command(['${tool:ng47}', '-c', 'print("prefix retained")'], requires=['ng47']))
+            self.assertEqual(result['status'], 'succeeded', result)
+            self.assertEqual(result['stdout'].strip(), 'prefix retained')
+
+    def test_missing_alias_uses_an_available_binding_for_same_capability(self):
+        with scratch() as directory, provider(Path(directory) / 'worker',
+                tools={'ngspice47': str(Path(directory) / 'missing'), 'ng47': sys.executable}) as (_, client):
+            result = client.run(command(['${tool:ngspice47}', '-c', 'print("ready")'], requires=['ng47']))
+            self.assertEqual(result['status'], 'succeeded', result)
+            self.assertEqual(result['stdout'].strip(), 'ready')
+
+    def test_registered_punctuation_tool_executes_and_expands_in_environment(self):
+        for name in ('clang++', 'compiler.v1'):
+            with self.subTest(name=name), scratch() as directory:
+                with provider(Path(directory) / 'worker', tools={name: sys.executable}) as (_, client):
+                    template = '${tool:' + name + '}'
+                    result = client.run(command([template, '-c', 'import os;print(os.environ["SELECTED"])'],
+                                                env={'SELECTED': template}, requires=[name]))
+                    self.assertEqual(result['status'], 'succeeded', result)
+                    self.assertEqual(Path(result['stdout'].strip()).resolve(), Path(sys.executable).resolve())
+
     def test_restored_receipts_drop_engine_hashes_and_retired_aliases(self):
         value=dict(id='original',tools={'ng47_sha256_'+'x'*43:dict(available=True),
                    'ngspice47':dict(available=True,sha256='old',supporting_sha256={'engine':'old'})},

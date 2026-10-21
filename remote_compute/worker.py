@@ -40,7 +40,7 @@ from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
-_VAR = re.compile(r"\$\{(work|cpus|exe|tool:[\w-]+|asset:[\w-]+|shared:[\w-]+)\}")
+_VAR = re.compile(r"\$\{(work|cpus|exe|tool:[A-Za-z_][A-Za-z0-9_+.-]*|asset:[\w-]+|shared:[\w-]+)\}")
 
 
 class Conflict(ValueError):
@@ -440,6 +440,18 @@ class Worker:
     def _save(self, job):
         atomic_json(job["directory"] / "result.json", job["result"])
 
+    def _tool_argv(self, name):
+        """Resolve one semantic capability for commands and path variables."""
+        canonical = canonical_capability(name)
+        names = ([name] if name in self.tools else []) + [
+            alias for alias in self.tools if alias != name and canonical_capability(alias) == canonical]
+        for alias in names:
+            if self.tool_info[alias]['available']:
+                return self.tools[alias]
+        if names:
+            return self.tools[names[0]]
+        raise KeyError(name)
+
     def _expand(self, text, task, work):
         def substitute(match):
             key = match[1]
@@ -456,10 +468,10 @@ class Worker:
                 return self.shared[name]
             if kind == "asset":
                 return (self.root / "assets" / task["assets"][name]).as_posix()
-            name = {'circt': 'circt-translate'}.get(name, name)
-            if len(self.tools[name]) != 1:
+            prefix = self._tool_argv(name)
+            if len(prefix) != 1:
                 raise ValueError("Multi-argument tools belong at argv[0]")
-            return Path(self.tools[name][0]).as_posix()
+            return Path(prefix[0]).as_posix()
         return _VAR.sub(substitute, text)
 
     def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
@@ -555,8 +567,9 @@ class Worker:
             cwd = cwd.resolve()
             commands = []
             for argv in task["steps"]:
-                match = re.fullmatch(r"\$\{tool:([\w-]+)\}", argv[0])
-                prefix = self.tools[match[1]] if match else [self._expand(argv[0], task, work)]
+                match = _VAR.fullmatch(argv[0])
+                prefix = (self._tool_argv(match[1][5:]) if match and match[1].startswith('tool:')
+                          else [self._expand(argv[0], task, work)])
                 commands.append([*prefix, *[self._expand(x, task, work) for x in argv[1:]]])
             for value in task["env"].values():
                 self._expand(value, task, work)
