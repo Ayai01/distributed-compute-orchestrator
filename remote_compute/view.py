@@ -218,8 +218,22 @@ def _label(job):
         return '/'.join(tokens)
     if project in ('analog-opt-bench','bench') or parts and parts[0]=='Analog':
         if parts[0]=='Analog':parts=parts[1:]
+        # This parent label repeats the total NFE after its count x budget.
+        # Keep the scenario and per-arm budget; the request retains full text.
+        if parts:
+            match=re.fullmatch(r'(\d+)x(\d+)=(\d+) NFE budget',parts[-1])
+            if match and int(match[1])*int(match[2])==int(match[3]):
+                budget=int(match[2])
+                parts[-1]=match[1]+'x'+(format(budget/1000,'g')+'k' if budget%1000==0 else str(budget))
+            if len(parts)>=2:
+                scenario=re.fullmatch(r'panda-(.+)-(\d+)',parts[-2])
+                if scenario:parts[-2]=scenario[1]+'#'+str(int(scenario[2]))
         text='/'.join(parts[-3:])
         return re.sub(r'\bb(\d{4,})\b',lambda m:'b'+format(int(m[1])/1000,'g')+'k',text)
+    if project=='arh-dse':
+        text='/'.join(parts[-2:])
+        text=re.sub(r'\bunrolled native gate\b','展开验收',text)
+        return re.sub(r'\bnative gate\b','原生验收',text)
     if project=='yolov8-quant-lab' and parts[-1]=='integer-range-and-cost':
         return 'INT4 range/cost'
     return '/'.join(parts[-2:]) or job.get('label','-')
@@ -298,11 +312,11 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','已用/预算(逻辑)','CPU','单/总','RAM','可配','GPU','进程RAM/预留'],
+            table=_table(['设备','已用/预算','CPU','单/总','RAM','可配','GPU','进程/预留'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
                          [11,10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
-            table=_table(['设备','已用/预算(逻辑)','CPU','RAM','可配'],[r[:5] for r in records],
+            table=_table(['设备','已用/预算','CPU','RAM','可配'],[r[:5] for r in records],
                          [7,10,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
@@ -311,14 +325,14 @@ class StatusRows(list):
                 table.append(_line(r[0]+': '+node['error'],width))
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
-        sections=[('设备资源 | RAM GiB | 算力 Miter/s',table,0)]
+        sections=[('设备资源 | 已用/预算(逻辑) | RAM GiB'+(' | Miter/s' if width>=100 else ''),table,0)]
         if width>=100:
-            details=_table(['设备','单/总','进程RAM/预留','设备IP','网络'],
+            details=_table(['设备','单/总','进程/预留','设备IP','网络'],
                            [[r[0],r[7],r[5],r[9],
                              _network_text(node.get('network'))] for node,r in self.devices],
                            [7,11,9,15,None],width,right=(1,2,3,4))
         elif width>=54:
-            details=_table(['设备','单/总','进程RAM/预留','设备IP'],
+            details=_table(['设备','单/总','进程/预留','设备IP'],
                            [[r[0],r[7],r[5],r[9]] for _,r in self.devices],
                            [7,11,9,None],width,right=(1,2,3))
         else:

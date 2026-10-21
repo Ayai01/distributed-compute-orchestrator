@@ -441,8 +441,13 @@ class ConsoleTests(unittest.TestCase):
                ('RGCN','rgcn-tsa-pre','RGCN','TSA pre'),
                ('RGCN','RGCN/tsa/nn-prev/s42','RGCN','TSA/nn-prev/s42'),
                ('Analog-Opt-Bench','Analog/class_ab/FACE-MO/b96000','Bench','class_ab/FACE-MO/b96k'),
+               ('Analog-Opt-Bench','Analog/panda-bookshelf_tall-0005/3x12000=36000 NFE budget','Bench','bookshelf_tall#5/3x12k'),
+               ('Analog-Opt-Bench','Analog/panda-cage-0003/3x48000=144000 NFE budget','Bench','cage#3/3x48k'),
+               ('Analog-Opt-Bench','Analog/native-mw11/6x12000=72000 NFE budget','Bench','native-mw11/6x12k'),
                ('AOP','aop/ngspice/LDO_SKY130_SSFF_m40_p125_4corners/ss125','AOP','LDO/ss125'),
                ('ARH-DSE','ARH-DSE/mac','ARH','mac'),
+               ('ARH-DSE','BOOM NCNN unrolled native gate','ARH','BOOM NCNN 展开验收'),
+               ('ARH-DSE','BOOM NCNN native gate','ARH','BOOM NCNN 原生验收'),
                ('yolov8-quant-lab','YOLO/integer-range-and-cost','YOLO','INT4 range/cost'),
                ('RGCN','RGCN','RGCN','-')]
         for project,label,source,description in cases:
@@ -450,6 +455,23 @@ class ConsoleTests(unittest.TestCase):
             self.assertEqual((_project(project),_label(job)),(source,description))
             self.assertEqual(job['label'],label)
             self.assertLessEqual(_width(description),26)
+
+    def test_resource_headers_and_parent_labels_fit_without_midword_elision(self):
+        job=dict(id='abcd'+'f'*28,project='Bench',cpus=1,memory_mb=1024,status='running',
+                 label='Analog/panda-bookshelf_tall-0005/3x12000=36000 NFE budget')
+        value=dict(role='scheduler',node='Aya1-PC',cpus=14,used_cpus=1,projects={},
+                   nodes=[dict(name='Aya1-PC',capacity=14,logical_cpus=28,active_jobs=[job])])
+        for width in (54,56,80,100,110,120,160,200):
+            with self.subTest(width=width):
+                rows=format_status(value,width=width).fit(42)
+                text='\n'.join(rows)
+                self.assertIn('进程/预留',text)
+                self.assertIn('已用/预算(逻辑)',text)
+                self.assertNotIn('进程...留',text)
+                self.assertNotIn('已用...辑)',text)
+                self.assertTrue(all(_width(row)==width for row in rows))
+                if width>=100:self.assertIn('bookshelf_tall#5/3x12k',text)
+        self.assertEqual(job['label'],'Analog/panda-bookshelf_tall-0005/3x12000=36000 NFE budget')
 
     def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):
         jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label='very-long-circuit-name/'*6+f'seed-{i}',

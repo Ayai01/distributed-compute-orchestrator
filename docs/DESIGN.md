@@ -329,6 +329,8 @@ Windows 外部任务 TMP 设置与输入相同的低完整性写入标签，父�
 
 看板宽度达到 120 列时左侧资源/份额、右侧逐任务，窄窗改上下分区；每任务独立一行，4位ID仅作展示。底部固定用法/候选/分隔/输入四行，极矮窗口优先输入。使用真实视口高度、ASCII 边框、实际字符单元宽度，按绝对坐标只画变化行。Windows 经典控制台启动尝试 160×50，并尊重屏幕上限、已有大窗口及 ConPTY 宿主尺寸。
 
+资源列用完整短表头“已用/预算”“进程/预留”，逻辑线程含义与 GiB 单位放在面板标题。任务表仅压缩显示：Bench 父标签保留场景编号和每项预算，如 `bookshelf_tall#5/3x12k`，不重复显示乘积总预算；ARH 原生门禁使用短描述。原任务标签及请求保持，通过 `jobs ID` 查看完整记录。
+
 Windows 的 CPU 校准缓存身份通过本机注册表和 `GetNativeSystemInfo` 读取，终端可见性与焦点识别共用 Toolhelp 进程快照。两条启动路径不查询 WMI，避免 Python 3.14 的 `platform.machine()` 或 PowerShell CIM 等待阻塞初始化与首帧；架构名称保持与已有校准缓存一致。
 
 托管父进程和服务子进程各自持有防休眠请求，覆盖子进程重载边界。Windows 使用 `PowerCreateRequest` 持有 SystemRequired/ExecutionRequired，操作员可用 `powercfg /requests` 核对具名 DCO 原因；Linux 的 systemd-logind 环境使用 `systemd-inhibit --what=idle --mode=block`，由随上下文退出的标准输入管道管理辅助进程。异常路径归还已取得的请求与句柄，显示器不要求常亮，一次性客户端操作不持有抑制请求。
