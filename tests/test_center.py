@@ -345,6 +345,31 @@ class CenterTests(unittest.TestCase):
                         self.assertEqual(client.fetch(identity)['stdout'].strip(),'42')
                     until(lambda:pool.nodes[0].reserved==0)
 
+    def test_late_lease_answer_preserves_the_original_failed_outcome(self):
+        code=("import os,sys\nsys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\n"
+              "from remote_compute import Client\n"
+              "Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],timeout=.1).resize("
+              "os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n")
+        with scratch() as root,provider(Path(root)/'worker',memory_mb=1024) as (worker,remote), \
+                Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client):
+            original=state.resize
+            def delayed(identity,*args,**kwargs):
+                until(lambda:worker.get(identity)['status']=='failed')
+                return original(identity,*args,**kwargs)
+            with patch.object(state,'resize',side_effect=delayed):
+                identity=client.submit(python(code,memory_mb=400))['id']
+                outcome=client.wait(identity,wait_timeout=5)
+            self.assertEqual(outcome['status'],'failed',outcome)
+            self.assertEqual(outcome['attempts'],[])
+            self.assertEqual(remote.status(identity)['status'],'failed')
+            self.assertEqual(remote.request('/jobs/'+identity+'/lease',
+                dict(request_id=1,grant=dict(cpus=99,memory_mb=999))),dict(accepted=True))
+            self.assertEqual(remote.status(identity)['cpus'],1)
+            result=client.fetch(identity)
+            self.assertEqual(result['steps'][0]['returncode'],1)
+            self.assertIn('timed out',result['stderr'])
+            until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
+
     def test_overlapping_node_sets_have_feasible_project_targets_and_admission(self):
         with scratch() as root,provider(Path(root)/'pc',cpus=2,tags=['physical_profile_a']) as (_,pc), \
                 provider(Path(root)/'tx',cpus=6,tags=['physical_profile_a']) as (_,tx), \

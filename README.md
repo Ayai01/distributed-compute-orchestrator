@@ -77,7 +77,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `sync_cache all` / `sync_cache arh --kind research` | 手动增量同步，详见下节 |
 | `wait` / `quit` | 等待本终端后台操作 / 退出 |
 
-任务表的Tag保留对象、阶段/方法和必要预算，例如 `AB-warm/4alg/b24k`、`fold-open/FACE/b12k`、`FSA/train/PVT/phy0`、`Rocket/prep`。工程、CPU和任务ID已有单独列，Tag不重复这些字段或长句；完整原标签继续由 `jobs ab12` 明细、API和回执保存。
+任务Tag保留对象、方法/阶段和必要预算，例如 `TSA s06 FIBER 12k`、`AB warm 4alg`、`Rocket prep`。seed可只显示后两位；工程、CPU和ID使用各自列。缩写只影响展示，完整seed、原标签、输入与科学身份继续由 `jobs ab12`、API和回执保存。
 
 设备名换成 `nodes` 的实际名称，也可用 `#编号`。任务支持唯一的至少四位 ID 前缀，API 使用完整 ID。`memory` 无单位为 MiB，`8G/8GB/8GiB` 均为 8 GiB，0 自动预算。`set limit` 限制本中心派发量，`cpus` 修改提供者总预算。
 
@@ -181,7 +181,7 @@ GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行�
 
 已验证工具可用操作员 `center.control(node=名称, worker={"tools": {别名: [可执行路径]}})` 在线登记，None 移除；后续任务用新别名。该操作更新运行进程，部署同时更新设备 `worker.local.json` 以便重载。临时能力验收后再登记正式别名。
 
-ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不含哈希、设备或 OS 选择条件；注册和准入会拒绝这类名称。能力与执行引擎不生成或保存哈希，科研回执和科学缓存也不记录引擎哈希。数值兼容性使用明文引擎族/主版本、执行协议、测量协议和容差；源码、模型与输入包仍按内容复用和验证完整性。
+ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不含哈希、设备或 OS 选择条件；注册和准入会拒绝这类名称。能力与执行引擎不生成或保存哈希，科研回执和科学缓存也不记录引擎哈希。数值兼容性使用明文引擎族/主版本、执行协议、测量协议和容差；源码（含生成RTL）、模型与输入包仍按内容复用和验证完整性。
 
 看板短表头：`CPU U/B` 为已用/预算逻辑线程，`RAM U/T` 为主机已用/总内存，`Avail` 为可分配内存，`RSS/Res` 为进程实际/已预留内存，`1T/All` 为单线程/总基准，`Share/Pri` 为份额/优先级，`Jobs/CPU` 为任务/线程，`Sec` 为运行秒数。
 

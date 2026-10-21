@@ -513,13 +513,15 @@ class Worker:
         """A task asks locally; the center answers through its existing poll."""
         with self.condition:
             job=self.jobs[identity]
-            if job['result']['status']!='running':raise Conflict('Only a running task can request resources')
             if 'request_id' in request:
+                # An answer may arrive after the requesting process finished.
+                # Acknowledge it without replacing that task's real outcome.
                 current=job['result'].get('resource_request')
-                if current and current['request_id']==request['request_id']:
+                if job['result']['status']=='running' and current and current['request_id']==request['request_id']:
                     job['resource_reply']=request
                     self.condition.notify_all()
                 return {'accepted':True}
+            if job['result']['status']!='running':raise Conflict('Only a running task can request resources')
             if job.get('callback',{}).get('mode')!='poll':raise Conflict('Task is not owned by a polling center')
             if 'resource_request' in job['result']:raise Conflict('A resource request is already pending')
             serial=job['lease_serial']=job.get('lease_serial',0)+1
@@ -528,6 +530,7 @@ class Worker:
             try:
                 while 'resource_reply' not in job:
                     if self.stopping or job['cancel'].is_set():raise Conflict('Worker is stopping')
+                    if job['result']['status']!='running':raise Conflict('Task finished before resource reply')
                     remaining=deadline-time.monotonic()
                     if remaining<=0:raise Conflict('Center resource reply timed out; existing grant retained')
                     self.condition.wait(min(remaining,.5))
