@@ -200,6 +200,8 @@ print(result["status"], result["cpus"])
 
 ### 同步内核在阶段边界借还资源
 
+全中心 `control(paused=True)` 只暂停新任务派发，已运行任务仍可按原 ID 在安全边界 `resize`；节点 worker 的 `paused` 则同时限制该节点增长。全中心暂停影响所有工程的新增派发，接口自身没有 TTL 或窗口所有权；临时维护执行方负责计时、记录原暂停状态并在结束或异常时恢复。公平份额、实际可用 CPU 和 RAM 准入始终有效。
+
 已确认的自动阶段增长需求若因满载只得到部分授予，后续派发为其保留节点公平份额内新释放的空核，避免空核持续被其它排队任务重新借走。计算保护量时沿用同工程就绪任务分配和原阶段内存模型；较高优先级任务仍可派发，内存不足的增长不锁住空核。降低需求、取消或结束后立即解除保护。保护不修改活动池或 worker 授予，调用工程在下一次池已关闭的安全边界通过原 ID 的 `resize` 领取；这些空核在领取前可暂时空闲。
 
 worker 任务环境提供 `REMOTE_COMPUTE_URL`、`REMOTE_COMPUTE_JOB_ID`、`REMOTE_COMPUTE_TOKEN`、`REMOTE_COMPUTE_HOME`，支持时 `REMOTE_COMPUTE_RESIZE=1`。SDK 使用执行设备的 DCO 包；远端请求先到本机 worker 的 lease 接口，再由中心的既有轮询连接转交授权。SDK 根据 `REMOTE_COMPUTE_LEASE` 和 worker 任务 ID 路由，调用工程直接使用下面的 Client 接口。中心仅监听回环时，已配置 worker 仍可通过这条单向通路借还资源。

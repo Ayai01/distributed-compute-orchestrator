@@ -183,6 +183,34 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_global_pause_blocks_dispatch_but_allows_existing_phase_growth(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
+            with center(pool,Path(root)/'center') as (_,client):
+                hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+                active=client.submit(python(hold,cpus=0,memory_mb=64,project='A'))['id']
+                until(lambda:client.status(active)['status']=='running')
+                before=client.status(active)
+                self.assertEqual(client.resize(active,1)['cpus'],1)
+                was_paused=client.health()['paused']
+                try:
+                    client.control(paused=True)
+                    waiting=client.submit(python(hold,cpus=1,memory_mb=64,project='B'))['id']
+                    reply=client.resize(active,2,base_memory_mb=64,memory_per_cpu_mb=32)
+                    self.assertEqual((reply['cpus'],reply['memory_mb']),(2,128))
+                    time.sleep(.15)
+                    self.assertEqual(client.status(waiting)['status'],'queued')
+                    after=client.status(active)
+                    self.assertEqual(after['status'],'running')
+                    self.assertEqual(after['started'],before['started'])
+                    self.assertEqual(after['request_sha256'],before['request_sha256'])
+                    self.assertEqual(pool.nodes[0].capacity,4)
+                    self.assertFalse(pool.nodes[0].health.get('paused',False))
+                finally:
+                    client.control(paused=was_paused)
+                until(lambda:client.status(waiting)['status']=='running')
+                for identity in (active,waiting):
+                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+
     def test_freed_cpu_waits_for_running_phase_growth_before_lending_again(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
             with center(pool,Path(root)/'center') as (state,client):
