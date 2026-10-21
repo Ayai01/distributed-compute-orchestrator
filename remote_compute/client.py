@@ -681,7 +681,11 @@ class Pool:
 
     def refresh(self, *, monitor=False, nodes=None, timeout=None):
         # A slow/offline worker never stalls another worker's CPU or lease sample.
-        selected = self.nodes if nodes is None else nodes
+        selected = list(self.nodes if nodes is None else nodes)
+        if nodes is None:
+            # Disabled hosts still drain accepted jobs, then stop background
+            # probes. Explicit maintenance refreshes keep their direct path.
+            selected = [node for node in selected if node.enabled or node.live_jobs or node.reserved or node.external]
         with self.refresh_lock:
             for node in selected:
                 pending=self.probe_futures.get(node.name)

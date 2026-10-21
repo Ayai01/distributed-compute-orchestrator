@@ -81,7 +81,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 
 设备名换成 `nodes` 的实际名称，也可用 `#编号`。任务支持唯一的至少四位 ID 前缀，API 使用完整 ID。`memory` 无单位为 MiB，`8G/8GB/8GiB` 均为 8 GiB，0 自动预算。`set limit` 限制本中心派发量，`cpus` 修改提供者总预算。
 
-单设备独立验收先记录节点的启用状态和预算，用`set 节点 enabled=false`停止该中心的新派发，等待该节点`reserved=0`且`active_jobs`为空。已有任务、原ID、回执和其他节点继续保留；不用退出服务来排空。HTTP/TLS节点可通过已有操作员worker连接执行隔离测试，hybrid本机在排空后使用本机独立测试进程。恢复时先收齐测试输出、清理本次任务并恢复设备预算，刷新中心节点健康，最后`set 节点 enabled=true`。脚本用`control(node=名称,routing={"enabled":False/True})`并在finally恢复原状态；禁用路由后不再通过同一中心向该节点提交维护任务。
+单设备独立验收先记录节点的启用状态和预算，用`set 节点 enabled=false`停止该中心的新派发，等待该节点`reserved=0`且`active_jobs`为空。已有任务、原ID、回执和其他节点继续保留；不用退出服务来排空。HTTP/TLS节点可通过已有操作员worker连接执行隔离测试，hybrid本机在排空后使用本机独立测试进程。禁用且已排空的节点停止周期健康探测，并从生产看板与通知中隐藏；设备配置仍保留，`set 节点 enabled=true` 后恢复发现，显式设备维护查询继续可用。恢复时先收齐测试输出、清理本次任务并恢复设备预算，刷新中心节点健康，最后`set 节点 enabled=true`。脚本用`control(node=名称,routing={"enabled":False/True})`并在finally恢复原状态；禁用路由后不再通过同一中心向该节点提交维护任务。
 
 Tab 在空输入时显示根命令候选，有输入时补全；Ctrl+Tab 翻任务页，空输入 Shift+Tab 反向翻页，PgUp/PgDn 翻输出，↑/↓ 选历史，Esc/Ctrl+C 清空输入，Enter 执行。补全只读当前快照。看板聚焦每秒刷新、失焦每 5 秒刷新；任务运行秒数从实际执行开始，线程预留与 CPU 使用率分列。
 

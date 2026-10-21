@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | TSA并发与单设备隔离 | 三机完成20个滚动观测点，1787个真实corner；排空尾部独立计时，原生产任务保留、节点恢复；CPU满线程可接近满载 | `results/tsa-pool-scaling-20261021/report.html`、`scaling.csv`、`isolation-ledger.json` |
 | ITX部署与真实执行 | 标准worker、24逻辑CPU；科学/神经/ONNX、真实TSA、原生RTL编译运行、SKY130几何及8GiB物理RAM盘均通过，按用户最新确认保存8核，现排空下线 | `itx-onboarding-current.json`、`.local/maintenance/itx-real-canary/`、`itx-sky130-geometry/` |
-| 八字符设备名 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；看板与隔离针对性回归41项通过。运行中的看板在自然空闲重载时加载 | `tests/test_console.py`、`tests/test_center.py` |
+| 八字符设备名 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；看板、隔离与离线节点针对性回归44项通过。运行中的看板在自然空闲重载时加载；禁用且排空的设备停止后台探测并隐藏，仍在排空的任务保持可见 | `tests/test_console.py`、`tests/test_center.py` |
 | 能力、工具模板、缓存消费者及混合版本 | 全量401项：397通过、4项环境跳过；原ID与数值保持 | `.local/maintenance/capability-unification-release-full.log`；`capability-profiles-live-proof.json` |
 | 规范能力部署与真实供给 | 三机自然空闲重载，60核授予及真实排队通过；Make联合要求60核 | `capability-idle-reload.json`、`capability-unification-after-reload.json`、`make-unification-admission.json` |
 | 启动、独立服务、重载 | 35项：34通过、1项环境跳过；headless与看板开关独立 | `.local/maintenance/headless-startup-lifecycle.log`；`headless-policy-deployment-jobs.json` |

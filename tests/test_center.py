@@ -183,6 +183,32 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_disabled_idle_node_stops_probes_but_draining_and_maintenance_refresh_work(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, worker):
+            with patch.object(worker, 'health', wraps=worker.health) as probe:
+                with Pool([dict(name='sleeping',client=worker,enabled=False)],refresh=.02) as pool:
+                    node=pool.nodes[0]
+                    time.sleep(.08)
+                    self.assertEqual(probe.call_count,0)
+                    pool.refresh(nodes=[node])
+                    self.assertEqual(probe.call_count,1)
+                    with pool.condition:
+                        node.live_jobs.add('accepted-job')
+                    until(lambda:probe.call_count>1)
+                    with pool.condition:
+                        node.live_jobs.clear()
+                    pool.refresh_lock.acquire()
+                    try:
+                        pending=pool.probe_futures.get(node.name)
+                        if pending is not None:pending.result()
+                        before=probe.call_count
+                    finally:
+                        pool.refresh_lock.release()
+                    time.sleep(.08)
+                    self.assertEqual(probe.call_count,before)
+                    pool.configure('sleeping',enabled=True)
+                    until(lambda:probe.call_count>before)
+
     def test_single_node_isolation_drains_keeps_receipts_and_maintenance_path(self):
         hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)\nprint('original-result')"
         with scratch() as root,provider(Path(root)/'one',cpus=1) as (_,one), \

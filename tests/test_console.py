@@ -317,6 +317,26 @@ class ConsoleTests(unittest.TestCase):
         for i in range(14,20):
             self.assertIn(f'log {i}','\n'.join(rows))
 
+    def test_disabled_idle_device_is_hidden_but_draining_device_stays_visible(self):
+        from remote_compute.view import format_notices
+        asleep=dict(name='Aya1-ITX',enabled=False,reserved=0,external_cpus=0,
+                    active_jobs=[],error='closed without response',
+                    events=[dict(time=1,ip='terminal',message='CPU budget 8')])
+        value=dict(role='scheduler',node='Aya1-PC',cpus=16,nodes=[
+            dict(name='Aya1-TX',enabled=True,capacity=24,logical_cpus=32),asleep])
+        for width in (54,80,110):
+            text='\n'.join(format_status(value,width=width))
+            self.assertIn('Aya1-TX',text)
+            self.assertNotIn('Aya1-ITX',text)
+            self.assertNotIn('without response',text)
+        self.assertFalse(format_notices(value))
+        for state in (dict(reserved=1),dict(external_cpus=1),dict(active_jobs=[dict(
+                id='accepted',cpus=1,memory_mb=64,status='running')]),dict(enabled=True)):
+            draining={**asleep,**state}
+            current={**value,'nodes':[draining]}
+            self.assertIn('Aya1-ITX','\n'.join(format_status(current,width=110)))
+            self.assertTrue(format_notices(current))
+
     def test_direct_device_shows_public_ip(self):
         value=dict(role='scheduler',node='Aya1-PC',nodes=[
             dict(name='Server',url='https://203.0.113.42:26133',

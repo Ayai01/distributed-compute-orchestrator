@@ -276,6 +276,11 @@ def _label(job):
     return '/'.join(parts[-2:]) or job.get('label','-')
 
 
+def _show_node(node):
+    return (node.get('enabled', True) or node.get('reserved', 0)
+            or node.get('external_cpus', 0) or node.get('active_jobs'))
+
+
 class StatusRows(list):
     def __init__(self, value, url='', width=110):
         self.value,self.url,self.width = value,url,max(20,width)
@@ -301,6 +306,8 @@ class StatusRows(list):
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
         self.devices,self.jobs=[],[]
         for number,node in enumerate(nodes,1):
+            if not _show_node(node):
+                continue
             name=node.get('node') or node.get('name') or '-'
             allocated=(node.get('reserved',0)+node.get('external_cpus',0) if 'reserved' in node else node.get('used_cpus',0))
             threads=f"{allocated}/{node.get('capacity',0)}({node.get('logical_cpus','?')})"
@@ -487,6 +494,8 @@ def format_notices(value):
     notices={}
     sources=[value]+list(value.get('nodes') or [])
     for source in sources:
+        if source is not value and not _show_node(source):
+            continue
         name=source.get('node') or source.get('name') or '-'
         for event in source.get('events') or []:
             message=event['message']
