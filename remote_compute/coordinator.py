@@ -869,14 +869,18 @@ class Coordinator:
                 previous_desired=job.get('desired_cpus')
                 job['desired_cpus']=desired
                 granted=desired
-                if desired>old or cpus==0:
+                cooperative=cpus==0 or job.get('auto_cpus',False)
+                # Automatic jobs may report a finite useful phase width.
+                # Repeating that width is still a drained boundary; returning
+                # to one CPU stays cheap for synchronous microkernels.
+                if desired>old or cpus==0 or (cooperative and desired>1):
                     resources=self.project_resources();group=job['task'].get('project') or 'default'
                     target=resources[group]['target']
                     room=target-resources[group]['used']+old
                     available=node.capacity-node.reserved-node.external+old
-                    floor=1 if cpus==0 else old
+                    floor=1 if cooperative else old
                     granted=max(floor,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
-                    if cpus==0 and node.enabled and not node.health.get('paused'):
+                    if cooperative and node.enabled and not node.health.get('paused'):
                         granted=min(granted,self._cooperative_cpu_target(identity,desired,resources))
                 granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
                     old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))

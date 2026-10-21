@@ -240,7 +240,9 @@ class CenterTests(unittest.TestCase):
                 until(lambda:client.status(first)['status']=='running')
                 second=client.submit(python(hold,project='B',cpus=0,memory_mb=64))['id']
                 self.assertEqual(client.status(first)['cpus'],4)
-                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],4)
+                # Arrival alone keeps the running pool intact. Its next
+                # drained finite request participates in project fairness.
+                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],2)
                 grant=client.resize(first,0,memory_mb=64)
                 self.assertEqual(grant['cpus'],2)
                 until(lambda:client.status(second)['status']=='running')
@@ -402,6 +404,29 @@ class CenterTests(unittest.TestCase):
                     client.cancel(identity);client.wait(identity);client.fetch(identity)
                 self.assertEqual(client.resize(first,0)['cpus'],4)
                 client.cancel(first);client.wait(first);client.fetch(first)
+                until(lambda:pool.nodes[0].reserved==0)
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_finite_phase_demand_from_auto_job_yields_to_ready_fixed_work(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                active=client.submit(python('import time;time.sleep(30)',cpus=0,project='RGCN'))['id']
+                until(lambda:client.status(active)['status']=='running')
+                self.assertEqual(client.status(active)['cpus'],4)
+                before=client.status(active)['request_sha256']
+                waiting=client.submit(python('import time;time.sleep(30)',cpus=3,project='RGCN'))['id']
+                # RGCN reports the useful width at a drained native boundary,
+                # including when it equals the previous phase's grant.
+                grant=client.resize(active,4,base_memory_mb=64,memory_per_cpu_mb=32)
+                self.assertEqual((grant['cpus'],grant['requested_cpus']),(1,4))
+                until(lambda:client.status(waiting)['status']=='running')
+                self.assertEqual(pool.nodes[0].reserved,4)
+                client.cancel(waiting);client.wait(waiting);client.fetch(waiting)
+                # A finite useful width remains an upper bound after the peer
+                # finishes; it does not request the whole node like cpus=0.
+                self.assertEqual(client.resize(active,2)['cpus'],2)
+                self.assertEqual(client.status(active)['request_sha256'],before)
+                client.cancel(active);client.wait(active);client.fetch(active)
                 until(lambda:pool.nodes[0].reserved==0)
                 self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 

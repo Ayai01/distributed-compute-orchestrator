@@ -211,7 +211,7 @@ finally:
     center.resize(identity, 1, memory_mb=resident_ram_mb)
 ```
 
-`resize` 保留原任务ID和输入摘要，返回 `id/cpus/memory_mb/requested_cpus`。增长受工程权重、任务 `max_cpus`、当前可用线程和RAM约束；调用方始终使用实际 `cpus`。可选 `memory_mb` 在同一请求中调整内存预留，例如编译结束、子进程退出后 `center.resize(identity, 1, memory_mb=512)`。内存准入失败返回409并保留原CPU/内存授予；实际RSS仍参与准入，降低申报不隐藏真实占用。两端声明 `resize_memory` 能力后使用联合调整，旧节点返回 `supported=False` 并保留原授予。同步批次结束后才归还，异步 pending 期间维持固定授予。BLAS 内层保持1，避免与外层并行相乘。worker 与中心同步计账，取消、异常和完成均按最后授予释放；回执保留 `initial_cpus/peak_cpus/resize_count`。旧节点未声明 resize 能力时继续原授予。
+`resize` 保留原任务ID和输入摘要，返回 `id/cpus/memory_mb/requested_cpus`。增长受工程权重、任务 `max_cpus`、当前可用线程和RAM约束；调用方始终使用实际 `cpus`。初始以 `cpus=0` 提交的自动任务，在已排空阶段申报正整数有用并行量时也参与同工程公平分配；重复当前线程数仍重新分配，申报值保持上限，归还到1核走直接路径。初始固定线程任务保留其显式调整语义。可选 `memory_mb` 在同一请求中调整内存预留，例如编译结束、子进程退出后 `center.resize(identity, 1, memory_mb=512)`。内存准入失败返回409并保留原CPU/内存授予；实际RSS仍参与准入，降低申报不隐藏真实占用。两端声明 `resize_memory` 能力后使用联合调整，旧节点返回 `supported=False` 并保留原授予。同步批次结束后才归还，异步 pending 期间维持固定授予。BLAS 内层保持1，避免与外层并行相乘。worker 与中心同步计账，取消、异常和完成均按最后授予释放；回执保留 `initial_cpus/peak_cpus/resize_count`。旧节点未声明 resize 能力时继续原授予。
 
 DCO负责跨工程份额、CPU/内存准入、实际授予和原ID资源账本；调用工程负责判断是否有可伸缩内核，并在并行池/子进程已收齐的安全边界借还。YOLO包审计默认每包1CPU；对约50毫秒的串行尾段增加线程会增加通信和调度开销，较大通道块才按实测启用多核。Rocket/BOOM可在编译结束后按实际仿真并发和DDR规模同时收缩CPU/内存，ARH常驻池保持初始授予直到池关闭。工程资源配置不参与科学结果缓存身份。
 
