@@ -17,7 +17,7 @@ from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
-                     aggregate_accelerators, canonical_capabilities)
+                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
@@ -47,6 +47,8 @@ class Coordinator:
         self.callback_address = None
         for path in (self.root / "jobs").glob("*/result.json"):
             value = json.loads(path.read_text(encoding="utf-8"))
+            if clean_tool_snapshot(value):
+                atomic_json(path, value)
             job = {"result": value, "directory": path.parent,
                    "cancel": threading.Event(), "node": None}
             self.jobs[value["id"]] = job
@@ -816,6 +818,7 @@ class Coordinator:
                     if node.asset_session==session:node.known_assets.add(asset)
 
     def _update(self, job, remote):
+        clean_tool_snapshot(remote)
         if 'resource_request' not in remote:job['result'].pop('resource_request',None)
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ('id',"assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}

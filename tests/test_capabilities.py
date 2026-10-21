@@ -13,10 +13,45 @@ from unittest.mock import patch
 from remote_compute import setup_tools
 from remote_compute.cli import main
 from remote_compute.worker import Worker
+from remote_compute.policy import canonical_capabilities, clean_tool_snapshot
 from test_compute import provider, scratch
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_restored_receipts_drop_engine_hashes_and_retired_aliases(self):
+        value=dict(id='original',tools={'ng47_sha256_'+'x'*43:dict(available=True),
+                   'ngspice47':dict(available=True,sha256='old',supporting_sha256={'engine':'old'})},
+                   attempts=[dict(tools={'python':dict(available=True,sha256='old')})])
+        self.assertTrue(clean_tool_snapshot(value))
+        self.assertEqual(value,dict(id='original',tools={'ng47':dict(available=True)},
+                                   attempts=[dict(tools={'python':dict(available=True)})]))
+        self.assertFalse(clean_tool_snapshot(value))
+
+    def test_capabilities_reject_engine_hashes_and_platform_selectors(self):
+        for name in ('ng47_sha256_'+'x'*43, 'engine_hash_1234', 'tool_'+('a'*64),
+                     'win32', 'linux', 'runtime_windows', 'ng47_sha-256_x', 'ng47_sha_256_x',
+                     'linux64', 'win10', 'ubuntu', 'x86_64', 'aarch64'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'semantic tool names'):
+                canonical_capabilities([name])
+        self.assertEqual(canonical_capabilities(['ngspice47','ng47','rgcn_python_linux']),
+                         ['ng47','rgcn_python'])
+
+    def test_tool_probe_does_not_hash_or_read_executable_contents(self):
+        worker=Worker.__new__(Worker);worker.env={}
+        with patch('hashlib.sha256',side_effect=AssertionError('engine hash generated')), \
+                patch.object(Path,'read_bytes',side_effect=AssertionError('engine contents read')):
+            tools,info=worker._probe_tools({'python':sys.executable})
+        self.assertEqual(set(info['python']),{'argv','available'})
+        self.assertTrue(info['python']['available'])
+        with self.assertRaisesRegex(ValueError,'semantic tool names'):
+            worker._probe_tools({'ng47_sha256_'+'x'*43:sys.executable})
+        with self.assertRaisesRegex(ValueError,'semantic tool names'):
+            worker._probe_tools({'rgcn_python_linux':sys.executable})
+
+    def test_worker_does_not_publish_operating_system_as_capability(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (worker,_):
+            self.assertNotIn(sys.platform,worker.health()['tags'])
+
     def test_removed_tool_clears_canonical_tag_and_readd_restores_it(self):
         with scratch() as directory:
             with provider(Path(directory)/'worker', tools={'ngspice47': sys.executable},

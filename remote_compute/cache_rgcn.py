@@ -6,6 +6,9 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import sys
+import types
+import uuid
 import zlib
 
 _CIRCUIT = r'[A-Za-z0-9][A-Za-z0-9_-]*'
@@ -15,10 +18,22 @@ _VERSION = 'native-circuit-dataset-v1'
 
 
 def _api(root):
+    package_name = '_dco_rgcn_' + uuid.uuid4().hex
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(Path(root) / 'src')]
+    sys.modules[package_name] = package
     spec = importlib.util.spec_from_file_location(
-        '_dco_rgcn_dataset_store', str(Path(root) / 'src' / 'dataset_store.py'))
+        package_name + '.dataset_store', str(Path(root) / 'src' / 'dataset_store.py'))
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        # Producer stores now share a relative payload codec. Keep imports
+        # isolated for each source root and release the temporary namespace.
+        for name in tuple(sys.modules):
+            if name == package_name or name.startswith(package_name + '.'):
+                sys.modules.pop(name, None)
     return module
 
 

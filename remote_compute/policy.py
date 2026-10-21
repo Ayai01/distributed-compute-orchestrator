@@ -6,6 +6,7 @@ from becoming a second placement API.
 """
 
 import math
+import re
 
 MAX_RESOURCE_SHARE = 16.0
 MAX_QUEUE_RATIO = 4.0
@@ -26,16 +27,50 @@ CAPABILITY_ALIASES = {
     'ngspice47': 'ng47',
     'onnx_cpu': 'onnx',
     'aop_hspice_python': 'aop-hs',
-    'rgcn_python_linux': 'rgcn-linux',
+    'rgcn_python_linux': 'rgcn_python',
+    'rgcn-linux': 'rgcn_python',
 }
 
+_IDENTITY_TAG = re.compile(
+    r'(?:^|[_:+.-])(?:sha[_-]?(?:1|224|256|384|512)|md5|hash|digest)(?:$|[_:+.-])'
+    r'|(?:^|[_:+.-])[0-9a-f]{32,}(?:$|[_:+.-])', re.I)
+_PLATFORM_TAG = re.compile(
+    r'(?:^|[_:+.-])(?:win\d*|windows\d*|linux\d*|darwin|macos|posix|nt|ubuntu|debian|centos|rhel|'
+    r'x86_64|amd64|aarch64|arm64)(?:$|[_:+.-])', re.I)
 
-def canonical_capability(value):
-    return CAPABILITY_ALIASES.get(str(value), str(value))
+
+def canonical_capability(value, *, registration=False):
+    name = CAPABILITY_ALIASES.get(str(value), str(value))
+    if (_IDENTITY_TAG.search(name) or _PLATFORM_TAG.search(name)
+            or registration and _PLATFORM_TAG.search(str(value))):
+        raise ValueError('Capabilities require semantic tool names, without hashes or platform selectors')
+    return name
 
 
 def canonical_capabilities(values):
     return sorted({canonical_capability(value) for value in (values or ())})
+
+
+def clean_tool_snapshot(result):
+    """Remove retired engine identities when loading durable task receipts."""
+    changed = False
+    if isinstance(result.get('tools'), dict):
+        tools = {}
+        for name, info in result['tools'].items():
+            try:
+                name = canonical_capability(name)
+            except ValueError:
+                continue
+            if isinstance(info, dict):
+                tools[name] = {key: value for key, value in info.items()
+                               if key in ('available', 'argv', 'engine', 'version', 'protocol')}
+        if tools != result['tools']:
+            result['tools'] = tools
+            changed = True
+    for attempt in result.get('attempts', ()):
+        if isinstance(attempt, dict):
+            changed = clean_tool_snapshot(attempt) or changed
+    return changed
 
 def normalize_accelerator_requirement(value):
     """Normalize one project accelerator request without exposing a device id."""

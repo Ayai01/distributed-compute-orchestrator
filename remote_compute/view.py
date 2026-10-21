@@ -126,7 +126,7 @@ def _short_capability(value):
     """Keep a custom capability readable without exposing project internals."""
     value=str(value)
     aliases={'aop_hspice_python':'AOP-HS','rgcn_python':'RGCN-Py','rgcn_train':'RGCN-ML',
-             'rgcn_python_linux':'RGCN-Linux','onnx_cpu':'ONNX-CPU','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
+             'rgcn_python_linux':'RGCN-Py','onnx_cpu':'ONNX-CPU','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
     return aliases.get(value, value)
 
 
@@ -312,11 +312,11 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['设备','已用/预算','CPU','单/总','RAM','可配','GPU','进程/预留'],
+            table=_table(['Node','CPU U/B','CPU%','1T/All','RAM U/T','Avail','GPU','RSS/Res'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
                          [11,10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
-            table=_table(['设备','已用/预算','CPU','RAM','可配'],[r[:5] for r in records],
+            table=_table(['Node','CPU U/B','CPU%','RAM U/T','Avail'],[r[:5] for r in records],
                          [7,10,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
@@ -325,25 +325,27 @@ class StatusRows(list):
                 table.append(_line(r[0]+': '+node['error'],width))
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
-        sections=[('设备资源 | 已用/预算(逻辑) | RAM GiB'+(' | Miter/s' if width>=100 else ''),table,0)]
+        sections=[('设备资源 | CPU U/B | RAM U/T GiB',table,0)]
         if width>=100:
-            details=_table(['设备','单/总','进程/预留','设备IP','网络'],
+            details=_table(['Node','1T/All','RSS/Res','IP','Net'],
                            [[r[0],r[7],r[5],r[9],
                              _network_text(node.get('network'))] for node,r in self.devices],
                            [7,11,9,15,None],width,right=(1,2,3,4))
         elif width>=54:
-            details=_table(['设备','单/总','进程/预留','设备IP'],
+            details=_table(['Node','1T/All','RSS/Res','IP'],
                            [[r[0],r[7],r[5],r[9]] for _,r in self.devices],
                            [7,11,9,None],width,right=(1,2,3))
         else:
             details=[_line(f'{r[0]} {r[7]} Miter/s',width) for r in records]
             details.extend(_line(f'#{r[10]} {r[0]} GPU {r[11]}',width) for r in records)
-            details.extend(_line(f'{r[0]} 进程RAM/预留 {r[5]} GiB | IP {r[9]}',width) for r in records)
-        sections.append(('启动基准 Miter/s | 进程RAM/预留 GiB',details,1))
+            for r in records:
+                details.append(_line(f'{r[0]} RSS/Res {r[5]} GiB',width))
+                details.append(_line(f'{r[0]} IP {r[9]}',width))
+        sections.append(('启动基准 1T/All Miter/s | RSS/Res GiB',details,1))
         if self.value.get('role')=='scheduler':
             if width>=42:
-                table=_table(['工程','权重','任务/线程','目标','排队'],self.projects,
-                             [None,4,9,4,4],width,right=(1,2,3,4))
+                table=_table(['Proj','Share','Jobs/CPU','Tgt','Q'],self.projects,
+                             [None,5,8,4,4],width,right=(1,2,3,4))
             else:
                 table=[_line(' '.join(map(str,r)),width) for r in self.projects]
             sections.append(('工程份额',table if self.projects else [_line('等待工程任务',width)],0))
@@ -391,18 +393,18 @@ class StatusRows(list):
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         records=[r if len(r)>7 else [*r,'-'] for r in records]
         if width>=110:
-            table=_table(['ID','设备','工程','份额/优先级','任务/线程','RAM','运行秒','状态','标签'],
+            table=_table(['ID','Node','Proj','Share/Pri','Jobs/CPU','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5,6)] for r in records],
                          [4,7,6,11,9,4,6,4,None],width,right=(3,4,5,6))
         elif width>=80:
-            table=_table(['ID','设备','工程','任务/线程','RAM','运行秒','状态','标签'],
+            table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
                          [4,7,6,9,4,6,4,None],width,right=(3,4,5))
         elif width>=54:
-            table=_table(['ID','设备','任务/线程','运行秒','标签'],[[r[i] for i in (0,1,3,7,6)] for r in records],
+            table=_table(['ID','Node','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,1,3,7,6)] for r in records],
                          [4,7,9,6,None],width,right=(2,3))
         elif width>=38:
-            table=_table(['ID','任务/线程','运行秒','标签'],[[r[i] for i in (0,3,7,6)] for r in records],
+            table=_table(['ID','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,3,7,6)] for r in records],
                          [4,9,6,None],width,right=(1,2))
         else:
             table=[_line('ID 任务/线程 运行秒 标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {r[6]}',width) for r in records]

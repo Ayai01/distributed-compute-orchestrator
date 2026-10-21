@@ -346,15 +346,15 @@ class CenterTests(unittest.TestCase):
                     until(lambda:pool.nodes[0].reserved==0)
 
     def test_overlapping_node_sets_have_feasible_project_targets_and_admission(self):
-        with scratch() as root,provider(Path(root)/'pc',cpus=2,tags=['windows_only']) as (_,pc), \
-                provider(Path(root)/'tx',cpus=6,tags=['windows_only']) as (_,tx), \
-                provider(Path(root)/'server',cpus=12,tags=['linux_only']) as (_,server):
+        with scratch() as root,provider(Path(root)/'pc',cpus=2,tags=['physical_profile_a']) as (_,pc), \
+                provider(Path(root)/'tx',cpus=6,tags=['physical_profile_a']) as (_,tx), \
+                provider(Path(root)/'server',cpus=12,tags=['physical_profile_b']) as (_,server):
             with Pool([pc,tx,server]) as pool,center(pool,Path(root)/'center') as (_,client):
                 client.control(paused=True)
                 tasks=[python('pass',project='ARH',node='node1'),
                        python('pass',project='ARH',cpus=0,node='node2'),
                        python('pass',project='Bench',cpus=0,max_cpus=2,node='node3')]
-                tasks += [python('pass',project='Bench',requires=['windows_only']) for _ in range(10)]
+                tasks += [python('pass',project='Bench',requires=['physical_profile_a']) for _ in range(10)]
                 identities=[client.submit(task)['id'] for task in tasks]
                 resources=client.health()['projects']
                 self.assertEqual({p:r['target'] for p,r in resources.items()},{'ARH':5,'Bench':5})

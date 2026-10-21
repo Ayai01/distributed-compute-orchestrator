@@ -332,7 +332,7 @@ class ConsoleTests(unittest.TestCase):
             dict(name='Aya1-TX',url='http://192.168.100.100:26133',capacity=30,
                  peers=[dict(ip='127.0.0.1'),dict(ip='192.168.1.6')])])
         text='\n'.join(format_status(value,width=159).fit(38))
-        self.assertIn('设备IP',text)
+        self.assertIn('IP',text)
         self.assertIn('192.168.100.100',text)
         self.assertNotIn('连接方向',text)
         self.assertNotIn('127.0.0.1',text)
@@ -465,13 +465,27 @@ class ConsoleTests(unittest.TestCase):
             with self.subTest(width=width):
                 rows=format_status(value,width=width).fit(42)
                 text='\n'.join(rows)
-                self.assertIn('进程/预留',text)
-                self.assertIn('已用/预算(逻辑)',text)
+                self.assertIn('RSS/Res',text)
+                self.assertIn('CPU U/B',text)
                 self.assertNotIn('进程...留',text)
                 self.assertNotIn('已用...辑)',text)
                 self.assertTrue(all(_width(row)==width for row in rows))
                 if width>=100:self.assertIn('bookshelf_tall#5/3x12k',text)
         self.assertEqual(job['label'],'Analog/panda-bookshelf_tall-0005/3x12000=36000 NFE budget')
+
+    def test_all_table_headers_remain_complete_at_each_layout_width(self):
+        import remote_compute.view as view
+        original=view._table
+        def checked(headers,*args,**kwargs):
+            rows=original(headers,*args,**kwargs)
+            for header in headers:self.assertIn(header,rows[0])
+            return rows
+        job=dict(id='abcd'+'f'*28,project='AOP',cpus=1,status='running',label='test')
+        value=dict(role='scheduler',node='Aya1-PC',projects={'AOP':dict(resource_share=1,used=1,target=2,queued=1)},
+                   nodes=[dict(name='Aya1-PC',capacity=14,active_jobs=[job])])
+        with patch.object(view,'_table',side_effect=checked):
+            for width in range(38,201):
+                with self.subTest(width=width):format_status(value,width=width).fit(50)
 
     def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):
         jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label='very-long-circuit-name/'*6+f'seed-{i}',
@@ -535,7 +549,7 @@ class ConsoleTests(unittest.TestCase):
                     status.task_page=page
                     rows=status.fit(22)
                     self.assertTrue(all(_width(row)==width for row in rows))
-                    self.assertIn('运行秒','\n'.join(rows))
+                    self.assertIn('Sec','\n'.join(rows))
                     for row in rows:
                         seen.extend(record[0] for record in status.records
                                     if any(prefix+record[0]+' |' in row for prefix in ('| ','+ ')))

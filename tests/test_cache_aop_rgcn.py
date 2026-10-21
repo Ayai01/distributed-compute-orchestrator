@@ -184,7 +184,9 @@ class RgcnCacheTests(Fixture):
         super().setUp()
         for root in (self.source, self.target):
             (root / 'src').mkdir()
-            shutil.copyfile(str(RGCN / 'src' / 'dataset_store.py'), str(root / 'src' / 'dataset_store.py'))
+            for name in ('dataset_store.py','dataset_payload.py'):
+                if (RGCN/'src'/name).is_file():
+                    shutil.copyfile(str(RGCN/'src'/name),str(root/'src'/name))
         self.api = cache_rgcn._api(self.source)
         self.signature = 'a' * 64
         self.legacy = 'b' * 64

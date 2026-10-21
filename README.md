@@ -157,23 +157,15 @@ python -B main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source
 python -B main.py --check
 ```
 
-setup 复用系统 Python 3.14，验证科学依赖后写本机 tools/env；Windows 原生工具放忽略的 `.tools/`。ngspice 可下载或复用，实际版本 47 才登记 ngspice47。RTL 从已有 MSYS2 提取 GCC/Verilator 闭包，保留标准库和必需运行依赖。Linux 直接配置已有 Python/ngspice/编译器；setup 的可移动工具链面向 Windows。
+setup 复用系统 Python 3.14，验证科学依赖后写本机 tools/env；Windows 原生工具放忽略的 `.tools/`。ngspice 可下载或复用，实际版本 47 才登记 ng47。RTL 从已有 MSYS2 提取 GCC/Verilator 闭包，保留标准库和必需运行依赖。Linux 直接配置已有 Python/ngspice/编译器；setup 的可移动工具链面向 Windows。
 
 工程别名为 `aop_python/rgcn_python/bench_python/arh_python`，训练单独登记已验证的 `rgcn_train`，ONNX CPU 使用验证过 OpenCV/ONNX Runtime/CPUExecutionProvider 的 `onnx_cpu`。GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行路径的调用方可协商 `accelerator_fallback`，具体请求和回执见 [DESIGN](docs/DESIGN.md#工程接口边界)；ARH 的 auto 使用30秒未派发队列阈值，显式 torch_cuda 保持强制GPU。`shared` 只登记真实部署目录，ARH 工具/模型及持久统计可通过 `shared:arh` 复用。Chisel/CIRCT/C++、CUDA 等按实际工具验证后登记。
 
 已验证工具可用操作员 `center.control(node=名称, worker={"tools": {别名: [可执行路径]}})` 在线登记，None 移除；后续任务用新别名。该操作更新运行进程，部署同时更新设备 `worker.local.json` 以便重载。临时能力验收后再登记正式别名。
 
-显式冻结 ngspice 数值引擎时，操作员先核验实际可执行文件的完整 SHA-256，再登记对应精确能力别名：
+ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不含哈希、设备或 OS 选择条件；注册和准入会拒绝这类名称。能力与执行引擎不生成或保存哈希，科研回执和科学缓存也不记录引擎哈希。数值兼容性使用明文引擎族/主版本、执行协议、测量协议和容差；源码、模型与输入包仍按内容复用和验证完整性。
 
-```python
-import base64
-
-engine_capability = 'ng47_sha256_' + base64.urlsafe_b64encode(
-    bytes.fromhex(engine_sha256)).decode('ascii').rstrip('=')
-center.control(node=名称, worker={'tools': {engine_capability: [可执行路径]}})
-```
-
-别名包含完整 256 位摘要，长度 55 字符，适用于现有 `requires` 长度限制。科研任务声明 `requires=['rgcn_train', 'ngspice47', engine_capability]`，由中心自动选择已登记该身份的兼容节点；科研 worker 在测量前再核验完整摘要，并在结果中记录实际身份。普通任务继续声明语义能力。运维登记与科研测量前复核分别负责兼容池和执行时身份，重载后由设备保存的工具配置恢复登记。
+看板短表头：`CPU U/B` 为已用/预算逻辑线程，`RAM U/T` 为主机已用/总内存，`Avail` 为可分配内存，`RSS/Res` 为进程实际/已预留内存，`1T/All` 为单线程/总基准，`Share/Pri` 为份额/优先级，`Jobs/CPU` 为任务/线程，`Sec` 为运行秒数。
 
 ## 部署到其他设备
 

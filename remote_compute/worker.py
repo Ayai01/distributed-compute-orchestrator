@@ -34,7 +34,8 @@ from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement,
-                     normalize_accelerators, aggregate_accelerators, canonical_capabilities)
+                     normalize_accelerators, aggregate_accelerators, canonical_capabilities,
+                     canonical_capability, clean_tool_snapshot)
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -211,6 +212,8 @@ class Worker:
         self.threads = set()
         for path in (self.root / "jobs").glob("*/result.json"):
             saved = json.loads(path.read_text(encoding="utf-8"))
+            if clean_tool_snapshot(saved):
+                atomic_json(path, saved)
             if saved["status"] not in TERMINAL:
                 saved.update(status="interrupted", finished=time.time(), error="Worker stopped before completion")
                 atomic_json(path, saved)
@@ -306,7 +309,7 @@ class Worker:
         # removals; a stale configured label must not restore a missing tool.
         tags = {tag for tag in self.configured_tags - self.tool_tags
                 if not tag.startswith('shared:')}
-        tags.update({sys.platform, *('shared:'+name for name in self.shared)})
+        tags.update('shared:'+name for name in self.shared)
         tags.update(canonical_capabilities(name for name, item in self.tool_info.items()
                                            if item['available']))
         if self.tool_info.get('verilator', {}).get('available'):
@@ -320,6 +323,7 @@ class Worker:
         search_path=self.env.get('PATH',os.environ.get('PATH',''))
         for name,argv in tools.items():
             if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_+.-]*',name):raise ValueError('Invalid tool name')
+            canonical_capability(name, registration=True)
             if not isinstance(argv,(str,list,tuple)):raise ValueError('Tool requires an argv prefix')
             argv=[argv] if isinstance(argv,str) else list(argv)
             if not argv or any(not isinstance(x,str) for x in argv):raise ValueError('Tool requires an argv prefix: '+name)
