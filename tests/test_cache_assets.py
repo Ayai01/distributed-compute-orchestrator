@@ -43,7 +43,7 @@ class CacheAssetTests(unittest.TestCase):
             models = [value for name,value in result.items() if name!='aop_code']
             self.assertEqual(len(models), 2)
             self.assertEqual({tuple(value['requires']) for value in models},
-                             {('aop_python','ngspice47'),('aop_python','hspice')})
+                             {('ng47','python_numpy'),('hspice','python_numpy')})
             expected = {model+'.lib':('.include "'+included+'.lib"\n').encode(),
                         included+'.lib':b'.model original\n'}
             for value in models:
@@ -78,11 +78,11 @@ class CacheAssetTests(unittest.TestCase):
             self.assertEqual(result['rgcn_native']['files'], native_files)
             self.assertEqual(result['rgcn_pdk']['files'], pdk_files)
             self.assertIs(result['rgcn_research_pdk']['files'], result['rgcn_pdk']['files'])
-            self.assertEqual(result['rgcn_research_pdk']['requires'], ['rgcn_train','ngspice47'])
+            self.assertEqual(result['rgcn_research_pdk']['requires'], ['ng47','python_torch_pyg'])
             self.assertEqual(set(result['rgcn_research']['files']), {
                 'src/current.py','configs/live.json','reference/current.spice',
                 'reference/retained.spice','tools/research_worker.py'})
-            self.assertEqual(result['rgcn_research']['requires'], ['rgcn_train'])
+            self.assertEqual(result['rgcn_research']['requires'], ['python_torch_pyg'])
             self.assertNotIn('configs/live.json', native_files)
 
     def test_bench_captures_original_named_source_and_static_groups(self):
@@ -98,7 +98,7 @@ class CacheAssetTests(unittest.TestCase):
         self.assertEqual(set(result), {'bench','bench_data'})
         self.assertEqual(pack(result['bench']['files']),pack(source))
         self.assertEqual(pack(result['bench_data']['files']),pack(static))
-        self.assertEqual(result['bench']['requires'], ['bench_python'])
+        self.assertEqual(result['bench']['requires'], ['python_scientific'])
         module._source_assets.assert_called_once()
 
     def test_arh_uses_existing_source_snapshot_without_copying_shared_tools(self):
@@ -108,7 +108,7 @@ class CacheAssetTests(unittest.TestCase):
             result=groups(Path.cwd(),'arh')
         module.files.assert_called_once_with(Path.cwd().resolve())
         self.assertEqual(result,{'arh_source':{
-            'files':files,'requires':['arh_python','shared:arh']}})
+            'files':files,'requires':['python_numpy','shared:arh']}})
 
     def test_unknown_project_does_not_import_or_scan_a_project(self):
         with patch('remote_compute.cache_assets.importlib.import_module') as imported:

@@ -8,6 +8,7 @@ import unicodedata
 from functools import lru_cache
 from urllib.parse import urlsplit
 from . import ABBREVIATION
+from .policy import canonical_capabilities
 
 
 _ambiguous_width = None
@@ -100,14 +101,14 @@ def _gb(value):
 
 
 def _capabilities(tags):
-    tags=set(tags or [])
+    tags=set(canonical_capabilities(set(tags or ())-{'win32','linux','darwin'}))
     groups=[('ng47' if {'ng47','ngspice47'} & tags else 'ng',{'ng','ng47','ngspice','ngspice47','spice'}),
             ('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
             ('Chisel',{'java','scala-cli','firtool'}),('CIRCT',{'circt','circt-translate'}),
             ('C++',{'cxx','gcc','g++','clang','clang++'}),
             ('ONNX',{'onnx','onnx_cpu','onnxruntime'}),
-            ('Python',{'python'}|{t for t in tags if '_python' in t}),
-            ('ML',{'rgcn_train'}),('GPU',{'gpu','cuda','rocm'})]
+            ('Python',{'python','python_numpy','python_scientific'}),('ML',{'python_torch_pyg'}),
+            ('Layout',{'layout_python','magic','netgen'}),('GPU',{'gpu','cuda','rocm'})]
     known={'cpu','win32','linux','darwin'}|{t for t in tags if t.startswith('shared:')}
     result=[]
     for name,members in groups:
@@ -125,8 +126,8 @@ def _capabilities(tags):
 def _short_capability(value):
     """Keep a custom capability readable without exposing project internals."""
     value=str(value)
-    aliases={'aop_hspice_python':'AOP-HS','rgcn_python':'RGCN-Py','rgcn_train':'RGCN-ML',
-             'rgcn_python_linux':'RGCN-Py','onnx_cpu':'ONNX-CPU','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
+    aliases={'python_numpy':'NumPy','python_scientific':'SciPy','python_torch_pyg':'ML',
+             'layout_python':'Layout','onnx':'ONNX','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
     return aliases.get(value, value)
 
 

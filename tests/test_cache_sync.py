@@ -205,7 +205,8 @@ class CacheRpcTests(unittest.TestCase):
         options = client.machine.return_value.python.call_args.kwargs
         self.assertEqual(options['project'], 'DCO-cache')
         self.assertEqual(options['retries'], 0)
-        self.assertEqual(options['requires'], ['arh_python'])
+        self.assertEqual(options['requires'], ['python_numpy'])
+        self.assertEqual(options['tool'], 'python_numpy')
 
     def test_final_collection_revisits_same_id_after_endpoint_recovers(self):
         client, accepted, rpc = self.fixture()

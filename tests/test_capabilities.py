@@ -10,17 +10,21 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from remote_compute import setup_tools, command
+from remote_compute import Client, Pool, setup_tools, command
 from remote_compute.cli import main
 from remote_compute.worker import Worker
 from remote_compute.policy import canonical_capabilities, clean_tool_snapshot
-from test_compute import provider, scratch
+from test_compute import provider, scratch, until
+from test_center import center
 
 
 class CapabilityTests(unittest.TestCase):
     def test_semantic_and_legacy_templates_share_the_registered_binding(self):
         aliases = (('ngspice47', 'ng47'), ('circt-translate', 'circt'),
-                   ('onnx_cpu', 'onnx'), ('aop_hspice_python', 'aop-hs'))
+                   ('onnx_cpu', 'onnx'), ('aop_hspice_python', 'python_numpy'),
+                   ('aop_python', 'python_numpy'), ('arh_python', 'python_numpy'),
+                   ('rgcn_python', 'python_numpy'), ('bench_python', 'python_scientific'),
+                   ('rgcn_train', 'python_torch_pyg'), ('rgcn_fiber', 'python_torch_pyg'))
         for legacy, semantic in aliases:
             for configured, requested in ((legacy, semantic), (semantic, legacy)):
                 with self.subTest(configured=configured, requested=requested), scratch() as directory:
@@ -71,7 +75,86 @@ class CapabilityTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'semantic tool names'):
                 canonical_capabilities([name])
         self.assertEqual(canonical_capabilities(['ngspice47','ng47','rgcn_python_linux']),
-                         ['ng47','rgcn_python'])
+                         ['ng47','python_numpy'])
+
+    def test_shared_runtime_profiles_use_every_compatible_provider(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root/'legacy', cpus=1, tools={'arh_python':sys.executable}) as (_, legacy), \
+                    provider(root/'canonical', cpus=2, tools={'python_numpy':sys.executable}) as (_, canonical):
+                with Pool([legacy, canonical]) as pool, center(pool, root/'center') as (_, operator):
+                    project = Client(operator.url)
+                    self.assertEqual(project.admission('runtime', requires=['rgcn_python'])['capable_cpus'], 3)
+                    public = operator.request('/capabilities')
+                    self.assertIn('python_numpy', public['tags'])
+                    self.assertIn('python_numpy', public['tools'])
+                    self.assertFalse({'arh_python','rgcn_python'} & set(public['tools']))
+                    task = command(['${tool:aop_python}', '-c',
+                                    'import os,pathlib,time;assert pathlib.Path(os.environ["PY"]).is_file();'
+                                    'time.sleep(.35);print("ready")'],
+                                   env={'PY':'${tool:rgcn_python}'}, requires=['python_numpy'], project='runtime')
+                    ids = [operator.submit(task)['id'] for _ in range(3)]
+                    results = [operator.wait(identity) for identity in ids]
+                    self.assertTrue(all(r['status']=='succeeded' and r['stdout'].strip()=='ready' for r in results), results)
+                    self.assertEqual(len({r['assigned_node'] for r in results}), 2)
+
+    def test_tool_path_templates_only_route_to_ready_providers(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root/'missing') as (_, missing), \
+                    provider(root/'ready', tools={'compiler.v1':sys.executable}) as (_, ready):
+                with Pool([missing, ready]) as pool, center(pool, root/'center') as (_, client):
+                    result = client.run(command(['${tool:python}', '-c',
+                        'import os;print(os.environ["COMPILER"])'], env={'COMPILER':'${tool:compiler.v1}'}))
+                    self.assertEqual(result['status'], 'succeeded', result)
+                    self.assertEqual(Path(result['stdout'].strip()), Path(sys.executable))
+                    self.assertEqual(result['worker_url'], ready.url)
+
+    def test_client_normalizes_older_services_without_changing_bindings(self):
+        response = dict(protocol=1, tags=['aop_python','arh_python','rgcn_fiber','rgcn_train'],
+                        tools=['bench_python','python_scientific','onnx_cpu'], capabilities=['admission'])
+        with patch.object(Client, 'request', return_value=response):
+            result = Client().capabilities()
+        self.assertEqual(result['tags'], ['python_numpy','python_torch_pyg'])
+        self.assertEqual(result['tools'], ['onnx','python_scientific'])
+
+    def test_runtime_binding_migration_preserves_an_accepted_job(self):
+        with scratch() as directory, provider(Path(directory)/'worker',
+                tools={'rgcn_fiber':sys.executable}) as (worker, client):
+            task = command(['${tool:rgcn_fiber}', '-c',
+                            'import time;time.sleep(.3);print("original")'])
+            task['requires'] = ['rgcn_fiber']
+            identity = client.submit(task)['id']
+            until(lambda: client.status(identity)['status']=='running')
+            before = client.status(identity)
+            worker.control({'tools':{'python_torch_pyg':sys.executable,'rgcn_fiber':None}})
+            result = client.wait(identity)
+            self.assertEqual(result['status'], 'succeeded', result)
+            self.assertEqual(result['stdout'].strip(), 'original')
+            for key in ('id','request_sha256','started'):
+                self.assertEqual(result[key], before[key])
+            following = client.run(command(['${tool:rgcn_train}', '-c', 'print("next")'],
+                                           requires=['python_torch_pyg']))
+            self.assertEqual(following['status'], 'succeeded', following)
+            self.assertEqual(following['stdout'].strip(), 'next')
+
+    def test_rolling_worker_retains_registered_aliases_until_retired(self):
+        with scratch() as directory, provider(Path(directory)/'worker',
+                tools={'arh_python':sys.executable,'python_numpy':sys.executable}) as (worker, _):
+            self.assertTrue({'arh_python','python_numpy'} <= set(worker.health()['tags']))
+            worker.control({'tools':{'arh_python':None}})
+            self.assertNotIn('arh_python', worker.health()['tags'])
+            self.assertIn('python_numpy', worker.health()['tags'])
+
+    def test_receipt_alias_merge_keeps_the_ready_canonical_binding(self):
+        value = dict(tools={'onnx':dict(available=True,argv=['canonical']),
+                           'onnx_cpu':dict(available=False,argv=['missing']),
+                           'rgcn_python':dict(available=True,argv=['native']),
+                           'rgcn_train':dict(available=True,argv=['training'])})
+        self.assertTrue(clean_tool_snapshot(value))
+        self.assertEqual(value['tools'], {'onnx':dict(available=True,argv=['canonical']),
+            'rgcn_python':dict(available=True,argv=['native']),
+            'rgcn_train':dict(available=True,argv=['training'])})
 
     def test_tool_probe_does_not_hash_or_read_executable_contents(self):
         worker=Worker.__new__(Worker);worker.env={}
@@ -179,7 +262,7 @@ class RuntimeSetupTests(unittest.TestCase):
             run.assert_not_called()
 
     @unittest.skipUnless(os.name == 'nt', 'Windows science installer')
-    def test_setup_registers_ngspice47_only_for_the_installed_47_engine(self):
+    def test_setup_registers_shared_profiles_and_only_verified_ng47(self):
         for version, expected in (('ngspice-47', True), ('ngspice-46', False)):
             with self.subTest(version=version), scratch() as directory:
                 root = Path(directory)
@@ -187,7 +270,10 @@ class RuntimeSetupTests(unittest.TestCase):
                         patch.object(setup_tools, '_ngspice',
                                      return_value=(root/'.tools/ngspice/bin/ngspice.exe', {'version': version})):
                     result = setup_tools.install(root, temporary_root=root/'tmp')
-                self.assertEqual('ngspice47' in result['tools'], expected)
+                self.assertEqual('ng47' in result['tools'], expected)
+                self.assertFalse({'aop_python','arh_python','rgcn_python','bench_python'} & set(result['tools']))
+                self.assertTrue({'python_numpy','python_scientific'} <= set(result['tools']))
+                self.assertNotIn('ARH_INFERENCE_PYTHON', result['env'])
                 self.assertIn('ngspice', result['tools'])
 
 

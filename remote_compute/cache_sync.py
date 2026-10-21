@@ -7,7 +7,7 @@ import uuid
 
 from .bundle import TERMINAL
 from .client import RemoteError
-from .policy import canonical_capabilities
+from .policy import canonical_capability, canonical_capabilities
 
 PROJECTS = ('aop', 'rgcn', 'arh', 'bench')
 _SCRIPT = """from pathlib import Path
@@ -47,7 +47,8 @@ class _RPC:
     def call(self, node, project, action, **arguments):
         self.check()
         assets = arguments.pop('_assets', {})
-        requires = arguments.pop('_requires', [project + '_python'])
+        runtime = canonical_capability(project + '_python')
+        requires = arguments.pop('_requires', [runtime])
         request = dict(project=project, action=action,
                        root=node.get('shared_paths', {}).get(project), **arguments)
         data = json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')
@@ -56,7 +57,7 @@ class _RPC:
         machine = self.client.machine(node['name'], cwd=node['tool_root'])
         try:
             machine.python(
-                _SCRIPT, tool='python' if action == 'warm' else project + '_python',
+                _SCRIPT, tool='python' if action == 'warm' else runtime,
                 files={'remote_op/request.json': data},
                 outputs=['remote_op/result/*'], wait=False, job_id=identity,
                 on_submit=self.on_submit, assets=assets, requires=requires,
@@ -289,7 +290,7 @@ def sync_cache(client, project='all', *, kind='all', on_submit=None, stop_event=
         for name in projects:
             rpc.check()
             sources = [node for node in nodes if node.get('shared_paths', {}).get(name)
-                       and name + '_python' in node.get('tags', ())]
+                       and canonical_capability(name + '_python') in canonical_capabilities(node.get('tags', ()))]
             item = report['projects'][name] = {}
             producer = None
             if name == 'arh' and len(sources) > 1 and kind in ('all', 'research'):

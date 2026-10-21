@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 import re
 
+from .policy import canonical_capabilities
+
 
 class _Capture:
     def __init__(self):
@@ -22,7 +24,7 @@ class _Capture:
 
 
 def _group(files, *requires):
-    return dict(files=files, requires=list(requires))
+    return dict(files=files, requires=canonical_capabilities(requires))
 
 
 def _aop(root):

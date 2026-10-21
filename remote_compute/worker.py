@@ -34,7 +34,7 @@ from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement,
-                     normalize_accelerators, aggregate_accelerators, canonical_capabilities,
+                     normalize_accelerators, aggregate_accelerators, canonical_capabilities, PYTHON_RUNTIME_ALIASES,
                      canonical_capability, clean_tool_snapshot)
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
@@ -312,6 +312,10 @@ class Worker:
         tags.update('shared:'+name for name in self.shared)
         tags.update(canonical_capabilities(name for name, item in self.tool_info.items()
                                            if item['available']))
+        # Registered legacy bindings keep older schedulers working during a
+        # rolling update; the project capability view publishes canonical names.
+        tags.update(name for name,item in self.tool_info.items()
+                    if name in PYTHON_RUNTIME_ALIASES and item['available'])
         if self.tool_info.get('verilator', {}).get('available'):
             tags.add('rtl')
         if self.accelerators:

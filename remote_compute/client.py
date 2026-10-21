@@ -227,6 +227,11 @@ class Client:
         result = self.request('/capabilities')
         if result.get('protocol') != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
+        # Existing services can retain legacy bindings for accepted jobs while
+        # callers use the same canonical view before the next idle reload.
+        for field in ('tags', 'tools'):
+            if field in result:
+                result[field] = canonical_capabilities(result[field])
         self._capabilities = result.get('capabilities', getattr(self, '_capabilities', None) or [])
         return result
 
@@ -771,15 +776,16 @@ class Pool:
 
     def _matching(self, task):
         cpus=task.get('cpus',1) or 1
-        required_tools={m[1] for argv in task.get('steps',())
-                        for m in [re.fullmatch(r'\$\{tool:([\w-]+)\}',argv[0])] if m}
         texts=[*task.get('env',{}).values(),task.get('cwd',''),
                *(arg for argv in task.get('steps',()) for arg in argv)]
+        required_tools=set(canonical_capabilities(name for text in texts for name in
+            re.findall(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}',text)))
         required_shared={name for text in texts for name in re.findall(r'\$\{shared:([\w-]+)\}',text)}
         required=canonical_capabilities(task.get('requires',()))
         return [n for n in self.nodes if (not task.get('node') or n.name==task['node'])
                 and set(required).issubset(canonical_capabilities(n.health.get('tags',())))
-                and all(n.health.get('tools',{}).get(tool,{}).get('available') for tool in required_tools)
+                and required_tools.issubset(canonical_capabilities(
+                    name for name,info in n.health.get('tools',{}).items() if info.get('available')))
                 and required_shared.issubset(n.health.get('shared',()))
                 and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)
                 and n.supports_accelerator(task.get('accelerator'))]

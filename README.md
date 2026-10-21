@@ -161,7 +161,21 @@ python -B main.py --check
 
 setup 复用系统 Python 3.14，验证科学依赖后写本机 tools/env；Windows 原生工具放忽略的 `.tools/`。ngspice 可下载或复用，实际版本 47 才登记 ng47。RTL 从已有 MSYS2 提取 GCC/Verilator 闭包，保留标准库和必需运行依赖。Linux 直接配置已有 Python/ngspice/编译器；setup 的可移动工具链面向 Windows。
 
-工程别名为 `aop_python/rgcn_python/bench_python/arh_python`，训练单独登记已验证的 `rgcn_train`，ONNX CPU 使用验证过 OpenCV/ONNX Runtime/CPUExecutionProvider 的 `onnx_cpu`。GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行路径的调用方可协商 `accelerator_fallback`，具体请求和回执见 [DESIGN](docs/DESIGN.md#工程接口边界)；ARH 的 auto 使用30秒未派发队列阈值，显式 torch_cuda 保持强制GPU。`shared` 只登记真实部署目录，ARH 工具/模型及持久统计可通过 `shared:arh` 复用。Chisel/CIRCT/C++、CUDA 等按实际工具验证后登记。
+Python 能力按实际运行环境登记；新增算法先复用已有环境，不按算法或工程重复增加名字。
+
+| 规范能力 / 工具 | 同一解释器内的就绪条件 |
+| --- | --- |
+| `python_numpy` | NumPy；用于 AOP、ARH 普通执行及 RGCN 原生测量 |
+| `python_scientific` | NumPy、SciPy、Numba、pymoo、moocore、threadpoolctl、scikit-learn、umap-learn；用于完整科学计算环境 |
+| `python_torch_pyg` | NumPy、Torch、PyG、SciPy、Numba、moocore、threadpoolctl；用于当前完整神经与数值环境 |
+| `onnx` | 经调用工程数值验收的 NumPy、ONNX、ONNX Runtime CPU 与 OpenCV 环境；固定 INT8 继续使用已有兼容解释器 |
+| `layout_python` | NumPy、gdstk、GLayout、gdsfactory、rectpack 及实际所需符号；PDK 由任务材料资产提供 |
+
+每个环境分别用实际解释器验证，不能把不同解释器中的包合起来当成同一环境就绪。`python` 只承诺 Python 标准库，不隐含上述包。CatBoost 等可选后端按实际调用检查，不作为所有神经任务的统一门槛。Magic、Netgen、ng47、Verilator、CIRCT、Java/Scala 和 C++ 仍是独立的真实工具需求。
+
+旧 `aop_python/arh_python/rgcn_python/aop_hspice_python` 等价于 `python_numpy`，`bench_python` 等价于 `python_scientific`，`rgcn_train/rgcn_fiber` 等价于 `python_torch_pyg`；`onnx_cpu/circt-translate/ngspice47` 分别等价于 `onnx/circt/ng47`。旧请求和模板继续兼容，已接受的原 ID、输入及执行绑定保持；新准入和能力汇总使用规范名。新部署先登记已实测的新绑定，忙碌实例保留旧绑定，空闲重载后再退出重复登记。
+
+GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行路径的调用方可协商 `accelerator_fallback`，具体请求和回执见 [DESIGN](docs/DESIGN.md#工程接口边界)；ARH 的 auto 使用30秒未派发队列阈值，显式 torch_cuda 保持强制GPU。`shared` 只登记真实部署目录，ARH 工具/模型及持久统计可通过 `shared:arh` 复用。
 
 已验证工具可用操作员 `center.control(node=名称, worker={"tools": {别名: [可执行路径]}})` 在线登记，None 移除；后续任务用新别名。该操作更新运行进程，部署同时更新设备 `worker.local.json` 以便重载。临时能力验收后再登记正式别名。
 

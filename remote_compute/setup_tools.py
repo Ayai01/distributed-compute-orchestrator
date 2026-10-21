@@ -144,12 +144,12 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
         temporary = Path(directory)
         python, runtime = _python(temporary)
         ngspice, simulator = _ngspice(tools/'ngspice', temporary, ngspice_source)
-    result = {'tools':{name:python.as_posix() for name in ('aop_python','rgcn_python','bench_python','arh_python')},
-              'env':{'PYTHONNOUSERSITE':'1', 'ARH_INFERENCE_PYTHON':python.as_posix()},
+    result = {'tools':{name:python.as_posix() for name in ('python_numpy','python_scientific')},
+              'env':{'PYTHONNOUSERSITE':'1'},
               'runtime':runtime, 'ngspice':simulator}
     result['tools']['ngspice'] = ngspice.as_posix()
     if re.search(r'\bngspice-47\b', simulator['version'], re.IGNORECASE):
-        result['tools']['ngspice47'] = ngspice.as_posix()
+        result['tools']['ng47'] = ngspice.as_posix()
     msys = tools/'msys64'
     if (msys/'usr/bin/bash.exe').is_file():
         for name in ('tmp','dev/shm','dev/mqueue','home'):

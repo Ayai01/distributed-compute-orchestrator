@@ -22,13 +22,23 @@ MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
 # Capability names are part of the project-facing contract.  Keep the older
 # tool labels accepted at the boundary while publishing compact canonical
 # fields to health, admission and the operator view.
+PYTHON_RUNTIME_ALIASES = {
+    'aop_python': 'python_numpy',
+    'arh_python': 'python_numpy',
+    'rgcn_python': 'python_numpy',
+    'aop_hspice_python': 'python_numpy',
+    'aop-hs': 'python_numpy',
+    'bench_python': 'python_scientific',
+    'rgcn_train': 'python_torch_pyg',
+    'rgcn_fiber': 'python_torch_pyg',
+}
 CAPABILITY_ALIASES = {
+    **PYTHON_RUNTIME_ALIASES,
     'circt-translate': 'circt',
     'ngspice47': 'ng47',
     'onnx_cpu': 'onnx',
-    'aop_hspice_python': 'aop-hs',
-    'rgcn_python_linux': 'rgcn_python',
-    'rgcn-linux': 'rgcn_python',
+    'rgcn_python_linux': 'python_numpy',
+    'rgcn-linux': 'python_numpy',
 }
 
 _IDENTITY_TAG = re.compile(
@@ -56,14 +66,22 @@ def clean_tool_snapshot(result):
     changed = False
     if isinstance(result.get('tools'), dict):
         tools = {}
-        for name, info in result['tools'].items():
+        for original, info in result['tools'].items():
             try:
-                name = canonical_capability(name)
+                name = canonical_capability(original)
             except ValueError:
                 continue
+            # Receipt keys describe bindings accepted by the frozen caller.
+            # Keep those paths distinct even when admission shares one profile.
+            if original in PYTHON_RUNTIME_ALIASES:
+                name = original
             if isinstance(info, dict):
-                tools[name] = {key: value for key, value in info.items()
-                               if key in ('available', 'argv', 'engine', 'version', 'protocol')}
+                item = {key: value for key, value in info.items()
+                        if key in ('available', 'argv', 'engine', 'version', 'protocol')}
+                previous = tools.get(name)
+                if (previous is None or item.get('available') and
+                        (not previous.get('available') or original == name)):
+                    tools[name] = item
         if tools != result['tools']:
             result['tools'] = tools
             changed = True
