@@ -108,6 +108,32 @@ class OfflineTests(unittest.TestCase):
                 else:self.fail('original cancellation did not finish after reconnect')
                 self.assertFalse(worker.jobs)
 
+    def test_restored_offline_original_keeps_health_and_cancels_before_reattachment(self):
+        from test_center import center
+        from test_compute import python
+        from remote_compute.bundle import task_bundle
+        with scratch() as root:
+            state_root=Path(root)/'center';identity='1234'+'a'*28
+            directory=state_root/'jobs'/identity;directory.mkdir(parents=True)
+            task=python('print(1)',project='AOP',label='original',memory_mb=128)
+            request=task_bundle(task);(directory/'request.zip').write_bytes(request)
+            original=dict(id=identity,status='running',submitted=time.time(),started=time.time(),
+                          assigned_node='offline',worker_url='http://127.0.0.1:1',cpus=1,memory_mb=128)
+            (directory/'result.json').write_text(json.dumps(original))
+            remote=Client(original['worker_url'],timeout=.1)
+            with patch.object(remote,'request',side_effect=AssertionError('offline RPC during recovery cancellation')), \
+                 Pool([dict(name='offline',client=remote,enabled=False)],refresh=1000) as pool, \
+                 center(pool,state_root) as (state,client):
+                self.assertEqual(client.health()['queued'],0)
+                result=client.cancel(identity)
+                self.assertEqual(result['status'],'interrupted')
+                self.assertTrue(result['cost_incomplete'])
+                self.assertTrue(result['remote_cancel_pending'])
+                receipt=client.fetch(identity,delete=False)
+                self.assertEqual(receipt['id'],identity)
+                self.assertEqual((directory/'request.zip').read_bytes(),request)
+                self.assertEqual(pool.nodes[0].reserved,0)
+
 
 class DiscoveryTests(unittest.TestCase):
     def test_real_lan_handshake_reads_worker_identity_without_job_submission(self):

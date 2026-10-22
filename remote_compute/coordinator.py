@@ -59,9 +59,9 @@ class Coordinator:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
                 self._restore_accelerator(task, value)
+                job.update(task=task,auto_cpus=task['cpus']==0)
                 value.setdefault('max_retries',task.get('retries',2))
                 if value['status']=='queued' or not value.get('worker_url'):
-                    job.update(task=task,auto_cpus=task['cpus']==0)
                     if value.get('worker_id'):job['worker_id']=value['worker_id']
                     value.update(status='queued')
                     self.queue.append(value['id'])
@@ -1088,6 +1088,14 @@ class Coordinator:
                     job["result"].update(status="cancelled", finished=time.time())
                     self._save(job)
                     archive_job(self.jobs, job)
+                elif job.get('recover') and job.get('node') is None:
+                    # No worker acknowledgement has been recovered. Keep its
+                    # original ID and cancellation intent for later cleanup.
+                    job['result'].update(status='interrupted',finished=time.time(),
+                        error='Cancellation pending before original worker reattachment',
+                        remote_cancel_pending=True,cost_incomplete=True)
+                    self._save(job)
+                    archive_job(self.jobs,job)
                 self.condition.notify_all()
             return self.get(identity)
 
