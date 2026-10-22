@@ -1,6 +1,6 @@
 # DCO 当前状态
 
-更新：2026-10-21。版本 0.8.7；实时任务、占用与已加载进程由看板和操作员 `health` 查询。操作见[README](../README.md)，机制见[DESIGN](DESIGN.md)，后续验收见[ROADMAP](ROADMAP.md)。
+更新：2026-10-22（UTC）。版本 0.8.7；实时任务、占用与已加载进程由看板和操作员 `health` 查询。操作见[README](../README.md)，机制见[DESIGN](DESIGN.md)，后续验收见[ROADMAP](ROADMAP.md)。
 
 ## 当前预算与能力
 
@@ -30,7 +30,8 @@
 | --- | --- | --- |
 | TSA并发与单设备隔离 | 三机完成20个滚动观测点，1787个真实corner；排空尾部独立计时，原生产任务保留、节点恢复；CPU满线程可接近满载 | `results/tsa-pool-scaling-20261021/report.html`、`scaling.csv`、`isolation-ledger.json` |
 | ITX部署与真实执行 | 标准worker、24逻辑CPU；科学/神经/ONNX、真实TSA、原生RTL编译运行、SKY130几何及8GiB物理RAM盘均通过，按用户最新确认保存8核，现排空下线 | `itx-onboarding-current.json`、`.local/maintenance/itx-real-canary/`、`itx-sky130-geometry/` |
-| 八字符设备名 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；看板、隔离与离线节点针对性回归44项通过。运行中的看板在自然空闲重载时加载；禁用且排空的设备停止后台探测并隐藏，仍在排空的任务保持可见 | `tests/test_console.py`、`tests/test_center.py` |
+| 八字符设备名与离线节点 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；针对性回归44项通过，运行看板已加载。禁用且排空的ITX停止后台探测并隐藏，仍在排空的任务保持可见 | `tests/test_console.py`、`tests/test_center.py`、`.local/maintenance/center-reload-20261022-proof.json` |
+| 自然批次边界重载 | 中心队列及全部节点活动/预留归零后重载，在线预算保持92核；四项AOP沿原UUID恢复，Bench及ARH维护门已释放 | `overnight-8h-current.json`、`.local/maintenance/center-reload-20261022-resume-proof.json` |
 | 能力、工具模板、缓存消费者及混合版本 | 全量401项：397通过、4项环境跳过；原ID与数值保持 | `.local/maintenance/capability-unification-release-full.log`；`capability-profiles-live-proof.json` |
 | 规范能力部署与真实供给 | 三机自然空闲重载，60核授予及真实排队通过；Make联合要求60核 | `capability-idle-reload.json`、`capability-unification-after-reload.json`、`make-unification-admission.json` |
 | 启动、独立服务、重载 | 35项：34通过、1项环境跳过；headless与看板开关独立 | `.local/maintenance/headless-startup-lifecycle.log`；`headless-policy-deployment-jobs.json` |
@@ -45,7 +46,7 @@
 
 ## 当前维护边界
 
-常驻中心及worker继续承接原任务；启动选项源码已增量同步三机，新的SDK客户端可使用独立的连接排队策略。服务端机制升级在自然空闲边界加载，输入、回执、成本、检查点和未领取成果保持。
+中心已于2026-10-22 01:16 UTC在自然批次边界加载源码`4bb0301`，三台在线设备继续承接原任务，ITX保持禁用。原输入、回执、成本、检查点和未领取成果保留；本次维护已完成，后续科研进度沿原ID记录在`overnight-8h-current.json`。
 
 四科研工程默认Web端口为8000/8001/8002/8003，CLI与Web生命周期及当前研究分别由各工程README/STATUS说明。已完成入口验收与后续运行关联记录在 `cli-web-parity-current.json`；当前任务数量直接从服务查询。
 
