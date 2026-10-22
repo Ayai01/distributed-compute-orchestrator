@@ -12,6 +12,66 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class FixedQueueFairnessTests(unittest.TestCase):
+    def test_single_cpu_job_grows_and_returns_at_completed_boundaries(self):
+        with scratch() as directory, provider(Path(directory)/'worker', cpus=8) as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
+                peers = [client.submit(python(HOLD, project=project, cpus=2, memory_mb=64))['id']
+                         for project in ('AOP', 'ARH', 'RGCN')]
+                until(lambda: all(client.status(key)['status']=='running' for key in peers))
+                accepted = client.submit(python(HOLD, project='Bench', cpus=1, max_cpus=4, memory_mb=80))
+                identity = accepted['id']
+                until(lambda: client.status(identity)['status']=='running')
+                self.assertEqual(client.status(identity)['cpus'], 1)
+                grant = client.resize(identity, 4, base_memory_mb=64, memory_per_cpu_mb=16)
+                self.assertEqual((grant['cpus'], grant['memory_mb']), (2, 96))
+                client.write_job_file(peers[0], 'release', 'done')
+                client.wait(peers[0])
+                client.fetch(peers[0])
+                grant = client.resize(identity, 4, base_memory_mb=64, memory_per_cpu_mb=16)
+                self.assertEqual((grant['cpus'], grant['memory_mb']), (4, 128))
+                grant = client.resize(identity, 1, base_memory_mb=64, memory_per_cpu_mb=16)
+                self.assertEqual((grant['cpus'], grant['memory_mb']), (1, 80))
+                self.assertEqual(client.status(identity)['request_sha256'], accepted['request_sha256'])
+                for key in (*peers[1:], identity):
+                    client.write_job_file(key, 'release', 'done')
+                    client.wait(key)
+                    client.fetch(key)
+
+    def test_four_single_cpu_projects_refill_fairly_over_multiple_rounds(self):
+        with scratch() as directory, provider(Path(directory)/'worker', cpus=8) as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
+                client.control(paused=True)
+                submitted = {client.submit(python(HOLD, project=project, memory_mb=64))['id']:project
+                             for project in ('AOP', 'ARH', 'Bench', 'RGCN') for _ in range(6)}
+                collected = set()
+                client.control(paused=False)
+                def running():
+                    rows = {project:[] for project in ('AOP', 'ARH', 'Bench', 'RGCN')}
+                    for key, project in submitted.items():
+                        if key not in collected and client.status(key, brief=True)['status']=='running':
+                            rows[project].append(key)
+                    return rows
+                def balanced():
+                    resources = client.health()['projects']
+                    return (len(resources)==4 and all(row['used']==row['target']==2 for row in resources.values())
+                            and all(len(keys)==2 for keys in running().values()))
+                until(balanced)
+                for _ in range(3):
+                    # Provider health can lag the grants. Use original task IDs
+                    # confirmed running before exercising the next refill.
+                    selected = {project:keys[0] for project,keys in running().items()}
+                    for key in selected.values(): client.write_job_file(key, 'release', 'done')
+                    for key in selected.values():
+                        client.wait(key)
+                        client.fetch(key)
+                        collected.add(key)
+                    until(balanced)
+                for key in submitted:
+                    if key not in collected:
+                        client.cancel(key)
+                        client.wait(key)
+                        client.fetch(key)
+
     def test_freed_cpus_accumulate_for_an_under_share_fixed_job(self):
         with scratch() as directory, provider(Path(directory)/'worker', cpus=4) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
