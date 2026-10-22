@@ -1,6 +1,7 @@
 """Fast-forward updates from the shared source repository; local runtimes stay local."""
 from pathlib import Path
 import os
+import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -9,7 +10,11 @@ URL = 'https://github.com/Ayai01/distributed-compute-orchestrator.git'
 
 def git(*args):
     options = ['-c', 'http.sslBackend=openssl'] if os.name == 'nt' else []
-    run = subprocess.run(['git', '-c', 'safe.directory=' + ROOT.as_posix(), *options, *args],
+    executable = shutil.which('git')
+    portable = ROOT / '.tools' / 'git' / 'cmd' / 'git.exe'
+    if not executable and portable.is_file():
+        executable = str(portable)
+    run = subprocess.run([executable or 'git', '-c', 'safe.directory=' + ROOT.as_posix(), *options, *args],
                          cwd=ROOT, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
     if run.returncode:
         raise RuntimeError(run.stderr.strip() or run.stdout.strip())

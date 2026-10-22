@@ -28,6 +28,7 @@
 
 | 范围 | 当前结论 | 证据 |
 | --- | --- | --- |
+| 局域网、外网认证与启动配置 | 核心421项：417通过、4项环境跳过；局域网免令牌、外网HTTPS/令牌/证书校验、重复接入保留预算及配置优先级通过 | `.local/maintenance/lan-admission-20261022/full-tests.log`、`access-tests.log` |
 | TSA并发与单设备隔离 | 三机完成20个滚动观测点，1787个真实corner；排空尾部独立计时，原生产任务保留、节点恢复；CPU满线程可接近满载 | `results/tsa-pool-scaling-20261021/report.html`、`scaling.csv`、`isolation-ledger.json` |
 | ITX部署与真实执行 | 标准worker、24逻辑CPU；科学/神经/ONNX、真实TSA、原生RTL编译运行、SKY130几何及8GiB物理RAM盘均通过，按用户最新确认保存8核，现排空下线 | `itx-onboarding-current.json`、`.local/maintenance/itx-real-canary/`、`itx-sky130-geometry/` |
 | 八字符设备名与离线节点 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；针对性回归44项通过，运行看板已加载。禁用且排空的ITX停止后台探测并隐藏，仍在排空的任务保持可见 | `tests/test_console.py`、`tests/test_center.py`、`.local/maintenance/center-reload-20261022-proof.json` |

@@ -3,6 +3,7 @@ __pycache__/
 *.local.json
 results/
 .runtime/
+.venv/
 .tools/
 .projects/
 .vscode/

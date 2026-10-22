@@ -24,6 +24,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
 from .policy import normalize_accelerator_requirement, canonical_capabilities
+from .auth import lan_endpoint
 
 
 class RemoteError(RuntimeError):
@@ -118,6 +119,10 @@ class Client:
     def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
+        if self.endpoint.scheme == 'http' and not getattr(self, '_lan_http_checked', False):
+            if not lan_endpoint(self.endpoint.hostname):
+                raise RemoteError('Non-LAN endpoints require HTTPS with certificate verification')
+            self._lan_http_checked = True
         # Both resource routes can wait for the center/worker handshake. A
         # direct hybrid resize needs the same deadline as a worker-side lease;
         # replies and ordinary requests keep their normal network deadline.

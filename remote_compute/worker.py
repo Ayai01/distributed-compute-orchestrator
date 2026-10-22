@@ -916,7 +916,9 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, address, worker, *, restart=None, certfile=None, keyfile=None):
+    def __init__(self, address, worker, *, restart=None, certfile=None, keyfile=None, trusted_networks=None):
+        from .auth import trusted_networks as parse_networks
+        self.trusted_networks = parse_networks(trusted_networks)
         self.worker = worker
         self.restart = restart
         self.connections = set()
@@ -1026,7 +1028,13 @@ class Handler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "")
         operator_secret = getattr(worker, 'operator_token', None)
         operator_auth = bool(operator_secret and hmac.compare_digest(authorization, "Bearer " + operator_secret))
-        if worker.token and not (hmac.compare_digest(authorization, "Bearer " + worker.token) or operator_auth):
+        from .auth import in_networks
+        lan = in_networks(self.client_address[0])
+        if not lan and not isinstance(self.connection, ssl.SSLSocket):
+            return self._reply({"error": "Non-LAN connections require HTTPS"}, 403)
+        trusted = lan and in_networks(self.client_address[0], self.server.trusted_networks)
+        token_auth = bool(worker.token and hmac.compare_digest(authorization, "Bearer " + worker.token))
+        if not trusted and not (token_auth or operator_auth):
             return self._reply({"error": "Token required"}, 401)
         # A scheduler has two views: project clients receive aggregate
         # capabilities and redacted job state, while the visible DCO console

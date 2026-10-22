@@ -622,11 +622,27 @@ class SchedulerShell(Shell):
     def do_add(self, line):
         """add http://设备IP:26133：以设备实际名称加入节点。"""
         url = words(line)[-1]
-        name = Client(url, os.environ.get('REMOTE_COMPUTE_TOKEN', ''), operator=True).health()['node']
-        if self.center:
-            self.center.control(add={"name": name, "url": url, "token": os.environ.get("REMOTE_COMPUTE_TOKEN", "")})
+        path = ROOT / 'nodes.local.json'
+        previous = read_json(path) if path.exists() else {}
+        saved = next((row for row in previous.get('nodes', [])
+                      if row['url'].rstrip('/') == url.rstrip('/')), {})
+        token = os.environ.get('REMOTE_COMPUTE_TOKEN', saved.get('token', ''))
+        name = Client(url, token, ca_file=saved.get('ca_file'), operator=True).health()['node']
+        snapshot = self.center.nodes() if self.center else self.pool.snapshot()
+        existing = next((row for row in snapshot['nodes'] if row['name'] == name
+                         or row['url'].rstrip('/') == url.rstrip('/')), None)
+        if existing:
+            routing = dict(url=url, enabled=True)
+            if self.center:
+                self.center.control(node=existing['name'], routing=routing)
+            else:
+                self.pool.configure(existing['name'], **routing)
+        elif self.center:
+            node = dict(name=name, url=url, token=token)
+            if saved.get('ca_file'):node['ca_file'] = saved['ca_file']
+            self.center.control(add=node)
         else:
-            self.pool.add(name, url, token=os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
+            self.pool.add(name, url, token=token, ca_file=saved.get('ca_file'))
         self.do_nodes("")
         self.do_save('')
 

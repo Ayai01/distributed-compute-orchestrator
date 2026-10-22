@@ -115,7 +115,8 @@ def run_scheduler(args, local_client=None, restarting=None):
                     threading.Thread(target=api.shutdown, daemon=True).start()
             coordinator.restart_available = args.service_child
             api = Server((args.host or "0.0.0.0", port), coordinator,
-                         restart=restart_center if args.service_child else None)
+                         restart=restart_center if args.service_child else None,
+                         trusted_networks=getattr(args, 'trusted_networks', None))
             api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             api_thread.start()
             print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}", flush=True)
@@ -333,6 +334,12 @@ def main(argv=None):
         if args.config and not path.exists():
             raise ValueError("Missing worker config: " + str(path))
         config = read_json(path) if path.exists() else {}
+        # One shared entry point: explicit CLI values win, then the ignored
+        # device configuration, then the existing built-in defaults.
+        for name in ('host', 'port', 'center_port', 'nodes', 'policy'):
+            if getattr(args, name) is None and name in config:
+                setattr(args, name, config[name])
+        args.trusted_networks = config.get('trusted_networks')
         if args.action == "sync_cache" and not args.url:
             port = args.center_port if args.center_port is not None else (
                 args.port if args.port is not None else DEFAULT_PORT)
@@ -460,7 +467,8 @@ def main(argv=None):
                 host = args.host or config.get("host", "127.0.0.1")
                 worker.restart_available = args.service_child
                 server = Server((host, port), worker, restart=restart_worker if args.service_child else None,
-                                certfile=config.get('certfile'),keyfile=config.get('keyfile'))
+                                 certfile=config.get('certfile'),keyfile=config.get('keyfile'),
+                                 trusted_networks=args.trusted_networks)
                 worker_url=f'{"https" if config.get("certfile") else "http"}://{host}:{server.server_port}'
                 print(f"算力提供者 {worker_url}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)

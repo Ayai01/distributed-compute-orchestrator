@@ -23,7 +23,7 @@ python -B main.py --help
 | worker | `python -B main.py --mode worker --host 0.0.0.0 --port 26133` | 独立算力及机器操作 |
 | 连接已有中心 | `python -B main.py --url http://127.0.0.1:26133` | 打开操作看板 |
 
-默认读取 `worker.local.json` 和 `nodes.local.json`，可用 `--config`、`--nodes` 指定。CLI 显式参数覆盖配置。独立 worker 只需 Python 和本工程，科研目录属于按需登记的共享能力。
+所有设备使用同一份源码和启动脚本；角色、地址、端口、预算、工具及路径差异保存在 Git 忽略的 `worker.local.json` 和 `nodes.local.json`。启动优先级为显式 CLI 参数 > 本机配置 > 内置默认值，可用 `--config`、`--nodes` 指定文件；本机配置中的 `mode/host/port/center_port` 同样生效。独立 worker 只需 Python 和本工程，科研目录属于按需登记的共享能力。
 
 服务保持一个可见前台终端，窗口可失焦或最小化。`--headless` / `--no-browser` 仅表示不弹浏览器；DCO本身为终端服务，这两个同义选项不改变看板或服务。只关闭交互看板使用 `--no-dashboard`，仍保留前台日志和终端要求。隐藏窗口、重定向输入输出、nohup 和无终端 systemd/计划任务会在启动检查中退出。一次性 CLI、Python API 和测试支持管道。桌面自启动使用登录后终端快捷方式；Linux `.desktop` 使用 `Terminal=true`。旧隐藏服务先保留在途任务和未领取结果，排空后从可见入口迁回。
 
@@ -193,7 +193,9 @@ ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不�
 
 源码和 Python 即可启动独立 worker；能力按实际任务补齐。设备使用系统 hostname，配置 host/port、CPU/RAM、tools/shared/env。Linux 普通磁盘示例为 `root=/home/user/.local/state/dco/worker`、`temp_root=/home/user/.local/state/dco/tmp`，在可见终端运行 `python3 -B main.py --config worker.local.json`。
 
-独立 worker 支持原生 HTTPS：本机设置 certfile/keyfile，中心节点 URL 使用 HTTPS 26133 并设置 ca_file；私钥留 worker。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。
+局域网节点可直接 `add http://设备IP:26133`，不需要令牌；重复添加会恢复已有节点，保留其预算、权重和在途任务。默认按 TCP 对端的回环、RFC1918、IPv6 ULA/链路本地地址识别局域网，`trusted_networks` 可缩小免令牌网段，例如 `["127.0.0.0/8", "::1/128", "192.168.1.0/24"]`，空列表要求局域网也认证。转发头不改变对端身份。中心操作员权限仍使用独立的本机托管凭据。
+
+非局域网连接必须使用原生 HTTPS 和非空令牌，未配置令牌则拒绝外网请求；SDK不会向公网HTTP地址发送凭据。本机配置 `certfile/keyfile/token`，中心 `nodes.local.json` 对应节点使用 HTTPS URL、`ca_file/token`；校验证书，私钥留 worker。`add` 复用已保存节点的证书和认证配置。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。未安装系统Git的Windows设备可将便携Git放在忽略的 `.tools/git/`，更新命令自动使用它。
 
 Windows 远端端口按部署需要用管理员 PowerShell 放行：
 
