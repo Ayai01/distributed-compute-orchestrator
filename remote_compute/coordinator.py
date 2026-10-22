@@ -22,6 +22,7 @@ from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
 from .cleanup import AssetCache
+from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
 import socket
 import math
 import os
@@ -41,7 +42,7 @@ class Coordinator:
         (self.root / "assets").mkdir(exist_ok=True)
         self.operator_token = self._load_operator_token(operator_token)
         self.condition = threading.Condition(threading.RLock())
-        self.jobs, self.queue, self.threads = {}, [], set()
+        self.jobs, self.queue, self.threads = JobRecords(self.root / 'jobs'), [], set()
         self.stopping = self.paused = False
         self.restart_available = False
         self.callback_address = None
@@ -49,8 +50,8 @@ class Coordinator:
             value = json.loads(path.read_text(encoding="utf-8"))
             if clean_tool_snapshot(value):
                 atomic_json(path, value)
-            job = {"result": value, "directory": path.parent,
-                   "cancel": threading.Event(), "node": None}
+            job = Job(result=value, directory=path.parent,
+                      cancel=threading.Event(), node=None)
             self.jobs[value["id"]] = job
             if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
                 with zipfile.ZipFile(path.parent/'request.zip') as archive:
@@ -68,6 +69,8 @@ class Coordinator:
                     job['recover']=True
                 value.pop('error',None)
                 atomic_json(path, value)
+            else:
+                archive_job(self.jobs, job, startup=True)
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
@@ -175,7 +178,7 @@ class Coordinator:
                 names={node.name for node in eligible}|set(held)
                 running=sum(job.get('auto_cpus',False) and (job.get('task',{}).get('project') or 'default')==project
                             and job['result'].get('assigned_node') in names
-                            and job['result']['status'] not in TERMINAL for job in self.jobs.values())
+                            and job['result']['status'] not in TERMINAL for job in active_values(self.jobs))
                 if running:
                     room=max(0,target-resources.get(project,{}).get('used',0))
                     free=[max(0,node.capacity-node.reserved-node.external) for node in eligible]
@@ -311,8 +314,8 @@ class Coordinator:
                     info["variants"].append({"node": node.name, **value})
         with self.condition:
             active = {}
-            known_ids = set(self.jobs)
-            for job in self.jobs.values():
+            known_ids = set()
+            for job in active_values(self.jobs):
                 result = job['result']
                 known_ids.add(job.get('worker_id', result.get('worker_id', result['id'])))
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
@@ -331,7 +334,10 @@ class Coordinator:
                     worker_id=job.get('worker_id',job['result'].get('worker_id',item['id']))
                     item['rss_mb']=sampled.get(worker_id,{}).get('rss_mb')
                 for item in node.get('active_jobs',[]):
-                    if item['id'] not in known_ids and 0 < item.get('cpus',0) <= remaining:
+                    known = item['id'] in known_ids or item['id'] in self.jobs
+                    if isinstance(self.jobs, JobRecords):
+                        known = known or self.jobs.knows_worker(item['id'])
+                    if not known and 0 < item.get('cpus',0) <= remaining:
                         external.append(item)
                         remaining -= item['cpus']
                 node['active_jobs'] = owned + external
@@ -339,7 +345,8 @@ class Coordinator:
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
-                    'retained_jobs': sum(j['result']['status'] in TERMINAL for j in self.jobs.values()),
+                    'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
+                                     + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs)),
                     'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
@@ -366,7 +373,7 @@ class Coordinator:
         capacities={name:node.reserved if node.health.get('paused') else node.capacity for name,node in online.items()}
         largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
         with self.condition,self.pool.condition:
-            for job in self.jobs.values():
+            for job in active_values(self.jobs):
                 if job['result']['status'] in TERMINAL:
                     continue
                 task = job.get('task', {})
@@ -481,14 +488,14 @@ class Coordinator:
             directory = self.root / "jobs" / identity
             directory.mkdir()
             (directory / "request.zip").write_bytes(payload)
-            job = {"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
+            job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
                    "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
                               "single_thread_weight": task.get('single_thread_weight',1.0),
                               "accelerator": task.get('accelerator'),
                               "max_retries": task.get('retries',2), "attempts": [],
                               "memory_mb": task["memory_mb"], "request_sha256": digest,
                               "submitted": time.time(), "started": None, "finished": None,
-                              "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}}
+                              "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}})
             if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                 job['result']['requested_accelerator'] = task['accelerator']
             self._save(job)
@@ -524,7 +531,7 @@ class Coordinator:
         finishing makes them available to queued work immediately.
         """
         protected,groups={},{}
-        for identity,job in sorted(self.jobs.items(),key=lambda row:-row[1].get('task',{}).get('priority',0)):
+        for identity,job in sorted(active_items(self.jobs),key=lambda row:-row[1].get('task',{}).get('priority',0)):
             held=job.get('node');current=job.get('task',{})
             desired=job.get('desired_cpus',0);old=current.get('cpus',0)
             if (held is None or not job.get('auto_cpus') or desired<=old
@@ -581,6 +588,7 @@ class Coordinator:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
                             self.queue.remove(identity)
+                            archive_job(self.jobs, job)
                             continue
                         if node is None:
                             continue
@@ -601,7 +609,7 @@ class Coordinator:
         with self.condition,self.pool.condition:
             pending=self.__dict__.get('_pending_recovery')
             if pending is None:
-                pending=self._pending_recovery={identity for identity,job in self.jobs.items() if job.get('recover')}
+                pending=self._pending_recovery={identity for identity,job in active_items(self.jobs) if job.get('recover')}
             for identity in list(pending):
                 job=self.jobs.get(identity)
                 if job is None or job['result']['status'] in TERMINAL:
@@ -730,6 +738,7 @@ class Coordinator:
             with self.condition:
                 self.threads.discard(threading.current_thread())
                 if retry and not self.stopping and not job['cancel'].is_set():self._retry(job,result)
+                archive_job(self.jobs, job)
                 self.condition.notify_all()
 
     def _submit(self, job, identity, payload, callback):
@@ -848,7 +857,7 @@ class Coordinator:
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
         resource=resources[group];priority=current['task'].get('priority',0)
-        members={key:job for key,job in self.jobs.items()
+        members={key:job for key,job in active_items(self.jobs)
                  if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
                  and (job['task'].get('project') or 'default')==group}
         nodes={node.name:node for node in self.pool.nodes
@@ -1046,6 +1055,7 @@ class Coordinator:
                     self.queue.remove(identity)
                     job["result"].update(status="cancelled", finished=time.time())
                     self._save(job)
+                    archive_job(self.jobs, job)
                 self.condition.notify_all()
             return self.get(identity)
 
@@ -1131,8 +1141,7 @@ class Coordinator:
     def _prune_assets(self, *, recent=True):
         now = time.time()
         protected = {key for key, (_, used) in self.asset_cache.entries.items() if recent and now-used < 5}
-        for job in self.jobs.values():
-            protected.update(job['result'].get('assets', {}).values())
+        protected.update(asset_references(self.jobs))
         for error in self.asset_cache.prune(protected):
             self.activity.notify('资产缓存待清理 '+error, 'local')
 
@@ -1157,7 +1166,7 @@ class Coordinator:
     def close(self):
         with self.condition:
             self.stopping = True
-            for identity in list(self.jobs):
+            for identity, _job in list(active_items(self.jobs)):
                 self.cancel(identity)
             self.condition.notify_all()
         self.scheduler.join()

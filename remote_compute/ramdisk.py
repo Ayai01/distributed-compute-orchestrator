@@ -97,7 +97,7 @@ def ensure_shared(size_gib=None, *, create=False):
     if os.name != 'nt':
         if os.environ.get('REMOTE_COMPUTE_WORKER')=='1':
             return None  # Linux jobs follow their configured ordinary-disk TMPDIR.
-        root=Path(settings.get('ramdisk_root',Path.home()/'.cache/codex-shared-ramdisk')).expanduser().absolute()
+        root=Path(settings.get('ramdisk_root',ROOT/'.local/ramdisk')).expanduser().absolute()
         if not os.path.ismount(root):
             if not create:return None
             root.mkdir(parents=True,exist_ok=True)
@@ -139,7 +139,7 @@ def ensure_shared(size_gib=None, *, create=False):
 
 def scratch(project):
     volume = ensure_shared()
-    root = (volume or Path(tempfile.gettempdir())) / project
+    root = (volume / project) if volume else ROOT / '.local/tmp' / project
     root.mkdir(parents=True, exist_ok=True)
     return root
 

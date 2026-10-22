@@ -30,6 +30,8 @@ from .resources import (Host, process_usage, cpu_benchmark, service_usage,
 from .telemetry import Activity
 from .client import RemoteError
 from .cleanup import AssetCache, remove_owned
+from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
+from .paths import cache_environment
 from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
@@ -148,8 +150,9 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, accelerators=None):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, cache_root=None, accelerators=None):
         self.root = Path(root).expanduser().resolve()
+        self.cache_root = Path(cache_root).expanduser().resolve() if cache_root else self.root / 'cache'
         self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
         if self.temp_root:
             self.temp_root/=hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
@@ -205,20 +208,25 @@ class Worker:
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
-        self.jobs = {}
+        self.jobs = JobRecords(self.root / 'jobs')
         self.queue = deque()
         self.used = 0
         self.stopping = False
         self.threads = set()
+        self.cleanup_pending = set()
         for path in (self.root / "jobs").glob("*/result.json"):
             saved = json.loads(path.read_text(encoding="utf-8"))
             if clean_tool_snapshot(saved):
                 atomic_json(path, saved)
-            if saved["status"] not in TERMINAL:
+            interrupted = saved["status"] not in TERMINAL
+            if interrupted:
                 saved.update(status="interrupted", finished=time.time(), error="Worker stopped before completion")
                 atomic_json(path, saved)
-            self.jobs[saved["id"]] = {"result": saved, "cancel": threading.Event(), "directory": path.parent}
+            self.jobs[saved["id"]] = Job(result=saved, cancel=threading.Event(), directory=path.parent)
             self._clean_temp(self.jobs[saved['id']])
+            if interrupted or saved.get('input_cleanup_error'):
+                self._clean_work(self.jobs[saved['id']])
+            archive_job(self.jobs, self.jobs[saved['id']], startup=True)
         self.asset_cache = AssetCache(self.root / 'assets')
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
@@ -244,12 +252,14 @@ class Worker:
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
+                    "cache_root": self.cache_root.as_posix(),
+                    "temp_root": self.temp_root.as_posix() if self.temp_root else None,
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started', 'accelerator')},
                                      'rss_mb':round(j.get('rss_mb',0),2),**({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
-                                    for j in self.jobs.values() if j['result']['status'] not in TERMINAL],
+                                    for j in active_values(self.jobs) if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
             if sample:
-                for name in ('benchmark','tools','shared','tags','home','tool_root','shared_paths','unavailable_shared','root'):
+                for name in ('benchmark','tools','shared','tags','home','tool_root','shared_paths','unavailable_shared','root','cache_root','temp_root'):
                     value.pop(name,None)
             return value
 
@@ -369,11 +379,11 @@ class Worker:
         with self.condition:
             if self.benchmark_thread and self.benchmark_thread.is_alive():
                 return {'status': 'running', 'benchmark': self.benchmark, 'benchmark_state': self.benchmark_state}
-            active = any(job['result']['status'] not in TERMINAL for job in self.jobs.values())
+            active = any(job['result']['status'] not in TERMINAL for job in active_values(self.jobs))
             self.benchmark_state = 'queued' if active else 'running'
             def run():
                 with self.condition:
-                    while active and not self.stopping and any(job['result']['status'] not in TERMINAL for job in self.jobs.values()):
+                    while active and not self.stopping and any(job['result']['status'] not in TERMINAL for job in active_values(self.jobs)):
                         self.condition.wait(0.5)
                     if self.stopping:
                         self.benchmark_thread = None
@@ -429,7 +439,7 @@ class Worker:
 
     def _memory_state(self):
         host = self.host.sample()
-        running = [j for j in self.jobs.values() if j["result"]["status"] == "running"]
+        running = [j for j in active_values(self.jobs) if j["result"]["status"] == "running"]
         reserved = sum(j['rss_mb'] if j.get('rss_sampled') else j['task']['memory_mb'] for j in running)
         unallocated = sum(j['task']['memory_mb'] for j in running if not j.get('rss_sampled'))
         available = max(0, min(self.memory_capacity - reserved,
@@ -598,9 +608,9 @@ class Worker:
                           "stdout": "", "stderr": "", "tools": self.tool_info,
                           "assets": task["assets"], "cwd": cwd.as_posix(),
                           "accelerator": task.get('accelerator')}
-                job = {"result": result, "cancel": threading.Event(), "task": task,
+                job = Job({"result": result, "cancel": threading.Event(), "task": task,
                        "commands": commands, "directory": directory, "cwd": cwd,
-                       'callback':dict(self.callback if callback is None else callback)}
+                       'callback':dict(self.callback if callback is None else callback)})
                 self._save(job)
             except BaseException:
                 if directory.exists():
@@ -652,6 +662,7 @@ class Worker:
                 environment['PATH'] = os.pathsep.join(
                     [str(path) for path in msys_paths if path.is_dir()] + ([inherited] if inherited else []))
             environment.update({key: self._expand(value, task, work) for key, value in task["env"].items()})
+            environment = cache_environment(environment, self.cache_root)
             # Default libraries to the grant; callers with outer parallelism
             # can explicitly keep each numerical kernel single-threaded.
             for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -739,6 +750,7 @@ class Worker:
                 self._save(job)
                 self.used -= task["cpus"]
                 self.threads.discard(threading.current_thread())
+                archive_job(self.jobs, job)
                 self.condition.notify_all()
 
     def _clean_work(self, job, *, discard=False):
@@ -764,17 +776,19 @@ class Worker:
                 reclaim(work)
         except (OSError, ValueError) as error:
             job['result']['input_cleanup_error'] = str(error)
+            self.cleanup_pending.add(job['result']['id'])
             self.activity.notify('输入临时物待清理 '+str(work), 'local')
         else:
             job['result'].pop('input_cleanup_error', None)
+            if not job['result'].get('cleanup_error'):
+                self.cleanup_pending.discard(job['result']['id'])
 
     def _prune_assets(self, *, recent=True):
         # A check/upload and the following submit are separate LAN requests.
         # Keep their short handoff intact even if active assets exceed the LRU target.
         now = time.time()
         protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if recent and now-used<5}
-        for job in self.jobs.values():
-            protected.update(job['result'].get('assets', {}).values())
+        protected.update(asset_references(self.jobs))
         for error in self.asset_cache.prune(protected):
             self.activity.notify('资产缓存待清理 '+error, 'local')
 
@@ -795,9 +809,12 @@ class Worker:
         with self.condition:
             if issue:
                 job['result']['cleanup_error']=issue
+                self.cleanup_pending.add(job['result']['id'])
                 self.activity.notify('临时目录待清理 '+str(temporary), 'local')
             else:
                 job['result'].pop('cleanup_error',None)
+                if not job['result'].get('input_cleanup_error'):
+                    self.cleanup_pending.discard(job['result']['id'])
 
     def get(self, identity):
         with self.condition:
@@ -846,6 +863,7 @@ class Worker:
                     self._clean_work(job, discard=True)
                     job["result"].update(status="cancelled", finished=time.time())
                     self._save(job)
+                    archive_job(self.jobs, job)
                 self.condition.notify_all()
             return self.get(identity)
 
@@ -870,6 +888,7 @@ class Worker:
                 raise Conflict("Cancel and wait for the job before deleting it")
             remove_owned(job["directory"])
             del self.jobs[identity]
+            self.cleanup_pending.discard(identity)
             self._prune_assets()
             return {"deleted": identity}
 
@@ -896,7 +915,7 @@ class Worker:
     def close(self):
         with self.condition:
             self.stopping = True
-            for identity in list(self.jobs):
+            for identity, _job in list(active_items(self.jobs)):
                 self.cancel(identity)
             self.condition.notify_all()
         self.scheduler.join()
@@ -905,7 +924,8 @@ class Worker:
         # Calibration runs in a daemon thread and observes ``stopping`` while
         # queued.  A running native helper has its own bounded timeout; do not
         # hold service shutdown open just to wait for that optional probe.
-        for job in self.jobs.values():
+        for identity in list(self.cleanup_pending):
+            job = self.jobs[identity]
             self._clean_temp(job)
             self._clean_work(job)
         self._prune_assets(recent=False)

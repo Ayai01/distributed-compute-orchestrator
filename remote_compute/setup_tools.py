@@ -1,4 +1,4 @@
-"""Reuse the machine Python for science; keep native tools inside the project."""
+"""Reuse working installations; put newly downloaded native tools inside DCO."""
 
 import json
 import os
@@ -84,10 +84,13 @@ def _ngspice(destination, temporary, source=None):
     executable = destination/'bin/ngspice.exe'
     if source:
         source = Path(source).resolve()
-        if not (source/'bin/ngspice.exe').is_file():
+        installed = source if source.is_file() else source/'bin/ngspice.exe'
+        if not installed.is_file():
             raise ValueError('ngspice source must contain bin/ngspice.exe: '+str(source))
-        if source != destination.resolve():
-            _merge_tree(source, destination)
+        if installed != executable.resolve():
+            version = _run([installed, '--version'], capture_output=True, text=True).stdout
+            return installed, {'version':next((line.strip(' *') for line in version.splitlines() if 'ngspice-' in line), version.strip()),
+                               'reused':True}
     elif not executable.is_file():
         archive, extractor = temporary/'ngspice.7z', temporary/'7zr.exe'
         _download(NGSPICE_URL, archive)
@@ -138,6 +141,13 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
     root = Path(root).resolve()
     tools = root/'.tools'
     tools.mkdir(exist_ok=True)
+    if ngspice_source is None:
+        config_path = root/'worker.local.json'
+        configured = json.loads(config_path.read_text(encoding='utf-8-sig')) if config_path.exists() else {}
+        known = configured.get('tools', {}).get('ngspice') or configured.get('tools', {}).get('ng47') or shutil.which('ngspice')
+        candidate = Path(known[0] if isinstance(known, list) else known) if known else None
+        if candidate and candidate.is_file():
+            ngspice_source = candidate
     temporary_root = Path(temporary_root) if temporary_root else scratch('DCO')
     temporary_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='install-science-', dir=temporary_root) as directory:
@@ -155,7 +165,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
         for name in ('tmp','dev/shm','dev/mqueue','home'):
             (msys/name).mkdir(parents=True, exist_ok=True)
         result['env']['MSYS2_ROOT'] = msys.as_posix()
-    result['installed_mib'] = {'ngspice':round(sum(p.stat().st_size for p in (tools/'ngspice').rglob('*') if p.is_file())/1024**2, 1)}
+    result['installed_mib'] = {'ngspice':0 if simulator.get('reused') else round(sum(p.stat().st_size for p in (tools/'ngspice').rglob('*') if p.is_file())/1024**2, 1)}
     (tools/'science.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     return result
 
@@ -193,22 +203,12 @@ def rtl_files(source):
     return sorted(files), dict(sorted(selected.items()))
 
 
-def copy_rtl(source, root=ROOT):
-    """Copy an existing MSYS2 runtime's actual compiler dependency closure."""
+def reuse_rtl(source, root=ROOT):
+    """Register the existing MSYS2 installation without copying its packages."""
     source, root = Path(source).resolve(), Path(root).resolve()
-    destination = root/'.tools/msys64'
-    if source == destination:
-        raise ValueError('Select the existing full MSYS2 installation as the source')
     files, packages = rtl_files(source)
-    for name in files:
-        target = destination/name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        original = source/name
-        if not target.is_file() or (target.stat().st_size,target.stat().st_mtime_ns) != (original.stat().st_size,original.stat().st_mtime_ns):
-            shutil.copy2(original, target)
-    for name in ('tmp','dev/shm','dev/mqueue','home'):
-        (destination/name).mkdir(parents=True, exist_ok=True)
-    result = {'env':{'MSYS2_ROOT':destination.as_posix()}, 'packages':packages,
-              'files':len(files), 'installed_mib':round(sum((destination/name).stat().st_size for name in files)/1024**2, 1)}
+    result = {'env':{'MSYS2_ROOT':source.as_posix()}, 'packages':packages,
+              'files':len(files), 'installed_mib':0, 'reused':True}
+    (root/'.tools').mkdir(parents=True, exist_ok=True)
     (root/'.tools/rtl.json').write_text(json.dumps(result, indent=2)+'\n', encoding='utf8')
     return result

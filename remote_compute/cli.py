@@ -19,6 +19,7 @@ from .worker import Conflict, Server, Worker
 from .startup import Cancelled, resolve, single_instance
 from .process import keep_awake
 from .terminal import require_visible
+from .records import active_values
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 26133
@@ -106,7 +107,7 @@ def run_scheduler(args, local_client=None, restarting=None):
             def restart_center(*, check=False):
                 if check:
                     with coordinator.condition:
-                        if coordinator.stopping or any(j['result']['status'] not in TERMINAL for j in coordinator.jobs.values()):
+                        if coordinator.stopping or any(j['result']['status'] not in TERMINAL for j in active_values(coordinator.jobs)):
                             raise Conflict('Scheduler has active jobs; wait for them to finish before restarting')
                         coordinator.stopping = True
                         coordinator.condition.notify_all()
@@ -294,7 +295,7 @@ def main(argv=None):
     item.add_argument('--check', action='store_true', dest='update_check')
     item = sub.add_parser('setup', help='复用系统Python安装科学包；原生工具存放于.tools')
     item.add_argument('--ngspice-source', help='复用已有ngspice目录，省去下载')
-    item.add_argument('--rtl-source', help='提取已有MSYS2的GCC/Verilator闭包')
+    item.add_argument('--rtl-source', help='原位复用已有MSYS2的GCC/Verilator，不复制安装')
     item = sub.add_parser('control', help='在线调整设备资源，保存到设备配置')
     item.add_argument('--node', default=socket.gethostname())
     item.add_argument('--cpus', type=int)
@@ -366,10 +367,10 @@ def main(argv=None):
             display(update(check=args.update_check))
             return 0
         if args.action == 'setup':
-            from .setup_tools import install, copy_rtl
+            from .setup_tools import install, reuse_rtl
             result = install(ngspice_source=args.ngspice_source)
             if args.rtl_source:
-                result['env'].update(copy_rtl(args.rtl_source)['env'])
+                result['env'].update(reuse_rtl(args.rtl_source)['env'])
             saved = {**config, 'tools': {**config.get('tools', {}), **result['tools']},
                      'env': {**config.get('env', {}), **result['env']}}
             atomic_json(path, saved, private=True)
@@ -433,8 +434,16 @@ def main(argv=None):
             port = args.port if args.port is not None else DEFAULT_PORT
             from .ramdisk import scratch
             root = args.root or config.get("root") or ROOT / '.local/state' / ('local' if args.mode == 'hybrid' else str(port))
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "temp_root", "accelerators") if key in config}
-            if 'temp_root' not in options:
+            if config.get('migrate_root_from'):
+                from .paths import migrate_worker_state
+                migrate_worker_state(config['migrate_root_from'], root, ROOT)
+                saved = read_json(path)
+                saved.pop('migrate_root_from', None)
+                atomic_json(path, saved, private=True)
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "temp_root", "cache_root", "accelerators") if key in config}
+            if options.get('cache_root') is None:
+                options['cache_root'] = ROOT / '.local/cache'
+            if options.get('temp_root') is None:
                 options['temp_root'] = scratch('DCO') / 'tmp'
             if args.worker_memory_mb is not None:
                 options["memory_mb"] = args.worker_memory_mb
@@ -456,7 +465,7 @@ def main(argv=None):
             def restart_worker(*, check=False):
                 if check:
                     with worker.condition:
-                        if worker.stopping or any(j["result"]["status"] not in TERMINAL for j in worker.jobs.values()):
+                        if worker.stopping or any(j["result"]["status"] not in TERMINAL for j in active_values(worker.jobs)):
                             raise Conflict("Worker has active jobs; wait for them to finish before restarting")
                         worker.stopping = True
                         worker.condition.notify_all()

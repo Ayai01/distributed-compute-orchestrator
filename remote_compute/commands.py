@@ -18,6 +18,7 @@ import uuid
 from .client import Client, Pool, RemoteError
 from .bundle import atomic_json
 from .tasks import ngspice, verilator
+from .records import active_items
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -824,8 +825,8 @@ class WorkerShell(Shell):
     def do_jobs(self, line):
         """jobs [任务ID前缀]：列出本节点任务或查看完整记录。"""
         with self.worker.condition:
-            rows=[j['result'].copy() for j in self.worker.jobs.values()
-                  if not line.strip() or j['result']['id'].startswith(line.strip())]
+            identities=[identity for identity in self.worker.jobs if identity.startswith(line.strip())]
+        rows=[self.worker.get(identity) for identity in identities]
         if line.strip() and len(rows)==1:
             from .view import wrap_lines
             width=max(20,shutil.get_terminal_size((110,32)).columns-5)
@@ -851,8 +852,8 @@ class WorkerShell(Shell):
     def do_cancel(self, line):
         """cancel 任务ID|all：取消任务及其子进程。"""
         with self.worker.condition:
-            rows = [job['result'] for job in self.worker.jobs.values()]
-            identities = list(self.worker.jobs) if line.strip() == "all" else [job_identity(rows,line.strip())]
+            rows = [{'id':identity} for identity in self.worker.jobs]
+            identities = [identity for identity,_ in active_items(self.worker.jobs)] if line.strip() == "all" else [job_identity(rows,line.strip())]
         for identity in identities:
             self.worker.cancel(identity)
         print("已发出取消。")
@@ -860,12 +861,12 @@ class WorkerShell(Shell):
     def do_logs(self, line):
         """logs 任务ID：查看日志；支持唯一4位ID，例如 logs ab12。"""
         with self.worker.condition:
-            identity = job_identity([job['result'] for job in self.worker.jobs.values()],line.strip())
+            identity = job_identity([{'id':identity} for identity in self.worker.jobs],line.strip())
         for key, value in self.worker.logs(identity).items():
             print(key + ":\n" + value)
 
     def do_delete(self, line):
         """delete 任务ID：删除已经结束且不再需要的任务文件。"""
         with self.worker.condition:
-            identity = job_identity([job['result'] for job in self.worker.jobs.values()],line.strip())
+            identity = job_identity([{'id':identity} for identity in self.worker.jobs],line.strip())
         display(self.worker.delete(identity))

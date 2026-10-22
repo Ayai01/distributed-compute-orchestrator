@@ -5,6 +5,8 @@
   "memory_mb": 0,
   "memory_reserve_mb": 16384,
   "memory_headroom_mb": 8192,
+  "temp_root": null,
+  "cache_root": null,
   "tags": ["cpu"],
   "accelerators": [],
   "tools": {},

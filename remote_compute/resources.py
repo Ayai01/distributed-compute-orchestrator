@@ -59,6 +59,15 @@ def _service_api():
     return Counters, psapi.GetProcessMemoryInfo, kernel.GetProcessHandleCount
 
 
+@lru_cache(maxsize=1)
+def _private_resident_mb(second):
+    try:
+        fields = dict(line.split(':', 1) for line in Path('/proc/self/smaps_rollup').read_text().splitlines() if ':' in line)
+        return sum(int(fields[key].split()[0]) for key in ('Private_Clean', 'Private_Dirty')) / 1024
+    except (OSError, KeyError, ValueError):
+        return None
+
+
 def service_usage():
     """Current service footprint, separate from the admitted child processes."""
     value = dict(pid=os.getpid(), threads=threading.active_count())
@@ -74,8 +83,10 @@ def service_usage():
     else:
         entries = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
         value.update(rss_mb=int(entries['VmRSS'].split()[0])/1024,
-                     private_mb=int(entries['VmData'].split()[0])/1024,
                      handles=len(list(Path('/proc/self/fd').iterdir())))
+        private = _private_resident_mb(int(time.monotonic()))
+        if private is not None:
+            value.update(private_mb=private, private_kind='resident')
     return value
 
 

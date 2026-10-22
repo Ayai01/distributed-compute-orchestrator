@@ -102,7 +102,19 @@ Tab 在空输入时显示根命令候选，有输入时补全；Ctrl+Tab 翻任�
 
 这是示例预算，按设备设置。复制 [worker.example.json](worker.example.json) 为 `worker.local.json` 后默认启动才会读取。`memory_mb=0` 默认使用物理内存减 16GiB，显式数值为设备计算预算；`memory_headroom_mb=8192` 为系统实时保留至少 8GiB 可用 RAM。运行任务首次取得进程树 RSS 后按实际占用准入；尚在派发或启动采样前按申报量预留。任务的阶段需求仍保留在回执中，实际用量增长继续计入设备预算。缺失共享路径标记为 `unavailable_shared`，其他能力继续提供。
 
-持久任务、输入、资产及未领取结果放在普通磁盘 `.local/state`：中心为 `scheduler/`，hybrid 本机 worker 为 `local/`，独立 worker 按端口隔离。设备 JSON 的 `root` 只指定 worker 状态根；CLI `--root` 同时指定 worker 根和中心的 `scheduler/` 子目录。`temp_root` 单独指定任务 TMP，默认使用共享 RAM 盘。迁移目录前核对回执和联接，排空后搬完整状态、更新配置再重载。
+持久任务、输入、资产及未领取结果放在普通磁盘 `.local/state`：中心为 `scheduler/`，hybrid 本机 worker 为 `local/`，独立 worker 按端口隔离。设备 JSON 的 `root` 只指定 worker 状态根；CLI `--root` 同时指定 worker 根和中心的 `scheduler/` 子目录。`temp_root` 缺省或null均使用共享RAM的DCO专属TMP；没有RAM盘时回落到工程`.local/tmp`。显式磁盘路径继续生效。
+
+| DCO目录 | 内容与回收规则 |
+| --- | --- |
+| `.local/state/` | 原任务、回执、检查点和待领取结果；收妥后按原ID清理，不按年龄丢弃 |
+| `.local/cache/` | 新建的编译、数值库及模型/依赖缓存；`cache_root`可配置，任务env覆盖设备env及默认值 |
+| `.tools/` | 缺少时新安装的工具及下载缓存；已能工作的外部安装直接引用，不复制环境 |
+| `.projects/` | DCO执行副本及其科研缓存；主工程工作区与正式发布成果继续由工程维护 |
+| `.local/tmp/`、共享RAM中的DCO目录 | 可重建临时物，按任务所有权回收 |
+
+以上目录与设备配置均被Git忽略。Python/Java/CUDA等系统运行环境及已有可用的外部工具、模型和依赖缓存原位复用；DCO新生成的信息集中在上述目录，显式缓存环境变量优先。未配置的Numba/Matplotlib/CUDA编译缓存默认写DCO；已有Coursier/Torch/HuggingFace依赖或模型缓存直接复用，避免再次下载。不要移动或清理在途任务正在使用的目录。
+
+旧worker状态迁入DCO时，在本机配置中将`root`设为新的`.local/state/...`路径，并临时添加`migrate_root_from`旧根。排空后正常重载；启动会先验证旧worker已退出，再在同一文件系统整体重命名并移除迁移字段。目标目录须尚不存在，原ID、回执、输入及链接原样保留；不合并两套状态、不复制工具目录。
 
 资源协商使用独立的 `lease_timeout`，默认取普通 `timeout` 与130秒中的较大值：远端 worker 的初始 lease 和本机直连中心的 resize 都使用这一期限，worker 可等待中心回复120秒。普通请求及中心的资源答复保持普通期限，`pool_timeout` 只管理本地连接排队。lease 或 resize 超时均不自动重发，资源变更可能已生效；先按原ID核对实际授予和任务状态。任务跟进使用 `status(id)`，全量 `status()` 读取全部保留历史，勿用于高频轮询或费用总账；已显式删除的任务由调用工程保存原回执与费用。
 
@@ -165,7 +177,7 @@ python -B main.py setup --ngspice-source "D:/Program Files/ngspice" --rtl-source
 python -B main.py --check
 ```
 
-setup 复用系统 Python 3.14，验证科学依赖后写本机 tools/env；Windows 原生工具放忽略的 `.tools/`。ngspice 可下载或复用，实际版本 47 才登记 ng47。RTL 从已有 MSYS2 提取 GCC/Verilator 闭包，保留标准库和必需运行依赖。Linux 直接配置已有 Python/ngspice/编译器；setup 的可移动工具链面向 Windows。
+setup复用系统Python，验证科学依赖后写本机tools/env。已有ngspice和MSYS2原位引用，保留其完整运行依赖；仅缺少的ngspice下载到忽略的`.tools/`，实际版本47才登记ng47。Linux直接配置已有Python/ngspice/编译器。
 
 Python 能力按实际运行环境登记；新增算法先复用已有环境，不按算法或工程重复增加名字。
 
