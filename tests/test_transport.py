@@ -6,6 +6,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import threading
@@ -22,6 +23,34 @@ from test_compute import provider, python, scratch, until
 
 
 class ArtifactReloadTests(unittest.TestCase):
+    def test_legacy_memory_return_only_confirms_an_identical_cpu_grant(self):
+        identity='e'*32;url='http://127.0.0.1:12345'
+        state=dict(id=identity,status='running',cpus=1,memory_mb=512)
+        with patch.dict(os.environ,REMOTE_COMPUTE_LEASE='1',REMOTE_COMPUTE_JOB_ID=identity,
+                        REMOTE_COMPUTE_WORKER_JOB_ID=identity,REMOTE_COMPUTE_URL=url):
+            for changes,requested in (({'status':'failed'},128),({'status':'cancelled'},128),
+                    ({'id':'f'*32},128),({'cpus':2},128),({'memory_mb':64},128),({},768)):
+                with self.subTest(changes=changes,requested=requested):
+                    client=Client(url);client._capabilities=['resize_memory']
+                    failure=RemoteError('min() iterable argument is empty');failure.status_code=409
+                    with patch.object(client,'request',side_effect=[failure,dict(state,**changes)]) as request:
+                        with self.assertRaises(RemoteError):client.resize(identity,1,memory_mb=requested)
+                    self.assertEqual([c.args[0] for c in request.call_args_list],['/jobs/'+identity+'/lease','/jobs/'+identity])
+                    self.assertEqual(request.call_args_list[-1].kwargs,dict(brief=True))
+
+    def test_unrelated_or_growing_resize_errors_are_never_hidden_or_replayed(self):
+        identity='e'*32;url='http://127.0.0.1:12345'
+        for leased,cpus,memory,message in ((False,1,128,'min() iterable argument is empty'),
+                (True,0,128,'min() iterable argument is empty'),(True,1,128,'Insufficient memory'),
+                (True,1,None,'min() iterable argument is empty')):
+            with self.subTest(leased=leased,cpus=cpus,memory=memory,message=message), \
+                    patch.dict(os.environ,REMOTE_COMPUTE_LEASE='1' if leased else '0',REMOTE_COMPUTE_JOB_ID=identity,REMOTE_COMPUTE_URL=url):
+                client=Client(url);client._capabilities=['resize_memory','resize_auto']
+                failure=RemoteError(message);failure.status_code=409
+                with patch.object(client,'request',side_effect=failure) as request:
+                    with self.assertRaises(RemoteError):client.resize(identity,cpus,memory_mb=memory)
+                self.assertEqual(request.call_count,1)
+
     def test_completed_result_survives_temporary_upstream_outage_without_reexecution(self):
         with scratch() as folder,provider(Path(folder)/'worker') as (_,worker_client):
             with Pool([dict(name='test',client=worker_client)]) as pool,center(pool,Path(folder)/'center') as (_,client):

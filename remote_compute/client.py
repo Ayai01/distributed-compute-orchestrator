@@ -298,7 +298,23 @@ class Client:
         action='lease' if (os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
                            and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/')) else 'resize'
         target=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',identity) if action=='lease' else identity
-        return self.request('/jobs/'+target+'/'+action, request)
+        try:
+            return self.request('/jobs/'+target+'/'+action, request)
+        except RemoteError as error:
+            # Old centers can fail a RAM return before changing any grant.
+            # During their natural drain, confirm this worker's original grant
+            # instead of replaying a lease or failing already-prepared work.
+            if (action!='lease' or modeled or memory_mb is None or cpus<1
+                    or getattr(error,'status_code',None)!=409
+                    or 'min() iterable argument is empty' not in str(error)):
+                raise
+            state=self.request('/jobs/'+target,brief=True)
+            if (state.get('id')!=target or state.get('status')!='running'
+                    or state.get('cpus')!=cpus or state.get('memory_mb',0)<memory_mb):
+                raise error
+            return dict(id=identity,node=state.get('node'),cpus=state['cpus'],memory_mb=state['memory_mb'],
+                        requested_cpus=cpus,supported=False,resize_applied=False,
+                        existing_grant_confirmed=True,resize_error=str(error))
 
     def nodes(self):
         if not self.operator:
@@ -1016,9 +1032,15 @@ class Pool:
 
     def _host_memory_free(self, node):
         machine = node.health.get("machine_id", node.client.url)
-        siblings = [n for n in self.nodes if n.health.get("machine_id", n.client.url) == machine and not n.error]
+        siblings = [n for n in self.nodes if n.health.get("machine_id", n.client.url) == machine]
+        sampled = [n for n in siblings if not n.error]
+        # A running task can return a lease while its host probe is failing.
+        # Keep its existing grant, but offer no new RAM without a live sample.
+        if not sampled:
+            return 0
         # One physical memory pool per machine, even with several worker ports.
-        physical = min(n.health.get("host_memory_available_mb", 0) - n.health.get("memory_headroom_mb",n.health.get("memory_reserve_mb", 0)) for n in siblings)
+        physical = min(n.health.get("host_memory_available_mb", 0) - n.health.get("memory_headroom_mb",n.health.get("memory_reserve_mb", 0)) for n in sampled)
+        # A failed probe does not release that sibling's outstanding reservations.
         unallocated = sum((n.memory_unreported+max(0,n.health.get('memory_reserved_mb',0)-n.health.get('rss_mb',0))
                            if n.health.get('memory_accounting')=='rss' else
                            max(0,n.reserved_memory_mb+n.external_memory_mb-n.health.get('rss_mb',0))) for n in siblings)

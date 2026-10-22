@@ -170,6 +170,27 @@ class CalibrationTests(unittest.TestCase):
     def choose(self,pool,weight=1.0):
         return pool._acquire(dict(steps=[['echo']],cpus=1,memory_mb=64,label='same-work',single_thread_weight=weight),block=False).name
 
+    def test_unavailable_host_has_no_new_memory_headroom(self):
+        pool=self.pool();node=pool.nodes[0]
+        node.error='temporary health timeout'
+        self.assertEqual(pool._host_memory_free(node),0)
+        pool.nodes.remove(node)
+        self.assertEqual(pool._host_memory_free(node),0)
+
+    def test_unreachable_sibling_retains_its_unreported_memory_reservation(self):
+        pool=self.pool();first,second=pool.nodes
+        second.health['machine_id']=first.health['machine_id']
+        first.error='temporary health timeout'
+        first.reserved_memory_mb=2048
+        first.health['rss_mb']=256
+        second.health['memory_headroom_mb']=1024
+        self.assertEqual(pool._host_memory_free(first),8192-1024-(2048-256))
+
+    def test_healthy_host_memory_uses_the_smallest_live_sample(self):
+        pool=self.pool();first,second=pool.nodes
+        second.health.update(machine_id=first.health['machine_id'],host_memory_available_mb=4096,memory_headroom_mb=1024)
+        self.assertEqual(pool._host_memory_free(first),3072)
+
     def test_unmeasured_tasks_use_mixed_speed_per_measured_cpu(self):
         pool=self.pool()
         pool.nodes[1].health['benchmark'].update(score=30,threads=10)

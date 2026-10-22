@@ -430,6 +430,72 @@ class CenterTests(unittest.TestCase):
             self.assertIn('timed out',result['stderr'])
             until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
 
+    def test_local_lease_can_release_grant_during_host_health_failure(self):
+        code=("import os,sys,time\nfrom pathlib import Path\n"
+              "sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\nfrom remote_compute import Client\n"
+              "while not Path('release-phase').exists():time.sleep(.01)\n"
+              "grant=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],lease_timeout=3).resize("
+              "os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n"
+              "print(str(grant['cpus'])+':'+str(grant['memory_mb']))\n")
+        with scratch() as root,provider(Path(root)/'worker',cpus=2,memory_mb=1024,memory_reserve_mb=0) as (worker,remote), \
+                Pool([remote]) as pool,center(pool,Path(root)/'center') as (_,client):
+            identity=client.submit(python(code,cpus=2,memory_mb=512))['id']
+            until(lambda:client.status(identity)['status']=='running')
+            with patch.object(pool,'_probe',return_value=None):
+                pool.refresh()
+                with pool.condition:pool.nodes[0].error='temporary health timeout'
+                client.write_job_file(identity,'release-phase','ready')
+                outcome=client.wait(identity,wait_timeout=5)
+            result=client.fetch(identity)
+            self.assertEqual(outcome['status'],'succeeded',result.get('stderr'))
+            self.assertEqual((result['id'],result['cpus'],result['memory_mb']),(identity,1,128))
+            self.assertEqual(result['stdout'].strip(),'1:128')
+            self.assertFalse(result['attempts'])
+            until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
+            self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_host_health_failure_rejects_memory_growth_then_recovers_original_job(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=2,memory_mb=1024,memory_reserve_mb=0) as (worker,remote), \
+                Pool([remote]) as pool,center(pool,Path(root)/'center') as (_,client):
+            identity=client.submit(python("from pathlib import Path;import time\nwhile not Path('done').exists():time.sleep(.01)",memory_mb=512))['id']
+            until(lambda:client.status(identity)['status']=='running')
+            with patch.object(pool,'_probe',return_value=None):
+                pool.refresh()
+                with pool.condition:pool.nodes[0].error='temporary health timeout'
+                with self.assertRaises(RemoteError) as denied:client.resize(identity,1,memory_mb=768)
+                self.assertEqual(denied.exception.status_code,409)
+                self.assertIn('Insufficient memory',str(denied.exception))
+                self.assertEqual((remote.status(identity)['cpus'],remote.status(identity)['memory_mb']),(1,512))
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
+            pool.refresh()
+            grant=client.resize(identity,1,memory_mb=768)
+            self.assertEqual((grant['cpus'],grant['memory_mb']),(1,768))
+            client.write_job_file(identity,'done','ready')
+            self.assertEqual(client.wait(identity,wait_timeout=5)['status'],'succeeded')
+            self.assertEqual(client.fetch(identity)['id'],identity)
+            until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
+            self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
+    def test_old_center_memory_return_error_uses_worker_confirmed_grant_once(self):
+        code=("import os,sys\nsys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\n"
+              "from remote_compute import Client\n"
+              "grant=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],lease_timeout=3).resize("
+              "os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n"
+              "assert grant['existing_grant_confirmed'] and not grant['resize_applied']\n"
+              "print(str(grant['cpus'])+':'+str(grant['memory_mb']))\n")
+        with scratch() as root,provider(Path(root)/'worker',memory_mb=1024,memory_reserve_mb=0) as (worker,remote), \
+                Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client):
+            with patch.object(state,'resize',side_effect=ValueError('min() iterable argument is empty')) as resize:
+                identity=client.submit(python(code,memory_mb=512))['id']
+                outcome=client.wait(identity,wait_timeout=5)
+                result=client.fetch(identity)
+            self.assertEqual(outcome['status'],'succeeded',result.get('stderr'))
+            self.assertEqual(result['stdout'].strip(),'1:512')
+            self.assertEqual(resize.call_count,1)
+            self.assertEqual((result['id'],result['memory_mb'],result['attempts']),(identity,512,[]))
+            until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
+            self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+
     def test_overlapping_node_sets_have_feasible_project_targets_and_admission(self):
         with scratch() as root,provider(Path(root)/'pc',cpus=2,tags=['physical_profile_a']) as (_,pc), \
                 provider(Path(root)/'tx',cpus=6,tags=['physical_profile_a']) as (_,tx), \
