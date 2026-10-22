@@ -70,13 +70,14 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None):
         self.url, self.token, self.operator = url.rstrip("/"), token, bool(operator)
         self.operator_token = operator_token if self.operator else None
         if timeout is None:
             timeout = (float(os.environ.get('REMOTE_COMPUTE_TIMEOUT',10))
                        if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else 10)
         self.timeout = timeout
+        self.lease_timeout = max(timeout, 130) if lease_timeout is None else lease_timeout
         self.pool_timeout = pool_timeout
         self.endpoint = urlsplit(self.url)
         self.connections = threading.local()
@@ -117,6 +118,11 @@ class Client:
     def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
+        # The worker can wait 120s for its center to answer a resource lease.
+        # Replies and ordinary requests keep their own network deadline.
+        lease_wait = (method in (None, 'POST') and isinstance(data, dict) and 'request_id' not in data
+                      and re.fullmatch(r'/jobs/[0-9a-f]{32}/lease', path))
+        network_timeout = getattr(self, 'lease_timeout', max(self.timeout, 130)) if lease_wait else self.timeout
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
                    'Accept-Encoding': 'gzip','X-DCO-Keepalive':'1'}
         auth_token = (self.operator_token or self.token) if self.operator else self.token
@@ -159,11 +165,11 @@ class Client:
             if connection is None:
                 factory = http.client.HTTPSConnection if self.endpoint.scheme == 'https' else http.client.HTTPConnection
                 options={'context':getattr(self,'ssl_context',None)} if self.endpoint.scheme=='https' else {}
-                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=self.timeout,**options)
+                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=network_timeout,**options)
                 self.connections.connection = connection
-            connection.timeout = self.timeout
+            connection.timeout = network_timeout
             if connection.sock is not None:
-                connection.sock.settimeout(self.timeout)
+                connection.sock.settimeout(network_timeout)
             try:
                 if partial and etag:
                     headers.update(Range='bytes='+str(len(partial))+'-', **{'If-Range':etag})

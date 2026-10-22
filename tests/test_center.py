@@ -408,7 +408,7 @@ class CenterTests(unittest.TestCase):
     def test_late_lease_answer_preserves_the_original_failed_outcome(self):
         code=("import os,sys\nsys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\n"
               "from remote_compute import Client\n"
-              "Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],timeout=.1).resize("
+              "Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],timeout=.1,lease_timeout=.1).resize("
               "os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n")
         with scratch() as root,provider(Path(root)/'worker',memory_mb=1024) as (worker,remote), \
                 Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client):

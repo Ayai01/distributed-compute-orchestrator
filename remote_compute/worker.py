@@ -1080,8 +1080,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Restart requires a supervised service")
             elif parts == ["jobs"] and self.command == "GET":
                 with worker.condition:
-                    value = [worker.public_get(identity) if scheduler and not operator else worker.get(identity)
-                             for identity in worker.jobs]
+                    identities = tuple(worker.jobs)
+                # Large retained histories must not hold up grants or replies.
+                # Each get copies one result; cleanup can remove later IDs.
+                value = []
+                for identity in identities:
+                    try:
+                        result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
+                    except KeyError:
+                        continue
+                    value.append(result)
             elif len(parts) == 2 and parts[0] == "assets" and self.command in {"GET", "POST"}:
                 value = worker.asset(parts[1], body)
             elif len(parts) >= 2 and parts[0] == "jobs":

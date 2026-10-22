@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from remote_compute import Client, Pool
+from remote_compute import Client, Pool, RemoteError
 from remote_compute.bundle import pack
 from remote_compute.client import PoolBusy, _ConnectionPool
 from remote_compute.worker import Handler
@@ -74,6 +74,83 @@ def slow_upload_server(*, interrupt=False):
 
 
 class TransportTests(unittest.TestCase):
+    def test_resource_lease_waits_past_normal_timeout_without_extending_other_requests(self):
+        identity = 'a'*32
+        calls, deadlines = [], []
+        original = http.client.HTTPConnection.request
+        def request(connection, method, path, *args, **kwargs):
+            deadlines.append((path, connection.timeout))
+            return original(connection, method, path, *args, **kwargs)
+        def delayed_lease(key, value):
+            calls.append((key, value))
+            time.sleep(.15)
+            return dict(id=key, cpus=1, memory_mb=128)
+        with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
+            client = Client(remote.url, timeout=.05)
+            environment = dict(REMOTE_COMPUTE_LEASE='1', REMOTE_COMPUTE_URL=remote.url,
+                               REMOTE_COMPUTE_JOB_ID=identity, REMOTE_COMPUTE_WORKER_JOB_ID=identity)
+            with patch.dict('os.environ', environment), patch.object(worker, 'lease', side_effect=delayed_lease), \
+                    patch.object(http.client.HTTPConnection, 'request', request):
+                result = client.resize(identity, 1, memory_mb=128)
+                client.health(brief=True)
+            self.assertEqual(result, dict(id=identity, cpus=1, memory_mb=128))
+            self.assertEqual(len(calls), 1)
+            self.assertIn(('/jobs/'+identity+'/lease', 130), deadlines)
+            self.assertEqual(deadlines[-1], ('/health', .05))
+            self.assertEqual(client.timeout, .05)
+
+    def test_explicit_short_lease_deadline_never_resubmits_the_pending_request(self):
+        identity = 'b'*32
+        calls = []
+        def delayed_lease(key, value):
+            calls.append((key, value))
+            time.sleep(.15)
+            return dict(id=key, cpus=1, memory_mb=128)
+        with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
+            client = Client(remote.url, timeout=1, lease_timeout=.05)
+            with patch.object(worker, 'lease', side_effect=delayed_lease):
+                with self.assertRaisesRegex(RemoteError, 'timed out'):
+                    client.request('/jobs/'+identity+'/lease', dict(cpus=1, memory_mb=128))
+                self.assertEqual(len(calls), 1)
+
+    def test_retained_job_listing_does_not_block_a_lease_reply(self):
+        entered, release = threading.Event(), threading.Event()
+        with scratch() as root, provider(Path(root)/'worker') as (worker, client):
+            identity = client.submit(python("print('retained')"))['id']
+            client.wait(identity)
+            original = worker.get
+            def slow_copy(key):
+                result = original(key)
+                entered.set()
+                release.wait(3)
+                return result
+            with patch.object(worker, 'get', side_effect=slow_copy), ThreadPoolExecutor(max_workers=1) as executor:
+                listing = executor.submit(client.status)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    control = Client(client.url, timeout=.5)
+                    self.assertEqual(control.request('/jobs/'+identity+'/lease',
+                        dict(request_id=1, grant=dict(cpus=1, memory_mb=128))), dict(accepted=True))
+                finally:
+                    release.set()
+                self.assertEqual([row['id'] for row in listing.result(timeout=3)], [identity])
+
+    def test_retained_job_listing_tolerates_cleanup_after_its_id_snapshot(self):
+        with scratch() as root, provider(Path(root)/'worker') as (worker, client):
+            first = client.submit(python("print('first')"))['id']
+            second = client.submit(python("print('second')"))['id']
+            client.wait(first)
+            client.wait(second)
+            original = worker.get
+            def cleanup_during_copy(identity):
+                result = original(identity)
+                if identity == first:
+                    worker.delete(second)
+                return result
+            with patch.object(worker, 'get', side_effect=cleanup_during_copy):
+                self.assertEqual([row['id'] for row in client.status()], [first])
+            self.assertEqual(client.status(first)['status'], 'succeeded')
+
     def test_slow_binary_upload_keeps_progress_past_the_socket_timeout(self):
         payload=b'asset-content'*160000
         identity=hashlib.sha256(payload).hexdigest()
