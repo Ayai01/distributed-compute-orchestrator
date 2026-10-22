@@ -556,6 +556,45 @@ class Coordinator:
                 groups[group]=groups.get(group,0)+count
         return protected
 
+    def _fixed_queue_claims(self, resources):
+        """Let a ready fixed-width job accumulate its share on one worker."""
+        claims, groups = {}, set()
+        def order(identity):
+            task = self.jobs[identity]['task']
+            group = task.get('project') or 'default'
+            return (-task['priority'], resources[group]['used']/resources[group]['resource_share'])
+        with self.pool.condition:
+            for identity in sorted(self.queue, key=order):
+                job = self.jobs[identity]; task = job['task']
+                group = task.get('project') or 'default'; resource = resources[group]
+                width = task['cpus']
+                if (job.get('auto_cpus') or width <= 1 or group in groups or job['cancel'].is_set()
+                        or width > resource['target']-resource['used']):
+                    continue
+                ready = [node for node in self.pool._matching(task)
+                         if node.name not in claims and not node.error and node.enabled
+                         and not node.health.get('paused') and not node.health.get('queued', 0)
+                         and node.capacity-node.external >= width
+                         and min(node.memory_free, self.pool._host_memory_free(node)) >= task['memory_mb']
+                         and node.can_match_accelerator(task.get('accelerator'))]
+                if ready:
+                    node = max(ready, key=lambda node: (node.capacity-node.reserved-node.external, node.name))
+                    claims[node.name] = (node, task)
+                    groups.add(group)
+        return claims
+
+    @staticmethod
+    def _fixed_queue_headroom(task, resources, claims):
+        group = task.get('project') or 'default'; current = resources[group]
+        protected = {}
+        for name, (node, waiting) in claims.items():
+            owner = waiting.get('project') or 'default'; resource = resources[owner]
+            if (owner != group and (waiting['priority'] > task['priority'] or
+                    waiting['priority'] == task['priority'] and
+                    resource['used']/resource['resource_share'] <= current['used']/current['resource_share'])):
+                protected[name] = max(0, min(waiting['cpus'], node.capacity-node.reserved-node.external))
+        return protected
+
     def _schedule(self):
         with self.condition:
             while not self.stopping:
@@ -565,6 +604,7 @@ class Coordinator:
                         self._fallback_accelerator(self.jobs[identity])
                     budgets = self.project_resources()
                     growth = {}
+                    fixed = None
                     # Within the same priority and CPU mode, place constrained
                     # work first so flexible jobs retain the other devices.
                     # First honor weighted targets, then lend otherwise idle slots.
@@ -581,10 +621,15 @@ class Coordinator:
                             priority=job['task']['priority']
                             if priority not in growth:
                                 growth[priority]=self._growth_headroom(job['task'],budgets)
+                            if fixed is None:
+                                fixed = self._fixed_queue_claims(budgets)
+                            headroom = dict(growth[priority])
+                            for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
+                                headroom[name] = max(headroom.get(name, 0), count)
                             node = self.pool._acquire(job["task"], block=False,
                                 cpu_limit=room if room > 0 else None,
                                 partial_cpus=time.time()-job['result']['submitted']>=1,job_id=job.get('worker_id',identity),
-                                node_headroom=growth[priority])
+                                node_headroom=headroom)
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -597,6 +642,7 @@ class Coordinator:
                         job["node"] = node
                         budget['used'] += job['task']['cpus']
                         growth.clear()
+                        fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              dispatched=time.time(), cpus=job['task']['cpus'])
                         self._save(job)
