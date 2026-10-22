@@ -27,6 +27,36 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def save_detached_node(path, node):
+    """Persist only this routing change; keep budgets, credentials and peers."""
+    if node.enabled or not node.detached or not Path(path).exists():return
+    value=read_json(path)
+    for row in value.get('nodes',[]):
+        if row.get('name')==node.name or row.get('url','').rstrip('/')==node.client.url:
+            row['enabled']=False
+    atomic_json(path,value,private=True)
+
+
+def scan_parser():
+    parser=argparse.ArgumentParser(prog='scan')
+    parser.add_argument('networks',nargs='*',metavar='IPv4-CIDR')
+    parser.add_argument('--port',dest='scan_port',type=int,default=26133)
+    parser.add_argument('--timeout',dest='scan_timeout',type=float,default=.7)
+    parser.add_argument('--add',dest='scan_add',action='store_true',help='接入本次发现的可用DCO')
+    return parser
+
+
+def scan_devices(args):
+    from .discovery import scan
+    path=Path(getattr(args,'nodes',None) or ROOT/'nodes.local.json')
+    known=read_json(path).get('nodes',[]) if path.exists() else []
+    value=scan(args.networks,port=args.scan_port,timeout=args.scan_timeout,known=known)
+    print('扫描网段: '+', '.join(value['networks']))
+    print('可用DCO: '+str(len(value['nodes'])))
+    table(value['nodes'],['name','url'])
+    return value['nodes']
+
+
 def words(line):
     lexer = shlex.shlex(line, posix=True)
     lexer.whitespace_split = True
@@ -130,7 +160,7 @@ COMMAND_TREE = (
     ('查看', ('status', 'nodes', 'jobs')),
     ('资源', ('cpus', 'memory', 'calibrate', 'pause', 'resume', 'policy', 'set')),
     ('任务', ('run', 'spice', 'rtl', 'batch', 'sync_cache', 'logs', 'cancel', 'fetch', 'wait')),
-    ('设备与文件', ('add', 'save', 'exec', 'python', 'ls', 'read', 'put', 'get', 'restart')),
+    ('设备与文件', ('add', 'scan', 'save', 'exec', 'python', 'ls', 'read', 'put', 'get', 'restart')),
     ('终端', ('help', 'quit')),
 )
 
@@ -277,6 +307,7 @@ class Shell(cmd.Cmd):
             parser = (submission_parser(command) if command in {'run','spice','rtl'} else
                       machine_parser(command) if command in MACHINE_ACTIONS else
                       cache_parser() if command == 'sync_cache' else None)
+            if command=='scan':parser=scan_parser()
             if parser:
                 action = parser._option_string_actions.get(previous)
                 if action is None or action.nargs == 0:
@@ -646,6 +677,15 @@ class SchedulerShell(Shell):
             self.pool.add(name, url, token=token, ca_file=saved.get('ca_file'))
         self.do_nodes("")
         self.do_save('')
+
+    def do_scan(self, line):
+        """scan [IPv4-CIDR] [--add]：扫描局域网；--add接入可用DCO。"""
+        self.scan(scan_parser().parse_args(words(line)))
+
+    def scan(self,args):
+        found=scan_devices(args)
+        if args.scan_add:
+            for node in found:self.do_add(node['url'])
 
     def do_save(self, _line):
         """保存当前节点和策略到 nodes.local.json，下次启动自动加载。"""

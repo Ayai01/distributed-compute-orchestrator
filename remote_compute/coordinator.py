@@ -687,6 +687,16 @@ class Coordinator:
             cancel_sent=False
             while True:
                 try:
+                    if job['cancel'].is_set() and node.detached:
+                        # Cancellation has no remote acknowledgement. Finish
+                        # the caller's drain, keeping the original receipt for
+                        # recovery rather than retrying uncertain computation.
+                        with self.condition:
+                            job['result'].update(status='interrupted',finished=time.time(),
+                                error='Cancellation pending on a worker detached after 60 seconds offline',
+                                remote_cancel_pending=True,cost_incomplete=True)
+                            self._save(job)
+                        break
                     if job["cancel"].is_set() and not cancel_sent:
                         node.client.cancel(identity)
                         cancel_sent=True
@@ -847,6 +857,9 @@ class Coordinator:
 
     def _update(self, job, remote):
         clean_tool_snapshot(remote)
+        if remote.get('status') in TERMINAL and remote['status']!='interrupted':
+            job['result'].pop('remote_cancel_pending',None)
+            job['result'].pop('cost_incomplete',None)
         if 'resource_request' not in remote:job['result'].pop('resource_request',None)
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ('id',"assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
@@ -1084,6 +1097,10 @@ class Coordinator:
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             result, client = self.get(identity), self._client(job)
+            node=job.get('node') or next((n for n in self.pool.nodes if n.client is client),None)
+            if result['status']=='interrupted' and node is not None and (node.detached or not node.enabled):
+                result['cost_incomplete']=True
+                client=None
             worker_id=job.get('worker_id',result.get('worker_id',identity))
             result_lock=job.setdefault('artifact_lock',threading.RLock())
             transfers=self.__dict__.setdefault('_artifact_transfers',{})
@@ -1148,6 +1165,8 @@ class Coordinator:
                     return {"deleted": identity}
             if client:
                 try:
+                    if job['result'].get('remote_cancel_pending'):
+                        client.cancel(job.get('worker_id',job['result'].get('worker_id',identity)))
                     client.delete(job.get('worker_id',job['result'].get('worker_id',identity)))
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404:

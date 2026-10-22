@@ -468,6 +468,8 @@ class Node:
     enabled: bool = True
     health: dict = field(default_factory=dict)
     error: str = ""
+    last_connected_at: float = field(default_factory=time.monotonic)
+    detached: bool = False
     reserved: int = 0
     external: int = 0
     memory_limit_mb: int = 0
@@ -596,9 +598,10 @@ class Pool:
     """
     POLICIES = {"adaptive", "balanced", "round_robin"}
 
-    def __init__(self, nodes, *, policy="adaptive", refresh=2):
+    def __init__(self, nodes, *, policy="adaptive", refresh=2, on_detach=None):
         self.condition = threading.Condition(threading.RLock())
         self.refresh_lock = threading.Lock()
+        self.on_detach = on_detach
         self.nodes = []
         self.policy = policy
         self.sample_seconds = refresh
@@ -663,6 +666,7 @@ class Pool:
             node.sampled_at=time.monotonic()
             node.error=error
             if not error:
+                node.last_connected_at=time.monotonic()
                 node.health={**node.health,**value}
                 jobs=value.get('active_jobs') or []
                 running=[job for job in jobs if job['status']=='running']
@@ -714,7 +718,8 @@ class Pool:
         if nodes is None:
             # Disabled hosts still drain accepted jobs, then stop background
             # probes. Explicit maintenance refreshes keep their direct path.
-            selected = [node for node in selected if node.enabled or node.live_jobs or node.reserved or node.external]
+            selected = [node for node in selected if not node.detached and
+                        (node.enabled or node.live_jobs or node.reserved or node.external)]
         with self.refresh_lock:
             for node in selected:
                 pending=self.probe_futures.get(node.name)
@@ -730,8 +735,27 @@ class Pool:
                 pending,_=wait_futures(pending,timeout=timeout)
             for future in pending:future.result()
 
+    def _expire_unreachable(self, now=None):
+        now=time.monotonic() if now is None else now
+        removed=[]
+        with self.condition:
+            for node in self.nodes:
+                if node.enabled and now-node.last_connected_at>=60:
+                    node.enabled=False
+                    node.detached=True
+                    if not node.error:node.error='No successful connection for 60 seconds'
+                    removed.append(node)
+            if removed:self.condition.notify_all()
+        for node in removed:
+            if self.on_detach:
+                try:self.on_detach(node)
+                except (OSError,ValueError) as error:
+                    with self.condition:node.error+='; saving disabled configuration: '+str(error)
+        return removed
+
     def _monitor(self):
         while not self.stop_event.wait(self.refresh_seconds):
+            self._expire_unreachable()
             self.refresh(monitor=True)
 
     def configure(self, name=None, *, policy=None, **changes):
@@ -763,6 +787,9 @@ class Pool:
                     node.error='Node address changed; checking worker'
                 for key, value in changes.items():
                     setattr(node, key, value)
+                if changes.get('enabled') is True:
+                    node.detached=False
+                    node.last_connected_at=time.monotonic()
                 if timeout is not None:
                     node.client.timeout=timeout
             self.condition.notify_all()
@@ -782,6 +809,7 @@ class Pool:
         with self.condition:
             return {"policy": self.policy, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
+                 "detached": n.detached,
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
                  "timeout": getattr(n.client,'timeout',10),
                  "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),

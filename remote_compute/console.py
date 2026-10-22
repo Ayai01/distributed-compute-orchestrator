@@ -49,9 +49,9 @@ def _paint_row(row):
     # Numeric IDs are identifiers; the trailing label is opaque user text.
     task = re.search(
         r'[|+] (?P<id>[0-9a-f]{4}) (?:'
-        r'\| (?:(?:[^|]*\| ){2} *1/\d+ *\|[^|]*\|[^|]*\|[^|]*\|'
-        r'|(?:[^|]*\| )? *1/\d+ *\|[^|]*\|)'
-        r'|1/\d+(?: +(?:\d+|-))?)(?P<label>.*)', row, re.I)
+        r'\| (?:(?:[^|]*\| ){2,3} *\d+/\d+ *\|[^|]*\|[^|]*\|[^|]*\|'
+        r'|(?:[^|]*\| )? *\d+/\d+ *\|[^|]*\|)'
+        r'|\d+/\d+(?: +(?:\d+|-))?)(?P<label>.*)', row, re.I)
     paint_end = task.start('label') if task else len(row)
     matches = [(match.start(), match.end()+1, '\x1b[34;1m')
                for match in title_pattern.finditer(row, 0, paint_end)]

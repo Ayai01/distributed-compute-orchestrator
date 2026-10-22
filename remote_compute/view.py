@@ -192,6 +192,14 @@ def _label(job):
         parts = parts[positions[-1]+1:]
     if not parts:
         return '-'
+    if project=='aop':
+        qualified=re.fullmatch(r'(ClassAB|TSA|FSA|LDO|BGR) targeted qualification(\d+) s(\d+) (\S+) (\S+)',
+                               '/'.join(parts),re.I)
+        if qualified:
+            circuit,count,seed,method,corner=qualified.groups()
+            circuit='AB' if circuit.casefold()=='classab' else circuit.upper()
+            budget=str(int(count)//1000)+'k' if int(count)>=1000 and int(count)%1000==0 else count
+            return f'{circuit} s{int(seed)%100:02d} {_tag_name(method)} Q{budget} {corner}'
     if project == 'aop' and len(parts)>=2:
         circuit=parts[-2].split('_',1)[0]
         if circuit.upper() in {'BGR','TSA','FSA','LDO','CLASSAB'}:
@@ -234,6 +242,16 @@ def _label(job):
                         for word in re.split(r'[/\s]+',text) if word)
     if project in ('analog-opt-bench','bench') or parts and parts[0]=='Analog':
         if parts[0]=='Analog':parts=parts[1:]
+        flat=re.fullmatch(r'(?:(\S+) )?(\S+) (\d+) (\d+)',' '.join(parts))
+        if flat:
+            method,scenario,budget,seed=flat.groups()
+            case=re.fullmatch(r'(?:panda-)?(.+)-(\d{4})',scenario)
+            name,number=(case[1],str(int(case[2]))) if case else (scenario,'')
+            name={'bookshelf_tall':'shelfT','bookshelf_wide':'shelfW','bookshelf':'shelf',
+                  'classab-warm':'ABw','classab':'AB','class_ab':'AB'}.get(name,_tag_name(name))
+            method=re.sub(r'^FIBER(\d+)$',r'F\1',method or '',flags=re.I)
+            budget=str(int(budget)//1000)+'k' if int(budget)>=1000 and int(budget)%1000==0 else budget
+            return ' '.join(t for t in (name+number,f's{int(seed)%100:02d}',_tag_name(method),budget) if t)
         # This parent label repeats the total NFE after its count x budget.
         # Keep the scenario and per-arm budget; the request retains full text.
         if parts:
@@ -277,7 +295,7 @@ def _label(job):
 
 
 def _show_node(node):
-    return (node.get('enabled', True) or node.get('reserved', 0)
+    return not node.get('detached',False) and (node.get('enabled', True) or node.get('reserved', 0)
             or node.get('external_cpus', 0) or node.get('active_jobs'))
 
 

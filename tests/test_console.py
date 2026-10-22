@@ -403,6 +403,35 @@ class ConsoleTests(unittest.TestCase):
                 self.assertIn('RAM \x1b[33m4096\x1b[0m',painted)
                 self.assertEqual(re.sub(r'\x1b\[[0-9;]*m','',painted),row)
 
+    def test_task_id_and_opaque_tag_colors_follow_every_actual_layout(self):
+        import remote_compute.console as console
+        with patch.object(console,'_COLOR_ENABLED',True):
+            for prefix in ('1234','0004','face','1a34'):
+                for cpus in (1,8,52):
+                    job=dict(id=prefix+'a'*28,project='Bench',label='opaque FACE 0004 16000 3561671 ss-40',
+                             cpus=cpus,memory_mb=512,status='running')
+                    value=dict(role='scheduler',node='Aya1-PC',nodes=[dict(name='Aya1-PC',capacity=52,active_jobs=[job])])
+                    for width in (32,38,54,79,80,100,110,119,120,134,159,160,165,180,200,240):
+                        with self.subTest(prefix=prefix,cpus=cpus,width=width):
+                            rows=format_status(value,width=width).fit(40)
+                            row=next(r for r in rows if re.search(r'[|+] '+prefix+r' ',r))
+                            painted=_paint_row(row)
+                            self.assertIn('\x1b[36m'+prefix+'\x1b[0m',painted)
+                            if 'opaque' in painted:self.assertNotIn('\x1b[',painted[painted.index('opaque'):])
+                            self.assertEqual(re.sub(r'\x1b\[[0-9;]*m','',painted),row)
+
+    def test_current_long_producer_labels_are_short_display_only(self):
+        from remote_compute.view import _label
+        cases=[('AOP','ClassAB targeted qualification256 s23 FACE tt27','AB s23 FACE Q256 tt27'),
+               ('AOP','FSA targeted qualification12000 s2026102217 FACE ff-40','FSA s17 FACE Q12k ff-40'),
+               ('Bench','bookshelf_tall-0004 16000 3561671','shelfT4 s71 16k'),
+               ('Bench','FIBER356 classab-warm 4000 3571009','ABw s09 F356 4k')]
+        for project,label,expected in cases:
+            job=dict(project=project,label=label)
+            self.assertEqual(_label(job),expected)
+            self.assertEqual(job['label'],label)
+            self.assertLessEqual(_width(expected),23)
+
     def test_jobs_prefix_selects_one_record_and_lists_colliding_ids(self):
         from remote_compute.commands import SchedulerShell
         identities=['1234'+'a'*28,'1234'+'b'*28]

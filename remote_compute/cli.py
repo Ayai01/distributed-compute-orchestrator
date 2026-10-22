@@ -43,6 +43,7 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
         if local_client and node.get('name') == socket.gethostname():
             node.update(url=local_client.url, client=local_client)
             continue
+        if not node.get('enabled',True):continue
         try:
             node['name'] = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),operator=True).health()['node']
         except RemoteError:
@@ -90,6 +91,11 @@ def run_scheduler(args, local_client=None, restarting=None):
                 config["nodes"].append({"name": name, "url": local_client.url, 'client': local_client})
     pool = Pool(config["nodes"], policy=args.policy or config.get("policy", "adaptive"))
     coordinator = api = api_thread = None
+    def detached(node):
+        from .commands import save_detached_node
+        save_detached_node(args.nodes or ROOT/'nodes.local.json',node)
+        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源；用add或scan重新发现')
+    pool.on_detach=detached
     dispatch = None
     try:
         if args.url:
@@ -163,7 +169,11 @@ def run_scheduler(args, local_client=None, restarting=None):
                 raise
             display(result)
             return 0 if result["status"] == "succeeded" else 1
-        if args.action == "nodes":
+        if args.action == 'scan':
+            shell=SchedulerShell(pool,dispatch)
+            try:shell.scan(args)
+            finally:shell.close()
+        elif args.action == "nodes":
             display(dispatch.nodes() if dispatch else pool.snapshot())
         elif args.action == "jobs":
             display(dispatch.status() if dispatch else {n.name: n.client.status() for n in pool.nodes if not n.error})
@@ -287,6 +297,8 @@ def main(argv=None):
     parser.add_argument("--test", action="store_true", help="运行核心回归")
     parser.add_argument("--test-native", action="store_true", help="同时验证真实ngspice和Verilator")
     sub = parser.add_subparsers(dest="action")
+    from .commands import scan_parser
+    sub.add_parser('scan',parents=[scan_parser()],add_help=False)
     sub.add_parser("nodes")
     sub.add_parser("jobs")
     item = sub.add_parser('ramdisk', help='检查/创建本设备配置的共享内存盘（默认8GiB）')
@@ -341,7 +353,7 @@ def main(argv=None):
             if getattr(args, name) is None and name in config:
                 setattr(args, name, config[name])
         args.trusted_networks = config.get('trusted_networks')
-        if args.action == "sync_cache" and not args.url:
+        if (args.action == "sync_cache" or args.action=='scan' and args.scan_add) and not args.url:
             port = args.center_port if args.center_port is not None else (
                 args.port if args.port is not None else DEFAULT_PORT)
             args.url = f"http://{args.host or '127.0.0.1'}:{port}"
@@ -358,6 +370,11 @@ def main(argv=None):
                                            args.port if args.port is not None else DEFAULT_PORT)
             if not args.service_child:
                 lifetime.enter_context(single_instance(endpoint, wait=30.0 if handoff else 0.0))
+        if args.action=='scan':
+            if not args.scan_add:
+                from .commands import scan_devices
+                scan_devices(args)
+                return 0
         if args.action == 'ramdisk':
             from .ramdisk import ensure_shared, install_driver
             print(install_driver() if args.install else ensure_shared(create=True))
