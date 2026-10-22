@@ -89,13 +89,17 @@ def run_scheduler(args, local_client=None, restarting=None):
                 existing.update(url=local_client.url,client=local_client)
             else:
                 config["nodes"].append({"name": name, "url": local_client.url, 'client': local_client})
-    pool = Pool(config["nodes"], policy=args.policy or config.get("policy", "adaptive"))
     coordinator = api = api_thread = None
     def detached(node):
         from .commands import save_detached_node
         save_detached_node(args.nodes or ROOT/'nodes.local.json',node)
-        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源；用add或scan重新发现')
-    pool.on_detach=detached
+        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源；每60秒重连，最多5次')
+    def reconnected(node):
+        from .commands import save_detached_node
+        save_detached_node(args.nodes or ROOT/'nodes.local.json',node)
+        if node.enabled and not node.error and coordinator:coordinator.activity.notify(node.name+' 已重连，恢复原预算')
+    pool = Pool(config["nodes"], policy=args.policy or config.get("policy", "adaptive"),
+                on_detach=detached,on_reconnect=reconnected)
     dispatch = None
     try:
         if args.url:

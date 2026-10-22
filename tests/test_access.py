@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute import Client, Pool, RemoteError
-from remote_compute.auth import in_networks
+from remote_compute.auth import in_networks, node_url
 from remote_compute.cli import main
 from remote_compute.commands import SchedulerShell
 from remote_compute.worker import Server
@@ -36,6 +36,57 @@ def external_peer(worker, **options):
 
 
 class AccessTests(unittest.TestCase):
+    def test_host_shorthand_uses_default_port_and_secure_public_transport(self):
+        for address,expected in [
+            ('1.191.212.42','https://1.191.212.42:26133'),
+            ('1.191.212.42:26133','https://1.191.212.42:26133'),
+            ('192.168.1.11','http://192.168.1.11:26133'),
+            ('https://192.168.1.11','https://192.168.1.11:26133'),
+            ('[::1]:26134','http://[::1]:26134'),
+            ('::1','http://[::1]:26133')]:
+            self.assertEqual(node_url(address),expected)
+        for address in ['', 'https://name/path', 'https://secret@host', 'host:0', 'ftp://host']:
+            with self.subTest(address=address),self.assertRaises(ValueError):node_url(address)
+
+    def test_bare_add_reuses_persisted_tls_credentials_and_keeps_budget(self):
+        with scratch() as root:
+            root=Path(root);url='https://203.0.113.42:26133'
+            row=dict(name='remote',url=url,token='node-secret',ca_file='trusted-node.pem',
+                     enabled=False,limit=52,timeout=30)
+            (root/'nodes.local.json').write_text(json.dumps({'nodes':[row]}))
+            control=Mock();control.nodes.return_value=dict(nodes=[row])
+            shell=SimpleNamespace(center=control,pool=None,do_nodes=Mock(),do_save=Mock())
+            with patch('remote_compute.commands.ROOT',root), \
+                 patch('remote_compute.commands.Client') as constructor, \
+                 patch.dict(os.environ,{},clear=True):
+                constructor.return_value.health.return_value=dict(node='remote')
+                SchedulerShell.do_add(shell,'203.0.113.42')
+            constructor.assert_called_once_with(url,'node-secret',ca_file='trusted-node.pem',timeout=30,operator=True)
+            self.assertEqual(control.control.call_args.kwargs['routing'],
+                             dict(url=url,enabled=True,ca_file='trusted-node.pem',timeout=30))
+            self.assertNotIn('limit',control.control.call_args.kwargs['routing'])
+
+    def test_bare_lan_address_keeps_a_saved_https_profile(self):
+        with scratch() as root:
+            root=Path(root);row=dict(name='remote',url='https://192.168.1.12:26133',token='node-secret',ca_file='cert.pem')
+            (root/'nodes.local.json').write_text(json.dumps({'nodes':[row]}))
+            control=Mock();control.nodes.return_value=dict(nodes=[row])
+            shell=SimpleNamespace(center=control,pool=None,do_nodes=Mock(),do_save=Mock())
+            with patch('remote_compute.commands.ROOT',root),patch('remote_compute.commands.Client') as constructor, \
+                 patch.dict(os.environ,{},clear=True):
+                constructor.return_value.health.return_value=dict(node='remote')
+                SchedulerShell.do_add(shell,'192.168.1.12')
+            self.assertEqual(constructor.call_args.args[0],row['url'])
+
+    def test_save_does_not_assign_center_credentials_to_an_unrelated_node(self):
+        with scratch() as root:
+            row=dict(name='remote',url='https://203.0.113.42:26133',weight=1,limit=52,memory_limit_mb=0,enabled=True)
+            shell=SimpleNamespace(pool=SimpleNamespace(nodes=[]),center=SimpleNamespace(
+                nodes=lambda:dict(policy='adaptive',nodes=[row]),token='center-only-secret'))
+            with patch('remote_compute.commands.ROOT',Path(root)):
+                SchedulerShell.do_save(shell,'')
+            self.assertNotIn('token',json.loads((Path(root)/'nodes.local.json').read_text())['nodes'][0])
+
     def test_lan_worker_admission_needs_no_token(self):
         with scratch() as root, provider(root, token='remote-secret') as (_, remote):
             self.assertEqual(Client(remote.url).health()['role'], 'worker')
@@ -78,6 +129,16 @@ class AccessTests(unittest.TestCase):
                 with self.assertRaises(RemoteError):
                     Client(url, token='remote-secret').health()
                 self.assertEqual(Client(url, token='remote-secret', ca_file=str(cert)).health()['role'], 'worker')
+                name=worker.health()['node']
+                row=dict(name=name,url=url,token='remote-secret',ca_file=str(cert),enabled=False,limit=1)
+                (root/'nodes.local.json').write_text(json.dumps({'nodes':[row]}))
+                with Pool([row]) as pool,center(pool,root/'center') as (_,control):
+                    shell=SimpleNamespace(center=control,pool=pool,do_nodes=Mock(),do_save=Mock())
+                    with patch('remote_compute.commands.ROOT',root),patch.dict(os.environ,{'REMOTE_COMPUTE_TOKEN':'remote-secret'}):
+                        SchedulerShell.do_add(shell,'127.0.0.1:'+str(server.server_port))
+                    self.assertTrue(pool.nodes[0].enabled)
+                    self.assertEqual(pool.nodes[0].limit,1)
+                    self.assertEqual(pool.nodes[0].client.ca_file,str(cert))
                 worker.token = ''
                 with self.assertRaisesRegex(RemoteError, '401'):
                     Client(url, ca_file=str(cert)).health()

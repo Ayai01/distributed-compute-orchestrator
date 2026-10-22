@@ -2,6 +2,7 @@
 
 import argparse
 import cmd
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -14,11 +15,14 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from .client import Client, Pool, RemoteError
 from .bundle import atomic_json
 from .tasks import ngspice, verilator
 from .records import active_items
+from .auth import node_url
+from .startup import single_instance, Cancelled
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -27,14 +31,31 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+@contextmanager
+def node_configuration(path):
+    """One read/merge/write across consoles and the background node monitor."""
+    try:
+        with single_instance('node-config:'+str(Path(path).resolve()),wait=10):
+            value=read_json(path) if Path(path).exists() else {}
+            yield value
+            atomic_json(path,value,private=True)
+    except Cancelled as error:
+        raise OSError('Node configuration is busy') from error
+
+
 def save_detached_node(path, node):
-    """Persist only this routing change; keep budgets, credentials and peers."""
-    if node.enabled or not node.detached or not Path(path).exists():return
-    value=read_json(path)
-    for row in value.get('nodes',[]):
-        if row.get('name')==node.name or row.get('url','').rstrip('/')==node.client.url:
-            row['enabled']=False
-    atomic_json(path,value,private=True)
+    """Persist automatic connection state; keep budgets, credentials and peers."""
+    if not Path(path).exists():return
+    with node_configuration(path) as value:
+        for row in value.get('nodes',[]):
+            if row.get('name')==node.name or row.get('url','').rstrip('/')==node.client.url:
+                row.update(enabled=node.enabled,url=node.client.url)
+                if getattr(node.client,'ca_file',None):row['ca_file']=node.client.ca_file
+                else:row.pop('ca_file',None)
+                if node.detached:
+                    row['reconnect']={'attempts':node.reconnect_attempts,'after':node.reconnect_after}
+                else:
+                    row.pop('reconnect',None)
 
 
 def scan_parser():
@@ -649,32 +670,52 @@ class SchedulerShell(Shell):
             self.center.control(node=name, routing=changes)
         else:
             self.pool.configure(name, **changes)
+        if set(changes)&{'enabled','url','ca_file'}:self.do_save('')
         self.do_nodes("")
 
     def do_add(self, line):
-        """add http://设备IP:26133：以设备实际名称加入节点。"""
-        url = words(line)[-1]
+        """add 设备IP[:端口]：默认26133；公网自动HTTPS并复用已保存证书和凭据。"""
+        args=words(line)
+        if len(args)!=1:raise ValueError('add 设备IP[:端口] 或 http(s)://设备IP[:端口]')
+        address=args[0]
         path = ROOT / 'nodes.local.json'
         previous = read_json(path) if path.exists() else {}
         saved = next((row for row in previous.get('nodes', [])
-                      if row['url'].rstrip('/') == url.rstrip('/')), {})
+                      if address == row['name'] or address in row.get('aliases',[])), {})
+        url=node_url(saved['url'] if saved else address)
+        if not saved:
+            saved = next((row for row in previous.get('nodes', []) if node_url(row['url'])==url
+                          or '://' not in address and urlsplit(node_url(row['url'])).netloc==urlsplit(url).netloc), {})
+        if saved and '://' not in address:url=node_url(saved['url'])
         token = os.environ.get('REMOTE_COMPUTE_TOKEN', saved.get('token', ''))
-        name = Client(url, token, ca_file=saved.get('ca_file'), operator=True).health()['node']
+        ca_file=saved.get('ca_file')
+        timeout=saved.get('timeout',10)
+        name = Client(url, token, ca_file=ca_file, timeout=timeout, operator=True).health()['node']
         snapshot = self.center.nodes() if self.center else self.pool.snapshot()
         existing = next((row for row in snapshot['nodes'] if row['name'] == name
                          or row['url'].rstrip('/') == url.rstrip('/')), None)
         if existing:
-            routing = dict(url=url, enabled=True)
+            routing = dict(url=url, enabled=True,ca_file=ca_file,timeout=timeout)
             if self.center:
                 self.center.control(node=existing['name'], routing=routing)
             else:
                 self.pool.configure(existing['name'], **routing)
         elif self.center:
             node = dict(name=name, url=url, token=token)
-            if saved.get('ca_file'):node['ca_file'] = saved['ca_file']
+            if ca_file:node['ca_file'] = ca_file
+            node['timeout']=timeout
             self.center.control(add=node)
         else:
-            self.pool.add(name, url, token=token, ca_file=saved.get('ca_file'))
+            self.pool.add(name, url, token=token, ca_file=ca_file,timeout=timeout)
+        # Remote center snapshots intentionally omit worker secrets. Remember
+        # only the verified endpoint's credentials before saving its routing.
+        with node_configuration(path) as current:
+            profile=next((row for row in current.get('nodes',[]) if row['name']==name or row['url']==url),None)
+            if profile is None:
+                profile=dict(name=name,url=url);current.setdefault('nodes',[]).append(profile)
+            profile.update(url=url,token=token,enabled=True)
+            if ca_file:profile['ca_file']=ca_file
+            profile.pop('reconnect',None)
         self.do_nodes("")
         self.do_save('')
 
@@ -689,27 +730,27 @@ class SchedulerShell(Shell):
 
     def do_save(self, _line):
         """保存当前节点和策略到 nodes.local.json，下次启动自动加载。"""
-        snapshot = self.center.nodes() if self.center else self.pool.snapshot()
         path = ROOT / "nodes.local.json"
-        previous = read_json(path) if path.exists() else {}
-        tokens = {n['url']: n.get('token', '') for n in previous.get('nodes', [])}
-        tokens.update({n.client.url: n.client.token for n in self.pool.nodes})
-        addresses = {n['name']: n.get('host_ip','') for n in previous.get('nodes', [])}
-        addresses.update({n.name:getattr(n,'host_ip','') for n in self.pool.nodes})
-        value = {"policy": snapshot["policy"], "nodes": []}
-        for row in snapshot["nodes"]:
-            node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
-            if addresses.get(row['name']):
-                node['host_ip'] = addresses[row['name']]
-            if row.get('timeout',10)!=10:
-                node['timeout']=row['timeout']
-            for key in ('ca_file','aliases'):
-                if row.get(key):node[key]=row[key]
-            token = tokens.get(row["url"], self.center.token if self.center else "")
-            if token:
-                node["token"] = token
-            value["nodes"].append(node)
-        atomic_json(path, value, private=True)
+        with node_configuration(path) as previous:
+            snapshot = self.center.nodes() if self.center else self.pool.snapshot()
+            tokens = {n['url']: n.get('token', '') for n in previous.get('nodes', [])}
+            tokens.update({n.client.url: n.client.token for n in self.pool.nodes})
+            addresses = {n['name']: n.get('host_ip','') for n in previous.get('nodes', [])}
+            addresses.update({n.name:getattr(n,'host_ip','') for n in self.pool.nodes})
+            value = {"policy": snapshot["policy"], "nodes": []}
+            for row in snapshot["nodes"]:
+                node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
+                if addresses.get(row['name']):
+                    node['host_ip'] = addresses[row['name']]
+                if row.get('timeout',10)!=10:
+                    node['timeout']=row['timeout']
+                for key in ('ca_file','aliases','reconnect'):
+                    if row.get(key):node[key]=row[key]
+                token = tokens.get(row["url"], "")
+                if token:
+                    node["token"] = token
+                value["nodes"].append(node)
+            previous.update(value)
         print("已保存:", path)
 
     def do_pause(self, line):

@@ -72,7 +72,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `pause Aya1-TX` / `resume Aya1-TX` | 停止/恢复接收新任务，已有任务继续 |
 | `restart --wait` / `restart Aya1-TX --wait` | 等空闲后在原终端重载中心/worker |
 | `scan [IPv4-CIDR] [--add]` | 探测局域网可用计算节点；默认只列出，`--add`沿add接入并保留原预算 |
-| `add http://192.168.1.10:26133` / `save` | 加入节点 / 保存路由配置 |
+| `add 192.168.1.10` / `save` | 加入节点（默认26133）/ 保存路由配置 |
 | `policy adaptive` | 切换中心策略 |
 | `set Aya1-TX limit=8 memory_limit_mb=4096 enabled=true` | 限制本中心向节点派发的资源 |
 | `sync_cache all` / `sync_cache arh --kind research` | 手动增量同步，详见下节 |
@@ -84,7 +84,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 
 单设备独立验收先记录节点的启用状态和预算，用`set 节点 enabled=false`停止该中心的新派发，等待该节点`reserved=0`且`active_jobs`为空。已有任务、原ID、回执和其他节点继续保留；不用退出服务来排空。HTTP/TLS节点可通过已有操作员worker连接执行隔离测试，hybrid本机在排空后使用本机独立测试进程。禁用且已排空的节点停止周期健康探测，并从生产看板与通知中隐藏；设备配置仍保留，`set 节点 enabled=true` 后恢复发现，显式设备维护查询继续可用。恢复时先收齐测试输出、清理本次任务并恢复设备预算，刷新中心节点健康，最后`set 节点 enabled=true`。脚本用`control(node=名称,routing={"enabled":False/True})`并在finally恢复原状态；禁用路由后不再通过同一中心向该节点提交维护任务。
 
-连续60秒没有成功健康握手的设备自动移出资源看板并停止常规探测，停用状态保存到忽略的节点配置，重开中心也不探测该设备。原任务、回执、预算和凭据保留。设备恢复后用`add http://设备IP:26133`重新握手；`scan`只探测可用节点，`scan --add`批量接入。默认扫描本机IPv4局域网段，也可用`scan 192.168.1.0/24 --port 26133 --timeout 0.7`指定；一次最多4096地址，不发送唤醒包，也不周期扫描。一次性入口为`python -B main.py scan`，加`--add`连接已有中心。
+连续60秒没有成功健康握手的设备自动移出资源看板，随后每60秒重连一次，最多5次；成功恢复原预算，五次失败后等`add 设备IP`或`scan --add`。次数与下次时间保存在忽略配置，重开中心继续剩余次数；人工停用的设备不自动重连。原任务、回执、预算和凭据保留。`scan`只探测可用节点，`scan --add`批量接入。默认扫描本机IPv4局域网段，也可用`scan 192.168.1.0/24 --port 26133 --timeout 0.7`指定；一次最多4096地址，不发送唤醒包，也不周期扫描。一次性入口为`python -B main.py scan`，加`--add`连接已有中心。
 
 Tab 在空输入时显示根命令候选，有输入时补全；Ctrl+Tab 翻任务页，空输入 Shift+Tab 反向翻页，PgUp/PgDn 翻输出，↑/↓ 选历史，Esc/Ctrl+C 清空输入，Enter 执行。补全只读当前快照。看板聚焦每秒刷新、失焦每 5 秒刷新；任务运行秒数从实际执行开始，线程预留与 CPU 使用率分列。
 
@@ -210,7 +210,7 @@ ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不�
 
 局域网节点可直接 `add http://设备IP:26133`，不需要令牌；重复添加会恢复已有节点，保留其预算、权重和在途任务。默认按 TCP 对端的回环、RFC1918、IPv6 ULA/链路本地地址识别局域网，`trusted_networks` 可缩小免令牌网段，例如 `["127.0.0.0/8", "::1/128", "192.168.1.0/24"]`，空列表要求局域网也认证。转发头不改变对端身份。中心操作员权限仍使用独立的本机托管凭据。
 
-非局域网连接必须使用原生 HTTPS 和非空令牌，未配置令牌则拒绝外网请求；SDK不会向公网HTTP地址发送凭据。本机配置 `certfile/keyfile/token`，中心 `nodes.local.json` 对应节点使用 HTTPS URL、`ca_file/token`；校验证书，私钥留 worker。`add` 复用已保存节点的证书和认证配置。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。未安装系统Git的Windows设备可将便携Git放在忽略的 `.tools/git/`，更新命令自动使用它。
+非局域网连接必须使用原生 HTTPS 和非空令牌，未配置令牌则拒绝外网请求；SDK不会向公网HTTP地址发送凭据。本机配置 `certfile/keyfile/token`，中心 `nodes.local.json` 对应节点使用 HTTPS URL、`ca_file/token`；校验证书，私钥留 worker。`add 公网IP`自动选择HTTPS和26133端口，复用已保存同地址的证书及节点凭据；首次接入先配置可信CA与节点令牌。证书可放忽略的`.local/certs/`，节点配置继续留本机。显式公网HTTP不会降级接入。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。未安装系统Git的Windows设备可将便携Git放在忽略的 `.tools/git/`，更新命令自动使用它。
 
 Windows 远端端口按部署需要用管理员 PowerShell 放行：
 

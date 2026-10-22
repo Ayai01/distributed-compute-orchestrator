@@ -1,6 +1,7 @@
 """LAN admission and the transport boundary for remote worker credentials."""
 import ipaddress
 import socket
+from urllib.parse import urlsplit, urlunsplit
 
 
 LAN_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
@@ -27,6 +28,31 @@ def lan_endpoint(host):
             return False
         return bool(addresses) and all(in_networks(item[4][0]) for item in addresses)
     return in_networks(host)
+
+
+def node_url(address):
+    """Expand an operator's host shorthand without downgrading public TLS."""
+    address = address.strip()
+    explicit = '://' in address
+    if not explicit:
+        try:
+            if ipaddress.ip_address(address).version == 6:
+                address = '[' + address + ']'
+        except ValueError:
+            pass
+    parsed = urlsplit(address if explicit else '//' + address)
+    if (not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or parsed.path not in ('', '/')
+            or explicit and parsed.scheme not in ('http', 'https', 'local')):
+        raise ValueError('Node address: host[:port] or http(s)://host[:port]')
+    if parsed.scheme == 'local':
+        return address.rstrip('/')
+    port = parsed.port if parsed.port is not None else 26133
+    if not 0 < port < 65536:
+        raise ValueError('Node port must be between 1 and 65535')
+    scheme = parsed.scheme if explicit else ('http' if lan_endpoint(parsed.hostname) else 'https')
+    host = '[' + parsed.hostname + ']' if ':' in parsed.hostname else parsed.hostname
+    return urlunsplit((scheme, host + ':' + str(port), '', '', ''))
 
 
 def trusted_networks(values):

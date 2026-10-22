@@ -470,6 +470,9 @@ class Node:
     error: str = ""
     last_connected_at: float = field(default_factory=time.monotonic)
     detached: bool = False
+    reconnect_attempts: int = 0
+    reconnect_after: float = 0.0
+    connection_generation: int = 0
     reserved: int = 0
     external: int = 0
     memory_limit_mb: int = 0
@@ -598,10 +601,11 @@ class Pool:
     """
     POLICIES = {"adaptive", "balanced", "round_robin"}
 
-    def __init__(self, nodes, *, policy="adaptive", refresh=2, on_detach=None):
+    def __init__(self, nodes, *, policy="adaptive", refresh=2, on_detach=None, on_reconnect=None):
         self.condition = threading.Condition(threading.RLock())
         self.refresh_lock = threading.Lock()
         self.on_detach = on_detach
+        self.on_reconnect = on_reconnect
         self.nodes = []
         self.policy = policy
         self.sample_seconds = refresh
@@ -623,6 +627,15 @@ class Pool:
                             enabled=entry.get("enabled", True))
                 node.host_ip = entry.get("host_ip", "")
                 node.aliases = entry.get('aliases',[])
+                retry = entry.get('reconnect')
+                if retry is not None and not node.enabled:
+                    attempts, after = (retry.get('attempts'), retry.get('after')) if isinstance(retry,dict) else (None,None)
+                    if (type(attempts) is not int or not 0 <= attempts <= 5
+                            or isinstance(after, bool) or not isinstance(after, (int, float))
+                            or not 0 <= after < float('inf')):
+                        raise ValueError('Node reconnect requires attempts 0..5 and a nonnegative timestamp')
+                    node.detached = True
+                    node.reconnect_attempts, node.reconnect_after = attempts, after
             self._validate_node(node)
             node.error = 'Checking worker'
             self.nodes.append(node)
@@ -650,8 +663,9 @@ class Pool:
                 or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)
                 or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
             raise ValueError("Node weight must be positive; limit is 0/auto or a positive integer")
-    def _probe(self, node, full=False):
+    def _probe(self, node, full=False, reconnect=False, generation=None):
         client=node.client
+        generation = node.connection_generation if generation is None else generation
         try:
             sampled=not full and 'health_sample' in node.health.get('capabilities',[])
             value=client.health(sample=True) if sampled else client.health()
@@ -662,10 +676,14 @@ class Pool:
             value,error={},str(exc)
         self._sample_network(node)
         with self.condition:
-            if client is not node.client:return
+            if client is not node.client or generation != node.connection_generation:return
             node.sampled_at=time.monotonic()
             node.error=error
             if not error:
+                previous_name = node.health.get('node')
+                if reconnect and previous_name and value.get('node') != previous_name:
+                    node.error = 'Reconnect worker identity differs from the accepted endpoint'
+                    return
                 node.last_connected_at=time.monotonic()
                 node.health={**node.health,**value}
                 jobs=value.get('active_jobs') or []
@@ -676,7 +694,11 @@ class Pool:
                                   max(job['memory_mb'],job.get('rss_mb',0))) for job in running if job['id'] in node.known_jobs)
                 node.external_memory_mb=max(0,value.get('memory_reserved_mb',0)-owned_memory)
                 node.known_jobs.intersection_update({job['id'] for job in jobs}|node.live_jobs)
+                if reconnect and node.detached:
+                    node.enabled, node.detached = True, False
+                    node.reconnect_attempts, node.reconnect_after = 0, 0.0
             self.condition.notify_all()
+        if reconnect:self._save_reconnect(node)
 
     @staticmethod
     def _network_target(node):
@@ -743,6 +765,8 @@ class Pool:
                 if node.enabled and now-node.last_connected_at>=60:
                     node.enabled=False
                     node.detached=True
+                    node.reconnect_attempts=0
+                    node.reconnect_after=time.time()+60
                     if not node.error:node.error='No successful connection for 60 seconds'
                     removed.append(node)
             if removed:self.condition.notify_all()
@@ -753,12 +777,43 @@ class Pool:
                     with self.condition:node.error+='; saving disabled configuration: '+str(error)
         return removed
 
+    def _retry_detached(self, now=None):
+        now = time.time() if now is None else now
+        retry = []
+        with self.refresh_lock:
+            with self.condition:
+                for node in self.nodes:
+                    pending = self.probe_futures.get(node.name)
+                    if (not node.detached or node.enabled or not node.reconnect_after
+                            or now < node.reconnect_after or node.reconnect_attempts >= 5
+                            or pending is not None and not pending.done()):
+                        continue
+                    node.reconnect_attempts += 1
+                    node.reconnect_after = now + 60 if node.reconnect_attempts < 5 else 0.0
+                    retry.append((node, node.connection_generation))
+            # Persist the consumed attempt before starting its network request,
+            # so a center restart cannot reset the five-attempt limit.
+            retry = [(node, generation) for node, generation in retry if self._save_reconnect(node)]
+            for node, generation in retry:
+                self.probe_futures[node.name] = self.probes.submit(self._probe, node, True, True, generation)
+        return [node for node, _ in retry]
+
+    def _save_reconnect(self,node):
+        if self.on_reconnect:
+            try:self.on_reconnect(node)
+            except (OSError,ValueError) as error:
+                with self.condition:node.error+='; saving reconnect configuration: '+str(error)
+                return False
+        return True
+
     def _monitor(self):
         while not self.stop_event.wait(self.refresh_seconds):
             self._expire_unreachable()
+            self._retry_detached()
             self.refresh(monitor=True)
 
     def configure(self, name=None, *, policy=None, **changes):
+        connection_change=bool(set(changes)&{'enabled','url','ca_file'})
         with self.condition:
             if policy is not None:
                 if policy not in self.POLICIES:
@@ -784,15 +839,19 @@ class Pool:
                     raise ValueError('Configure each worker URL once')
                 if address.rstrip('/')!=node.client.url or ca_file!=getattr(node.client,'ca_file',None):
                     node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file)
+                    node.connection_generation+=1
                     node.error='Node address changed; checking worker'
                 for key, value in changes.items():
                     setattr(node, key, value)
-                if changes.get('enabled') is True:
+                if 'enabled' in changes:
+                    node.connection_generation+=1
                     node.detached=False
-                    node.last_connected_at=time.monotonic()
+                    node.reconnect_attempts,node.reconnect_after=0,0.0
+                    if changes['enabled']:node.last_connected_at=time.monotonic()
                 if timeout is not None:
                     node.client.timeout=timeout
             self.condition.notify_all()
+        if name is not None and connection_change:self._save_reconnect(node)
 
     def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None):
         node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file), weight=weight, limit=limit)
@@ -807,9 +866,11 @@ class Pool:
 
     def snapshot(self):
         with self.condition:
-            return {"policy": self.policy, "nodes": [
+            return {"policy": self.policy,
+                "reconnect_policy": {"offline_seconds":60,"interval_seconds":60,"attempts":5}, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
                  "detached": n.detached,
+                 **({'reconnect': {'attempts': n.reconnect_attempts, 'after': n.reconnect_after}} if n.detached else {}),
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
                  "timeout": getattr(n.client,'timeout',10),
                  "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),
