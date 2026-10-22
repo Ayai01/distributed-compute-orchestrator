@@ -45,6 +45,8 @@ class LocalClient(Client):
                     return progress(result) if brief else result
                 if parts[2:] == ['cancel']:
                     return worker.cancel(identity)
+                if parts[2:] == ['asset-handoff'] and method in {'POST','DELETE'}:
+                    return worker.asset_handoff(identity,data['assets'] if method=='POST' else None)
                 if parts[2:] == ['resize']:
                     options={k:data[k] for k in ('memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in data}
                     return worker.resize(identity,data['cpus'],**options)

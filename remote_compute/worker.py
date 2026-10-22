@@ -214,6 +214,7 @@ class Worker:
         self.stopping = False
         self.threads = set()
         self.cleanup_pending = set()
+        self.asset_handoffs = {}
         for path in (self.root / "jobs").glob("*/result.json"):
             saved = json.loads(path.read_text(encoding="utf-8"))
             if clean_tool_snapshot(saved):
@@ -234,7 +235,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version','accelerators']+(['restart'] if self.restart_available else []))
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version','accelerators','asset_handoff']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -617,6 +618,7 @@ class Worker:
                     shutil.rmtree(directory)
                 raise
             self.jobs[identity] = job
+            self.asset_handoffs.pop(identity,None)
             self.queue.append(identity)
             self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
             self.condition.notify_all()
@@ -788,6 +790,11 @@ class Worker:
         # Keep their short handoff intact even if active assets exceed the LRU target.
         now = time.time()
         protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if recent and now-used<5}
+        for identity,(assets,expires) in tuple(self.asset_handoffs.items()):
+            if time.monotonic()>=expires:
+                self.asset_handoffs.pop(identity,None)
+            else:
+                protected.update(assets)
         protected.update(asset_references(self.jobs))
         for error in self.asset_cache.prune(protected):
             self.activity.notify('资产缓存待清理 '+error, 'local')
@@ -892,11 +899,35 @@ class Worker:
             self._prune_assets()
             return {"deleted": identity}
 
+    def asset_handoff(self, identity, assets=None):
+        """Hold an original request's inputs across a slow resynchronization."""
+        if not _ID.fullmatch(identity):
+            raise ValueError('Job id requires 32 lowercase hex characters')
+        with self.condition:
+            if assets is None:
+                self.asset_handoffs.pop(identity,None)
+            else:
+                if self.stopping:
+                    raise Conflict('Worker is stopping')
+                if not isinstance(assets,list) or any(not isinstance(a,str) or not _ASSET.fullmatch(a) for a in assets):
+                    raise ValueError('Asset handoff requires synchronized SHA256 ids')
+                # This is only a cache reference, never a task or CPU grant.
+                # Abandoned transfers expire; each input check/upload renews it.
+                now=time.monotonic()
+                self.asset_handoffs={key:value for key,value in self.asset_handoffs.items() if value[1]>now}
+                if identity not in self.jobs:
+                    self.asset_handoffs[identity]=(frozenset(assets),now+3600)
+            return {'id':identity}
+
     def asset(self, identity, payload=None):
         if not _ASSET.fullmatch(identity):
             raise ValueError("Asset id requires SHA256")
         directory = self.root / "assets" / identity
         with self.condition:
+            now=time.monotonic()
+            for key,(assets,expires) in tuple(self.asset_handoffs.items()):
+                if identity in assets and expires>now:
+                    self.asset_handoffs[key]=(assets,now+3600)
             if payload is not None and not directory.is_dir():
                 if hashlib.sha256(payload).hexdigest() != identity:
                     raise ValueError("Asset digest does not match bundle")
@@ -928,6 +959,7 @@ class Worker:
             job = self.jobs[identity]
             self._clean_temp(job)
             self._clean_work(job)
+        self.asset_handoffs.clear()
         self._prune_assets(recent=False)
         self.root_lock.close()
 
@@ -1152,6 +1184,8 @@ class Handler(BaseHTTPRequestHandler):
                         value = worker.public_result(value)
                 elif parts[2:] == ['lease'] and self.command == 'POST' and hasattr(worker,'lease'):
                     value=worker.lease(identity,json.loads(body))
+                elif parts[2:] == ['asset-handoff'] and self.command in {'POST','DELETE'} and not scheduler:
+                    value=worker.asset_handoff(identity,json.loads(body)['assets'] if self.command=='POST' else None)
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
                     value = (worker.artifacts(identity,is_connected=self._connected,public=not operator) if hasattr(worker,'pool')
                              else worker.artifacts(identity))

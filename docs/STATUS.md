@@ -24,6 +24,8 @@
 
 ## 验收与证据入口
 
+- 慢派发资产交接：隔离夹具复现5秒保护过期后，两次原ID派发均被并发LRU回收打断。新增按原ID暂存引用的补传交接，HTTP和hybrid同链路通过；正常缓存命中不增加请求，旧worker兼容。全量437项、4项环境跳过，其余通过；日志`.local/maintenance/resource-audit-20261022/asset-handoff-full.log`。现有忙碌服务继续运行，待自然空闲边界加载。
+
 证据位于既有 `results/repair-20261020/`，完整日志位于 `.local/maintenance/`。表中计数对应各自输入与源码范围，不合并成一次实验。
 
 | 范围 | 当前结论 | 证据 |

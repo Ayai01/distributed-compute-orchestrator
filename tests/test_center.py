@@ -833,7 +833,9 @@ class CenterTests(unittest.TestCase):
                         with coordinator.condition:
                             coordinator.jobs[identity]['result'].update(status='interrupted',error='connection lost')
                         with patch.object(worker,'artifacts',side_effect=RemoteError('still unavailable')):
-                            with self.assertRaises(RemoteError) as raised:client.fetch(identity,delete=False)
+                            # Check the server's typed upstream failure directly;
+                            # fetch intentionally waits through transient 502s.
+                            with self.assertRaises(RemoteError) as raised:client.request('/jobs/'+identity+'/artifacts',binary=True)
                             self.assertEqual(raised.exception.status_code,502)
                         result=client.fetch(identity,delete=False)
                         self.assertEqual(result['status'],expected)

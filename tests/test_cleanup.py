@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Pool
+from remote_compute.local import LocalClient
 from test_center import center
 from test_compute import provider, python, scratch, until
 
@@ -121,6 +122,9 @@ class CleanupTests(unittest.TestCase):
                 node=pool.nodes[0]
                 node.known_assets.add(second)
                 node.asset_session=(node.health.get('pid'),node.health.get('root'),node.health.get('asset_revision'))
+                # Previously deployed providers keep the ordinary one-shot
+                # resynchronization when the handoff extension is absent.
+                node.health['capabilities'].remove('asset_handoff')
                 restored=client.run(task(second))
                 self.assertEqual(restored['status'],'succeeded',restored)
                 self.assertEqual(restored['stdout'].strip(),'b'*80)
@@ -144,6 +148,88 @@ class CleanupTests(unittest.TestCase):
             self.assertFalse((worker.root/'assets'/incoming).exists())
             self.assertTrue((worker.root/'assets'/active).exists())
             client.cancel(first);client.wait(first);client.fetch(first)
+
+    def test_slow_asset_handoff_survives_collection_after_both_upload_attempts(self):
+        self._slow_asset_handoff()
+
+    def test_private_worker_has_the_same_slow_asset_handoff(self):
+        self._slow_asset_handoff(local=True)
+
+    def _slow_asset_handoff(self, *, local=False):
+        with scratch() as directory, provider(Path(directory)/'worker') as (worker, provider_client):
+            worker.asset_cache.limit=1
+            if local:provider_client=LocalClient(worker)
+            with Pool([provider_client]) as pool, center(pool,Path(directory)/'center') as (_,client):
+                source=client.sync_files({'code.txt':b'source'})
+                model=client.sync_files({'data.txt':b'model'})
+                original=pool.nodes[0].client.submit_bundle
+                attempts=[]
+                def delayed(identity,payload,**options):
+                    # A collector can run after the five-second upload grace,
+                    # while this request is still crossing the network.
+                    with worker.condition:
+                        for key,(size,_used) in tuple(worker.asset_cache.entries.items()):
+                            worker.asset_cache.entries[key]=(size,time.time()-6)
+                        worker._prune_assets()
+                    attempts.append(identity)
+                    return original(identity,payload,**options)
+                task=python("from pathlib import Path;print(Path(r'${asset:code}/code.txt').read_text()+Path(r'${asset:model}/data.txt').read_text())",
+                            assets={'code':source,'model':model},retries=0)
+                with patch.object(pool.nodes[0].client,'submit_bundle',side_effect=delayed):
+                    identity=client.submit(task)['id']
+                    result=client.wait(identity)
+                self.assertEqual(result['status'],'succeeded',result.get('error'))
+                self.assertEqual(set(attempts),{identity})
+                self.assertEqual(len(attempts),2)
+                self.assertEqual(client.fetch(identity)['stdout'].strip(),'sourcemodel')
+                self.assertFalse(worker.asset_handoffs)
+                with worker.condition:
+                    for key,(size,_used) in tuple(worker.asset_cache.entries.items()):
+                        worker.asset_cache.entries[key]=(size,time.time()-6)
+                    worker._prune_assets()
+                self.assertLessEqual(worker.asset_cache.snapshot()['bytes'],1)
+
+    def test_abandoned_asset_handoffs_expire_and_shared_handoffs_release_independently(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (worker,client):
+            worker.asset_cache.limit=1
+            asset=client.sync_files({'model':b'model'})
+            one,two='a'*32,'b'*32
+            for identity in (one,two):
+                client.request('/jobs/'+identity+'/asset-handoff',{'assets':[asset]})
+            self.assertFalse(worker.jobs)
+            with worker.condition:
+                worker.asset_cache.entries[asset]=(5,time.time()-6)
+                worker._prune_assets()
+            self.assertTrue((worker.root/'assets'/asset).exists())
+            client.request('/jobs/'+one+'/asset-handoff',method='DELETE')
+            with worker.condition:
+                worker._prune_assets()
+                self.assertTrue((worker.root/'assets'/asset).exists())
+                assets,_expires=worker.asset_handoffs[two]
+                worker.asset_handoffs[two]=(assets,time.monotonic()-1)
+                worker._prune_assets()
+            self.assertFalse(worker.asset_handoffs)
+            self.assertFalse((worker.root/'assets'/asset).exists())
+
+    def test_failed_submission_releases_its_asset_handoff_and_keeps_the_error(self):
+        from remote_compute import RemoteError
+        with scratch() as directory,provider(Path(directory)/'worker') as (worker,provider_client):
+            with Pool([provider_client]) as pool,center(pool,Path(directory)/'center') as (_,client):
+                asset=client.sync_files({'model':b'model'})
+                failures=[]
+                def reject(identity,payload,**options):
+                    failures.append(identity)
+                    message='Synchronize missing asset first: '+asset if len(failures)==1 else 'original validation failure'
+                    error=RemoteError(message);error.status_code=400
+                    raise error
+                with patch.object(pool.nodes[0].client,'submit_bundle',side_effect=reject):
+                    identity=client.submit(python('pass',assets={'model':asset},retries=0))['id']
+                    result=client.wait(identity)
+                self.assertIn('original validation failure',result['error'])
+                self.assertEqual(failures,[identity,identity])
+                self.assertFalse(worker.asset_handoffs)
+                self.assertFalse(worker.jobs)
+                client.fetch(identity)
 
 
 if __name__=='__main__':

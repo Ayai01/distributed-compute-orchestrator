@@ -1,6 +1,7 @@
 """A central HTTP endpoint forwarding accepted jobs to the shared worker pool."""
 
 import hashlib
+from contextlib import contextmanager
 import io
 import json
 from pathlib import Path
@@ -745,8 +746,9 @@ class Coordinator:
         node, force, uncertain = job['node'], False, False
         while True:
             try:
-                self._ensure_assets(node, job['task']['assets'].values(), force=force)
-                node.client.submit_bundle(identity,payload,**({'callback':callback} if callback else {}))
+                with self._asset_handoff(node,identity,job['task']['assets'].values(),enabled=force):
+                    self._ensure_assets(node, job['task']['assets'].values(), force=force)
+                    node.client.submit_bundle(identity,payload,**({'callback':callback} if callback else {}))
                 return True
             except PoolBusy as error:
                 # Nothing was sent. Keep the same reservation and ID while the
@@ -803,6 +805,23 @@ class Coordinator:
         self.queue.append(identity);self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])
         self._save(job)
         self.activity.notify('Worker stopped; retry original task ['+identity[:4]+']')
+
+    @contextmanager
+    def _asset_handoff(self, node, identity, assets, *, enabled):
+        if not enabled or 'asset_handoff' not in node.health.get('capabilities',[]):
+            yield
+            return
+        route='/jobs/'+identity+'/asset-handoff'
+        node.client.request(route,{'assets':sorted(set(assets))})
+        try:
+            yield
+        finally:
+            # Acceptance replaces the handoff with the ordinary job reference.
+            # Failure/cancellation releases it without changing the original ID.
+            try:
+                node.client.request(route,method='DELETE')
+            except RemoteError:
+                pass  # Worker expiry also releases an unreachable sender's hold.
 
     def _ensure_assets(self, node, assets, *, force=False):
         # Cache changes invalidate presence, but keep same-hash uploads serialized.
