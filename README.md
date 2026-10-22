@@ -104,7 +104,7 @@ Tab 在空输入时显示根命令候选，有输入时补全；Ctrl+Tab 翻任�
 
 持久任务、输入、资产及未领取结果放在普通磁盘 `.local/state`：中心为 `scheduler/`，hybrid 本机 worker 为 `local/`，独立 worker 按端口隔离。设备 JSON 的 `root` 只指定 worker 状态根；CLI `--root` 同时指定 worker 根和中心的 `scheduler/` 子目录。`temp_root` 单独指定任务 TMP，默认使用共享 RAM 盘。迁移目录前核对回执和联接，排空后搬完整状态、更新配置再重载。
 
-任务的资源长轮询可在 worker 等待中心回复120秒。SDK以 `lease_timeout` 单独设置这类读取期限，默认取普通 `timeout` 与130秒中的较大值；普通请求及中心的资源答复仍使用普通期限，`pool_timeout` 只管理本地连接排队。长轮询超时不会自动重发，原请求可能仍在等待；先按原ID核对状态，避免重复发起。任务跟进使用 `status(id)`，全量 `status()` 读取全部保留历史，勿用于高频轮询或费用总账；已显式删除的任务由调用工程保存原回执与费用。
+资源协商使用独立的 `lease_timeout`，默认取普通 `timeout` 与130秒中的较大值：远端 worker 的初始 lease 和本机直连中心的 resize 都使用这一期限，worker 可等待中心回复120秒。普通请求及中心的资源答复保持普通期限，`pool_timeout` 只管理本地连接排队。lease 或 resize 超时均不自动重发，资源变更可能已生效；先按原ID核对实际授予和任务状态。任务跟进使用 `status(id)`，全量 `status()` 读取全部保留历史，勿用于高频轮询或费用总账；已显式删除的任务由调用工程保存原回执与费用。
 
 部署改名后核对 tools/shared/env、`.tools/science.json`、`.tools/rtl.json` 和联接目标。`worker.local.json`、`nodes.local.json`、`.local/`、`.tools/`、`.projects/`、`.runtime/`、结果均留本机；令牌、证书私钥保留在设备配置。服务配置使用私密原子写入。
 

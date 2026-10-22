@@ -118,11 +118,13 @@ class Client:
     def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
-        # The worker can wait 120s for its center to answer a resource lease.
-        # Replies and ordinary requests keep their own network deadline.
-        lease_wait = (method in (None, 'POST') and isinstance(data, dict) and 'request_id' not in data
-                      and re.fullmatch(r'/jobs/[0-9a-f]{32}/lease', path))
-        network_timeout = getattr(self, 'lease_timeout', max(self.timeout, 130)) if lease_wait else self.timeout
+        # Both resource routes can wait for the center/worker handshake. A
+        # direct hybrid resize needs the same deadline as a worker-side lease;
+        # replies and ordinary requests keep their normal network deadline.
+        resource_wait = (method in (None, 'POST') and isinstance(data, dict) and (
+            re.fullmatch(r'/jobs/[0-9a-f]{32}/resize', path)
+            or 'request_id' not in data and re.fullmatch(r'/jobs/[0-9a-f]{32}/lease', path)))
+        network_timeout = getattr(self, 'lease_timeout', max(self.timeout, 130)) if resource_wait else self.timeout
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
                    'Accept-Encoding': 'gzip','X-DCO-Keepalive':'1'}
         auth_token = (self.operator_token or self.token) if self.operator else self.token
@@ -148,7 +150,7 @@ class Client:
         partial, etag = bytearray(), None
         attempts = 4 if binary and method == 'GET' else 2
         retryable=(method=='GET' or method=='POST' and (path=='/admission' or bool(re.fullmatch(
-            r'/(jobs/[0-9a-f]{32}(/(?:resize|cancel))?|assets/[0-9a-f]{64})',path))))
+            r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         for attempt in range(attempts):
             if attempt and asset_upload:

@@ -37,6 +37,7 @@
 | 启动、独立服务、重载 | 35项：34通过、1项环境跳过；headless与看板开关独立 | `.local/maintenance/headless-startup-lifecycle.log`；`headless-policy-deployment-jobs.json` |
 | 高并发客户端传输与恢复 | 26项通过；128并发共享8连接，本地FIFO等待独立于网络timeout，原任务不重复 | `.local/maintenance/client-pool-backpressure-tests.log` |
 | 任务终态与迟到资源回执 | 95项通过；失败/取消期间的lease响应保持原结局、费用及资源释放 | `.local/maintenance/lease-terminal-preservation-tests.log` |
+| 资源协商期限与丢失回执 | 22项HTTP传输及7项授权/回执回归通过；直连resize与初始lease共用独立期限，超时不自动重发，按原ID确认已生效授予 | `.local/maintenance/resize-ack-20261022/transport-tests.log`、`center-tests.log` |
 | 终端与短标签 | 39项通过；表头、多宽度、数字ID颜色及原标签保持 | `compact-task-tags-proof.json` |
 | 语义缓存交换 | 80项通过；原生缓存命中、逻辑记录完整及重复同步零导出 | `.local/maintenance/semantic-cache-final.log` |
 | 内存准入与迁移 | 实际RSS、阶段CPU/RAM借还、原检查点接续通过 | `production-policy-canaries.json`、`temporary-ku-memory-migration.json`、`ku-training-multicore-live.json` |
@@ -48,7 +49,7 @@
 
 中心已于2026-10-22 01:16 UTC在自然批次边界加载源码`4bb0301`，三台在线设备继续承接原任务，ITX保持禁用。原输入、回执、成本、检查点和未领取成果保留；本次维护已完成，后续科研进度沿原ID记录在`overnight-8h-current.json`。
 
-新补修复已加入源码：全量历史列举仅锁定ID快照，逐项复制不占批次全局锁；SDK资源长轮询使用独立期限。SDK可增量同步供新进程使用，中心的列表修复需后续空闲启动加载，本研究窗口不再次重载。验收与生效范围继续记录在上述任务账本。
+新补修复已加入源码：全量历史列举仅锁定ID快照，逐项复制不占批次全局锁；SDK初始lease与直连resize共用独立资源协商期限。SDK增量同步供新进程使用，中心的列表修复留后续空闲启动加载，在途科研继续。验收与生效范围继续记录在上述任务账本。
 
 四科研工程默认Web端口为8000/8001/8002/8003，CLI与Web生命周期及当前研究分别由各工程README/STATUS说明。已完成入口验收与后续运行关联记录在 `cli-web-parity-current.json`；当前任务数量直接从服务查询。
 

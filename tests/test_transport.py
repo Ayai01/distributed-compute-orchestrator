@@ -113,6 +113,47 @@ class TransportTests(unittest.TestCase):
                     client.request('/jobs/'+identity+'/lease', dict(cpus=1, memory_mb=128))
                 self.assertEqual(len(calls), 1)
 
+    def test_direct_resource_resize_uses_the_lease_deadline(self):
+        identity = 'c'*32
+        calls, deadlines = [], []
+        original = http.client.HTTPConnection.request
+        def request(connection, method, path, *args, **kwargs):
+            deadlines.append((path, connection.timeout))
+            return original(connection, method, path, *args, **kwargs)
+        def delayed_resize(key, cpus, **options):
+            calls.append((key, cpus, options))
+            time.sleep(.15)
+            return dict(id=key, cpus=cpus, memory_mb=options['memory_mb'])
+        with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
+            client = Client(remote.url, timeout=.05)
+            with patch.object(worker, 'resize', side_effect=delayed_resize), \
+                    patch.object(http.client.HTTPConnection, 'request', request):
+                result = client.resize(identity, 1, memory_mb=128)
+                client.health(brief=True)
+            self.assertEqual(result, dict(id=identity, cpus=1, memory_mb=128))
+            self.assertEqual(len(calls), 1)
+            self.assertIn(('/jobs/'+identity+'/resize', 130), deadlines)
+            self.assertEqual(deadlines[-1], ('/health', .05))
+            self.assertEqual(client.timeout, .05)
+
+    def test_timed_out_resize_is_not_replayed_and_original_grant_can_be_queried(self):
+        identity = 'd'*32
+        calls, state = [], dict(id=identity, status='running', cpus=4, memory_mb=512)
+        def accepted_resize(key, cpus, **options):
+            calls.append(key)
+            state.update(cpus=cpus, memory_mb=options['memory_mb'])
+            time.sleep(.15)
+            return dict(id=key, cpus=state['cpus'], memory_mb=state['memory_mb'])
+        with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
+            client = Client(remote.url, timeout=1, lease_timeout=.05)
+            with patch.object(worker, 'resize', side_effect=accepted_resize), \
+                    patch.object(worker, 'get', side_effect=lambda key:dict(state)):
+                with self.assertRaisesRegex(RemoteError, 'timed out'):
+                    client.resize(identity, 1, memory_mb=128)
+                observed = client.status(identity)
+                self.assertEqual(observed, dict(id=identity, status='running', cpus=1, memory_mb=128))
+                self.assertEqual(calls, [identity])
+
     def test_retained_job_listing_does_not_block_a_lease_reply(self):
         entered, release = threading.Event(), threading.Event()
         with scratch() as root, provider(Path(root)/'worker') as (worker, client):
