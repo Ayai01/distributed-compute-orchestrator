@@ -21,6 +21,31 @@ from test_center import center
 from test_compute import provider, python, scratch, until
 
 
+class ArtifactReloadTests(unittest.TestCase):
+    def test_completed_result_survives_temporary_upstream_outage_without_reexecution(self):
+        with scratch() as folder,provider(Path(folder)/'worker') as (_,worker_client):
+            with Pool([dict(name='test',client=worker_client)]) as pool,center(pool,Path(folder)/'center') as (_,client):
+                identity=client.submit(python("print('executed once')"))['id']
+                original=client.wait(identity)
+                raw=pool.nodes[0].client.artifacts(identity)
+                with patch.object(pool.nodes[0].client,'artifacts',side_effect=[RemoteError('provider reloading'),RemoteError('provider starting'),raw]) as download, \
+                        patch.object(client,'submit',side_effect=AssertionError('must not resubmit')):
+                    result=client.fetch(identity)
+                self.assertEqual(download.call_count,3)
+                self.assertEqual(result['id'],identity)
+                self.assertEqual(result['cpu_seconds'],original['cpu_seconds'])
+                self.assertEqual(result['stdout'].strip(),'executed once')
+                with self.assertRaises(RemoteError):client.status(identity)
+
+    def test_unknown_result_is_reported_immediately(self):
+        client=Client('http://127.0.0.1:1')
+        error=RemoteError('unknown task');error.status_code=404
+        with patch.object(Client,'request',side_effect=error) as request, \
+                patch('remote_compute.client.time.sleep',side_effect=AssertionError('permanent error must not wait')):
+            with self.assertRaises(RemoteError):client.artifacts('0'*32)
+        self.assertEqual(request.call_count,1)
+
+
 @contextmanager
 def slow_upload_server(*, interrupt=False):
     received=[]

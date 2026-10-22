@@ -225,6 +225,7 @@ class Client:
                 if not retryable or attempt==attempts-1:
                     error=RemoteError(f'{self.url}{path}: {exc}')
                     error.transport_code=getattr(exc,'winerror',None) or getattr(exc,'errno',None)
+                    error.transport_retryable=isinstance(exc,(ConnectionError,TimeoutError,http.client.HTTPException))
                     raise error from None
                 time.sleep(min(1,.1*2**attempt))
         return raw if binary else json.loads(raw)
@@ -384,7 +385,22 @@ class Client:
             if backend is None:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None)))
             backend.timeout=max(120,self.timeout)
-        return backend.request("/jobs/" + identity + "/artifacts", binary=True)
+        deadline=time.monotonic()+max(120,self.timeout)
+        delay=.2
+        while True:
+            try:
+                return backend.request("/jobs/" + identity + "/artifacts", binary=True)
+            except RemoteError as error:
+                # A drained provider can reload while its completed results
+                # are being collected. Retry only this read of the original ID;
+                # submit, resource leases and permanent HTTP errors never replay.
+                transient=(getattr(error,'status_code',None) in (502,503)
+                           or getattr(error,'transport_retryable',False))
+                remaining=deadline-time.monotonic()
+                if not transient or remaining<=0:
+                    raise
+                time.sleep(min(delay,remaining))
+                delay=min(1,delay*2)
 
     def fetch(self, identity, output_dir=None, *, delete=True):
         raw = self.artifacts(identity)
