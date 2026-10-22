@@ -12,6 +12,30 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class FixedQueueFairnessTests(unittest.TestCase):
+    def test_single_cpu_phase_growth_accumulates_under_continuous_refill(self):
+        with scratch() as directory, provider(Path(directory)/'worker', cpus=6) as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
+                accepted = client.submit(python(HOLD, project='growing', cpus=1, max_cpus=3, memory_mb=64))
+                identity = accepted['id']
+                until(lambda: client.status(identity)['status']=='running')
+                peers = [client.submit(python(HOLD, project='small', memory_mb=64))['id'] for _ in range(5)]
+                until(lambda: all(client.status(key)['status']=='running' for key in peers))
+                refill = client.submit(python(HOLD, project='small', memory_mb=64))['id']
+                self.assertEqual(client.resize(identity, 3)['cpus'], 1)
+                for expected, key in zip((2, 3), peers):
+                    client.write_job_file(key, 'release', 'done')
+                    client.wait(key)
+                    time.sleep(.4)
+                    self.assertEqual(client.status(refill)['status'], 'queued')
+                    self.assertEqual(client.resize(identity, 3)['cpus'], expected)
+                self.assertEqual(client.status(identity)['request_sha256'], accepted['request_sha256'])
+                client.resize(identity, 1)
+                until(lambda: client.status(refill)['status']=='running')
+                for key in (*peers, identity, refill):
+                    client.cancel(key)
+                    client.wait(key)
+                    client.fetch(key)
+
     def test_single_cpu_job_grows_and_returns_at_completed_boundaries(self):
         with scratch() as directory, provider(Path(directory)/'worker', cpus=8) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):

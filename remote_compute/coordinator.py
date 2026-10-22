@@ -535,7 +535,7 @@ class Coordinator:
         for identity,job in sorted(active_items(self.jobs),key=lambda row:-row[1].get('task',{}).get('priority',0)):
             held=job.get('node');current=job.get('task',{})
             desired=job.get('desired_cpus',0);old=current.get('cpus',0)
-            if (held is None or not job.get('auto_cpus') or desired<=old
+            if (held is None or desired<=old
                     or job['result']['status']!='running' or job['cancel'].is_set()
                     or current.get('priority',0)<task.get('priority',0)
                     or held.error or not held.enabled or held.health.get('paused')):
