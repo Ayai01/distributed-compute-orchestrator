@@ -955,6 +955,7 @@ class CenterTests(unittest.TestCase):
                         ids=[client.submit(python(code,project='CPU-placement'))['id'] for _ in range(3)]
                         client.control(paused=False)
                         until(lambda:client.health()['used_cpus']==7)
+                        until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
                         self.assertEqual([client.status(i)['assigned_node'] for i in ids],['warm','warm','busy'])
                         for identity in [initial,*ids]:
                             client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
@@ -967,6 +968,7 @@ class CenterTests(unittest.TestCase):
                 ids=[client.submit(python("from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)",
                     cpus=0,project='automatic'))['id'] for _ in range(window.current())]
                 until(lambda:client.health()['used_cpus']==4)
+                until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
                 self.assertEqual(len({client.status(i)['assigned_node'] for i in ids}),2)
                 for identity in ids:
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
@@ -1022,6 +1024,7 @@ class CenterTests(unittest.TestCase):
                 identities=[client.submit(python(hold,cpus=0,max_cpus=8,project='automatic'))['id']
                             for _ in range(window.current())]
                 until(lambda:client.health()['used_cpus']==6)
+                until(lambda:all(client.status(identity)['status']=='running' for identity in identities))
                 self.assertEqual(len({client.status(identity)['assigned_node'] for identity in identities}),3)
                 for identity in identities:
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
@@ -1044,6 +1047,7 @@ class CenterTests(unittest.TestCase):
                 first=list(ids)
                 ids += [client.submit(python(hold,cpus=0,project='phased'))['id'] for _ in range(2)]
                 until(lambda:client.health()['used_cpus']==8)
+                until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
                 self.assertTrue(all(client.status(identity)['cpus']==1 for identity in first))
                 window.updated=0
                 self.assertEqual(window.current(),4)
@@ -1062,6 +1066,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual((window['running_tasks'],window['queued_tasks'],window['max_in_flight']),(3,2,6))
                 ids.append(client.submit(python(hold,cpus=0,max_cpus=2,project='capped'))['id'])
                 until(lambda:client.health()['used_cpus']==4)
+                until(lambda:client.status(ids[-1])['status']=='running')
                 self.assertEqual(client.status(ids[-1])['cpus'],1)
                 for identity in ids:
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
@@ -1546,7 +1551,7 @@ class CenterTests(unittest.TestCase):
         with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, node):
             # Exercise admission before the partial-grant grace expires,
             # independently of the host's HTTP and process-startup latency.
-            now=time.time();clock=SimpleNamespace(time=lambda:now,sleep=time.sleep)
+            now=time.time();clock=SimpleNamespace(time=lambda:now,sleep=time.sleep,monotonic=time.monotonic)
             with patch('remote_compute.coordinator.time',clock), \
                     Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
                 task=python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",project='A')

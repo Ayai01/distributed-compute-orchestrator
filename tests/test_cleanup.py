@@ -15,6 +15,60 @@ from test_compute import provider, python, scratch, until
 
 
 class CleanupTests(unittest.TestCase):
+    def test_center_reclaims_scoped_inputs_only_after_all_producers_and_receipts_release(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
+            with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                state.asset_cache.limit = 1
+                one, two = '1'*32, '2'*32
+                source = {'value': b'original immutable input'}
+                asset = client.sync_files(source, job_id=one, content_id='frozen-input')
+                self.assertEqual(client.sync_files(source, job_id=two, content_id='frozen-input'), asset)
+                task = python("from pathlib import Path;print(Path(r'${asset:data}/value').read_text())", assets={'data':asset})
+                # The second producer has not submitted, well beyond the old grace.
+                client.submit(task, job_id=one); client.wait(one)
+                with state.asset_cache.lock:
+                    size, _ = state.asset_cache.entries[asset]
+                    state.asset_cache.entries[asset] = (size, time.time()-60)
+                client.fetch(one)
+                self.assertTrue((state.root/'assets'/(asset+'.zip')).is_file())
+                self.assertNotIn(one, state.asset_handoffs)
+                self.assertIn(two, state.asset_handoffs)
+                client.submit(task, job_id=two); client.wait(two)
+                client.release_assets(two)
+                self.assertTrue((state.root/'assets'/(asset+'.zip')).is_file(), 'Uncollected receipt owns its input')
+                self.assertEqual(client.fetch(two)['stdout'].strip(), 'original immutable input')
+                self.assertFalse((state.root/'assets'/(asset+'.zip')).exists())
+                self.assertEqual(state.asset_cache.snapshot()['bytes'], 0)
+
+    def test_abandoned_center_preparation_releases_or_expires_without_a_task(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
+            with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                state.asset_cache.limit = 1
+                one, two = '3'*32, '4'*32
+                first = client.sync_files({'data':b'cancelled preparation'}, job_id=one)
+                client.release_assets(one)
+                self.assertFalse((state.root/'assets'/(first+'.zip')).exists())
+                second = client.sync_files({'data':b'abandoned preparation'}, job_id=two)
+                assets, _ = state.asset_handoffs[two]
+                state.asset_handoffs[two] = (assets, time.monotonic()-1)
+                # Ordinary later upload is sufficient; no timer or extra GC loop.
+                client.sync_files({'data':b'current preparation'}, job_id='5'*32)
+                self.assertFalse((state.root/'assets'/(second+'.zip')).exists())
+                self.assertEqual(len(state.jobs), 0)
+                self.assertNotIn(two, state.asset_handoffs)
+
+    def test_legacy_producer_keeps_shared_asset_after_scoped_consumer_is_collected(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
+            with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                state.asset_cache.limit = 1
+                source = {'data':b'shared with an older caller'}
+                asset = client.sync_files(source)
+                identity = '6'*32
+                self.assertEqual(client.sync_files(source, job_id=identity), asset)
+                client.run(python('print("collected")', assets={'data':asset}), job_id=identity)
+                self.assertTrue((state.root/'assets'/(asset+'.zip')).exists())
+            self.assertFalse((Path(directory)/'center/assets'/(asset+'.zip')).exists())
+
     def test_two_collection_cleanups_do_not_delete_the_same_job_twice(self):
         class Together:
             def __init__(self):

@@ -123,7 +123,11 @@ class Client:
             pool=self.__dict__.setdefault('_transport',_ConnectionPool())
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
-        bulk = isinstance(data, bytes) or binary
+        # Cache lookups/handoffs and collection cleanup may wait behind disk I/O,
+        # even with tiny JSON bodies. They must leave the control slot available.
+        bulk = (isinstance(data, bytes) or binary or path.startswith('/assets/')
+                or path.endswith(('/asset-handoff', '/logs'))
+                or method == 'DELETE' and path.startswith('/jobs/'))
         if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, cancel=cancel):
             raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         # Old live instances may still own a per-thread cached connection.
@@ -198,7 +202,7 @@ class Client:
                 # A lost reply can follow a fully validated upload. Probe within
                 # this pool slot before sending the same content again.
                 try:
-                    published=self._request(path,method='GET',cancel=cancel)
+                    published=self._request(path,method='GET',extra_headers=extra_headers,cancel=cancel)
                 except RequestCancelled:
                     raise
                 except RemoteError:
@@ -485,32 +489,49 @@ class Client:
     def sync(self, root, patterns=("**/*",)):
         return self.sync_files(tree(root, patterns))
 
-    def sync_files(self, files, *, content_id=None):
+    def sync_files(self, files, *, content_id=None, job_id=None):
         """Reuse a caller's immutable content identity before preparing a ZIP.
 
         content_id must cover relative names, bytes and executable modes. files
         may be a zero-argument factory; it runs only when the asset is missing.
         The small per-client index stores IDs, never source files or archives.
+        job_id holds transient inputs until that original request is accepted.
+        Abandoned preparation can release the hold with release_assets(job_id).
         """
+        if job_id is not None and (not isinstance(job_id,str) or not re.fullmatch(r'[a-f0-9]{32}',job_id)):
+            raise ValueError('Job id requires 32 lowercase hex characters')
+        options = {'extra_headers':{'X-DCO-Asset-Job':job_id}} if job_id else {}
         if content_id is not None:
             if not isinstance(content_id,str) or not content_id:
                 raise ValueError('content_id must be a nonempty immutable content identifier')
             with self._asset_lock:
                 identity=self._asset_ids.get(content_id)
-            if identity and self.request('/assets/'+identity)['exists']:
+            if identity and self.request('/assets/'+identity, **options)['exists']:
                 with self._asset_lock:
                     if content_id in self._asset_ids:self._asset_ids.move_to_end(content_id)
                 return identity
         payload = pack(files() if callable(files) else files)
         identity = hashlib.sha256(payload).hexdigest()
-        if not self.request("/assets/" + identity)["exists"]:
-            self.request("/assets/" + identity, payload)
+        if not self.request("/assets/" + identity, **options)["exists"]:
+            self.request("/assets/" + identity, payload, **options)
         if content_id is not None:
             with self._asset_lock:
                 self._asset_ids[content_id]=identity
                 self._asset_ids.move_to_end(content_id)
                 while len(self._asset_ids)>128:self._asset_ids.popitem(last=False)
         return identity
+
+    def release_assets(self, job_id):
+        """Release an abandoned input handoff; accepted task references remain."""
+        if not isinstance(job_id,str) or not re.fullmatch(r'[a-f0-9]{32}',job_id):
+            raise ValueError('Job id requires 32 lowercase hex characters')
+        try:
+            return self.request('/jobs/'+job_id+'/asset-handoff', method='DELETE')
+        except RemoteError as error:
+            if getattr(error,'status_code',None) != 404:
+                raise
+            # Older centers retain their original shutdown-only cache policy.
+            return {'id':job_id}
 
 
 @dataclass

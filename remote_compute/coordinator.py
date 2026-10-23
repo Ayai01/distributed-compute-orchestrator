@@ -13,7 +13,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
-from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
+from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff
 from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
@@ -44,6 +44,8 @@ class Coordinator:
         self.operator_token = self._load_operator_token(operator_token)
         self.condition = threading.Condition(threading.RLock())
         self.jobs, self.queue, self.threads = JobRecords(self.root / 'jobs'), [], set()
+        self.asset_handoffs = {}
+        self.legacy_assets = set()
         self.stopping = self.paused = False
         self.restart_available = False
         self.callback_address = None
@@ -209,7 +211,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -348,7 +350,7 @@ class Coordinator:
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs)),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -468,14 +470,15 @@ class Coordinator:
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
-        with self.condition:
-            if self.stopping:
-                raise Conflict("Scheduler is stopping")
-            if identity in self.jobs:
-                saved = self.jobs[identity]["result"]
-                if saved["request_sha256"] != digest:
-                    raise Conflict("Job id already contains a different request")
-                return dict(saved)
+        with self.asset_cache.lock:
+            with self.condition:
+                if self.stopping:
+                    raise Conflict("Scheduler is stopping")
+                if identity in self.jobs:
+                    saved = self.jobs[identity]["result"]
+                    if saved["request_sha256"] != digest:
+                        raise Conflict("Job id already contains a different request")
+                    return dict(saved)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 raw_task = json.loads(archive.read("task.json"))
                 if not operator and raw_task.get('node') is not None:
@@ -500,10 +503,17 @@ class Coordinator:
             if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                 job['result']['requested_accelerator'] = task['accelerator']
             self._save(job)
-            self.jobs[identity] = job
-            self.queue.append(identity)
-            self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
-            self.condition.notify_all()
+            with self.condition:
+                stopping = self.stopping
+                if not stopping:
+                    self.jobs[identity] = job
+                    self.asset_handoffs.pop(identity, None)
+                    self.queue.append(identity)
+                    self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
+                    self.condition.notify_all()
+            if stopping:
+                shutil.rmtree(directory)
+                raise Conflict("Scheduler is stopping")
             return dict(job["result"])
 
     def _queued_candidates(self,budgets):
@@ -1188,13 +1198,16 @@ class Coordinator:
             result_lock=job.setdefault('artifact_lock',threading.RLock())
             transfers=self.__dict__.setdefault('_artifact_transfers',{})
             transfer_lock=transfers.setdefault(client.url,threading.Lock()) if client else None
-        files = {}
-        if client:
-            from .local import LocalClient
-            if isinstance(client, LocalClient) and result['status'] != 'interrupted':
-                return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
-            try:
-                with result_lock:
+        with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    raise KeyError(identity)
+            files = {}
+            if client:
+                from .local import LocalClient
+                if isinstance(client, LocalClient) and result['status'] != 'interrupted':
+                    return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
+                try:
                     if is_connected and not is_connected():
                         raise ConnectionAbortedError('Result download caller disconnected while queued')
                     cached=job['directory']/'worker-artifacts.zip'
@@ -1219,21 +1232,21 @@ class Coordinator:
                             temporary.replace(cached)
                         finally:
                             unlink(temporary)
-            except RemoteError as error:
-                if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
-                    raise
-            else:
-                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-                    files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
-                    if result['status']=='interrupted':
-                        remote=json.loads(archive.read('result.json'))
-                        with self.condition:
-                            job['result'].pop('error',None)
-                            job['result'].pop('connection_error',None)
-                            self._update(job,remote)
-                            result=self.get(identity)
-        files["result.json"] = json_bytes(self.public_result(result) if public else result)
-        return pack(files)
+                except RemoteError as error:
+                    if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
+                        raise
+                else:
+                    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                        files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
+                        if result['status']=='interrupted':
+                            remote=json.loads(archive.read('result.json'))
+                            with self.condition:
+                                job['result'].pop('error',None)
+                                job['result'].pop('connection_error',None)
+                                self._update(job,remote)
+                                result=self.get(identity)
+            files["result.json"] = json_bytes(self.public_result(result) if public else result)
+            return pack(files)
 
     def delete(self, identity):
         with self.condition:
@@ -1257,20 +1270,39 @@ class Coordinator:
             shutil.rmtree(job["directory"])
             with self.condition:
                 del self.jobs[identity]
-            return {"deleted": identity}
+        self._prune_assets()
+        return {"deleted": identity}
 
     def _prune_assets(self, *, recent=True):
-        now = time.time()
-        protected = {key for key, (_, used) in self.asset_cache.entries.items() if recent and now-used < 5}
-        protected.update(asset_references(self.jobs))
-        for error in self.asset_cache.prune(protected):
-            self.activity.notify('资产缓存待清理 '+error, 'local')
+        with self.asset_cache.lock:
+            with self.condition:
+                # Legacy callers have no producer identity. Keep their uploads
+                # until shutdown; an arbitrary delay is not a transfer of ownership.
+                protected = set(self.legacy_assets) if recent else set()
+                now = time.monotonic()
+                for identity, (assets, expires) in tuple(self.asset_handoffs.items()):
+                    if now >= expires:
+                        self.asset_handoffs.pop(identity, None)
+                    else:
+                        protected.update(assets)
+                protected.update(asset_references(self.jobs))
+            for error in self.asset_cache.prune(protected):
+                self.activity.notify('资产缓存待清理 '+error, 'local')
 
-    def asset(self, identity, payload=None):
+    def asset_handoff(self, identity, assets=None):
+        # The same original-ID handoff is understood by center and worker.
+        value = asset_handoff(self, identity, assets)
+        if assets is None:
+            self._prune_assets()
+        return value
+
+    def asset(self, identity, payload=None, *, job_id=None):
         if not _ASSET.fullmatch(identity):
             raise ValueError("Asset id requires SHA256")
+        if job_id is not None and not _ID.fullmatch(job_id):
+            raise ValueError('Job id requires 32 lowercase hex characters')
         path = self.root / "assets" / (identity + ".zip")
-        with self.condition:
+        with self.asset_cache.lock:
             if payload is not None and not path.is_file():
                 if hashlib.sha256(payload).hexdigest() != identity:
                     raise ValueError("Asset digest does not match bundle")
@@ -1282,6 +1314,14 @@ class Coordinator:
                     unlink(temporary)
             if path.is_file():
                 self.asset_cache.touch(identity)
+                if job_id is None:
+                    self.legacy_assets.add(identity)
+            if job_id is not None:
+                with self.condition:
+                    held = self.asset_handoffs.get(job_id, (set(), 0))[0]
+                self.asset_handoff(job_id, list(set(held) | {identity}))
+            if payload is not None:
+                self._prune_assets()
             return {"id": identity, "exists": path.is_file()}
 
     def close(self):
@@ -1293,5 +1333,6 @@ class Coordinator:
         self.scheduler.join()
         for thread in list(self.threads):
             thread.join()
+        self.asset_handoffs.clear()
         self._prune_assets(recent=False)
         self.root_lock.close()

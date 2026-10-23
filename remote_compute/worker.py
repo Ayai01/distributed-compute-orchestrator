@@ -49,6 +49,27 @@ class Conflict(ValueError):
     pass
 
 
+def asset_handoff(service, identity, assets=None):
+    """Hold an original request's inputs across a slow resynchronization."""
+    if not _ID.fullmatch(identity):
+        raise ValueError('Job id requires 32 lowercase hex characters')
+    with service.asset_cache.lock, service.condition:
+        if assets is None:
+            service.asset_handoffs.pop(identity,None)
+        else:
+            if service.stopping:
+                raise Conflict('Worker is stopping')
+            if not isinstance(assets,list) or any(not isinstance(a,str) or not _ASSET.fullmatch(a) for a in assets):
+                raise ValueError('Asset handoff requires synchronized SHA256 ids')
+            # This is only a cache reference, never a task or CPU grant.
+            # Abandoned transfers expire; each input check/upload renews it.
+            now=time.monotonic()
+            service.asset_handoffs={key:value for key,value in service.asset_handoffs.items() if value[1]>now}
+            if identity not in service.jobs:
+                service.asset_handoffs[identity]=(frozenset(assets),now+3600)
+        return {'id':identity}
+
+
 def lock_root(root, role):
     root.mkdir(parents=True, exist_ok=True)
     handle = (root / (role + ".lock")).open("a+b")
@@ -555,14 +576,15 @@ class Worker:
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
-        with self.condition:
-            if self.stopping:
-                raise Conflict("Worker is stopping")
-            if identity in self.jobs:
-                result = self.jobs[identity]["result"]
-                if result["request_sha256"] != digest:
-                    raise Conflict("Job id already contains a different request")
-                return dict(result)
+        with self.asset_cache.lock:
+            with self.condition:
+                if self.stopping:
+                    raise Conflict("Worker is stopping")
+                if identity in self.jobs:
+                    result = self.jobs[identity]["result"]
+                    if result["request_sha256"] != digest:
+                        raise Conflict("Job id already contains a different request")
+                    return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), self.capacity)
                 if task["memory_mb"] > self.memory_capacity:
@@ -613,15 +635,20 @@ class Worker:
                        "commands": commands, "directory": directory, "cwd": cwd,
                        'callback':dict(self.callback if callback is None else callback)})
                 self._save(job)
+                with self.condition:
+                    if self.stopping:
+                        raise Conflict("Worker is stopping")
+                    if task['cpus'] > self.capacity or task['memory_mb'] > self.memory_capacity:
+                        raise Conflict('Worker budget changed during submission; retry the original id')
+                    self.jobs[identity] = job
+                    self.asset_handoffs.pop(identity,None)
+                    self.queue.append(identity)
+                    self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
+                    self.condition.notify_all()
             except BaseException:
                 if directory.exists():
                     shutil.rmtree(directory)
                 raise
-            self.jobs[identity] = job
-            self.asset_handoffs.pop(identity,None)
-            self.queue.append(identity)
-            self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
-            self.condition.notify_all()
             return dict(result)
 
     def _schedule(self):
@@ -788,16 +815,18 @@ class Worker:
     def _prune_assets(self, *, recent=True):
         # A check/upload and the following submit are separate LAN requests.
         # Keep their short handoff intact even if active assets exceed the LRU target.
-        now = time.time()
-        protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if recent and now-used<5}
-        for identity,(assets,expires) in tuple(self.asset_handoffs.items()):
-            if time.monotonic()>=expires:
-                self.asset_handoffs.pop(identity,None)
-            else:
-                protected.update(assets)
-        protected.update(asset_references(self.jobs))
-        for error in self.asset_cache.prune(protected):
-            self.activity.notify('资产缓存待清理 '+error, 'local')
+        with self.asset_cache.lock:
+            with self.condition:
+                now = time.time()
+                protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if recent and now-used<5}
+                for identity,(assets,expires) in tuple(self.asset_handoffs.items()):
+                    if time.monotonic()>=expires:
+                        self.asset_handoffs.pop(identity,None)
+                    else:
+                        protected.update(assets)
+                protected.update(asset_references(self.jobs))
+            for error in self.asset_cache.prune(protected):
+                self.activity.notify('资产缓存待清理 '+error, 'local')
 
     def _temporary(self, job):
         base=getattr(self,'temp_root',None)
@@ -829,7 +858,13 @@ class Worker:
 
     def job_file(self, identity, name, data=None):
         with self.condition:
-            path = inside(self.jobs[identity]['directory'] / 'input', name)
+            job = self.jobs[identity]
+            result_lock = job.setdefault('artifact_lock', threading.RLock())
+        with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    raise KeyError(identity)
+            path = inside(job['directory'] / 'input', name)
             if data is None:
                 return path.read_bytes()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -840,15 +875,27 @@ class Worker:
 
     def job_file_version(self, identity, name, version=None):
         with self.condition:
-            path=inside(self.jobs[identity]['directory']/'input',name)
-        with path.open('rb') as stream:
-            stat=os.fstat(stream.fileno())
-            current='"'+str(stat.st_ino)+'-'+str(stat.st_mtime_ns)+'-'+str(stat.st_size)+'"'
-            return dict(version=current,changed=current!=version,data=stream.read() if current!=version else None)
+            job = self.jobs[identity]
+            result_lock = job.setdefault('artifact_lock', threading.RLock())
+        with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    raise KeyError(identity)
+            path=inside(job['directory']/'input',name)
+            with path.open('rb') as stream:
+                stat=os.fstat(stream.fileno())
+                current='"'+str(stat.st_ino)+'-'+str(stat.st_mtime_ns)+'-'+str(stat.st_size)+'"'
+                return dict(version=current,changed=current!=version,data=stream.read() if current!=version else None)
 
     def logs(self, identity):
         with self.condition:
-            directory = self.jobs[identity]["directory"]
+            job = self.jobs[identity]
+            result_lock = job.setdefault('artifact_lock', threading.RLock())
+        with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    raise KeyError(identity)
+            directory = job["directory"]
             result = {}
             for name in ("stdout", "stderr"):
                 path = directory / (name + ".log")
@@ -861,27 +908,38 @@ class Worker:
             return result
 
     def cancel(self, identity):
+        queued = False
         with self.condition:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 job["cancel"].set()
-                if job["result"]["status"] == "queued":
+                if job["result"]["status"] == "queued" and identity in self.queue:
                     self.queue.remove(identity)
-                    self._clean_work(job, discard=True)
-                    job["result"].update(status="cancelled", finished=time.time())
-                    self._save(job)
-                    archive_job(self.jobs, job)
+                    queued = True
                 self.condition.notify_all()
-            return self.get(identity)
+        if queued:
+            self._clean_work(job, discard=True)
+            with self.condition:
+                job["result"].update(status="cancelled", finished=time.time())
+                self._save(job)
+                archive_job(self.jobs, job)
+                self.condition.notify_all()
+        return self.get(identity)
 
     def artifacts(self, identity, *, result=None):
         with self.condition:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
+            result_lock = job.setdefault('artifact_lock', threading.RLock())
+        with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    raise KeyError(identity)
+                receipt = json_bytes(job["result"] if result is None else result)
             directory = job["directory"]
             task = job.get("task") or json.loads((directory / "task.json").read_text(encoding="utf-8"))
-            files = {"result.json": json_bytes(job["result"] if result is None else result)}
+            files = {"result.json": receipt}
             files.update({"files/" + name: path for name, path in tree(directory / "input", task["outputs"]).items()})
             for name in ("stdout.log", "stderr.log"):
                 if (directory / name).exists():
@@ -893,41 +951,29 @@ class Worker:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Cancel and wait for the job before deleting it")
+            result_lock = job.setdefault('artifact_lock', threading.RLock())
+        with result_lock:
+            with self.condition:
+                if self.jobs.get(identity) is not job:
+                    return {"deleted": identity}
             remove_owned(job["directory"])
-            del self.jobs[identity]
-            self.cleanup_pending.discard(identity)
-            self._prune_assets()
-            return {"deleted": identity}
+            with self.condition:
+                del self.jobs[identity]
+                self.cleanup_pending.discard(identity)
+        self._prune_assets()
+        return {"deleted": identity}
 
     def asset_handoff(self, identity, assets=None):
-        """Hold an original request's inputs across a slow resynchronization."""
-        if not _ID.fullmatch(identity):
-            raise ValueError('Job id requires 32 lowercase hex characters')
-        with self.condition:
-            if assets is None:
-                self.asset_handoffs.pop(identity,None)
-            else:
-                if self.stopping:
-                    raise Conflict('Worker is stopping')
-                if not isinstance(assets,list) or any(not isinstance(a,str) or not _ASSET.fullmatch(a) for a in assets):
-                    raise ValueError('Asset handoff requires synchronized SHA256 ids')
-                # This is only a cache reference, never a task or CPU grant.
-                # Abandoned transfers expire; each input check/upload renews it.
-                now=time.monotonic()
-                self.asset_handoffs={key:value for key,value in self.asset_handoffs.items() if value[1]>now}
-                if identity not in self.jobs:
-                    self.asset_handoffs[identity]=(frozenset(assets),now+3600)
-            return {'id':identity}
+        return asset_handoff(self, identity, assets)
 
-    def asset(self, identity, payload=None):
+    def asset(self, identity, payload=None, *, job_id=None):
         if not _ASSET.fullmatch(identity):
             raise ValueError("Asset id requires SHA256")
+        if job_id is not None and not _ID.fullmatch(job_id):
+            raise ValueError('Job id requires 32 lowercase hex characters')
         directory = self.root / "assets" / identity
-        with self.condition:
-            now=time.monotonic()
-            for key,(assets,expires) in tuple(self.asset_handoffs.items()):
-                if identity in assets and expires>now:
-                    self.asset_handoffs[key]=(assets,now+3600)
+        with self.asset_cache.lock:
+            started = time.monotonic()
             if payload is not None and not directory.is_dir():
                 if hashlib.sha256(payload).hexdigest() != identity:
                     raise ValueError("Asset digest does not match bundle")
@@ -941,14 +987,23 @@ class Worker:
                         remove_owned(temporary)
             if directory.is_dir():
                 self.asset_cache.touch(identity)
+            with self.condition:
+                now=time.monotonic()
+                for key,(assets,expires) in tuple(self.asset_handoffs.items()):
+                    if identity in assets and expires>started:
+                        self.asset_handoffs[key]=(assets,now+3600)
+                if job_id is not None:
+                    held = self.asset_handoffs.get(job_id, (set(), 0))[0]
+                    self.asset_handoff(job_id, list(set(held) | {identity}))
             return {"id": identity, "exists": directory.is_dir()}
 
     def close(self):
         with self.condition:
             self.stopping = True
-            for identity, _job in list(active_items(self.jobs)):
-                self.cancel(identity)
+            pending = list(active_items(self.jobs))
             self.condition.notify_all()
+        for identity, _job in pending:
+            self.cancel(identity)
         self.scheduler.join()
         for thread in list(self.threads):
             thread.join()
@@ -1153,7 +1208,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     value.append(result)
             elif len(parts) == 2 and parts[0] == "assets" and self.command in {"GET", "POST"}:
-                value = worker.asset(parts[1], body)
+                job_id = self.headers.get('X-DCO-Asset-Job')
+                value = worker.asset(parts[1], body, **({'job_id':job_id} if job_id else {}))
             elif len(parts) >= 2 and parts[0] == "jobs":
                 identity = parts[1]
                 if len(parts) == 2 and self.command == "POST":
@@ -1186,7 +1242,7 @@ class Handler(BaseHTTPRequestHandler):
                         value = worker.public_result(value)
                 elif parts[2:] == ['lease'] and self.command == 'POST' and hasattr(worker,'lease'):
                     value=worker.lease(identity,json.loads(body))
-                elif parts[2:] == ['asset-handoff'] and self.command in {'POST','DELETE'} and not scheduler:
+                elif parts[2:] == ['asset-handoff'] and self.command in {'POST','DELETE'}:
                     value=worker.asset_handoff(identity,json.loads(body)['assets'] if self.command=='POST' else None)
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
                     value = (worker.artifacts(identity,is_connected=self._connected,public=not operator) if hasattr(worker,'pool')

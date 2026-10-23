@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 import time
 
 
@@ -28,6 +29,9 @@ class AssetCache:
     def __init__(self, root, limit=512 * 1024**2, *, archives=False):
         self.root, self.limit = Path(root), limit
         self.archives = archives
+        # File operations share this lock; health reads only the short metadata lock.
+        self.lock = threading.RLock()
+        self.metadata_lock = threading.Lock()
         self.entries = {}
         self.revision = 0
         for path in self.root.iterdir():
@@ -43,7 +47,9 @@ class AssetCache:
                 directories[:] = [name for name in directories if not self._linked(Path(folder)/name)]
                 size += sum((Path(folder)/name).stat().st_size for name in files
                             if not self._linked(Path(folder)/name))
-        self.entries[path.stem if self.archives else path.name] = (size, path.stat().st_mtime)
+        used = path.stat().st_mtime
+        with self.metadata_lock:
+            self.entries[path.stem if self.archives else path.name] = (size, used)
 
     def _path(self, identity):
         return self.root / (identity + '.zip' if self.archives else identity)
@@ -54,18 +60,25 @@ class AssetCache:
         return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 1024)
 
     def touch(self, identity):
-        path = self._path(identity)
-        if identity not in self.entries:
-            self._add(path)
-        size, _ = self.entries[identity]
-        self.entries[identity] = (size, time.time())
-        os.utime(path, None)
+        with self.lock:
+            path = self._path(identity)
+            if identity not in self.entries:
+                self._add(path)
+            os.utime(path, None)
+            with self.metadata_lock:
+                size, _ = self.entries[identity]
+                self.entries[identity] = (size, time.time())
 
     def snapshot(self):
-        return dict(bytes=sum(size for size, _ in self.entries.values()),
-                    limit_bytes=self.limit, count=len(self.entries))
+        with self.metadata_lock:
+            return dict(bytes=sum(size for size, _ in self.entries.values()),
+                        limit_bytes=self.limit, count=len(self.entries))
 
     def prune(self, protected):
+        with self.lock:
+            return self._prune(protected)
+
+    def _prune(self, protected):
         total = self.snapshot()['bytes']
         errors = []
         for identity, (size, _used) in sorted(self.entries.items(), key=lambda item: item[1][1]):
@@ -78,7 +91,8 @@ class AssetCache:
             except OSError as error:
                 errors.append(str(error))
             else:
-                self.entries.pop(identity)
-                self.revision += 1
+                with self.metadata_lock:
+                    self.entries.pop(identity)
+                    self.revision += 1
                 total -= size
         return errors

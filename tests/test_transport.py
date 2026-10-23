@@ -15,11 +15,146 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
-from remote_compute.bundle import pack
+from remote_compute.bundle import pack, unpack
 from remote_compute.client import PoolBusy, RequestCancelled, _ConnectionPool
 from remote_compute.worker import Handler
 from test_center import center
 from test_compute import provider, python, scratch, until
+
+
+class BulkIOControlTests(unittest.TestCase):
+    def test_waiting_asset_metadata_keeps_a_control_connection_available(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, client):
+            entered, release = threading.Event(), threading.Event()
+            def slow(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):raise AssertionError('Unpack was not released')
+                return unpack(*args, **kwargs)
+            with patch('remote_compute.worker.unpack', side_effect=slow), ThreadPoolExecutor(max_workers=10) as executor:
+                upload = executor.submit(client.sync_files, {'data':b'original data'})
+                try:
+                    self.assertTrue(entered.wait(3))
+                    lookups = [executor.submit(client.request, '/assets/'+format(i,'064x')) for i in range(7)]
+                    until(lambda:client._transport.bulk_active==7)
+                    self.assertEqual(executor.submit(client.health).result(timeout=2)['role'], 'worker')
+                finally:
+                    release.set()
+                upload.result(timeout=5)
+                self.assertTrue(all(not lookup.result(timeout=5)['exists'] for lookup in lookups))
+
+    def blocked(self, target, original, action, probe, *, matches=lambda *args: True, concurrent=None):
+        entered, release = threading.Event(), threading.Event()
+        def slow(*args, **kwargs):
+            if matches(*args):
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError('Blocked I/O was not released')
+            return original(*args, **kwargs)
+        with patch(target, side_effect=slow), ThreadPoolExecutor(max_workers=3) as executor:
+            first = executor.submit(action)
+            try:
+                self.assertTrue(entered.wait(3), target)
+                second = executor.submit(concurrent) if concurrent else None
+                executor.submit(probe).result(timeout=2)
+                if second:
+                    self.assertFalse(second.done(), 'Deletion must wait for the original artifact reader')
+            finally:
+                release.set()
+            result = first.result(timeout=5)
+            if second:
+                second.result(timeout=5)
+            return result
+
+    def test_worker_artifact_pack_preserves_control_and_serializes_delete(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, client):
+            identity = client.submit(python("from pathlib import Path;Path('answer').write_text('paid result')", outputs=['answer']))['id']
+            client.wait(identity)
+            result = self.blocked('remote_compute.worker.pack', pack,
+                lambda: client.fetch(identity, delete=False),
+                lambda: self.assertEqual(client.status(identity)['status'], 'succeeded'),
+                concurrent=lambda: client.delete(identity))
+            self.assertEqual(result['files']['answer'], b'paid result')
+
+    def test_versioned_file_read_finishes_before_concurrent_delete(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (worker, client):
+            identity = client.submit(python("from pathlib import Path;Path('answer').write_text('paid result')", outputs=['answer']))['id']
+            client.wait(identity)
+            target = worker.root/'jobs'/identity/'input'/'answer'
+            original = Path.open
+            entered, release = threading.Event(), threading.Event()
+            @contextmanager
+            def slow(path, *args, **kwargs):
+                with original(path, *args, **kwargs) as stream:
+                    if path != target:
+                        yield stream
+                    else:
+                        class Reader:
+                            def fileno(self):return stream.fileno()
+                            def read(self):
+                                entered.set()
+                                if not release.wait(5):raise AssertionError('Read was not released')
+                                return stream.read()
+                        yield Reader()
+            with patch.object(Path, 'open', slow), ThreadPoolExecutor(max_workers=3) as executor:
+                first = executor.submit(client.read_job_file_changed, identity, 'answer')
+                try:
+                    self.assertTrue(entered.wait(3))
+                    deletion = executor.submit(client.delete, identity)
+                    self.assertEqual(executor.submit(client.status, identity).result(timeout=2)['status'], 'succeeded')
+                    self.assertFalse(deletion.done())
+                finally:
+                    release.set()
+                self.assertEqual(first.result(timeout=5)['data'], b'paid result')
+                deletion.result(timeout=5)
+
+    def test_worker_asset_unpack_and_submission_keep_status_and_grants_responsive(self):
+        with scratch() as directory, provider(Path(directory)/'worker', cpus=2) as (_, client):
+            identity = client.submit(python('import time;time.sleep(30)', cpus=2))['id']
+            until(lambda: client.status(identity)['status'] == 'running')
+            def probe():
+                self.assertEqual(client.status(identity)['status'], 'running')
+                self.assertEqual(client.resize(identity, 1)['cpus'], 1)
+                self.assertEqual(client.health()['used_cpus'], 1)
+            try:
+                asset = self.blocked('remote_compute.worker.unpack', unpack,
+                    lambda: client.sync_files({'model': b'original model'}), probe)
+                submitted = self.blocked('remote_compute.worker.unpack', unpack,
+                    lambda: client.submit(python('print("second")', assets={'model': asset})), probe)
+                self.assertEqual(client.wait(submitted['id'])['status'], 'succeeded')
+                client.fetch(submitted['id'])
+            finally:
+                client.cancel(identity)
+                client.wait(identity)
+                client.fetch(identity)
+
+    def test_center_asset_and_request_writes_leave_control_responsive(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
+            with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                identity = client.submit(python('print("retained")'))['id']
+                client.wait(identity)
+                probe = lambda: self.assertEqual(client.status(identity)['status'], 'succeeded')
+                original = Path.write_bytes
+                # Path methods need their descriptor binding retained by the patch.
+                for kind in ('asset', 'request'):
+                    entered, release = threading.Event(), threading.Event()
+                    def slow(path, data):
+                        if state.root in path.parents and (path.suffix == '.upload' if kind == 'asset' else path.name == 'request.zip'):
+                            entered.set()
+                            if not release.wait(5):
+                                raise AssertionError('Write was not released')
+                        return original(path, data)
+                    action = (lambda: client.sync_files({'code': b'original code'})) if kind == 'asset' else (lambda: client.submit(python('print("second")')))
+                    with patch.object(Path, 'write_bytes', slow), ThreadPoolExecutor(max_workers=2) as executor:
+                        first = executor.submit(action)
+                        try:
+                            self.assertTrue(entered.wait(3))
+                            executor.submit(probe).result(timeout=2)
+                        finally:
+                            release.set()
+                        outcome = first.result(timeout=5)
+                    if kind == 'request':
+                        client.wait(outcome['id']); client.fetch(outcome['id'])
+                client.fetch(identity)
 
 
 class ArtifactReloadTests(unittest.TestCase):
@@ -302,8 +437,10 @@ class TransportTests(unittest.TestCase):
         identity=hashlib.sha256(payload).hexdigest()
         original=Handler._reply
         requests=[]
+        owner='7'*32
         def reply(handler,value,status=200):
             if handler.path=='/assets/'+identity:
+                self.assertEqual(handler.headers.get('X-DCO-Asset-Job'),owner)
                 requests.append((handler.command,int(handler.headers.get('Content-Length',0))))
                 if handler.command=='POST' and len(requests)==1:
                     self.assertTrue(value['exists'])
@@ -312,9 +449,10 @@ class TransportTests(unittest.TestCase):
             return original(handler,value,status)
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):
             with patch.object(Handler,'_reply',reply):
-                result=client.request('/assets/'+identity,payload)
+                result=client.request('/assets/'+identity,payload,extra_headers={'X-DCO-Asset-Job':owner})
             self.assertEqual(result,dict(id=identity,exists=True))
             self.assertEqual(requests,[('POST',len(payload)),('GET',0)])
+            self.assertEqual(worker.asset_handoffs[owner][0],frozenset({identity}))
             self.assertEqual((worker.root/'assets'/identity/'model.npz').read_bytes(),bytes(range(256))*8192)
 
     def test_connection_slots_are_fifo_and_timeout_never_sends_a_request(self):

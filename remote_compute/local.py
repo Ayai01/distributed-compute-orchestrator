@@ -31,7 +31,8 @@ class LocalClient(Client):
                 with worker.condition:
                     return [(progress(worker.get(identity)) if brief else worker.get(identity)) for identity in worker.jobs]
             if len(parts) == 2 and parts[0] == 'assets':
-                return worker.asset(parts[1], data)
+                job_id = (extra_headers or {}).get('X-DCO-Asset-Job')
+                return worker.asset(parts[1], data, **({'job_id':job_id} if job_id else {}))
             if len(parts) >= 2 and parts[0] == 'jobs':
                 identity = parts[1]
                 if len(parts) == 2:
