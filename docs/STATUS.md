@@ -10,6 +10,8 @@
 
 本机DCO引用RGCN的Windows EDA/Cygwin与ARH的ONNX环境，作为共享在用依赖维护；协调归DCO，科研源码、模型与观测归各工程。沿原路径复用，不复制出另一套环境。
 
+Windows Magic GDS入口已修复：ITX/TX的通用Tcl入口在最小矩形写出时异常退出，改为同一安装的`magicdnull.exe`原生批处理入口；TX同时修正安装目录对应的`CAD_ROOT`及在线/持久工具绑定。PC原入口正常。三台用原58.53µm MiM脚本及冻结PDK技术文件均写出1,355,458字节GDS，独立读取为1cell/21,176polygons且边界相同；本次0SPICE。证据见`.local/maintenance/continuous-supervision-20261023/magic-gds-repair.json`，能力验收已补Magic写出后的独立GDS读取。
+
 ## 本轮实现与验证
 
 - 0.8.10合并SDK同内容并发准备，8个请求只打包/摘要/上传一次，各原ID分别持有交接引用；缓存缺失不重复查询。`fetch(output_dir=...)`直接解包到目录，省去全部文件的重复内存读取。Bench冻结原ZIP直接上传，每包客户端两次打包/三次摘要缩为各一次，原内容身份保持。
