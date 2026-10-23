@@ -75,8 +75,8 @@ def _windows_visible():
     if name.value != 'PseudoConsoleWindow':
         return bool(user.IsWindowVisible(window))
 
-    # ConPTY's own HWND is hidden. Check its actual terminal/editor ancestors,
-    # rather than trusting inherited WT_SESSION / TERM_PROGRAM variables.
+    # ConPTY's own HWND is hidden. A visible chat/editor ancestor does not
+    # prove that its terminal pane is visible; require an actual terminal host.
     parents = {pid: parent for pid, (parent, _) in _windows_processes().items()}
     user.GetWindowThreadProcessId.argtypes = [w.HWND, c.POINTER(w.DWORD)]
     owner = w.DWORD()
@@ -97,7 +97,10 @@ def _windows_visible():
         pid = w.DWORD()
         user.GetWindowThreadProcessId(hwnd, c.byref(pid))
         if pid.value in ancestors and user.IsWindowVisible(hwnd):
-            found.append(True)
+            host_class = c.create_unicode_buffer(128)
+            user.GetClassNameW(hwnd, host_class, len(host_class))
+            if host_class.value in {'ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS'}:
+                found.append(True)
         return True
 
     user.EnumWindows.argtypes = [callback_type, w.LPARAM]

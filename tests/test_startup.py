@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from remote_compute import startup, terminal
 from remote_compute.cli import ROOT
@@ -17,6 +17,42 @@ from remote_compute import Pool
 
 
 class StartupTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows ConPTY host visibility')
+    def test_conpty_requires_its_own_visible_terminal_not_a_chat_or_editor_window(self):
+        kernel, user = MagicMock(), MagicMock()
+        kernel.GetConsoleWindow.return_value = 1
+        user.GetShellWindow.return_value = 2
+        owners = {1: 40, 2: 10, 3: 20, 4: 50}
+        classes = {1: 'PseudoConsoleWindow', 3: 'Chrome_WidgetWin_1',
+                   4: 'CASCADIA_HOSTING_WINDOW_CLASS'}
+        processes = {30: (20, 'python.exe'), 40: (20, 'conhost.exe'),
+                     20: (10, 'ChatGPT.exe'), 10: (0, 'explorer.exe'),
+                     50: (10, 'WindowsTerminal.exe')}
+
+        def owner(hwnd, pointer):
+            pointer._obj.value = owners[hwnd]
+
+        def window_class(hwnd, buffer, _size):
+            buffer.value = classes[hwnd]
+            return len(buffer.value)
+
+        user.GetWindowThreadProcessId.side_effect = owner
+        user.GetClassNameW.side_effect = window_class
+        user.IsWindowVisible.side_effect = lambda hwnd: hwnd in (3, 4)
+        user.EnumWindows.side_effect = lambda callback, unused: [callback(hwnd, 0) for hwnd in (3, 4)]
+        with patch('ctypes.WinDLL', side_effect=lambda name, **unused: kernel if name == 'kernel32' else user), \
+                patch.object(terminal, '_windows_processes', return_value=processes), \
+                patch.object(terminal.os, 'getpid', return_value=30):
+            # The unrelated visible Windows Terminal cannot admit this PTY.
+            for application in ('ChatGPT.exe', 'Code.exe'):
+                processes[20] = (10, application)
+                self.assertFalse(terminal._windows_visible())
+            processes[20] = (10, 'WindowsTerminal.exe')
+            classes[3] = 'CASCADIA_HOSTING_WINDOW_CLASS'
+            self.assertTrue(terminal._windows_visible())
+            user.IsWindowVisible.side_effect = lambda hwnd: hwnd == 4
+            self.assertFalse(terminal._windows_visible())
+
     @unittest.skipUnless(os.name == 'nt', 'Native Windows console visibility')
     def test_native_visible_console_passes_and_same_hidden_console_fails(self):
         code = '''import ctypes as c,sys
