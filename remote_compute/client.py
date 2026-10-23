@@ -972,7 +972,7 @@ class Pool:
                  "tool_root": n.health.get("tool_root"),
                  **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
-                 "seconds_by_label": dict(n.durations), "error": n.error} for n in self.nodes]}
+                  "timing_labels": len(n.durations), "error": n.error} for n in self.nodes]}
 
     def _matching(self, task):
         cpus=task.get('cpus',1) or 1
@@ -1120,7 +1120,12 @@ class Pool:
                 node.completed += 1
                 if result["status"] == "succeeded":
                     measured = result["elapsed"]
-                    node.durations[label] = 0.7 * node.durations.get(label, measured) + 0.3 * measured
+                    previous = node.durations.pop(label, measured)
+                    node.durations[label] = 0.7 * previous + 0.3 * measured
+                    # Keep exact workload labels; unrelated sizes/seeds are not
+                    # merged into a scheduling estimate. Old one-off labels expire.
+                    while len(node.durations) > 256:
+                        del node.durations[next(iter(node.durations))]
                 else:
                     node.failed += 1
             self.condition.notify_all()

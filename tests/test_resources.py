@@ -14,6 +14,17 @@ from test_compute import provider, scratch
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_forced_calibration_bypasses_and_invalidates_memoized_result(self):
+        cpu_benchmark.cache_clear()
+        self.addCleanup(cpu_benchmark.cache_clear)
+        with patch('remote_compute.benchmark.calibrated',side_effect=[1,2,3,4]) as kernel:
+            self.assertEqual(cpu_benchmark(4),1)
+            self.assertEqual(cpu_benchmark(4,force=True),2)
+            self.assertEqual(cpu_benchmark(4,force=True),3)
+            self.assertEqual(cpu_benchmark(4),4)
+            self.assertEqual(cpu_benchmark(4),4)
+        self.assertEqual(kernel.call_count,4)
+
     def test_startup_calls_native_measurement_once_per_budget(self):
         cpu_benchmark.cache_clear()
         result=dict(name=NAME,score=2.5,unit='Miter/s',threads=24,seconds=1.9,total_seconds=2.0)
@@ -155,6 +166,23 @@ class BenchmarkTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_completed_labels_are_bounded_and_not_exported_in_node_snapshots(self):
+        pool=self.pool();node=pool.nodes[0]
+        for i in range(300):
+            node.reserved+=1;node.reserved_memory_mb+=64
+            pool._release(node,dict(label='work-'+str(i),cpus=1,memory_mb=64),
+                          dict(status='succeeded',elapsed=10))
+        self.assertEqual(len(node.durations),256)
+        self.assertNotIn('work-0',node.durations)
+        node.reserved+=1;node.reserved_memory_mb+=64
+        pool._release(node,dict(label='work-44',cpus=1,memory_mb=64),
+                      dict(status='succeeded',elapsed=20))
+        self.assertEqual(node.durations['work-44'],13)
+        self.assertEqual(list(node.durations)[-1],'work-44')
+        row=pool.snapshot()['nodes'][0]
+        self.assertEqual(row['timing_labels'],256)
+        self.assertNotIn('seconds_by_label',row)
+
     def pool(self,policy='adaptive'):
         # Exercise placement without workers, subprocesses or production load.
         from threading import Condition

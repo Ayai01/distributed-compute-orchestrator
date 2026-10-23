@@ -15,16 +15,24 @@ MIB = 1024 * 1024
 DEFAULT_MEMORY_RESERVE_MB = 16 * 1024
 DEFAULT_MEMORY_HEADROOM_MB = 8 * 1024
 MACHINE_ID = socket.gethostname() + ":" + f"{uuid.getnode():012x}"
-@lru_cache(maxsize=None)
 def cpu_benchmark(cpus, executable=None, environment=(), *, force=False):
     """Measure a fixed circuit/RTL/scientific mix at the worker CPU budget."""
     if type(cpus) is not int or cpus < 1:
         raise ValueError('Benchmark cpus must be a positive integer')
-    from .benchmark import calibrated
-    options = dict(executable=executable, environment=environment)
     if force:
-        options['force'] = True
-    return calibrated(cpus, **options)
+        from .benchmark import calibrated
+        _cached_cpu_benchmark.cache_clear()
+        return calibrated(cpus, executable=executable, environment=environment, force=True)
+    return _cached_cpu_benchmark(cpus, executable, environment)
+
+
+@lru_cache(maxsize=16)
+def _cached_cpu_benchmark(cpus, executable, environment):
+    from .benchmark import calibrated
+    return calibrated(cpus, executable=executable, environment=environment)
+
+
+cpu_benchmark.cache_clear = _cached_cpu_benchmark.cache_clear
 
 
 def memory():

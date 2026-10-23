@@ -1,81 +1,33 @@
 # DCO 当前状态
 
-更新：2026-10-23（UTC）。源码版本 0.8.8；实时任务、占用与已加载进程由看板和操作员 `health` 查询。操作见[README](../README.md)，机制见[DESIGN](DESIGN.md)，后续验收见[ROADMAP](ROADMAP.md)。
+更新：2026-10-23（UTC）。源码版本0.8.9。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
 
-ku26s/TX反复失联已现场定位：大上传占满中心8个连接槽，健康/资源请求在本地排队超期，而独立SSH及新HTTPS正常。现同一8连接内大传输最多7条，保留控制通路；27项传输回归及全量481项（477通过、4项环境跳过）完成。另隔离复现并修复未完成TLS握手堵住新连接的问题，3项直连回归覆盖原任务保持、超时及无效TLS。部署及实际加载见`.local/maintenance/continuous-supervision-20261023/`；原TSA/LDO训练保留，中心和worker只在各自空闲边界加载。
+## 设备与能力
 
-2026-10-23再次上传审计已归因到Bench数值提取的原始输入资产：零丢事件ETW分开确认公网ku及局域网TX的传输，TUN与物理转发不重复计量。两项旧取消任务已沿原ID收齐并清理；派发前取消仍上传大资产的缺口已修，保留其他消费者的共享上传。全量484项，480通过、4项环境跳过；回归与运行模块加载证明见`.local/maintenance/upload-cancel-20261023/`，当前任务和科学输入保持。
+192.168.1.11为Aya1-ITX，已由用户重新启用。ITX设备16线程曾受中心遗留limit=8截断，已将该路由上限恢复为自动；配置和在线中心均已更新，实测capacity/reserved/used均达到16。PC、TX与ITX的Windows能力页一致：`ng47 RTL Chisel CIRCT C++ ONNX Py ML Layout bison flex m4 make`；ku26s保留其Linux工具差异，按完整语义能力组合准入。
 
-本轮已实现大文件I/O与调度条件锁隔离、原任务ID生产者交接和运行时资产回收。真实HTTP控制响应5项、资产生命周期15项通过；全量491项（487通过、4项环境跳过）完成，连接分类补充由最终传输回归覆盖。部署进度保存在`.local/maintenance/continuous-supervision-20261023/state.json`，最终日志为`io-lifecycle-tests.log`。旧调用方式继续保留本次运行的上传资产，临时大输入接入`job_id`后使用引用回收。已有科研任务和原回执保持，服务在真实空闲边界加载。
+四节点已有科学Python、PyG、ONNX、SPICE及RTL实测。Windows版图环境复用已有安装，ku26s额外提供HSPICE。能力不携带引擎哈希，不按设备或OS限制科研路由；旧别名仅服务原请求兼容。证明见`.local/maintenance/continuous-supervision-20261023/capability-alignment-proof.json`与`state.json`。
 
-## 当前预算与能力
+本机DCO引用RGCN的Windows EDA/Cygwin与ARH的ONNX环境，作为共享在用依赖维护；协调归DCO，科研源码、模型与观测归各工程。沿原路径复用，不复制出另一套环境。
 
-| 设备 | CPU预算 / 逻辑线程 | 计算RAM | RAM盘配置 |
-| --- | ---: | ---: | ---: |
-| Aya1-PC | 20 / 28 | 16GiB | 8GiB |
-| Aya1-TX | 24 / 32 | 16GiB | 8GiB |
-| ku26s | 52 / 104 | 64GiB | 16GiB |
-| Aya1-ITX | 8 / 24 | 总内存减16GiB，约15.8GiB | 8GiB |
+## 本轮实现与验证
 
-2026-10-23用户重新加入192.168.1.11（Aya1-ITX），四机均在线；本轮核对时中心预算为20/24/52/8，合计104，后续以实时配置为准。原任务保持运行。ku26s任务TMP目前使用普通磁盘；独立tmpfs列入空闲维护。RAM准入使用进程树RSS及系统实时8GiB余量，未采样派发暂按申报量预留。
+- 0.8.9修复强制校准被缓存截住、`cpus 0`拒绝自动预算、CLI只显示设置值而隐藏中心截断。校准缓存最多16项，显式强制请求每次执行；CPU回执显示设备配置、中心上限和有效预算。
+- 同标签耗时只保留最近256项，精确标签仍用于同工作量估算；普通节点快照仅报告条目数量。旧运行实例曾累计2006项，约占146KB节点响应的87%。
+- 0.8.8将大文件I/O移出调度全局锁，按原任务ID交接临时资产，结果领取与删除共享单任务锁；8条传输连接内保留控制通路，TLS握手不堵接收循环。现有原ID、冻结输入和未领取结果继续使用。
+- 新动态输入使用`sync_files(..., job_id=原ID)`，提交成功转为任务引用，放弃准备时`release_assets(原ID)`；静态共享源码/模型继续复用。ARH/RGCN/Bench的在改适配文件由现有负责人接入，避免并行覆盖。
+- AOP的TSA宽度下限、未引用资产回收以及Bench返回包内存峰值已由本轮直接整改，具体回归与修改归各自工程状态。
 
-| 语义能力 / 工具 | 已验证供给 |
-| --- | --- |
-| python_numpy、python_scientific、python_torch_pyg、onnx | 四设备在线，各环境所需包位于实际执行的同一解释器；可用预算随当前配置变化 |
-| ng47、Verilator、CIRCT及相应编译器 | 按完整工具组合匹配；GSIM联合要求当前76核，普通任务按各自语义能力准入 |
-| layout_python、Magic、Netgen及布局材料 | 三台Windows环境就绪，当前中心联合准入52核；材料由任务内容资产提供 |
-| HSPICE | 当前ku26s环境就绪，52核 |
+0.8.8完整测试491项（487通过、4环境跳过），Linux生命周期及HTTP控制回归通过。0.8.9本轮完整493项（489通过、4环境跳过）及39模块Python3.7语法检查通过；日志与各节点实际加载记录保存在`.local/maintenance/continuous-supervision-20261023/`；部署只在真实空闲边界加载，不中断科研任务。
 
-以上为当前工具供给，不是设备或OS绑定策略。旧工程名和rgcn_fiber仅作原请求/模板兼容，公开能力使用规范环境名；已接受任务保持原绑定和回执。
+## 存储与收尾
 
-Windows能力页已对齐为`ng47 RTL Chisel CIRCT C++ ONNX Py ML Layout bison flex m4 make`。PC复用已有Cygwin补齐构建工具登记；TX补齐缺失版图依赖及可迁移Magic/Netgen启动绑定；ITX源码从b03e0bf快进到0.8.8实现，实际科学计算、PyG、ONNX、SPICE、RTL及版图/LVS通过。配置已在线生效并写回本机文件；繁忙服务保留现有进程，0.8.8代码在空闲边界加载。节点能力、联合准入、分项验证及原回执索引见`.local/maintenance/continuous-supervision-20261023/capability-alignment-proof.json`。
+运行状态只索引活跃任务，终态回执按原ID读磁盘，内存最近缓存64份。ARH已保存结果却未删除远端原任务是当前终态目录积压的主要来源；负责人正在补齐持久化后清理和历史批次收束。完成的清理不重复运行。
 
-## 验收与证据入口
+科研观测、模型、分区、原ID与费用保留一份有效实体；临时运输包、无消费者的旧生成物和重复副本按实际引用回收。统计扣除硬链接重复计数，同卷改名按文件ID核验，不额外全量hash。旧8.87GiB编译物迁移、Bench约550GiB实际空间回收和AOP模型硬链接已有独立证据，分别见`.local/maintenance/storage-audit-20261022/`、`quarantine-cleanup-20261023/`及AOP的STATUS，不重跑这些批次。
 
-- 公平等待：现场复现Bench固定6–7核排队，而刚释放的核被单核任务连续借走。整组积累修复已在三节点排空后加载，最新中心35744，在线92核，远端worker进程保持。Bench旧整组恢复链已停用，首批独立1核/2GiB搜索已在PC/TX/ku运行，源码与参考资产复用；后续RAM按搜索及捕获峰值细化，已受理任务保持原申报。重载后的真实AOP/ARH积压持续补位，RGCN训练已实测阶段8↔1借还。证据见`.local/maintenance/bench-task-shape-20261022/`及`.local/maintenance/fair-queue-20261022/`。
-- 单核起步：满载复现固定1核入口申报更大阶段需求仍被连续小任务抢走空槽，已补同样的增长积累保护并加载accdac0。8项隔离HTTP/执行回归覆盖整组积累、优先级、内存、取消、多节点、1→2→4→1借还、四工程3轮补位和满载单核逐步增核；全量459项，455通过、4项环境跳过。调用方保持有用需求，按实际授予建池，串行阶段归还；原任务不改输入。日志见上述目录`single-entry-growth-{before,after,full}.log`。
-- 失联设备：60秒移出资源后每60秒重连、最多5次；成功恢复原预算，人工停用保持停用。裸地址add默认26133并复用已保存的HTTPS证书。30项定向、全量470项（466通过、4项环境跳过）完成，覆盖真实TLS、5次上限、跨重启额度、晚到回复、并发配置写及API人工停用；DSH两项持久化意见已复核修正。ku26s经既有SSH映射核对终端/worker正常，公网恢复后原52核已接回，无任务重算。ARH固定cohort在途期间由独立临时监护承接ku26s重连，4项隔离验收通过；中心待自然终态加载，加载后监护自动退出。证据见`.local/maintenance/node-reconnect-20261022/`。原ID取消与费用不完整标记沿用既有恢复规则。
-- Tag/ID：补齐Share/Pri布局与线程数量识别，修正纯数字ID黄色、Tag内FACE和数字误染；43项控制台回归含192种真实行组合通过。冗长阶段、实例序号、预算及seed仅压缩显示，原输入保留。
+## 维护入口
 
-- 慢派发资产交接：隔离夹具复现5秒保护过期后，两次原ID派发均被并发LRU回收打断。新增按原ID暂存引用的补传交接，HTTP和hybrid同链路通过；正常缓存命中不增加请求，旧worker兼容。全量437项、4项环境跳过，其余通过；日志`.local/maintenance/resource-audit-20261022/asset-handoff-full.log`。在线三节点已加载，中心正常终端重开，8条ITX原中断回执保全，三工程维护门已释放；生效证据见本轮`center-final-live-proof.json`。
+现有维护策略、负责人、会话游标及部署状态统一保存在`.local/maintenance/continuous-supervision-20261023/policy.json`和`state.json`。本会话负责DCO、算力调度和跨工程接口；AOP_v2、FIBER-MO、ARH-DSE、RGCN继续由现有负责人推进科研。消息只发具体增量与证据，不重复长上下文；不设全局科研截止。
 
-证据位于既有 `results/repair-20261020/`，完整日志位于 `.local/maintenance/`。表中计数对应各自输入与源码范围，不合并成一次实验。
-
-| 范围 | 当前结论 | 证据 |
-| --- | --- | --- |
-| 局域网、外网认证与启动配置 | 核心421项：417通过、4项环境跳过；局域网免令牌、外网HTTPS/令牌/证书校验、重复接入保留预算及配置优先级通过 | `.local/maintenance/lan-admission-20261022/full-tests.log`、`access-tests.log` |
-| 四机源码及LAN/WAN实测 | 四机统一main源码，设备差异留忽略配置；TX与ITX匿名HTTP200并承接科研，ku26s匿名401、HTTPS及令牌200；中心原进程和在途任务保留 | `.local/maintenance/lan-admission-20261022/` |
-| TSA并发与单设备隔离 | 三机完成20个滚动观测点，1787个真实corner；排空尾部独立计时，原生产任务保留、节点恢复；CPU满线程可接近满载 | `results/tsa-pool-scaling-20261021/report.html`、`scaling.csv`、`isolation-ledger.json` |
-| ITX部署与真实执行 | 标准worker、24逻辑CPU；科学/神经/ONNX、真实TSA、原生RTL编译运行、SKY130几何及8GiB物理RAM盘均通过；重新接入时科学Python及ngspice实测通过，现已关机、保存8核配置 | `itx-onboarding-current.json`、`.local/maintenance/itx-real-canary/`、`itx-sky130-geometry/`、`.local/maintenance/lan-admission-20261022/live-canaries.json` |
-| 八字符设备名与离线节点 | 资源、明细、任务列保留八字符完整名称，兼容宽字符；原44项回归通过。本轮60秒失联机制进一步隐藏残留快照、停止探测，并保留原任务恢复记录 | `tests/test_console.py`、`tests/test_discovery.py`、`.local/maintenance/offline-nodes-20261022/` |
-| 自然批次边界重载 | 01:16 UTC中心排空重载，当时在线92核；四项AOP沿原UUID恢复。后续ITX重新接入至100核沿用原中心进程 | `overnight-8h-current.json`、`.local/maintenance/center-reload-20261022-resume-proof.json` |
-| 能力、工具模板、缓存消费者及混合版本 | 全量401项：397通过、4项环境跳过；原ID与数值保持 | `.local/maintenance/capability-unification-release-full.log`；`capability-profiles-live-proof.json` |
-| 规范能力部署与真实供给 | 三机自然空闲重载，60核授予及真实排队通过；Make联合要求60核 | `capability-idle-reload.json`、`capability-unification-after-reload.json`、`make-unification-admission.json` |
-| 启动、独立服务、重载 | 35项：34通过、1项环境跳过；headless与看板开关独立 | `.local/maintenance/headless-startup-lifecycle.log`；`headless-policy-deployment-jobs.json` |
-| 高并发客户端传输与恢复 | 26项通过；128并发共享8连接，本地FIFO等待独立于网络timeout，原任务不重复 | `.local/maintenance/client-pool-backpressure-tests.log` |
-| 任务终态与迟到资源回执 | 95项通过；失败/取消期间的lease响应保持原结局、费用及资源释放 | `.local/maintenance/lease-terminal-preservation-tests.log` |
-| 资源协商期限与丢失回执 | 22项HTTP传输及7项授权/回执回归通过；直连resize与初始lease共用独立期限，超时不自动重发，按原ID确认已生效授予 | `.local/maintenance/resize-ack-20261022/transport-tests.log`、`center-tests.log` |
-| 终端与短标签 | 39项通过；表头、多宽度、数字ID颜色及原标签保持 | `compact-task-tags-proof.json` |
-| 语义缓存交换 | 80项通过；原生缓存命中、逻辑记录完整及重复同步零导出 | `.local/maintenance/semantic-cache-final.log` |
-| 内存准入与迁移 | 实际RSS、阶段CPU/RAM借还、原检查点接续通过 | `production-policy-canaries.json`、`temporary-ku-memory-migration.json`、`ku-training-multicore-live.json` |
-| Windows/Linux生命周期 | 可见终端、防自动休眠、进程树回收、端口所有权及原ID恢复通过 | `maintenance-reload-state.json`、`live-linux-power-after-reload.json`、`tx-wake-verified.json` |
-| 跨工程真实执行 | AOP角点、RGCN训练/物理链、ARH原生块与Bench科学数组均有实测；科研结论归所属工程 | `aop-replica-placement-audit.json`、`arh-native64-warm-throughput.json`、`rgcn-layout-pc-readiness.json`、`cli-web-parity-current.json` |
-| 人类约束与独立交叉审查 | 最新确认及逐项源代码核对已保存 | `design-intent-confirmed.json`、`dsh-cross-check-current.json` |
-
-## 当前维护边界
-
-ARH两块物理入口前租约失败已在隔离HTTP链复现：宿主健康探测失败时`_host_memory_free`对空集合取min，连归还额度也被终止。核心及SDK修复通过全量478项（474通过、4跳过），DSH已按调用链核对；无采样时不提供新增RAM，故障端口预留仍计账。现有RGCN完整训练保留，核心在其自然空闲边界加载；SDK只确认原worker同CPU/足额RAM的窄兼容，避免为已知旧中心错误终止准备完成的块，隔离验收及实际生效范围见`.local/maintenance/empty-host-lease-20261022/`。原4098任务ID及164323.23875CPU秒由负责人收齐，只有2个失败块允许按明确入口前证据恢复，成功前缀复用；HEALTH RELEASED以台账中的实际部署与公共lease验收为准。
-
-存储审计已按真实NTFS文件ID重算：`D:/Projects`逻辑634.65GiB、独立实体602.44GiB，Bench分别534.43/502.23GiB；32.20GiB为已共享的硬链接重复计数。已将1,228份、8.87GiB旧Rocket编译中间物逐文件校验移至`E:/待删除/Arclight-storage-20261022`，保留21份有效程序及16组已发布RTL。Bench当前报告全部12,597个CAS块仍有引用；历史科研raw、SDK领取和后处理数据包由负责人按消费者收束，保留在途与唯一证据。源头约束、DSH二次裁决和恢复清单见`.local/maintenance/storage-audit-20261022/`，不按目录年龄整体退役科学数据。
-
-2026-10-22资源审计已完成四节点120秒采样：本机物理上传均值0.098MiB/s；另一次10秒ETW记录DCO向ku约1.34MiB/s的任务传输突发，未复现持续5MiB/s。Windows节点磁盘健康均正常。4秒零丢事件写入归因发现AOP BGR协调SQLite进程约5.15MiB/s、DCO自身约0.10MiB/s；AOP调用层由其负责人处理，不改在途科学输入。
-
-中心约7万份终态记录引起内存膨胀和调度全历史扫描，源码已改为终态按需读取及活跃索引。原70055份磁盘回执的只读装载实测新增RSS25.91MiB，完整历史常驻缓存0，原记录无改写。终态最近缓存上限64；`temp_root:null`恢复RAM默认，新建库缓存集中DCO。具体节点迁移、重载生效及最终回归记录见`.local/maintenance/resource-audit-20261022/`和维护账本。
-
-中心已完成2026-10-22多次自然边界维护，加载源码和各节点进程以维护证据及实时健康信息为准；当前三机在线预算92核，ITX停用。原输入、回执、成本、检查点和未领取成果保留；后续科研进度沿原ID记录在`overnight-8h-current.json`。八小时全局截止已按用户新指令解除，各实验保留原科学预算。
-
-全量历史列举仅锁定ID快照，逐项复制不占批次全局锁；SDK初始lease与直连resize共用独立资源协商期限。本轮中心已加载这些修复，原ID和已付结果继续保留。验收与生效范围记录在上述任务账本。
-
-四科研工程默认Web端口为8000/8001/8002/8003，CLI与Web生命周期及当前研究分别由各工程README/STATUS说明。已完成入口验收与后续运行关联记录在 `cli-web-parity-current.json`；当前任务数量直接从服务查询。
-
-GPU已具备静态档案、每卡容量匹配、整卡独占与显式CPU回退合同；真实GPU计算和Linux独立tmpfs的后续验收见ROADMAP。详细历史实测保留在原证据目录及Git，不在本页逐轮复述。
+GPU实际计算与Linux独立tmpfs验收仍按[ROADMAP](ROADMAP.md)推进；旧完整历史和原始实测保留在原证据目录与Git。

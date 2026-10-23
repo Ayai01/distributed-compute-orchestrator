@@ -384,7 +384,6 @@ class Worker:
     def _calibrate(self):
         """Re-measure the fixed native mix without occupying a task slot."""
         try:
-            cpu_benchmark.cache_clear()
             result = dict(cpu_benchmark(self.capacity, self.benchmark_python, self.benchmark_env, force=True))
             with self.condition:
                 self.benchmark = result
@@ -420,8 +419,8 @@ class Worker:
             raise ValueError("Control accepts cpus, memory_mb, memory_reserve_mb, memory_headroom_mb, paused, tools and benchmark")
         if value.get('benchmark'):
             return self.calibrate()
-        if "cpus" in value and (type(value["cpus"]) is not int or not 1 <= value["cpus"] <= self.cpu_limit):
-            raise ValueError(f"cpus must be in 1..{self.cpu_limit}")
+        if "cpus" in value and (type(value["cpus"]) is not int or not 0 <= value["cpus"] <= self.cpu_limit):
+            raise ValueError(f"cpus must be in 0..{self.cpu_limit} (0 = automatic)")
         if "paused" in value and not isinstance(value["paused"], bool):
             raise ValueError("paused must be true or false")
         for key in ('memory_mb','memory_reserve_mb','memory_headroom_mb'):
@@ -444,7 +443,7 @@ class Worker:
                 self._refresh_tags()
                 self.configuration_revision += 1
             if "cpus" in value:
-                self.capacity = value["cpus"]
+                self.capacity = value["cpus"] or self.cpu_limit
             if "paused" in value:
                 self.paused = value["paused"]
             if "memory_mb" in value:

@@ -786,7 +786,12 @@ class SchedulerShell(Shell):
         else:
             self._node(name).client.control(cpus=int(count))
         self.pool.refresh()
-        print(name+' CPU预算已设为 '+str(count)+'；配置已保存。')
+        snapshot = self.center.nodes() if self.center else self.pool.snapshot()
+        row = next(row for row in snapshot['nodes'] if row['name'] == name)
+        budget = row['capacity']
+        limit = row['limit']
+        print(name+' CPU配置已保存：设备 '+str(count if int(count) else '自动')+
+              '；中心上限 '+str(limit or '自动')+'；有效预算 '+str(budget)+'。')
 
     def do_memory(self, line):
         """memory [节点] RAM：设置任务RAM预算；8G=8GiB，无单位按MiB，0为自动。

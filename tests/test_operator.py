@@ -37,8 +37,13 @@ class OperatorTests(unittest.TestCase):
             with provider(Path(directory)/'worker',cpus=0,cpu_limit=24) as (worker,client):
                 self.assertEqual(client.health()['cpus'],24)
                 self.assertEqual(client.health()['cpu_limit'],24)
-                with self.assertRaisesRegex(RemoteError,'1..24'):
+                with self.assertRaisesRegex(RemoteError,'0..24'):
                     client.control(cpus=25)
+                client.control(cpus=8)
+                saved=[]
+                worker.save_settings=saved.append
+                self.assertEqual(client.control(cpus=0)['cpus'],24)
+                self.assertEqual(saved,[{'cpus':0}])
     def test_running_job_progress_and_stop_do_not_need_a_compute_slot(self):
         with scratch() as directory, provider(Path(directory) / 'worker', cpus=1) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(directory) / 'center') as (_, client):
