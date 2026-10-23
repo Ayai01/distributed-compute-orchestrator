@@ -20,6 +20,7 @@ import time
 from urllib.parse import quote
 from urllib.parse import urlsplit
 import uuid
+import weakref
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
@@ -114,6 +115,7 @@ class Client:
         self._capabilities = None
         self._asset_ids = OrderedDict()
         self._asset_lock = threading.Lock()
+        self._asset_transfers = weakref.WeakValueDictionary()
         self.ca_file=ca_file or (os.environ.get('REMOTE_COMPUTE_CA') if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else None)
         self.ssl_context=ssl.create_default_context(cafile=self.ca_file) if self.ca_file else None
 
@@ -464,10 +466,11 @@ class Client:
         raw = self.artifacts(identity)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             result = json.loads(archive.read("result.json"))
-            result["files"] = {name[6:]: archive.read(name) for name in archive.namelist() if name.startswith("files/")}
+            names = [name for name in archive.namelist() if name.startswith("files/")]
+            result["files"] = ({name[6:]: archive.read(name) for name in names} if output_dir is None
+                               else sorted({name[6:] for name in names}))
         if output_dir is not None:
             unpack(raw, Path(output_dir))
-            result["files"] = sorted(result["files"])
             result["output_dir"] = str(Path(output_dir).resolve())
         result["url"] = self.url
         if delete:
@@ -501,25 +504,33 @@ class Client:
         if job_id is not None and (not isinstance(job_id,str) or not re.fullmatch(r'[a-f0-9]{32}',job_id)):
             raise ValueError('Job id requires 32 lowercase hex characters')
         options = {'extra_headers':{'X-DCO-Asset-Job':job_id}} if job_id else {}
+        transfer = threading.Lock()
         if content_id is not None:
             if not isinstance(content_id,str) or not content_id:
                 raise ValueError('content_id must be a nonempty immutable content identifier')
             with self._asset_lock:
-                identity=self._asset_ids.get(content_id)
-            if identity and self.request('/assets/'+identity, **options)['exists']:
+                transfer = self._asset_transfers.setdefault(content_id, transfer)
+        # Share preparation/upload for one immutable input. Each waiting job
+        # still checks presence with its own handoff; unrelated inputs proceed.
+        with transfer:
+            known = None
+            if content_id is not None:
                 with self._asset_lock:
-                    if content_id in self._asset_ids:self._asset_ids.move_to_end(content_id)
-                return identity
-        payload = pack(files() if callable(files) else files)
-        identity = hashlib.sha256(payload).hexdigest()
-        if not self.request("/assets/" + identity, **options)["exists"]:
-            self.request("/assets/" + identity, payload, **options)
-        if content_id is not None:
-            with self._asset_lock:
-                self._asset_ids[content_id]=identity
-                self._asset_ids.move_to_end(content_id)
-                while len(self._asset_ids)>128:self._asset_ids.popitem(last=False)
-        return identity
+                    known=self._asset_ids.get(content_id)
+                if known and self.request('/assets/'+known, **options)['exists']:
+                    with self._asset_lock:
+                        if content_id in self._asset_ids:self._asset_ids.move_to_end(content_id)
+                    return known
+            payload = pack(files() if callable(files) else files)
+            identity = hashlib.sha256(payload).hexdigest()
+            if identity == known or not self.request("/assets/" + identity, **options)["exists"]:
+                self.request("/assets/" + identity, payload, **options)
+            if content_id is not None:
+                with self._asset_lock:
+                    self._asset_ids[content_id]=identity
+                    self._asset_ids.move_to_end(content_id)
+                    while len(self._asset_ids)>128:self._asset_ids.popitem(last=False)
+            return identity
 
     def release_assets(self, job_id):
         """Release an abandoned input handoff; accepted task references remain."""

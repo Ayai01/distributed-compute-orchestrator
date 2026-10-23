@@ -306,9 +306,10 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
     def test_known_content_reuses_remote_asset_before_preparing_zip(self):
         from remote_compute.client import Client
         from remote_compute.bundle import pack
-        client=Client();present=set();uploads=[]
+        client=Client();present=set();uploads=[];lookups=[]
         def request(path,data=None):
             if data is not None:present.add(path);uploads.append(data)
+            else:lookups.append(path)
             return dict(exists=path in present)
         with patch.object(client,'request',side_effect=request),patch('remote_compute.client.pack',wraps=pack) as compress:
             factory=__import__('unittest.mock',fromlist=['Mock']).Mock(return_value={'data':b'x'*1000})
@@ -318,3 +319,67 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
             present.clear()
             self.assertEqual(client.sync_files(factory,content_id='data-v1'),first)
             self.assertEqual(len(uploads),2);self.assertEqual(factory.call_count,2)
+            self.assertEqual(len(lookups),3)
+
+    def test_concurrent_content_sync_prepares_once_and_keeps_each_job_handoff(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from remote_compute.bundle import pack
+        client=Client();present=set();holds=set();uploads=[]
+        entered=threading.Event();release=threading.Event();lock=threading.Lock()
+        def factory():
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {'model':b'frozen model'}
+        def request(path,data=None,extra_headers=None):
+            with lock:
+                holds.add(extra_headers['X-DCO-Asset-Job'])
+                if data is not None:present.add(path);uploads.append(data)
+                return dict(exists=path in present)
+        identities=[f'{i:032x}' for i in range(8)]
+        with patch.object(client,'request',side_effect=request),patch('remote_compute.client.pack',wraps=pack) as compress:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                pending=[executor.submit(client.sync_files,factory,content_id='model-v1',job_id=identity)
+                         for identity in identities]
+                self.assertTrue(entered.wait(3))
+                time.sleep(.05)
+                release.set()
+                assets=[item.result(3) for item in pending]
+            self.assertEqual(len(set(assets)),1)
+            self.assertEqual(compress.call_count,1)
+            self.assertEqual(len(uploads),1)
+            self.assertEqual(holds,set(identities))
+
+    def test_distinct_content_prepares_concurrently_and_failed_preparation_can_retry(self):
+        from concurrent.futures import ThreadPoolExecutor
+        client=Client();entered=threading.Barrier(2)
+        def factory():
+            entered.wait(3)
+            return {'data':b'content'}
+        with patch.object(client,'request',return_value={'exists':True}):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                pending=[executor.submit(client.sync_files,factory,content_id=key) for key in ('one','two')]
+                for item in pending:item.result(4)
+            with self.assertRaisesRegex(ValueError,'prepare failed'):
+                client.sync_files(lambda: (_ for _ in ()).throw(ValueError('prepare failed')),content_id='retry')
+            self.assertTrue(client.sync_files({'data':b'content'},content_id='retry'))
+
+    def test_fetch_to_directory_reads_each_payload_once_and_deletes_after_extract(self):
+        import zipfile
+        from remote_compute.bundle import pack
+        client=Client();identity='e'*32
+        raw=pack({'result.json':json.dumps(dict(id=identity,status='succeeded')).encode(),
+                  'files/large.bin':b'x'*10000,'stdout.log':b'finished'})
+        reads=[];read=zipfile.ZipFile.read
+        def read_once(archive,name,*args,**kwargs):
+            reads.append(name.filename if isinstance(name,zipfile.ZipInfo) else name)
+            return read(archive,name,*args,**kwargs)
+        with scratch() as directory:
+            root=Path(directory)
+            def delete(value):
+                self.assertEqual(value,identity)
+                self.assertEqual((root/'files/large.bin').read_bytes(),b'x'*10000)
+            with patch.object(client,'artifacts',return_value=raw),patch.object(client,'delete',side_effect=delete), \
+                    patch.object(zipfile.ZipFile,'read',read_once):
+                result=client.fetch(identity,root)
+            self.assertEqual(result['files'],['large.bin'])
+            self.assertEqual(reads.count('files/large.bin'),1)
