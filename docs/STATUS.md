@@ -12,21 +12,23 @@ ku26s/TX反复失联已现场定位：大上传占满中心8个连接槽，健�
 
 | 设备 | CPU预算 / 逻辑线程 | 计算RAM | RAM盘配置 |
 | --- | ---: | ---: | ---: |
-| Aya1-PC | 16 / 28 | 16GiB | 8GiB |
+| Aya1-PC | 20 / 28 | 16GiB | 8GiB |
 | Aya1-TX | 24 / 32 | 16GiB | 8GiB |
 | ku26s | 52 / 104 | 64GiB | 16GiB |
 | Aya1-ITX | 8 / 24 | 总内存减16GiB，约15.8GiB | 8GiB |
 
-四机配置预算按用户确认的16/24/52/8保存，合计100；2026-10-22 ITX重新接入后又由用户正常关机，目前停用，在线三机预算92。原任务及预算保留。ku26s任务TMP目前使用普通磁盘；独立tmpfs列入空闲维护。RAM准入使用进程树RSS及系统实时8GiB余量，未采样派发暂按申报量预留。
+2026-10-23用户重新加入192.168.1.11（Aya1-ITX），四机均在线；本轮核对时中心预算为20/24/52/8，合计104，后续以实时配置为准。原任务保持运行。ku26s任务TMP目前使用普通磁盘；独立tmpfs列入空闲维护。RAM准入使用进程树RSS及系统实时8GiB余量，未采样派发暂按申报量预留。
 
 | 语义能力 / 工具 | 已验证供给 |
 | --- | --- |
-| python_numpy、python_scientific、python_torch_pyg、onnx | 已配置四设备；目前在线三机92核，各环境所需包位于实际执行的同一解释器 |
+| python_numpy、python_scientific、python_torch_pyg、onnx | 四设备在线，各环境所需包位于实际执行的同一解释器；可用预算随当前配置变化 |
 | ng47、Verilator、CIRCT及相应编译器 | 按完整工具组合匹配；GSIM联合要求当前76核，普通任务按各自语义能力准入 |
-| layout_python、Magic、Netgen及布局材料 | Aya1-PC、Aya1-ITX环境就绪；ITX关机期间在线16核，材料仍由任务内容资产提供 |
+| layout_python、Magic、Netgen及布局材料 | 三台Windows环境就绪，当前中心联合准入52核；材料由任务内容资产提供 |
 | HSPICE | 当前ku26s环境就绪，52核 |
 
 以上为当前工具供给，不是设备或OS绑定策略。旧工程名和rgcn_fiber仅作原请求/模板兼容，公开能力使用规范环境名；已接受任务保持原绑定和回执。
+
+Windows能力页已对齐为`ng47 RTL Chisel CIRCT C++ ONNX Py ML Layout bison flex m4 make`。PC复用已有Cygwin补齐构建工具登记；TX补齐缺失版图依赖及可迁移Magic/Netgen启动绑定；ITX源码从b03e0bf快进到0.8.8实现，实际科学计算、PyG、ONNX、SPICE、RTL及版图/LVS通过。配置已在线生效并写回本机文件；繁忙服务保留现有进程，0.8.8代码在空闲边界加载。节点能力、联合准入、分项验证及原回执索引见`.local/maintenance/continuous-supervision-20261023/capability-alignment-proof.json`。
 
 ## 验收与证据入口
 
