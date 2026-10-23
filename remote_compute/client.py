@@ -35,6 +35,25 @@ class PoolBusy(RemoteError):
     """The local connection queue timed out before any request was sent."""
 
 
+class RequestCancelled(RemoteError):
+    """An optional pre-submission transfer was abandoned by its caller."""
+
+
+def _check_cancelled(cancel):
+    if cancel is not None and cancel():
+        raise RequestCancelled('Transfer cancelled before task submission')
+
+
+class _UploadBody(io.BytesIO):
+    def __init__(self, data, cancel):
+        super().__init__(data)
+        self.cancel = cancel
+
+    def read(self, size=-1):
+        _check_cancelled(self.cancel)
+        return super().read(size)
+
+
 class _ConnectionPool:
     def __init__(self):
         self.idle = []
@@ -44,7 +63,7 @@ class _ConnectionPool:
         self.bulk_active = 0
         self.waiting = deque()
 
-    def acquire(self, timeout, *, bulk=False):
+    def acquire(self, timeout, *, bulk=False, cancel=None):
         ticket = (object(), bulk)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
@@ -54,10 +73,14 @@ class _ConnectionPool:
                 # grants, even when slow uploads have queued more transfers.
                 while not self.available or next((entry for entry in self.waiting
                         if not entry[1] or self.bulk_active < 7), None) is not ticket:
+                    _check_cancelled(cancel)
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         return False
-                    self.condition.wait(remaining)
+                    wait_for=remaining
+                    if cancel is not None:wait_for=.1 if remaining is None else min(.1,remaining)
+                    self.condition.wait(wait_for)
+                _check_cancelled(cancel)
                 self.available -= 1
                 self.bulk_active += int(bulk)
                 return True
@@ -94,14 +117,14 @@ class Client:
         self.ca_file=ca_file or (os.environ.get('REMOTE_COMPUTE_CA') if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else None)
         self.ssl_context=ssl.create_default_context(cafile=self.ca_file) if self.ca_file else None
 
-    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
+    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
         pool=self.__dict__.get('_transport')
         if pool is None:
             pool=self.__dict__.setdefault('_transport',_ConnectionPool())
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
         bulk = isinstance(data, bytes) or binary
-        if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk):
+        if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, cancel=cancel):
             raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         # Old live instances may still own a per-thread cached connection.
         previous=getattr(self.connections,'connection',None)
@@ -115,7 +138,12 @@ class Client:
             except (OSError,ValueError):connection.close()
         self.connections.connection=connection
         try:
-            return self._request(path,data,method=method,binary=binary,brief=brief,extra_headers=extra_headers)
+            return self._request(path,data,method=method,binary=binary,brief=brief,extra_headers=extra_headers,cancel=cancel)
+        except RequestCancelled:
+            connection=getattr(self.connections,'connection',None)
+            if connection is not None:connection.close()
+            self.connections.connection=None
+            raise
         finally:
             connection=getattr(self.connections,'connection',None)
             self.connections.connection=None
@@ -123,7 +151,7 @@ class Client:
                 with pool.lock:pool.idle.append(connection)
             pool.release(bulk=bulk)
 
-    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
+    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         if self.endpoint.scheme == 'http' and not getattr(self, '_lan_http_checked', False):
@@ -165,11 +193,14 @@ class Client:
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         for attempt in range(attempts):
+            _check_cancelled(cancel)
             if attempt and asset_upload:
                 # A lost reply can follow a fully validated upload. Probe within
                 # this pool slot before sending the same content again.
                 try:
-                    published=self._request(path,method='GET')
+                    published=self._request(path,method='GET',cancel=cancel)
+                except RequestCancelled:
+                    raise
                 except RemoteError:
                     pass
                 else:
@@ -192,7 +223,7 @@ class Client:
                 # A bytes body uses one sendall with a whole-body deadline.
                 # The reader loop sends bounded blocks, so active uploads can
                 # outlast the socket timeout. Each retry starts at byte zero.
-                body=io.BytesIO(data) if stream_body else data
+                body=_UploadBody(data,cancel) if stream_body else data
                 connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
                 response = connection.getresponse()
                 self.connections.response_status=response.status

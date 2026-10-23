@@ -4,7 +4,7 @@ import zipfile
 import json
 from urllib.parse import unquote
 
-from .client import Client, RemoteError
+from .client import Client, RemoteError, _check_cancelled
 from .worker import Conflict
 from .bundle import progress
 
@@ -14,7 +14,8 @@ class LocalClient(Client):
         super().__init__('local://' + worker.health()['node'])
         self.worker = worker
 
-    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
+    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
+        _check_cancelled(cancel)
         worker = self.worker
         method = method or ('POST' if data is not None else 'GET')
         parts = path.strip('/').split('/')

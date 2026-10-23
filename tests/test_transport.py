@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
 from remote_compute.bundle import pack
-from remote_compute.client import PoolBusy, _ConnectionPool
+from remote_compute.client import PoolBusy, RequestCancelled, _ConnectionPool
 from remote_compute.worker import Handler
 from test_center import center
 from test_compute import provider, python, scratch, until
@@ -76,7 +76,7 @@ class ArtifactReloadTests(unittest.TestCase):
 
 
 @contextmanager
-def slow_upload_server(*, interrupt=False):
+def slow_upload_server(*, interrupt=False, started=None):
     received=[]
     class Receiver(BaseHTTPRequestHandler):
         def setup(self):
@@ -97,6 +97,7 @@ def slow_upload_server(*, interrupt=False):
                 chunk=self.rfile.read(min(32768,length-len(content)))
                 if not chunk:break
                 content.extend(chunk)
+                if started is not None:started.set()
                 if interrupt and not received and len(content)>=65536:
                     received.append((self.path,bytes(content),self.headers.get('Transfer-Encoding')))
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -266,6 +267,35 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(len(received),2)
             self.assertEqual(received[0],('/assets/'+identity,payload[:65536],None))
             self.assertEqual(received[1],('/assets/'+identity,payload,None))
+
+    def test_cancelled_asset_upload_stops_partial_body_without_retry_and_releases_slot(self):
+        payload=b'asset-content'*160000
+        identity=hashlib.sha256(payload).hexdigest()
+        started,cancel=threading.Event(),threading.Event()
+        with slow_upload_server(started=started) as (client,received),ThreadPoolExecutor(max_workers=1) as callers:
+            upload=callers.submit(client.request,'/assets/'+identity,payload,cancel=cancel.is_set)
+            self.assertTrue(started.wait(2));cancel.set()
+            with self.assertRaises(RequestCancelled):upload.result(timeout=3)
+            until(lambda:bool(received))
+            self.assertEqual(len(received),1)
+            self.assertGreater(len(received[0][1]),0)
+            self.assertLess(len(received[0][1]),len(payload))
+            self.assertEqual(client._transport.available,8)
+            self.assertEqual(client._transport.bulk_active,0)
+            self.assertEqual(client.request('/assets/'+identity),dict(exists=False))
+
+    def test_cancelled_pool_wait_never_sends_or_takes_another_callers_slot(self):
+        pool=_ConnectionPool()
+        for _ in range(8):self.assertTrue(pool.acquire(0))
+        client=Client();client._transport=pool;cancel=threading.Event()
+        with patch.object(client,'_request') as request,ThreadPoolExecutor(max_workers=1) as callers:
+            waiting=callers.submit(client.request,'/assets/'+'a'*64,b'data',cancel=cancel.is_set)
+            until(lambda:bool(pool.waiting));cancel.set()
+            with self.assertRaises(RequestCancelled):waiting.result(timeout=1)
+            request.assert_not_called()
+        self.assertFalse(pool.waiting)
+        self.assertEqual(pool.available,0)
+        for _ in range(8):pool.release()
 
     def test_lost_asset_reply_checks_publication_without_reuploading_the_body(self):
         payload=pack({'model.npz':bytes(range(256))*8192})

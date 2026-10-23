@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
-from remote_compute.client import PoolBusy
+from remote_compute.client import PoolBusy, RequestCancelled
 from remote_compute.coordinator import Coordinator
 from remote_compute.cli import SchedulerShell
 from remote_compute.worker import Conflict, Server
@@ -1454,6 +1454,46 @@ class CenterTests(unittest.TestCase):
                     for identity in identities:client.wait(identity)
                 for identity in identities:client.fetch(identity)
                 self.assertEqual(counts,['GET','POST'])
+
+    def test_asset_cancellation_preserves_active_shared_consumers_and_releases_cancelled_waiters(self):
+        for cancelled in ('owner','waiter','both'):
+            with self.subTest(cancelled=cancelled),scratch() as root,provider(Path(root)/'worker',cpus=2) as (worker,remote):
+                with host_load(worker,0,'asset-cancellation'),Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client):
+                    asset=client.sync_files({'input':b'frozen shared input'})
+                    original=remote.request
+                    entered,release=threading.Event(),threading.Event();uploads=[]
+                    def delayed(path,data=None,**options):
+                        if path=='/assets/'+asset and data is not None:
+                            uploads.append(asset);entered.set()
+                            while not release.wait(.01):
+                                if options.get('cancel') is not None and options['cancel']():
+                                    raise RequestCancelled('abandoned asset')
+                        return original(path,data,**options)
+                    with patch.object(remote,'request',side_effect=delayed):
+                        first=client.submit(python('print(42)',assets={'input':asset}))['id']
+                        try:
+                            self.assertTrue(entered.wait(2))
+                            second=client.submit(python('print(42)',assets={'input':asset}))['id']
+                            until(lambda:client.status(second)['status']=='dispatching')
+                            if cancelled in ('owner','both'):client.cancel(first)
+                            if cancelled in ('waiter','both'):client.cancel(second)
+                            if cancelled in ('waiter','both'):
+                                self.assertEqual(client.wait(second,wait_timeout=2)['status'],'cancelled')
+                                self.assertNotIn(second,worker.jobs)
+                            if cancelled=='both':
+                                self.assertEqual(client.wait(first,wait_timeout=2)['status'],'cancelled')
+                                self.assertNotIn(first,worker.jobs)
+                            release.set()
+                            for identity,is_cancelled in ((first,cancelled in ('owner','both')),
+                                                         (second,cancelled in ('waiter','both'))):
+                                result=client.wait(identity,wait_timeout=3)
+                                self.assertEqual(result['status'],'cancelled' if is_cancelled else 'succeeded')
+                                if is_cancelled:self.assertIsNone(result['started'])
+                                client.fetch(identity)
+                            self.assertEqual(uploads,[asset])
+                            until(lambda:pool.nodes[0].reserved==0)
+                        finally:
+                            release.set()
 
     def test_auto_cpu_result_preserves_original_submission_identity(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,node):

@@ -12,7 +12,7 @@ import weakref
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
-from .client import PoolBusy, RemoteError
+from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task
 from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
@@ -727,7 +727,7 @@ class Coordinator:
                 callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
                 if callback:callback={**callback,'job_id':job['result']['id']}
                 if not self._submit(job, identity, payload, callback):
-                    result=dict(status='cancelled',finished=time.time())
+                    result=dict(status='cancelled',finished=time.time(),cancelled_before_submit=True,cpu_seconds=0)
                     with self.condition:self._update(job,result)
                     return
             cancel_sent=False
@@ -801,11 +801,18 @@ class Coordinator:
     def _submit(self, job, identity, payload, callback):
         node, force, uncertain = job['node'], False, False
         while True:
+            if not uncertain and job['cancel'].is_set():return False
+            submitting=False
             try:
                 with self._asset_handoff(node,identity,job['task']['assets'].values(),enabled=force):
-                    self._ensure_assets(node, job['task']['assets'].values(), force=force)
+                    self._ensure_assets(node, job['task']['assets'].values(), force=force,
+                                        cancel=None if uncertain else job['cancel'].is_set)
+                    if not uncertain and job['cancel'].is_set():return False
+                    submitting=True
                     node.client.submit_bundle(identity,payload,**({'callback':callback} if callback else {}))
                 return True
+            except RequestCancelled:
+                return False
             except PoolBusy as error:
                 # Nothing was sent. Keep the same reservation and ID while the
                 # local transport queue drains, rather than ending the task.
@@ -821,7 +828,12 @@ class Coordinator:
                     continue
                 if self.stopping or getattr(error,'status_code',None) is not None:
                     raise
-                uncertain=True
+                uncertain=uncertain or submitting
+                if not uncertain:
+                    # Asset failures precede any job POST. Cancellation can
+                    # release this grant without querying/replaying a job.
+                    if job['cancel'].wait(.1):return False
+                    continue
                 # A missing POST reply says nothing about acceptance. Keep the
                 # original worker, ID and grant while querying that same job.
                 while True:
@@ -879,7 +891,7 @@ class Coordinator:
             except RemoteError:
                 pass  # Worker expiry also releases an unreachable sender's hold.
 
-    def _ensure_assets(self, node, assets, *, force=False):
+    def _ensure_assets(self, node, assets, *, force=False, cancel=None):
         # Cache changes invalidate presence, but keep same-hash uploads serialized.
         assets=set(assets)
         if not assets:return
@@ -893,13 +905,29 @@ class Coordinator:
             locks=node.__dict__.setdefault('_asset_upload_locks',weakref.WeakValueDictionary())
             pending=[(asset,locks.setdefault(asset,threading.Lock())) for asset in assets-node.known_assets]
         for asset,transfer in pending:
-            with transfer:
+            _check_cancelled(cancel)
+            while not transfer.acquire(timeout=.1):
+                _check_cancelled(cancel)
+            try:
+                _check_cancelled(cancel)
                 with node.asset_lock:
                     if node.asset_session==session and asset in node.known_assets:continue
-                if not node.client.request('/assets/' + asset)['exists']:
-                    node.client.request('/assets/' + asset, (self.root/'assets'/(asset+'.zip')).read_bytes())
+                def abandoned():
+                    if cancel is None or not cancel():return False
+                    # Other accepted jobs can still need this same upload.
+                    # Finish their shared transfer while cancelling its owner
+                    # before job submission; cancelled waiters leave the lock.
+                    with self.condition:
+                        return not any(job.get('node') is node and not job['cancel'].is_set()
+                                       and asset in job.get('task',{}).get('assets',{}).values()
+                                       for job in active_values(self.jobs))
+                if not node.client.request('/assets/' + asset,cancel=abandoned)['exists']:
+                    node.client.request('/assets/' + asset, (self.root/'assets'/(asset+'.zip')).read_bytes(),cancel=abandoned)
                 with node.asset_lock:
                     if node.asset_session==session:node.known_assets.add(asset)
+                _check_cancelled(cancel)
+            finally:
+                transfer.release()
 
     def _update(self, job, remote):
         clean_tool_snapshot(remote)
@@ -1151,6 +1179,7 @@ class Coordinator:
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             result, client = self.get(identity), self._client(job)
+            if result.get('cancelled_before_submit'):client=None
             node=job.get('node') or next((n for n in self.pool.nodes if n.client is client),None)
             if result['status']=='interrupted' and node is not None and (node.detached or not node.enabled):
                 result['cost_incomplete']=True
