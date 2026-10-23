@@ -14,7 +14,7 @@ sh start.sh
 python -B main.py --help
 ```
 
-按系统选择一个启动脚本；脚本切到工程根，优先系统 Python 3.14，再尝试当前 Python 与已有工程环境。Windows 双击 `start.cmd` 也可。包安装用对应解释器的 `python -m pip`。
+按系统选择一个启动脚本；脚本切到工程根，优先系统 Python 3.14，再尝试当前 Python 与已有工程环境。Windows 双击 `start.cmd` 也可，支持Windows Terminal默认终端委托，不要求其窗口进程位于cmd父进程链。包安装用对应解释器的 `python -m pip`。
 
 | 模式 | 命令 | 用途 |
 | --- | --- | --- |

@@ -19,7 +19,7 @@ from remote_compute import Pool
 
 class StartupTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows ConPTY host visibility')
-    def test_conpty_requires_its_own_visible_terminal_not_a_chat_or_editor_window(self):
+    def test_conpty_uses_own_visibility_or_its_visible_terminal_host(self):
         kernel, user = MagicMock(), MagicMock()
         kernel.GetConsoleWindow.return_value = 1
         user.GetShellWindow.return_value = 2
@@ -48,6 +48,11 @@ class StartupTests(unittest.TestCase):
             for application in ('ChatGPT.exe', 'Code.exe'):
                 processes[20] = (10, application)
                 self.assertFalse(terminal._windows_visible())
+            # Default-terminal delegation keeps the UI outside the parent
+            # chain and synchronizes visibility onto this session's HWND.
+            user.IsWindowVisible.side_effect = lambda hwnd: hwnd in (1, 4)
+            self.assertTrue(terminal._windows_visible())
+            user.IsWindowVisible.side_effect = lambda hwnd: hwnd in (3, 4)
             processes[20] = (10, 'WindowsTerminal.exe')
             classes[3] = 'CASCADIA_HOSTING_WINDOW_CLASS'
             self.assertTrue(terminal._windows_visible())

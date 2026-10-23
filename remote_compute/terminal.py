@@ -115,11 +115,14 @@ def _windows_visible():
         return False
     name = c.create_unicode_buffer(128)
     user.GetClassNameW(window, name, len(name))
-    if name.value != 'PseudoConsoleWindow':
-        return bool(user.IsWindowVisible(window))
+    visible = bool(user.IsWindowVisible(window))
+    # Delegated Windows Terminal sessions mirror their real window's visibility
+    # onto this pseudo HWND; their UI process need not be a console ancestor.
+    if name.value != 'PseudoConsoleWindow' or visible:
+        return visible
 
-    # ConPTY's own HWND is hidden. A visible chat/editor ancestor does not
-    # prove that its terminal pane is visible; require an actual terminal host.
+    # Older ConPTY hosts leave that HWND hidden. A visible chat/editor ancestor
+    # does not prove its terminal pane is visible; require a terminal host.
     parents = {pid: parent for pid, (parent, _) in _windows_processes().items()}
     user.GetWindowThreadProcessId.argtypes = [w.HWND, c.POINTER(w.DWORD)]
     owner = w.DWORD()
