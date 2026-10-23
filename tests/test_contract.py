@@ -15,6 +15,39 @@ from test_center import center
 
 
 class ContractTests(unittest.TestCase):
+    def test_own_task_file_preserves_tool_prefix_for_polling_and_hybrid(self):
+        from remote_compute.local import LocalClient
+        code = """import json,os,sys
+from pathlib import Path
+sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])
+from remote_compute import Client
+identity=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID') or os.environ['REMOTE_COMPUTE_JOB_ID']
+record=json.loads((Path(os.environ['REMOTE_COMPUTE_JOB_DIR'])/'result.json').read_text(encoding='utf-8'))
+assert record['id']==identity
+client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''))
+public=client.status(identity)
+Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_tools=public.get('tools',{}))),encoding='utf-8')
+"""
+        for mode in ('polling', 'hybrid'):
+            with self.subTest(mode=mode), scratch() as temporary:
+                root = Path(temporary)
+                prefix = [sys.executable, '-B', str(root / 'helper with spaces.py'), 'runtime with spaces', 'magic']
+                with provider(root / 'worker', tools={'magic': prefix}) as (worker, remote):
+                    selected = LocalClient(worker) if mode == 'hybrid' else remote
+                    with Pool([selected]) as pool, center(pool, root / 'center') as (_, operator):
+                        client = Client(operator.url)
+                        receipt = client.run(python(code, outputs=['context.json'], requires=['magic'], memory_mb=64))
+                        self.assertEqual(receipt['status'], 'succeeded', receipt.get('stderr'))
+                        result = json.loads(receipt['files']['context.json'])
+                        self.assertEqual(result['tools']['magic']['argv'], prefix)
+                        self.assertTrue(result['tools']['magic']['available'])
+                        if mode == 'hybrid':
+                            # The callback addresses the scheduler's project view;
+                            # a worker-local command path is intentionally private.
+                            self.assertNotIn('argv', result['public_tools'].get('magic', {}))
+                        else:
+                            self.assertEqual(result['public_tools']['magic']['argv'], prefix)
+
     def test_project_view_is_aggregate_and_rejects_node_selection(self):
         with scratch() as directory, provider(Path(directory) / 'worker', cpus=2,
                 tools={'verilator': sys.executable}, tags=['rtl']) as (_, remote):

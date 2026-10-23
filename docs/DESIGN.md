@@ -79,6 +79,19 @@ Python 环境及旧名映射见 README。`requires`、命令、参数和环境�
 
 工具模板与能力使用同一语义别名表，`${tool:ng47}`和旧配置键可互通。命令首项保留完整argv前缀，路径/环境变量仅接受单可执行文件绑定；优先使用同一语义能力的可用绑定。登记允许的加号、点、连字符在模板中保持相同语法。
 
+任务进程内部继续调用 Magic/Netgen 等工具时，读取 DCO 注入的自身执行记录，保留其中 `tools[工具名]['argv']` 的完整前缀：
+
+```python
+identity = os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID') or os.environ['REMOTE_COMPUTE_JOB_ID']
+record = json.loads((Path(os.environ['REMOTE_COMPUTE_JOB_DIR']) / 'result.json').read_text(encoding='utf-8'))
+assert record['id'] == identity
+binding = record['tools']['magic']
+assert binding['available']
+subprocess.run([*binding['argv'], *arguments], check=True)
+```
+
+该记录由 worker 接收任务时保存，任务只读取自己的目录及 ID。单路径是长度 1 的前缀；命令向量中的解释器、运行库适配器和固定参数一并保留。`REMOTE_COMPUTE_URL` 是资源协商/状态回调入口：独立 worker 可指向本机 worker，hybrid 则指向中心的公开视图，公开状态仅提供工具可用性，不承诺工具路径。进程内工具调用统一使用自身执行记录，端口和设备仍由 DCO 管理；命令路径仅用于本次执行，不进入科学身份或缓存分区。
+
 中心声明`admission_job`时，`admission(project, job_id=原任务ID)`返回该任务的`recommended_cpus`、`current_cpus`、`current_memory_mb`和`available_memory_mb`，供阶段边界先判断是否值得调整工作池。此查询不改变授权；需要调整时排空当前池，再调用`resize`并按实际回执建池。运行中的worker任务通过同一lease通路查询。
 
 `queue_ratio`（默认 1.0）控制提前排队比例。`Client.admission()` 返回当前窗口及 `max_in_flight` 安全上界；`Client.window()` 每秒至多刷新一次当前份额和上界，节点新增、能力登记和预算变化都会反映到窗口：
