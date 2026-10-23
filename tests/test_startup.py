@@ -2,6 +2,7 @@
 from pathlib import Path
 from contextlib import redirect_stderr, nullcontext
 import io
+import json
 import os
 import socket
 import subprocess
@@ -12,7 +13,7 @@ from unittest.mock import MagicMock, patch
 from remote_compute import startup, terminal
 from remote_compute.cli import ROOT
 from test_center import center
-from test_compute import provider, scratch
+from test_compute import provider, python, scratch, until
 from remote_compute import Pool
 
 
@@ -85,6 +86,77 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
                     child.kill()
                     child.wait()
 
+    @unittest.skipUnless(os.name == 'nt', 'Native Windows console close')
+    def test_native_console_close_cancels_original_remote_task_and_releases_state(self):
+        import ctypes as c
+        from ctypes import wintypes as w
+        from remote_compute import Client, RemoteError
+        user = c.WinDLL('user32')
+        user.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+        code = '''import ctypes as c,sys
+from pathlib import Path
+kernel=c.WinDLL('kernel32');kernel.GetConsoleWindow.restype=c.c_void_p
+Path(sys.argv.pop(1)).write_text(str(kernel.GetConsoleWindow()),encoding='utf-8')
+from remote_compute.cli import main
+raise SystemExit(main())
+'''
+        for no_dashboard in (False, True):
+            with self.subTest(no_dashboard=no_dashboard), scratch() as directory:
+                root = Path(directory)
+                with provider(root/'worker') as (worker, remote):
+                    config = root/'config.json'
+                    config.write_text('{}', encoding='utf-8')
+                    nodes = root/'nodes.json'
+                    nodes.write_text(json.dumps({'nodes': [
+                        {'name': 'isolated', 'url': remote.url}]}), encoding='utf-8')
+                    with socket.socket() as probe:
+                        probe.bind(('127.0.0.1', 0))
+                        port = probe.getsockname()[1]
+                    hwnd_path = root/'console-hwnd.txt'
+                    command = [sys.executable, '-B', '-c', code, str(hwnd_path),
+                               '--mode', 'scheduler', '--port', str(port), '--config', str(config),
+                               '--nodes', str(nodes), '--root', str(root/'center')]
+                    if no_dashboard:
+                        command.append('--no-dashboard')
+                    child = subprocess.Popen(command, cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                    client = Client('http://127.0.0.1:' + str(port), timeout=1)
+                    identity = None
+                    try:
+                        def ready():
+                            try:
+                                return client.health(brief=True)['role'] == 'scheduler'
+                            except RemoteError:
+                                return False
+                        until(ready, seconds=15)
+                        identity = client.submit(python('import time;time.sleep(30)',
+                                                        cpus=1, memory_mb=128))['id']
+                        def running():
+                            try:
+                                return remote.status(identity, brief=True)['status'] == 'running'
+                            except RemoteError as error:
+                                if error.status_code == 404:
+                                    return False
+                                raise
+                        until(running)
+                        self.assertTrue(user.PostMessageW(int(hwnd_path.read_text()), 0x10, 0, 0))
+                        child.wait(timeout=10)
+                        until(lambda: remote.status(identity, brief=True)['status'] == 'cancelled')
+                        receipt = json.loads((root/'center/scheduler/jobs'/identity/'result.json').read_text())
+                        self.assertEqual(receipt['status'], 'cancelled')
+                        self.assertEqual(receipt['id'], identity)
+                        from remote_compute.worker import lock_root
+                        lock = lock_root(root/'center/scheduler', 'scheduler')
+                        lock.close()
+                    finally:
+                        try:
+                            if identity:
+                                remote.cancel(identity)
+                                remote.wait(identity, wait_timeout=5)
+                        finally:
+                            if child.poll() is None:
+                                user.PostMessageW(int(hwnd_path.read_text()), 0x10, 0, 0)
+                                child.wait(timeout=10)
+
     def test_all_service_entry_modes_reject_redirects_before_startup_side_effects(self):
         from remote_compute.cli import main
         for mode in ('scheduler', 'hybrid', 'worker'):
@@ -113,6 +185,7 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
     def test_client_actions_keep_pipe_support_and_console_connection_is_checked(self):
         from remote_compute.cli import main
         with patch('remote_compute.cli.require_visible') as visible, \
+                patch('remote_compute.cli.single_instance', return_value=nullcontext()), \
                 patch('remote_compute.cli.run_scheduler', return_value=0):
             self.assertEqual(main(['--url', 'http://127.0.0.1:26133', 'jobs']), 0)
             visible.assert_not_called()
@@ -122,6 +195,7 @@ Path(sys.argv[1]).write_text('visible-hidden-visible passed',encoding='utf-8')
     def test_headless_does_not_disable_the_terminal_dashboard(self):
         from remote_compute.cli import main
         with patch('remote_compute.cli.require_visible'), \
+                patch('remote_compute.cli.single_instance', return_value=nullcontext()), \
                 patch('remote_compute.cli.run_scheduler', return_value=0) as run:
             self.assertEqual(main(['--url', 'http://127.0.0.1:26133', '--headless']), 0)
             self.assertTrue(run.call_args.args[0].no_browser)

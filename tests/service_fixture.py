@@ -9,6 +9,7 @@ import sys
 
 ENTRY = '''import sys
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 from remote_compute.cli import main
@@ -17,7 +18,7 @@ with tempfile.TemporaryDirectory(prefix='dco-service-config-') as directory:
         path=Path(directory)/'worker.json'
         path.write_text('{}',encoding='utf8')
         sys.argv[1:1]=['--config',str(path)]
-    with patch('remote_compute.cli.require_visible'):
+    with patch('remote_compute.cli.require_visible'), patch('remote_compute.cli.console_close',return_value=nullcontext()):
         raise SystemExit(main())
 '''
 

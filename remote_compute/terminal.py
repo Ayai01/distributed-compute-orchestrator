@@ -1,9 +1,43 @@
 """Require a visible, foreground terminal before starting an operator service."""
 
+from contextlib import contextmanager
 import os
 import socket
 import subprocess
 import sys
+
+
+@contextmanager
+def console_close(stopping):
+    """Let a Windows window close reach the service's normal finally blocks."""
+    if os.name != 'nt':
+        yield
+        return
+    import ctypes as c
+    import threading
+    from ctypes import wintypes as w
+    kernel = c.WinDLL('kernel32', use_last_error=True)
+    callback_type = c.WINFUNCTYPE(w.BOOL, w.DWORD)
+    finished = threading.Event()
+
+    @callback_type
+    def close(event):
+        if event != 2:  # CTRL_CLOSE_EVENT; keep ordinary Ctrl+C behavior.
+            return False
+        stopping.set()
+        # Windows terminates the process when this callback returns. Keep its
+        # close deadline available for existing cancellation and state cleanup.
+        finished.wait(4)
+        return True
+
+    kernel.SetConsoleCtrlHandler.argtypes = [callback_type, w.BOOL]
+    if not kernel.SetConsoleCtrlHandler(close, True):
+        raise c.WinError(c.get_last_error())
+    try:
+        yield
+    finally:
+        finished.set()
+        kernel.SetConsoleCtrlHandler(close, False)
 
 
 def _windows_processes():

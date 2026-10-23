@@ -18,7 +18,7 @@ from .bundle import TERMINAL, atomic_json
 from .worker import Conflict, Server, Worker
 from .startup import Cancelled, resolve, single_instance
 from .process import keep_awake
-from .terminal import require_visible
+from .terminal import console_close, require_visible
 from .records import active_values
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,8 +75,9 @@ def _operator_token(args, configured_token=''):
     return ''
 
 
-def run_scheduler(args, local_client=None, restarting=None):
+def run_scheduler(args, local_client=None, restarting=None, stopping=None):
     restarting = restarting or threading.Event()
+    stopping = stopping or threading.Event()
     operator_token = _operator_token(args)
     config = load_nodes(args.nodes, args.url, local_client, operator_token=operator_token or None)
     if local_client:
@@ -136,7 +137,7 @@ def run_scheduler(args, local_client=None, restarting=None):
         if args.action is None:
             if args.no_dashboard:
                 try:
-                    while api_thread is None or api_thread.is_alive():
+                    while not stopping.is_set() and (api_thread is None or api_thread.is_alive()):
                         time.sleep(0.5)
                 except KeyboardInterrupt:
                     return 0
@@ -145,7 +146,7 @@ def run_scheduler(args, local_client=None, restarting=None):
             try:
                 shell.do_nodes("")
                 shell.loop(dispatch.health if dispatch else None, dispatch.url if dispatch else '',
-                           api_thread.is_alive if api_thread else lambda: True)
+                           lambda: not stopping.is_set() and (api_thread is None or api_thread.is_alive()))
             finally:
                 shell.close()
             return 75 if restarting.is_set() else 0
@@ -341,9 +342,12 @@ def main(argv=None):
     worker = server = thread = None
     lifetime = ExitStack()
     restarting = threading.Event()
+    stopping = threading.Event()
     try:
         if args.action is None and not (args.test or args.test_native or args.check):
             require_visible()
+            if args.service_child or args.url:
+                lifetime.enter_context(console_close(stopping))
         if (args.service_child and not args.url and args.action is None and
                 not (args.test or args.test_native or args.check) and handoff_python(invocation)):
             return 0
@@ -508,16 +512,17 @@ def main(argv=None):
         if args.mode == "worker":
             if args.no_dashboard:
                 try:
-                    while thread.is_alive():
+                    while thread.is_alive() and not stopping.is_set():
                         thread.join(0.5)
                 except KeyboardInterrupt:
                     pass
             else:
-                WorkerShell(worker).loop(worker.health, worker_url, thread.is_alive)
+                WorkerShell(worker).loop(worker.health, worker_url,
+                                         lambda: thread.is_alive() and not stopping.is_set())
             return 75 if restarting.is_set() else 0
         if worker:
             from .local import LocalClient
-        return run_scheduler(args, LocalClient(worker) if worker else None, restarting)
+        return run_scheduler(args, LocalClient(worker) if worker else None, restarting, stopping)
     except Cancelled as error:
         print(error)
         return 0

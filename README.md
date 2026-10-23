@@ -27,7 +27,7 @@ python -B main.py --help
 
 服务保持一个可见前台终端，窗口可失焦或最小化。聊天应用或编辑器主窗口可见，不代表其中的工具终端可见。`--headless` / `--no-browser` 仅表示不弹浏览器；DCO本身为终端服务，这两个同义选项不改变看板或服务。只关闭交互看板使用 `--no-dashboard`，仍保留前台日志和终端要求。隐藏窗口、重定向输入输出、nohup 和无终端 systemd/计划任务会在启动检查中退出。一次性 CLI、Python API 和测试支持管道。桌面自启动使用登录后终端快捷方式；Linux `.desktop` 使用 `Terminal=true`。旧隐藏服务先保留在途任务和未领取结果，排空后从可见入口迁回。
 
-Windows 常驻服务通过具名的 SYSTEM/EXECUTION 电源请求阻止自动休眠和执行挂起，显示器仍按系统设置熄屏；Linux 在有 systemd-logind 的环境持有 idle 抑制锁。请求由托管父进程与服务子进程分别持有，随进程退出释放。每个端点只开一个交互窗口。端口冲突显示 PID/命令，可选择 `reuse/kill/admin-kill/cancel`；默认Cancel只取消本次启动，保留旧服务，显式reuse才连接旧实例。结束进程前核对其任务。
+Windows 常驻服务通过具名的 SYSTEM/EXECUTION 电源请求阻止自动休眠和执行挂起，显示器仍按系统设置熄屏；Linux 在有 systemd-logind 的环境持有 idle 抑制锁。请求由托管父进程与服务子进程分别持有，随进程退出释放。Windows关闭服务窗口会请求正常退出，取消本入口持有的任务并保留原ID回执；关闭另开的`--url`看板只结束该看板及其自有操作。每个端点只开一个交互窗口。端口冲突显示 PID/命令，可选择 `reuse/kill/admin-kill/cancel`；默认Cancel只取消本次启动，保留旧服务，显式reuse才连接旧实例。结束进程前核对其任务。
 
 ### 地址和端口参数
 
