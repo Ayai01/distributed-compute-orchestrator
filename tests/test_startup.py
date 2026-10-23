@@ -157,6 +157,69 @@ raise SystemExit(main())
                                 user.PostMessageW(int(hwnd_path.read_text()), 0x10, 0, 0)
                                 child.wait(timeout=10)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Native Linux terminal hangup')
+    def test_native_tty_hangup_cancels_original_remote_task_and_releases_state(self):
+        import pty
+        from remote_compute import Client, RemoteError
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root/'worker') as (worker, remote):
+                config = root/'config.json'
+                config.write_text('{}', encoding='utf-8')
+                nodes = root/'nodes.json'
+                nodes.write_text(json.dumps({'nodes': [
+                    {'name': 'isolated', 'url': remote.url}]}), encoding='utf-8')
+                with socket.socket() as probe:
+                    probe.bind(('127.0.0.1', 0))
+                    port = probe.getsockname()[1]
+                master, slave = pty.openpty()
+                code = ('import fcntl,termios;fcntl.ioctl(0,termios.TIOCSCTTY,0);'
+                        'from remote_compute.cli import main;raise SystemExit(main())')
+                child = subprocess.Popen([sys.executable, '-B', '-c', code, '--service-child',
+                    '--mode', 'scheduler', '--port', str(port), '--config', str(config),
+                    '--nodes', str(nodes), '--root', str(root/'center'), '--no-dashboard'],
+                    cwd=ROOT, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+                os.close(slave)
+                client = Client('http://127.0.0.1:' + str(port), timeout=1)
+                identity = None
+                try:
+                    def ready():
+                        try:
+                            return client.health(brief=True)['role'] == 'scheduler'
+                        except RemoteError:
+                            return False
+                    until(ready, seconds=15)
+                    identity = client.submit(python('import time;time.sleep(30)',
+                                                    cpus=1, memory_mb=128))['id']
+                    def running():
+                        try:
+                            return remote.status(identity, brief=True)['status'] == 'running'
+                        except RemoteError as error:
+                            if error.status_code == 404:
+                                return False
+                            raise
+                    until(running)
+                    os.close(master)
+                    master = None
+                    child.wait(timeout=10)
+                    until(lambda: remote.status(identity, brief=True)['status'] == 'cancelled')
+                    receipt = json.loads((root/'center/scheduler/jobs'/identity/'result.json').read_text())
+                    self.assertEqual(receipt['status'], 'cancelled')
+                    self.assertEqual(receipt['id'], identity)
+                    from remote_compute.worker import lock_root
+                    lock = lock_root(root/'center/scheduler', 'scheduler')
+                    lock.close()
+                finally:
+                    try:
+                        if identity:
+                            remote.cancel(identity)
+                            remote.wait(identity, wait_timeout=5)
+                    finally:
+                        if master is not None:
+                            os.close(master)
+                        if child.poll() is None:
+                            child.wait(timeout=10)
+
     def test_all_service_entry_modes_reject_redirects_before_startup_side_effects(self):
         from remote_compute.cli import main
         for mode in ('scheduler', 'hybrid', 'worker'):

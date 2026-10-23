@@ -9,9 +9,18 @@ import sys
 
 @contextmanager
 def console_close(stopping):
-    """Let a Windows window close reach the service's normal finally blocks."""
+    """Let terminal closure reach the service's normal finally blocks."""
     if os.name != 'nt':
-        yield
+        import signal
+        def stop(_number, _frame):
+            stopping.set()
+        previous = {number: signal.signal(number, stop)
+                    for number in (signal.SIGHUP, signal.SIGTERM)}
+        try:
+            yield
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
         return
     import ctypes as c
     import threading
