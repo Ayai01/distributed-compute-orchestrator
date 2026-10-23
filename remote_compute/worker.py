@@ -317,7 +317,7 @@ class Worker:
         # must not make a CPU job appear to own an accelerator.
         denied = dict(DCO_ACCELERATOR_KIND='', DCO_ACCELERATOR_COUNT='0',
                       DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='',
-                      CUDA_VISIBLE_DEVICES='')
+                      CUDA_VISIBLE_DEVICES='-1')
         # Windows treats environment names case-insensitively, even when
         # the Python input mapping contains both upper- and lower-case keys.
         for key in list(environment):

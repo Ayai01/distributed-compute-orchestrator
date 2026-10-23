@@ -52,12 +52,15 @@ GPU 和其他加速器使用同一套汇总能力协议。`capabilities()['accel
 ```python
 from remote_compute import command
 
-task = command(["${tool:python}", "train.py"], cpus=4, memory_mb=8192,
-               project="rgcn", accelerator={"kind":"cuda", "memory_mb":8192,
+task = command(["${tool:python_torch_pyg}", "train.py"], cpus=4, memory_mb=8192,
+               requires=["python_torch_pyg"], project="rgcn",
+               accelerator={"kind":"cuda", "memory_mb":4096,
                                              "requires":["gpu:training"]})
 ```
 
-调度器按配置档案中的类型、每卡容量与标签匹配，并以整卡单元独占预留；`memory_mb` 表示每张卡须满足的最低容量，计账按占用卡数，实际显存用量由执行后端管理。卡号来自设备配置的 `ids`，同一物理卡只登记一次。运行环境提供 `DCO_ACCELERATOR_KIND`、`DCO_ACCELERATOR_COUNT`、`DCO_ACCELERATOR_MEMORY_MB`、`DCO_ACCELERATOR_IDS`；CUDA 任务同时得到 `CUDA_VISIBLE_DEVICES`。worker 每次执行都从本次授权重写这些变量：无授权时分别为空、0、0、空，并将 `CUDA_VISIBLE_DEVICES` 置空，避免继承调用者或设备环境中的GPU权限。工程依据本任务授权选择后端。训练、GPU 仿真和通用 GPU 任务可用不同标签；无GPU设备配置空档案，CPU任务照常使用。
+调度器按配置档案中的类型、每卡容量与标签匹配，并以整卡单元独占预留；`memory_mb` 表示每张卡须满足的最低容量，计账按占用卡数，实际显存用量由执行后端管理。卡号来自设备配置的 `ids`，同一物理卡只登记一次；配置拒绝同类型重复ID，CUDA部署使用完整GPU UUID，避免序号与UUID混登记。运行环境提供 `DCO_ACCELERATOR_KIND`、`DCO_ACCELERATOR_COUNT`、`DCO_ACCELERATOR_MEMORY_MB`、`DCO_ACCELERATOR_IDS`；CUDA 任务同时得到 `CUDA_VISIBLE_DEVICES`。worker 每次执行都从本次授权重写这些变量：无授权时分别为空、0、0、空，并将 `CUDA_VISIBLE_DEVICES` 设为`-1`。Windows实机CUDA会把空值当作未设置，明确禁用值保证未授予任务看不到CUDA设备。工程依据本任务授权选择后端。训练、GPU 仿真和通用 GPU 任务可用不同标签；无GPU设备配置空档案，CPU任务照常使用。
+
+GPU档案与执行解释器一起验收：工具登记的同一解释器须具备完整数值依赖及CUDA构建，随后验证CPU无授予、GPU实际计算、数值等价和结束释放。调用方在授予后选择逻辑`cuda:0`，批量复用驻留模型和数据，按完整阶段计时，包括准备、数据搬运、输出及检查点；单个矩阵核的速度不作为工程加速依据。小批NumPy搜索、SPICE及RTL保持原CPU路径，后端选择不更改研究输入、预算或已接受任务。
 
 兼容CPU执行的任务先检查中心是否声明 `accelerator_fallback`，再在同一份 admission/任务 `accelerator` 对象中加入 `fallback_after_seconds`（有限非负秒数）。该字段由调用方显式提供；省略时保持强制加速器。无匹配在线GPU时立即改为CPU；仍未派发的任务到达队列阈值时改为CPU，同一任务ID、请求包和输入摘要保持不变。首次派发后执行选择冻结，重试和恢复沿用该选择。CPU回退回执含 `accelerator: null`、原需求 `requested_accelerator`，以及 `accelerator_fallback: {"reason":"unavailable"或"queue_timeout","at":Unix秒}`。admission 的 `fallback_capable_cpus` 表示CPU路径匹配的在线预算。
 

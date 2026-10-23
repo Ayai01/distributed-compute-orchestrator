@@ -1,6 +1,6 @@
 # DCO 当前状态
 
-更新：2026-10-23（UTC）。源码版本0.8.13。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
+更新：2026-10-23（UTC）。源码版本0.8.14。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
 
 ## 设备与能力
 
@@ -14,6 +14,8 @@ Windows Magic GDS入口已修复：ITX/TX的通用Tcl入口在最小矩形写出
 
 ## 本轮实现与验证
 
+- 0.8.14拒绝同类型重复GPU ID，未授予CUDA使用明确禁用值`-1`；Windows真实CUDA环境已复现空值仍可见、修复后不可见，授予后INT8矩阵逐值及FP32计算通过并释放整卡。契约21项通过。共享Python3.12/Torch2.14.1+cu130/PyG环境复用已有固定ORT1.22.1依赖，当前科研实例继续使用原环境到空闲重载。
+- PC的4070 Ti SUPER已通过ARH冻结YOLOv8 INT8/INT32图端到端比较：同4张COCO128，CPU4线程中位1.974秒，CUDA批4为0.1845秒，约10.70倍；包括前处理、每图103层共26,515,200字节回传与检测。全部节点、检测及单次激活位翻转结果相等，显存峰404,179,456字节。原科学曲线不重跑。TX环境通过唯一一次局域网传输复用同一已验证安装轮子，实际GPU验证与加载状态见维护`state.json.gpu_integration`。
 - 0.8.13补齐POSIX终端挂断及SIGTERM的正常退出路径；ku26s隔离实测旧实现终端挂断后远端任务仍为running，修复后真实PTY挂断会取消原任务、保留回执并释放状态锁。ku26s启动回归16项（13通过、3项Windows环境跳过，3.492秒）；源码已同步四节点，在线科研服务继续保留到空闲边界。
 - 0.8.12补齐Windows关窗退出：旧实现原生关窗后，隔离远端任务仍为running；修复后，有看板和no-dashboard两种真实控制台关窗均取消原远端任务、持久化原ID回执并释放状态锁。启动与生命周期共34项（33通过、1环境跳过）。当前中心保留原在途任务，先由独立操作看板连接；用户已选择空闲后迁移服务核心，实际迁移状态见维护`state.json`。
 - 0.8.11修复ConPTY把可见聊天/编辑器主窗口误当作服务终端的问题，只接受本终端祖先链中的真实可见终端宿主。另在真实Codex工具PTY中确认拒绝启动，独立经典控制台窗口确认可见。
@@ -36,4 +38,4 @@ Windows Magic GDS入口已修复：ITX/TX的通用Tcl入口在最小矩形写出
 
 现有维护策略、负责人、会话游标及部署状态统一保存在`.local/maintenance/continuous-supervision-20261023/policy.json`和`state.json`。本会话负责DCO、算力调度和跨工程接口；AOP_v2、FIBER-MO、ARH-DSE、RGCN继续由现有负责人推进科研。消息只发具体增量与证据，不重复长上下文；不设全局科研截止。
 
-GPU实际计算与Linux独立tmpfs验收仍按[ROADMAP](ROADMAP.md)推进；旧完整历史和原始实测保留在原证据目录与Git。
+GPU的INT24生产图、RGCN完整准备/训练/VAL/保存比较及Linux独立tmpfs验收按[ROADMAP](ROADMAP.md)推进；旧完整历史和原始实测保留在原证据目录与Git。

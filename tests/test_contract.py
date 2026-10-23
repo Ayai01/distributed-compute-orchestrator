@@ -107,6 +107,18 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                 self.assertNotIn('cwd', result)
                 self.assertNotIn('assigned_node', result)
 
+    def test_accelerator_profiles_cannot_count_one_device_twice(self):
+        from remote_compute.policy import normalize_accelerators
+        invalid = ([dict(kind='cuda', count=2, ids=['0', '0'])],
+                   [dict(kind='cuda'), dict(kind='cuda')],
+                   [dict(kind='cuda', ids=['GPU-test']), dict(kind='cuda', ids=['GPU-test'])])
+        for profiles in invalid:
+            with self.subTest(profiles=profiles), self.assertRaisesRegex(ValueError, 'Duplicate accelerator device'):
+                normalize_accelerators(profiles)
+        profiles = normalize_accelerators([dict(kind='cuda', ids=['0']),
+                                          dict(kind='cuda', ids=['1']), dict(kind='xpu', ids=['0'])])
+        self.assertEqual(sum(p['count'] for p in profiles), 3)
+
     def test_accelerator_requirement_does_not_fallback_to_cpu(self):
         with scratch() as directory, provider(Path(directory) / 'cpu', cpus=2) as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
@@ -136,7 +148,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
             self.assertEqual(cpu['status'], 'succeeded', cpu)
             self.assertEqual(json.loads(cpu['stdout']), dict(
                 DCO_ACCELERATOR_KIND='', DCO_ACCELERATOR_COUNT='0',
-                DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='', CUDA_VISIBLE_DEVICES=''))
+                DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='', CUDA_VISIBLE_DEVICES='-1'))
             gpu = remote.run(python(code, env=supplied, accelerator=dict(kind='cuda')))
             self.assertEqual(gpu['status'], 'succeeded', gpu)
             self.assertEqual(json.loads(gpu['stdout']), dict(

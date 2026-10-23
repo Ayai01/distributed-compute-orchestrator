@@ -125,6 +125,7 @@ def normalize_accelerators(value):
     if not isinstance(value, list) or len(value) > MAX_ACCELERATORS:
         raise ValueError(f'accelerators must be a list of at most {MAX_ACCELERATORS} profiles')
     result = []
+    devices = set()
     for profile in value:
         if not isinstance(profile, dict):
             raise ValueError('accelerator profiles must be objects')
@@ -141,6 +142,11 @@ def normalize_accelerators(value):
                 or (ids is not None and (not isinstance(ids, list) or len(ids) != count
                                          or any(not isinstance(item, str) or not item for item in ids)))):
             raise ValueError('accelerator profiles require kind, count, memory_mb, tags and optional ids')
+        for device in ids if ids is not None else map(str, range(count)):
+            key = kind, device
+            if key in devices:
+                raise ValueError('Duplicate accelerator device: ' + kind + '/' + device)
+            devices.add(key)
         result.append(dict(kind=kind, count=count, memory_mb=memory_mb,
                            tags=canonical_capabilities(tags), ids=list(ids) if ids is not None else None))
     return result

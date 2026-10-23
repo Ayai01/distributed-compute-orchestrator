@@ -200,6 +200,8 @@ Python 能力按实际运行环境登记；新增算法先复用已有环境，�
 
 GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行路径的调用方可协商 `accelerator_fallback`，具体请求和回执见 [DESIGN](docs/DESIGN.md#工程接口边界)；ARH 的 auto 使用30秒未派发队列阈值，显式 torch_cuda 保持强制GPU。`shared` 只登记真实部署目录，ARH 工具/模型及持久统计可通过 `shared:arh` 复用。
 
+CUDA环境由操作员按实际消费者配置在忽略的`.tools`中，服务继续只使用标准库。`python_torch_pyg`必须绑定同一套完整数值环境；ARH另通过设备环境的`ARH_INFERENCE_PYTHON`复用已验证的Torch/OpenCV/ONNX解释器，量化推理保留工程固定的ONNX Runtime版本。安装后先做实际GPU及端到端验证，再登记`accelerators`并在空闲时重载；在途任务继续使用原环境。共享环境的有效消费者及部署证据见[STATUS](docs/STATUS.md)。
+
 已验证工具可用操作员 `center.control(node=名称, worker={"tools": {别名: [可执行路径]}})` 在线登记，None 移除；后续任务用新别名。该操作更新运行进程，部署同时更新设备 `worker.local.json` 以便重载。临时能力验收后再登记正式别名。
 
 Windows 节点接入时按上述规范环境和实际工具补齐能力，再比较看板“运行能力”行；路径及编译器实现保留设备的真实配置。已有 Cygwin 工具原位复用，迁移时同时带上动态库、Tcl 脚本和实际执行器。Magic 批处理使用实际安装的 `magicdnull.exe -nowrapper`，配套 Cygwin 运行库及对应安装目录的 `CAD_ROOT`；当前构建在通用 `tclsh` 加载入口中写 GDS 会异常退出。验收须由 Magic 写 GDS，再用独立解析器读取几何，并检查 LVS 报告。`layout_python` 的 PDK 由任务资产及 `PDK_ROOT` 提供，避免随环境反复复制完整模型。
