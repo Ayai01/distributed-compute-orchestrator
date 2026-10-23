@@ -979,7 +979,9 @@ class Server(ThreadingHTTPServer):
         if certfile:
             context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(certfile,keyfile)
-            self.socket=context.wrap_socket(self.socket,server_side=True)
+            # Handshake in the timed request thread, so an incomplete peer
+            # cannot hold the accept loop and block every new connection.
+            self.socket=context.wrap_socket(self.socket,server_side=True,do_handshake_on_connect=False)
         if hasattr(worker,'restart_node'):
             worker.callback_address=self.server_address
         else:
@@ -1020,7 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLError):
             self.close_connection = True
 
     def setup(self):

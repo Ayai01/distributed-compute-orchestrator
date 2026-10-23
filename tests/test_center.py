@@ -177,7 +177,9 @@ def center(pool, root):
 
 @contextmanager
 def host_load(worker, percent, machine):
-    sample = dict(worker.host.sample(), cpu_percent=percent, logical_cpus=8, machine_id=machine)
+    # These CPU-placement fixtures must not inherit the live host's RAM pressure.
+    sample = dict(worker.host.sample(), cpu_percent=percent, logical_cpus=8, machine_id=machine,
+                  memory_total_mb=32768,host_memory_available_mb=24576)
     with patch.object(worker.host, 'sample', return_value=sample):
         yield
 

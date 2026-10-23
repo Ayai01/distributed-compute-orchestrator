@@ -1,6 +1,8 @@
 # DCO 当前状态
 
-更新：2026-10-22（UTC）。版本 0.8.7；实时任务、占用与已加载进程由看板和操作员 `health` 查询。操作见[README](../README.md)，机制见[DESIGN](DESIGN.md)，后续验收见[ROADMAP](ROADMAP.md)。
+更新：2026-10-23（UTC）。版本 0.8.7；实时任务、占用与已加载进程由看板和操作员 `health` 查询。操作见[README](../README.md)，机制见[DESIGN](DESIGN.md)，后续验收见[ROADMAP](ROADMAP.md)。
+
+ku26s/TX反复失联已现场定位：大上传占满中心8个连接槽，健康/资源请求在本地排队超期，而独立SSH及新HTTPS正常。现同一8连接内大传输最多7条，保留控制通路；27项传输回归及全量481项（477通过、4项环境跳过）完成。另隔离复现并修复未完成TLS握手堵住新连接的问题，3项直连回归覆盖原任务保持、超时及无效TLS。部署及实际加载见`.local/maintenance/continuous-supervision-20261023/`；原TSA/LDO训练保留，中心和worker只在各自空闲边界加载。
 
 ## 当前预算与能力
 

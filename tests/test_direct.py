@@ -3,18 +3,62 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import unittest
+from unittest.mock import patch
 
 from remote_compute import Client,Pool
-from remote_compute.worker import Server
+from remote_compute.worker import Handler,Server
 from test_center import center
 from test_compute import provider,python,scratch,until
 
 
 class DirectTests(unittest.TestCase):
+    def test_incomplete_tls_peer_does_not_block_new_connections_or_running_task(self):
+        openssl=shutil.which('openssl')
+        if not openssl and os.name=='nt':openssl='D:/Program Files/Git/usr/bin/openssl.exe'
+        if not openssl or not Path(openssl).is_file():self.skipTest('openssl generates a temporary test certificate')
+        with scratch() as temporary,provider(Path(temporary)/'worker',cpus=1) as (worker,_):
+            root=Path(temporary);cert=root/'node.crt';key=root/'node.key'
+            subprocess.run([openssl,'req','-x509','-newkey','rsa:2048','-nodes','-days','1',
+                '-subj','/CN=localhost','-addext','subjectAltName=IP:127.0.0.1',
+                '-keyout',str(key),'-out',str(cert)],check=True,capture_output=True)
+            server=Server(('127.0.0.1',0),worker,certfile=str(cert),keyfile=str(key))
+            entered=threading.Event();accept=server.get_request
+            def accepting():
+                entered.set()
+                return accept()
+            server.get_request=accepting
+            thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.02},daemon=True)
+            thread.start();idle=None
+            def fresh():return Client('https://127.0.0.1:'+str(server.server_port),ca_file=str(cert),timeout=1)
+            try:
+                client=fresh()
+                identity=client.submit(python("import time;from pathlib import Path\nwhile not Path('release').exists():time.sleep(.02)"))['id']
+                until(lambda:worker.get(identity)['status']=='running')
+                entered.clear()
+                with patch.object(Handler,'idle_timeout',.5),patch.object(Server,'handle_error') as errors:
+                    idle=socket.create_connection(server.server_address,timeout=2)
+                    self.assertTrue(entered.wait(2))
+                    self.assertEqual(fresh().health(brief=True)['role'],'worker')
+                    idle.settimeout(2)
+                    self.assertEqual(idle.recv(1),b'')
+                    idle.close();idle=None
+                    with socket.create_connection(server.server_address,timeout=2) as invalid:
+                        invalid.sendall(b'GET /health HTTP/1.0\r\n\r\n')
+                        self.assertEqual(invalid.recv(1),b'')
+                    self.assertEqual(fresh().status(identity,brief=True)['status'],'running')
+                    client.write_job_file(identity,'release','done')
+                    self.assertEqual(client.wait(identity)['status'],'succeeded')
+                    client.fetch(identity)
+                    errors.assert_not_called()
+            finally:
+                if idle:idle.close()
+                server.shutdown();thread.join();server.server_close()
+
     def test_https_and_local_resource_requests_need_no_reverse_connection(self):
         openssl=shutil.which('openssl')
         if not openssl and os.name=='nt':openssl='D:/Program Files/Git/usr/bin/openssl.exe'

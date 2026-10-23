@@ -41,28 +41,34 @@ class _ConnectionPool:
         self.lock = threading.Lock()
         self.condition = threading.Condition()
         self.available = 8
+        self.bulk_active = 0
         self.waiting = deque()
 
-    def acquire(self, timeout):
-        ticket = object()
+    def acquire(self, timeout, *, bulk=False):
+        ticket = (object(), bulk)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
             self.waiting.append(ticket)
             try:
-                while not self.available or self.waiting[0] is not ticket:
+                # Reserve one of the same eight slots for health, status and
+                # grants, even when slow uploads have queued more transfers.
+                while not self.available or next((entry for entry in self.waiting
+                        if not entry[1] or self.bulk_active < 7), None) is not ticket:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         return False
                     self.condition.wait(remaining)
                 self.available -= 1
+                self.bulk_active += int(bulk)
                 return True
             finally:
                 self.waiting.remove(ticket)
                 self.condition.notify_all()
 
-    def release(self):
+    def release(self, *, bulk=False):
         with self.condition:
             self.available += 1
+            self.bulk_active -= int(bulk)
             self.condition.notify_all()
 
     def __del__(self):
@@ -94,7 +100,8 @@ class Client:
             pool=self.__dict__.setdefault('_transport',_ConnectionPool())
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
-        if not pool.acquire(getattr(self, 'pool_timeout', None)):
+        bulk = isinstance(data, bytes) or binary
+        if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk):
             raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         # Old live instances may still own a per-thread cached connection.
         previous=getattr(self.connections,'connection',None)
@@ -114,7 +121,7 @@ class Client:
             self.connections.connection=None
             if connection is not None:
                 with pool.lock:pool.idle.append(connection)
-            pool.release()
+            pool.release(bulk=bulk)
 
     def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None):
         if self.endpoint.scheme not in {'http', 'https'}:

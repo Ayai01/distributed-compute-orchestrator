@@ -312,6 +312,46 @@ class TransportTests(unittest.TestCase):
         for _ in range(7):pool.release()
         self.assertEqual(pool.available,8)
 
+    def test_bulk_uploads_leave_a_slot_for_health_and_original_task_grants(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            identity=client.submit(python("import time;from pathlib import Path\nwhile not Path('release').exists():time.sleep(.02)"))['id']
+            until(lambda:worker.get(identity)['status']=='running')
+            client.timeout=5
+            release=threading.Event();lock=threading.Lock()
+            counts=dict(active=0,peak=0,requests=0)
+            original=Handler._reply
+            def delayed(handler,value,status=200):
+                if handler.server.worker is not worker or handler.command!='POST' or not handler.path.startswith('/assets/'):
+                    return original(handler,value,status)
+                with lock:
+                    counts['active']+=1;counts['requests']+=1
+                    counts['peak']=max(counts['peak'],counts['active'])
+                try:
+                    release.wait(5)
+                    return original(handler,value,status)
+                finally:
+                    with lock:counts['active']-=1
+            payloads=[pack({'input.dat':bytes([i])*1024}) for i in range(8)]
+            with patch.object(Handler,'_reply',delayed),ThreadPoolExecutor(max_workers=9) as callers:
+                uploads=[callers.submit(client.request,'/assets/'+hashlib.sha256(data).hexdigest(),data) for data in payloads]
+                try:
+                    until(lambda:counts['active']==8 or counts['active']==7 and bool(client._transport.waiting))
+                    health=callers.submit(client.health,brief=True).result(timeout=1)
+                    self.assertEqual(health['role'],'worker')
+                    grant=callers.submit(client.resize,identity,1,memory_mb=128).result(timeout=1)
+                    self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb']),(identity,1,128))
+                    self.assertLessEqual(counts['peak'],7)
+                finally:
+                    release.set()
+                self.assertTrue(all(f.result(timeout=5)['exists'] for f in uploads))
+            self.assertEqual(counts['requests'],8)
+            self.assertEqual(client._transport.available,8)
+            self.assertFalse(client._transport.waiting)
+            self.assertEqual(client.timeout,5)
+            self.assertEqual(list(worker.jobs),[identity])
+            client.write_job_file(identity,'release','done');client.wait(identity)
+            self.assertEqual(client.fetch(identity)['status'],'succeeded')
+
     def test_interrupted_binary_get_resumes_and_changed_or_legacy_payload_restarts(self):
         original=Handler._reply
         for mode in ('resume','changed','legacy'):
