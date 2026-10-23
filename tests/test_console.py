@@ -150,6 +150,7 @@ class ConsoleTests(unittest.TestCase):
         center=Mock();pool=Mock()
         center.status.return_value=[dict(id=identity)]
         center.nodes.return_value=dict(policy='adaptive',nodes=[dict(name='local-device',capacity=8,limit=8)])
+        center.control.return_value=center.nodes.return_value
         center.logs.return_value=dict(stdout='ready')
         center.cancel.return_value=dict(status='cancelled')
         center.fetch.return_value=dict(status='succeeded',output_dir='D:/结果')
@@ -160,6 +161,7 @@ class ConsoleTests(unittest.TestCase):
                 shell.onecmd('cpus 12')
                 center.control.assert_called_with(node='local-device',worker={'cpus':12})
                 self.assertIn('中心上限 8；有效预算 8',output.getvalue())
+                pool.refresh.assert_not_called()
                 shell.onecmd('memory 1.5G')
                 center.control.assert_called_with(node='local-device',worker={'memory_mb':1536})
                 shell.onecmd('logs abcd')

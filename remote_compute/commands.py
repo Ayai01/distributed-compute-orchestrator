@@ -782,11 +782,11 @@ class SchedulerShell(Shell):
             raise ValueError('需要线程数，可在前面指定设备')
         name, count = (socket.gethostname(),args[0]) if len(args)==1 else (self._node(args[0]).name,args[1])
         if self.center:
-            self.center.control(node=name, worker={"cpus": int(count)})
+            snapshot = self.center.control(node=name, worker={"cpus": int(count)})
         else:
             self._node(name).client.control(cpus=int(count))
-        self.pool.refresh()
-        snapshot = self.center.nodes() if self.center else self.pool.snapshot()
+            self.pool.refresh()
+            snapshot = self.pool.snapshot()
         row = next(row for row in snapshot['nodes'] if row['name'] == name)
         budget = row['capacity']
         limit = row['limit']
