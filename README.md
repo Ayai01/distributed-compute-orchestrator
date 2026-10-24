@@ -125,6 +125,8 @@ Tab 在空输入时显示根命令候选，有输入时补全；Ctrl+Tab 翻任�
 
 临时大输入在准备阶段已确定原任务ID时，使用 `client.sync_files(files, job_id=原ID)`，提交也传同一 `job_id`；若准备取消，调用 `client.release_assets(原ID)`。引用覆盖同步至受理的间隔，任务收妥删除后按LRU回收；多生产者共享同一内容分别受保护。重开或交接1小时未更新后重新同步原冻结内容。固定源码/模型继续分包复用。协议和旧服务兼容规则见[DESIGN](docs/DESIGN.md#接入与传输约定)。
 
+已有冻结ZIP的恢复入口用 `client.has_asset(资产ID, job_id=原ID)` 检查是否存在，返回布尔值；短暂读超时沿既有有限重连处理。存在时直接复用，缺失时才补传原ZIP，查询不打包、摘要或上传内容。
+
 ## 手动缓存同步
 
 `sync_cache all|aop|rgcn|arh|bench` 通过原队列以低优先级单线程增量同步。`--kind research|assets|all` 选择科研缓存、内容资产或两者；不带 `--url` 的一次性 `python -B main.py sync_cache all` 连接本机已有中心。

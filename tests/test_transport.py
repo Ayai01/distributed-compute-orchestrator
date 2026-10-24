@@ -318,6 +318,61 @@ class StatusReadReconnectTests(unittest.TestCase):
         else:error.status_code=status
         return error
 
+    def test_resize_bootstrap_recovers_health_before_one_actual_grant_change(self):
+        with scratch() as root,provider(Path(root)/'worker') as (_,client):
+            identity=client.submit(python('import time; time.sleep(30)'))['id']
+            until(lambda:client.status(identity,brief=True)['status']=='running')
+            original=Handler._reply;requests=[]
+            def reply(handler,value,status=200):
+                requests.append((handler.command,handler.path))
+                if handler.path.startswith('/health') and sum(path.startswith('/health') for _,path in requests)<=2:
+                    handler.close_connection=True;return
+                return original(handler,value,status)
+            try:
+                with patch.object(Handler,'_reply',reply):
+                    grant=client.resize(identity,1,memory_mb=256)
+                self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb']),(identity,1,256))
+                self.assertEqual(sum(path.startswith('/health') for _,path in requests),3)
+                self.assertEqual([path for method,path in requests if method=='POST'],['/jobs/'+identity+'/resize'])
+            finally:
+                client.cancel(identity);client.wait(identity);client.fetch(identity)
+
+    def test_resize_bootstrap_rejects_permanent_health_error_before_mutation(self):
+        client=Client();error=self.outage(403)
+        with patch.object(client,'health',side_effect=error) as health,patch.object(client,'request') as request,patch('remote_compute.client.time.sleep') as sleep:
+            with self.assertRaises(RemoteError) as caught:client.resize('a'*32,1,memory_mb=256)
+        self.assertIs(caught.exception,error)
+        self.assertEqual(health.call_count,1);request.assert_not_called();sleep.assert_not_called()
+
+    def test_resize_bootstrap_outage_is_finite_and_never_changes_grant(self):
+        client=Client();clock=[0.]
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(client,'health',side_effect=self.outage()) as health,patch.object(client,'request') as request,patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+            with self.assertRaises(RemoteError):client.resize('a'*32,1,memory_mb=256)
+        self.assertAlmostEqual(clock[0],120.)
+        self.assertLess(health.call_count,40);request.assert_not_called()
+
+    def test_unsupported_resize_recovers_only_original_grant_read(self):
+        client=Client();client._capabilities=[];identity='b'*32
+        state=dict(id=identity,status='running',cpus=1,memory_mb=512)
+        with patch.object(client,'status',side_effect=[self.outage(),state]) as status,patch.object(client,'request') as request,patch('remote_compute.client.time.sleep'):
+            grant=client.resize(identity,0,memory_mb=256)
+        self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb'],grant['supported']),(identity,1,512,False))
+        self.assertEqual([call.args for call in status.call_args_list],[(identity,)]*2)
+        request.assert_not_called()
+
+    def test_legacy_lease_confirms_original_grant_after_read_outage_without_replaying_lease(self):
+        client=Client();client._capabilities=['resize_memory'];identity='c'*32;worker='d'*32
+        failure=self.outage(409);failure.args=('min() iterable argument is empty',)
+        state=dict(id=worker,status='running',cpus=1,memory_mb=512)
+        environment=dict(REMOTE_COMPUTE_LEASE='1',REMOTE_COMPUTE_URL=client.url,
+                         REMOTE_COMPUTE_JOB_ID=identity,REMOTE_COMPUTE_WORKER_JOB_ID=worker)
+        with patch.dict(os.environ,environment),patch.object(client,'request',side_effect=[failure,self.outage(),state]) as request,patch('remote_compute.client.time.sleep'):
+            grant=client.resize(identity,1,memory_mb=256)
+        self.assertEqual([call.args[0] for call in request.call_args_list],['/jobs/'+worker+'/lease','/jobs/'+worker,'/jobs/'+worker])
+        self.assertEqual(grant['id'],identity)
+        self.assertTrue(grant['existing_grant_confirmed']);self.assertFalse(grant['resize_applied'])
+
     def test_wait_recovers_after_both_http_status_attempts_drop(self):
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):
             identity=client.submit(python("print('paid once')"))['id']
@@ -386,6 +441,45 @@ class StatusReadReconnectTests(unittest.TestCase):
             with self.assertRaises(RemoteError):client.admission('RGCN')
         self.assertAlmostEqual(clock[0],120.)
         self.assertLess(request.call_count,40)
+
+    def test_known_asset_recovers_without_repacking_or_reuploading(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            identity=client.sync_files({'model':b'original bytes'},content_id='frozen-model')
+            owner='a'*32;original=Handler._reply;requests=[]
+            def reply(handler,value,status=200):
+                if handler.path=='/assets/'+identity:
+                    requests.append((handler.command,handler.headers.get('X-DCO-Asset-Job')))
+                    if len(requests)<=2:handler.close_connection=True;return
+                return original(handler,value,status)
+            with patch.object(Handler,'_reply',reply),patch('remote_compute.client.pack',side_effect=AssertionError('Known model was repacked')):
+                self.assertEqual(client.sync_files(lambda: self.fail('Known model was prepared'),content_id='frozen-model',job_id=owner),identity)
+            self.assertEqual(requests,[('GET',owner)]*3)
+            self.assertEqual(worker.asset_handoffs[owner][0],frozenset({identity}))
+
+    def test_asset_presence_reads_only_metadata_for_existing_and_missing_assets(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            identity=client.sync_files({'code.py':b'print(1)'})
+            with patch('remote_compute.client.pack',side_effect=AssertionError('Presence check prepared data')):
+                self.assertTrue(client.has_asset(identity))
+                self.assertFalse(client.has_asset('0'*64))
+            self.assertEqual((worker.root/'assets'/identity/'code.py').read_bytes(),b'print(1)')
+            self.assertFalse((worker.root/'assets'/('0'*64)).exists())
+            self.assertFalse(worker.jobs)
+
+    def test_asset_presence_permanent_error_is_immediate(self):
+        client=Client();error=self.outage(403)
+        with patch.object(client,'request',side_effect=error) as request,patch('remote_compute.client.time.sleep') as sleep:
+            with self.assertRaises(RemoteError):client.has_asset('a'*64)
+        self.assertEqual(request.call_count,1);sleep.assert_not_called()
+
+    def test_asset_presence_outage_has_the_same_finite_window(self):
+        client=Client();clock=[0.]
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(client,'request',side_effect=self.outage()) as request,patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+            with self.assertRaises(RemoteError):client.has_asset('a'*64,job_id='b'*32)
+        self.assertAlmostEqual(clock[0],120.)
+        self.assertLess(request.call_count,40)
+        self.assertTrue(all(call.args==('/assets/'+'a'*64,) and call.kwargs=={'extra_headers':{'X-DCO-Asset-Job':'b'*32}} for call in request.call_args_list))
 
 
 class TransportTests(unittest.TestCase):

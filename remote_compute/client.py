@@ -327,11 +327,11 @@ class Client:
         modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
         if memory_mb is not None or cpus==0 or modeled:
             if getattr(self, '_capabilities', None) is None:
-                self.health(brief=True)
+                self._read_reconnecting(lambda: self.health(brief=True))
             if (memory_mb is not None and not ({'resize_memory','memory_resize'} & set(self._capabilities))
                     or cpus==0 and not ({'resize_auto','cpu_auto_resize'} & set(self._capabilities))
                     or modeled and not ({'resize_memory_model','memory_resize_model'} & set(self._capabilities))):
-                state=self.status(identity,brief=True)
+                state=self._read_reconnecting(lambda: self.status(identity,brief=True))
                 return dict(id=identity,node=state.get('assigned_node',state.get('node')),
                             cpus=state['cpus'],memory_mb=state['memory_mb'],requested_cpus=cpus,supported=False)
         request = dict(cpus=cpus)
@@ -352,7 +352,7 @@ class Client:
                     or getattr(error,'status_code',None)!=409
                     or 'min() iterable argument is empty' not in str(error)):
                 raise
-            state=self.request('/jobs/'+target,brief=True)
+            state=self._read_reconnecting(lambda: self.request('/jobs/'+target,brief=True))
             if (state.get('id')!=target or state.get('status')!='running'
                     or state.get('cpus')!=cpus or state.get('memory_mb',0)<memory_mb):
                 raise error
@@ -496,6 +496,11 @@ class Client:
     def sync(self, root, patterns=("**/*",)):
         return self.sync_files(tree(root, patterns))
 
+    def has_asset(self, identity, *, job_id=None):
+        """Read immutable asset presence without preparing or uploading it."""
+        options = {'extra_headers':{'X-DCO-Asset-Job':job_id}} if job_id else {}
+        return self._read_reconnecting(lambda:self.request('/assets/'+identity, **options))['exists']
+
     def sync_files(self, files, *, content_id=None, job_id=None):
         """Reuse a caller's immutable content identity before preparing a ZIP.
 
@@ -521,13 +526,13 @@ class Client:
             if content_id is not None:
                 with self._asset_lock:
                     known=self._asset_ids.get(content_id)
-                if known and self.request('/assets/'+known, **options)['exists']:
+                if known and self.has_asset(known, job_id=job_id):
                     with self._asset_lock:
                         if content_id in self._asset_ids:self._asset_ids.move_to_end(content_id)
                     return known
             payload = pack(files() if callable(files) else files)
             identity = hashlib.sha256(payload).hexdigest()
-            if identity == known or not self.request("/assets/" + identity, **options)["exists"]:
+            if identity == known or not self.has_asset(identity, job_id=job_id):
                 self.request("/assets/" + identity, payload, **options)
             if content_id is not None:
                 with self._asset_lock:
