@@ -79,13 +79,14 @@ class AssetCache:
             return self._prune(protected)
 
     def _prune(self, protected):
-        total = self.snapshot()['bytes']
+        # Live inputs do not evict the bounded warm set needed by the next stage.
+        idle = [(identity, size, used) for identity, (size, used) in self.entries.items()
+                if identity not in protected]
+        total = sum(size for _identity, size, _used in idle)
         errors = []
-        for identity, (size, _used) in sorted(self.entries.items(), key=lambda item: item[1][1]):
+        for identity, size, _used in sorted(idle, key=lambda item: item[2]):
             if total <= self.limit:
                 break
-            if identity in protected:
-                continue
             try:
                 remove_owned(self._path(identity))
             except OSError as error:

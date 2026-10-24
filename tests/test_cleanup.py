@@ -169,19 +169,22 @@ class CleanupTests(unittest.TestCase):
                 with patch('remote_compute.worker.time.time',return_value=time.time()+6):
                     client.fetch(two)
                 self.assertTrue((worker.root/'assets'/first).exists())
-                self.assertFalse((worker.root/'assets'/second).exists())
+                self.assertTrue((worker.root/'assets'/second).exists())
                 client.fetch(one)
+                with patch('remote_compute.worker.time.time',return_value=time.time()+60),worker.condition:
+                    worker._prune_assets()
+                self.assertFalse((worker.root/'assets'/first).exists())
                 # Retain the center's stale session cache to exercise the race
                 # between worker eviction and the next periodic health sample.
                 node=pool.nodes[0]
-                node.known_assets.add(second)
+                node.known_assets.add(first)
                 node.asset_session=(node.health.get('pid'),node.health.get('root'),node.health.get('asset_revision'))
                 # Previously deployed providers keep the ordinary one-shot
                 # resynchronization when the handoff extension is absent.
                 node.health['capabilities'].remove('asset_handoff')
-                restored=client.run(task(second))
+                restored=client.run(task(first))
                 self.assertEqual(restored['status'],'succeeded',restored)
-                self.assertEqual(restored['stdout'].strip(),'b'*80)
+                self.assertEqual(restored['stdout'].strip(),'a'*80)
                 with patch('remote_compute.worker.time.time',return_value=time.time()+6),worker.condition:
                     worker._prune_assets()
                 self.assertLessEqual(worker.asset_cache.snapshot()['bytes'],100)
@@ -199,7 +202,12 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(result['stdout'].strip(),'b'*80)
             with patch('remote_compute.worker.time.time',return_value=time.time()+6),worker.condition:
                 worker._prune_assets()
+            self.assertTrue((worker.root/'assets'/incoming).exists())
+            replacement=client.sync_files({'data':b'c'*80})
+            with patch('remote_compute.worker.time.time',return_value=time.time()+6),worker.condition:
+                worker._prune_assets()
             self.assertFalse((worker.root/'assets'/incoming).exists())
+            self.assertTrue((worker.root/'assets'/replacement).exists())
             self.assertTrue((worker.root/'assets'/active).exists())
             client.cancel(first);client.wait(first);client.fetch(first)
 
