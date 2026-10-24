@@ -87,6 +87,19 @@ def shared_volume():
     return None
 
 
+def _mark_shared(root, size):
+    path=root/MARKER
+    expected=dict(version=1,kind='ramdisk',shared=True,capacity_bytes=size)
+    try:
+        current=json.loads(path.read_text(encoding='utf-8-sig'))
+    except (FileNotFoundError,ValueError):
+        pass
+    else:
+        if all(current.get(key)==value for key,value in expected.items()):
+            return  # Readers need neither write access nor repeated metadata I/O.
+    path.write_text(json.dumps(dict(expected,purpose='Shared simulation scratch for all local projects'),indent=2),encoding='utf-8')
+
+
 def ensure_shared(size_gib=None, *, create=False):
     """Reuse/extend the marked volume; never create a second disk after a failed resize."""
     settings=json.loads((ROOT/'worker.local.json').read_text(encoding='utf-8-sig')) if (ROOT/'worker.local.json').is_file() else {}
@@ -108,7 +121,7 @@ def ensure_shared(size_gib=None, *, create=False):
         if abs(shutil.disk_usage(root).total-size)>32*1024**2:
             if not create:raise OSError('Shared tmpfs size differs from configured capacity; run ramdisk during maintenance')
             _run(['mount','-o',f'remount,size={size_gib}G',root])
-        (root/MARKER).write_text(json.dumps(dict(version=1,kind='ramdisk',shared=True,capacity_bytes=size)),encoding='utf8')
+        _mark_shared(root,size)
         return root
     with creation_lock():
         root = shared_volume()
@@ -132,8 +145,7 @@ def ensure_shared(size_gib=None, *, create=False):
             root = Path(letter + ':/')
             _run([executable, '-a', '-t', 'vm', '-s', f'{size_gib}G', '-m', letter + ':',
                   '-p', '/fs:ntfs /q /y /v:SHARED_RAM'])
-        (root / MARKER).write_text(json.dumps(dict(version=1, kind='ramdisk', shared=True,
-            capacity_bytes=size, purpose='Shared simulation scratch for all local projects'), indent=2), encoding='utf-8')
+        _mark_shared(root,size)
         return root
 
 

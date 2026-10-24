@@ -43,6 +43,9 @@ class Coordinator:
         (self.root / "assets").mkdir(exist_ok=True)
         self.operator_token = self._load_operator_token(operator_token)
         self.condition = threading.Condition(threading.RLock())
+        self.submission_lock = threading.RLock()
+        self.accepting_assets = set()
+        self.asset_writes = weakref.WeakValueDictionary()
         self.jobs, self.queue, self.threads = JobRecords(self.root / 'jobs'), [], set()
         self.asset_handoffs = {}
         self.legacy_assets = set()
@@ -103,22 +106,6 @@ class Coordinator:
         project = request.get('project') or 'default'
         job_id=request.get('job_id')
         advice={}
-        if job_id is not None:
-            with self.condition,self.pool.condition:
-                job=self.jobs.get(job_id)
-                if job is None or job.get('node') is None or job['result']['status'] in TERMINAL:
-                    raise Conflict('admission job_id must identify a running task')
-                if (job['task'].get('project') or 'default')!=project:
-                    raise ValueError('admission project differs from the running task')
-                node=job['node'];old=job['task']['cpus'];old_memory=job['task']['memory_mb']
-                resource=self.project_resources()[project]
-                advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
-                                  resource['target']-resource['used']+old,node.capacity-node.reserved-node.external+old))
-                if job.get('auto_cpus'):
-                    advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,{project:resource}))
-                advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
-                            current_cpus=old,current_memory_mb=old_memory,
-                            available_memory_mb=old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
         share = request.get('resource_share', 1.0)
         ratio = request.get('queue_ratio', 1.0)
         cpus = request.get('cpus', 1)
@@ -159,6 +146,25 @@ class Coordinator:
         grants=weighted_node_threads({n.name:n.reserved if n.health.get('paused') else n.capacity for n in self.pool.nodes if n.name in names
                                      and not n.error and n.enabled},shares,demands,rooms)
         target=sum(grants[project].values())
+        if job_id is not None:
+            with self.condition,self.pool.condition:
+                job=self.jobs.get(job_id)
+                if job is None or job.get('node') is None or job['result']['status'] in TERMINAL:
+                    raise Conflict('admission job_id must identify a running task')
+                if (job['task'].get('project') or 'default')!=project:
+                    raise ValueError('admission project differs from the running task')
+                node=job['node'];old=job['task']['cpus'];old_memory=job['task']['memory_mb']
+                resource=self.project_resources()[project]
+                # Advice must describe the new phase's opportunity. Using the
+                # previous one-CPU demand here prevents an idle pool reborrowing.
+                preview=dict(resource,target=target,node_targets=grants[project]) if job.get('auto_cpus') else resource
+                advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
+                                  preview['target']-resource['used']+old,node.capacity-node.reserved-node.external+old))
+                if job.get('auto_cpus'):
+                    advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,{project:preview}))
+                advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
+                            current_cpus=old,current_memory_mb=old_memory,
+                            available_memory_mb=old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
         ceilings=[min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible]+list(held.values())
         maximum=sum(ceilings)
         unit = cpus or maximum_cpus
@@ -470,7 +476,7 @@ class Coordinator:
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
-        with self.asset_cache.lock:
+        with self.submission_lock:
             with self.condition:
                 if self.stopping:
                     raise Conflict("Scheduler is stopping")
@@ -485,36 +491,46 @@ class Coordinator:
                     raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
-            for asset in set(task['assets'].values()):
-                if not (self.root/'assets'/(asset+'.zip')).is_file():
-                    raise ValueError('Synchronize missing asset first: '+asset)
-                self.asset_cache.touch(asset)
-            directory = self.root / "jobs" / identity
-            directory.mkdir()
-            (directory / "request.zip").write_bytes(payload)
-            job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
-                   "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
-                              "single_thread_weight": task.get('single_thread_weight',1.0),
-                              "accelerator": task.get('accelerator'),
-                              "max_retries": task.get('retries',2), "attempts": [],
-                              "memory_mb": task["memory_mb"], "request_sha256": digest,
-                              "submitted": time.time(), "started": None, "finished": None,
-                              "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}})
-            if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
-                job['result']['requested_accelerator'] = task['accelerator']
-            self._save(job)
-            with self.condition:
-                stopping = self.stopping
-                if not stopping:
-                    self.jobs[identity] = job
-                    self.asset_handoffs.pop(identity, None)
-                    self.queue.append(identity)
-                    self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
-                    self.condition.notify_all()
-            if stopping:
-                shutil.rmtree(directory)
-                raise Conflict("Scheduler is stopping")
-            return dict(job["result"])
+            with self.asset_cache.lock:
+                for asset in set(task['assets'].values()):
+                    if not (self.root/'assets'/(asset+'.zip')).is_file():
+                        raise ValueError('Synchronize missing asset first: '+asset)
+                    self.asset_cache.touch(asset)
+                with self.condition:
+                    self.accepting_assets.update(task['assets'].values())
+            # Durable request writes must not serialize unrelated cache hits.
+            # This reference belongs to acceptance, independently of the caller
+            # releasing its preparation handoff before publication finishes.
+            try:
+                directory = self.root / "jobs" / identity
+                directory.mkdir()
+                (directory / "request.zip").write_bytes(payload)
+                job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
+                       "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
+                                  "single_thread_weight": task.get('single_thread_weight',1.0),
+                                  "accelerator": task.get('accelerator'),
+                                  "max_retries": task.get('retries',2), "attempts": [],
+                                  "memory_mb": task["memory_mb"], "request_sha256": digest,
+                                  "submitted": time.time(), "started": None, "finished": None,
+                                  "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}})
+                if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
+                    job['result']['requested_accelerator'] = task['accelerator']
+                self._save(job)
+                with self.condition:
+                    stopping = self.stopping
+                    if not stopping:
+                        self.jobs[identity] = job
+                        self.asset_handoffs.pop(identity, None)
+                        self.queue.append(identity)
+                        self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
+                        self.condition.notify_all()
+                if stopping:
+                    shutil.rmtree(directory)
+                    raise Conflict("Scheduler is stopping")
+                return dict(job["result"])
+            finally:
+                with self.asset_cache.lock, self.condition:
+                    self.accepting_assets.clear()
 
     def _queued_candidates(self,budgets):
         """Within a priority, serve the least CPU per resource-share first."""
@@ -1286,6 +1302,7 @@ class Coordinator:
                     else:
                         protected.update(assets)
                 protected.update(asset_references(self.jobs))
+                protected.update(self.accepting_assets)
             for error in self.asset_cache.prune(protected):
                 self.activity.notify('资产缓存待清理 '+error, 'local')
 
@@ -1302,17 +1319,9 @@ class Coordinator:
         if job_id is not None and not _ID.fullmatch(job_id):
             raise ValueError('Job id requires 32 lowercase hex characters')
         path = self.root / "assets" / (identity + ".zip")
-        with self.asset_cache.lock:
-            if payload is not None and not path.is_file():
-                if hashlib.sha256(payload).hexdigest() != identity:
-                    raise ValueError("Asset digest does not match bundle")
-                temporary = path.with_suffix(".upload")
-                try:
-                    temporary.write_bytes(payload)
-                    temporary.replace(path)
-                finally:
-                    unlink(temporary)
-            if path.is_file():
+        def published():
+            exists=path.is_file()
+            if exists:
                 self.asset_cache.touch(identity)
                 if job_id is None:
                     self.legacy_assets.add(identity)
@@ -1320,9 +1329,28 @@ class Coordinator:
                 with self.condition:
                     held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                 self.asset_handoff(job_id, list(set(held) | {identity}))
-            if payload is not None:
-                self._prune_assets()
-            return {"id": identity, "exists": path.is_file()}
+            return {"id": identity, "exists": exists}
+        if payload is None:
+            with self.asset_cache.lock:
+                return published()
+        with self.condition:
+            transfer=self.asset_writes.setdefault(identity,threading.Lock())
+        with transfer:
+            with self.asset_cache.lock:
+                value=published()
+            if not value['exists']:
+                if hashlib.sha256(payload).hexdigest() != identity:
+                    raise ValueError("Asset digest does not match bundle")
+                temporary=path.with_suffix('.upload')
+                try:
+                    temporary.write_bytes(payload)
+                    with self.asset_cache.lock:
+                        temporary.replace(path)
+                        value=published()
+                finally:
+                    unlink(temporary)
+        self._prune_assets()
+        return value
 
     def close(self):
         with self.condition:

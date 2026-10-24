@@ -19,6 +19,17 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
+    def test_returned_auto_task_advice_can_reborrow_without_mutating_its_demand(self):
+        state=self.center([16]);node=state.pool.nodes[0];node.reserved=1
+        job=dict(task=dict(steps=[['echo']],cpus=1,memory_mb=64,project='A'),
+            auto_cpus=True,node=node,cancel=threading.Event(),desired_cpus=1,result=dict(status='running'))
+        state.jobs={'active':job}
+        offer=state.admission(dict(project='A',cpus=0,job_id='active'))
+        self.assertEqual(offer['recommended_cpus'],16)
+        self.assertEqual((job['desired_cpus'],job['task']['cpus'],node.reserved),(1,1,1))
+        job['task']['max_cpus']=4
+        self.assertEqual(state.admission(dict(project='A',cpus=0,job_id='active'))['recommended_cpus'],4)
+
     def center(self, capacities):
         from types import SimpleNamespace
         from remote_compute.client import Node

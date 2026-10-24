@@ -156,6 +156,53 @@ class BulkIOControlTests(unittest.TestCase):
                         client.wait(outcome['id']); client.fetch(outcome['id'])
                 client.fetch(identity)
 
+    def test_center_existing_asset_metadata_stays_responsive_during_other_writes(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
+            with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                known=client.sync_files({'known':b'published immutable input'})
+                original=Path.write_bytes
+                for kind in ('asset','request'):
+                    entered,release=threading.Event(),threading.Event()
+                    def slow(path,data):
+                        if state.root in path.parents and (path.suffix=='.upload' if kind=='asset' else path.name=='request.zip'):
+                            entered.set()
+                            if not release.wait(5):raise AssertionError('Write was not released')
+                        return original(path,data)
+                    action=(lambda:client.sync_files({'new':b'another immutable input'})) if kind=='asset' else (lambda:client.submit(python('print("ok")',assets={'known':known})))
+                    with self.subTest(kind=kind), patch.object(Path,'write_bytes',slow), ThreadPoolExecutor(max_workers=2) as executor:
+                        first=executor.submit(action)
+                        try:
+                            self.assertTrue(entered.wait(3))
+                            self.assertTrue(executor.submit(client.request,'/assets/'+known).result(timeout=1)['exists'])
+                        finally:
+                            release.set()
+                            accepted=first.result(timeout=5)
+                    if kind=='request':
+                        client.wait(accepted['id']);client.fetch(accepted['id'])
+
+    def test_center_acceptance_protects_input_after_producer_releases_its_handoff(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
+            with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):
+                identity='a'*32
+                asset=client.sync_files({'code':b'original input'},job_id=identity)
+                state.asset_cache.limit=0
+                original=Path.write_bytes;entered,release=threading.Event(),threading.Event()
+                def slow(path,data):
+                    if state.root in path.parents and path.name=='request.zip':
+                        entered.set()
+                        if not release.wait(5):raise AssertionError('Write was not released')
+                    return original(path,data)
+                with patch.object(Path,'write_bytes',slow),ThreadPoolExecutor(max_workers=2) as executor:
+                    accepted=executor.submit(client.submit,python('print("ok")',assets={'code':asset}),job_id=identity)
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        executor.submit(client.release_assets,identity).result(timeout=1)
+                        self.assertTrue(client.request('/assets/'+asset,extra_headers={'X-DCO-Asset-Job':identity})['exists'])
+                    finally:release.set()
+                    self.assertEqual(accepted.result(timeout=5)['id'],identity)
+                self.assertEqual(client.wait(identity)['status'],'succeeded')
+                client.fetch(identity)
+
 
 class ArtifactReloadTests(unittest.TestCase):
     def test_legacy_memory_return_only_confirms_an_identical_cpu_grant(self):

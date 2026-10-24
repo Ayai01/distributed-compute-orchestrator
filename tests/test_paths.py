@@ -11,6 +11,16 @@ from remote_compute.worker import Conflict, lock_root
 
 
 class PathTests(unittest.TestCase):
+    def test_valid_shared_ram_marker_needs_no_rewrite_or_writer_privilege(self):
+        from remote_compute.ramdisk import _mark_shared,MARKER
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);_mark_shared(root,8*1024**3)
+            before=(root/MARKER).read_bytes()
+            with patch.object(Path,'write_text',side_effect=PermissionError('reader token')):
+                _mark_shared(root,8*1024**3)
+                with self.assertRaises(PermissionError):_mark_shared(root,16*1024**3)
+            self.assertEqual((root/MARKER).read_bytes(),before)
+
     def test_execution_derives_cache_paths_after_task_environment_override(self):
         from test_compute import provider, python
         with tempfile.TemporaryDirectory() as folder:
