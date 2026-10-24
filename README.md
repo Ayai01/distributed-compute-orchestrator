@@ -25,6 +25,8 @@ python -B main.py --help
 
 所有设备使用同一份源码和启动脚本；角色、地址、端口、预算、工具及路径差异保存在 Git 忽略的 `worker.local.json` 和 `nodes.local.json`。启动优先级为显式 CLI 参数 > 本机配置 > 内置默认值，可用 `--config`、`--nodes` 指定文件；本机配置中的 `mode/host/port/center_port` 同样生效。独立 worker 只需 Python 和本工程，科研目录属于按需登记的共享能力。
 
+独立 worker 开始监听后，已登记它的中心即可自动重连并下发任务，无需在 worker 再手动连接；看板刷新不作为任务受理门槛。worker 重启只把旧未完成任务标记为 `interrupted`，原 ID 的恢复由中心协调。需要从首次受理就限定 CPU 时，在启动前设置本机配置的 `cpus` 或使用 `--cpus N`；运行中修改预算会保存，已接受任务保留原授予直至归还。
+
 服务保持一个可见前台终端，窗口可失焦或最小化。聊天应用或编辑器主窗口可见，不代表其中的工具终端可见。`--headless` / `--no-browser` 仅表示不弹浏览器；DCO本身为终端服务，这两个同义选项不改变看板或服务。只关闭交互看板使用 `--no-dashboard`，仍保留前台日志和终端要求。隐藏窗口、重定向输入输出、nohup 和无终端 systemd/计划任务会在启动检查中退出。一次性 CLI、Python API 和测试支持管道。桌面自启动使用登录后终端快捷方式；Linux `.desktop` 使用 `Terminal=true`。旧隐藏服务先保留在途任务和未领取结果，排空后从可见入口迁回。
 
 Windows 常驻服务通过具名的 SYSTEM/EXECUTION 电源请求阻止自动休眠和执行挂起，显示器仍按系统设置熄屏；Linux 在有 systemd-logind 的环境持有 idle 抑制锁。请求由托管父进程与服务子进程分别持有，随进程退出释放。Windows关闭服务窗口、POSIX终端挂断或SIGTERM会请求正常退出，取消本入口持有的任务并保留原ID回执；关闭另开的`--url`看板只结束该看板及其自有操作。每个端点只开一个交互窗口。端口冲突显示 PID/命令，可选择 `reuse/kill/admin-kill/cancel`；默认Cancel只取消本次启动，保留旧服务，显式reuse才连接旧实例。结束进程前核对其任务。
