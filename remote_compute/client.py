@@ -377,10 +377,11 @@ class Client:
         if max_cpus is not None:
             request['max_cpus'] = max_cpus
         if job_id is not None:request['job_id']=job_id
+        # Both forms ask for advice; unlike a resource resize, neither changes a grant.
         if os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'):
             identity=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',os.environ['REMOTE_COMPUTE_JOB_ID'])
-            return self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission'))
-        return self.request('/admission',request)
+            return self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission')))
+        return self._read_reconnecting(lambda:self.request('/admission',request))
 
     def window(self, project, **options):
         from .admission import AdmissionWindow
@@ -424,12 +425,30 @@ class Client:
     def delete(self, identity):
         return self.request("/jobs/" + identity, method="DELETE")
 
+    def _read_reconnecting(self, read, *, deadline=None):
+        """Keep an existing observation across a bounded transport outage."""
+        expires=time.monotonic()+max(120,self.timeout)
+        if deadline is not None:expires=min(expires,deadline)
+        delay=.2
+        while True:
+            try:
+                return read()
+            except RemoteError as error:
+                transient=(getattr(error,'status_code',None) in (502,503)
+                           or getattr(error,'transport_retryable',False))
+                remaining=expires-time.monotonic()
+                if not transient or remaining<=0:
+                    raise
+                time.sleep(min(delay,remaining))
+                delay=min(5,delay*2)
+
     def wait(self, identity, *, poll=0.15, wait_timeout=None):
         started = time.monotonic()
+        deadline=None if wait_timeout is None else started+wait_timeout
         while True:
-            result = self.status(identity, brief=True)
+            result = self._read_reconnecting(lambda:self.status(identity,brief=True),deadline=deadline)
             if result["status"] in TERMINAL:
-                result = self.status(identity)
+                result = self._read_reconnecting(lambda:self.status(identity),deadline=deadline)
                 result["url"] = self.url
                 return result
             if wait_timeout is not None and time.monotonic() - started >= wait_timeout:
@@ -445,22 +464,7 @@ class Client:
             if backend is None:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None)))
             backend.timeout=max(120,self.timeout)
-        deadline=time.monotonic()+max(120,self.timeout)
-        delay=.2
-        while True:
-            try:
-                return backend.request("/jobs/" + identity + "/artifacts", binary=True)
-            except RemoteError as error:
-                # A drained provider can reload while its completed results
-                # are being collected. Retry only this read of the original ID;
-                # submit, resource leases and permanent HTTP errors never replay.
-                transient=(getattr(error,'status_code',None) in (502,503)
-                           or getattr(error,'transport_retryable',False))
-                remaining=deadline-time.monotonic()
-                if not transient or remaining<=0:
-                    raise
-                time.sleep(min(delay,remaining))
-                delay=min(1,delay*2)
+        return self._read_reconnecting(lambda:backend.request("/jobs/"+identity+"/artifacts",binary=True))
 
     def fetch(self, identity, output_dir=None, *, delete=True):
         raw = self.artifacts(identity)

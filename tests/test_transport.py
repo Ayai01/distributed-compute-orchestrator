@@ -310,6 +310,84 @@ def slow_upload_server(*, interrupt=False, started=None):
         server.shutdown();thread.join();server.server_close()
 
 
+class StatusReadReconnectTests(unittest.TestCase):
+    @staticmethod
+    def outage(status=None):
+        error=RemoteError('temporary status connection loss')
+        if status is None:error.transport_retryable=True
+        else:error.status_code=status
+        return error
+
+    def test_wait_recovers_after_both_http_status_attempts_drop(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            identity=client.submit(python("print('paid once')"))['id']
+            original=Handler._reply;dropped=[]
+            def reply(handler,value,status=200):
+                if handler.command=='GET' and handler.path=='/jobs/'+identity and len(dropped)<2:
+                    dropped.append(identity);handler.close_connection=True;return
+                return original(handler,value,status)
+            with patch.object(Handler,'_reply',reply):
+                result=client.wait(identity,wait_timeout=5)
+            self.assertEqual(dropped,[identity,identity])
+            self.assertEqual(list(worker.jobs),[identity])
+            self.assertEqual(result['stdout'].strip(),'paid once')
+            self.assertEqual(client.fetch(identity)['id'],identity)
+
+    def test_wait_recovers_terminal_receipt_without_changing_id(self):
+        client=Client();identity='a'*32
+        receipt=dict(id=identity,status='succeeded',cpu_seconds=7)
+        with patch.object(client,'status',side_effect=[dict(id=identity,status='succeeded'),self.outage(503),receipt]) as status,patch('remote_compute.client.time.sleep'):
+            self.assertEqual(client.wait(identity),dict(receipt,url=client.url))
+        self.assertEqual([call.args for call in status.call_args_list],[(identity,)]*3)
+
+    def test_wait_does_not_retry_a_missing_original(self):
+        client=Client();error=self.outage(404)
+        with patch.object(client,'status',side_effect=error) as status,patch('remote_compute.client.time.sleep') as sleep:
+            with self.assertRaises(RemoteError) as caught:client.wait('b'*32)
+        self.assertIs(caught.exception,error)
+        self.assertEqual(status.call_count,1);sleep.assert_not_called()
+
+    def test_wait_reconnect_preserves_the_callers_deadline(self):
+        client=Client();clock=[0.];error=self.outage()
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(client,'status',side_effect=error),patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+            with self.assertRaises(RemoteError) as caught:client.wait('c'*32,wait_timeout=.3)
+        self.assertIs(caught.exception,error)
+        self.assertAlmostEqual(clock[0],.3)
+
+    def test_admission_recovers_only_the_same_readonly_advice(self):
+        client=Client();grant=dict(current=3,maximum=8)
+        with patch.object(client,'request',side_effect=[self.outage(502),grant]) as request,patch('remote_compute.client.time.sleep'):
+            self.assertEqual(client.admission('RGCN',cpus=1,requires=['ng47']),grant)
+        self.assertEqual(request.call_count,2)
+        self.assertEqual(request.call_args_list[0],request.call_args_list[1])
+        self.assertEqual(request.call_args.args[0],'/admission')
+
+    def test_forwarded_admission_reconnect_remains_an_advice_operation(self):
+        client=Client();identity='d'*32
+        environment=dict(REMOTE_COMPUTE_LEASE='1',REMOTE_COMPUTE_URL=client.url,
+                         REMOTE_COMPUTE_JOB_ID='e'*32,REMOTE_COMPUTE_WORKER_JOB_ID=identity)
+        with patch.dict(os.environ,environment),patch.object(client,'request',side_effect=[self.outage(),dict(current=2)]) as request,patch('remote_compute.client.time.sleep'):
+            self.assertEqual(client.admission('ARH-DSE')['current'],2)
+        self.assertEqual(request.call_args_list[0],request.call_args_list[1])
+        self.assertEqual(request.call_args.args[0],'/jobs/'+identity+'/lease')
+        self.assertEqual(request.call_args.args[1]['_operation'],'admission')
+
+    def test_admission_permanent_error_is_immediate(self):
+        client=Client();error=self.outage(403)
+        with patch.object(client,'request',side_effect=error) as request,patch('remote_compute.client.time.sleep') as sleep:
+            with self.assertRaises(RemoteError):client.admission('RGCN')
+        self.assertEqual(request.call_count,1);sleep.assert_not_called()
+
+    def test_admission_outage_has_a_finite_window(self):
+        client=Client();clock=[0.]
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(client,'request',side_effect=self.outage()) as request,patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+            with self.assertRaises(RemoteError):client.admission('RGCN')
+        self.assertAlmostEqual(clock[0],120.)
+        self.assertLess(request.call_count,40)
+
+
 class TransportTests(unittest.TestCase):
     def test_resource_lease_waits_past_normal_timeout_without_extending_other_requests(self):
         identity = 'a'*32
