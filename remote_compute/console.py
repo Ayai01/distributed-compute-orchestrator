@@ -343,6 +343,55 @@ class FocusRefresh:
         return refresh
 
 
+class _StatusReader:
+    """One pending read; the terminal keeps painting the last complete snapshot."""
+    def __init__(self, read):
+        self.read = read
+        self.lock = threading.Lock()
+        self.wakeup = threading.Event()
+        self.pending, self.closed = True, False
+        self.result = (0, None, None)
+        self.wakeup.set()
+        self.thread = threading.Thread(target=self._run, name='console-status', daemon=True)
+        self.thread.start()
+
+    def request(self):
+        with self.lock:
+            if self.pending or self.closed:
+                return False
+            self.pending = True
+            self.wakeup.set()
+            return True
+
+    def snapshot(self):
+        with self.lock:
+            return self.result
+
+    def _run(self):
+        while True:
+            self.wakeup.wait()
+            self.wakeup.clear()
+            with self.lock:
+                if self.closed:
+                    return
+                read = self.read
+            try:
+                value, error = read(), None
+            except Exception as failure:
+                value, error = None, str(failure)
+            with self.lock:
+                if self.closed:
+                    return
+                self.result = (self.result[0]+1, value, error)
+                self.pending = False
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            self.read, self.result = None, (0, None, None)
+            self.wakeup.set()
+
+
 class _PosixKeyboard:
     """Translate ordinary terminal keys to the dashboard's existing key codes."""
     def __init__(self):
@@ -421,10 +470,13 @@ class Dashboard:
         empty_tab = False
         completion = CommandCompletion()
         painter=state.get('painter') or RowPainter()
-        rows, events, value = [], [], {}
+        rows, events, value = ['正在获取状态…'], [], {}
         revision, cached_key, body = 0, None, []
         context_key, context = None, None
         stdout, stderr, shell_stdout = sys.stdout, sys.stderr, self.shell.stdout
+        reader = _StatusReader(self.health)
+        received, first_refresh = 0, True
+        pending_since, waiting = time.monotonic(), False
         try:
             sys.stdout = sys.stderr = self.shell.stdout = self
             if _state is None:
@@ -436,15 +488,30 @@ class Dashboard:
                     if not self.alive():
                         break
                     now = time.monotonic()
-                    if refresh.due(now, focus(), force=last == 0):
+                    source_revision, snapshot, error = reader.snapshot()
+                    if source_revision != received:
+                        received, pending_since = source_revision, None
                         try:
-                            value = self.health()
-                            rows = format_status(value, self.url)
+                            if error is not None:
+                                raise RuntimeError(error)
+                            status = format_status(snapshot, self.url)
+                            value, rows = snapshot, status
                             events = format_notices(value)
-                        except (OSError, RuntimeError, ValueError) as error:
-                            rows = ['连接状态: ' + str(error)]
+                        except (OSError, RuntimeError, ValueError) as failure:
+                            notice = '连接状态: ' + str(failure)
+                            if not value:
+                                rows = [notice]
+                            events = format_notices(value)+[notice]
                         revision += 1
+                    if refresh.due(now, focus(), force=last == 0):
+                        if not first_refresh and reader.request():
+                            pending_since = now
+                        first_refresh = False
                         last = now
+                    reading = pending_since is not None and now-pending_since >= 2
+                    if reading != waiting:
+                        waiting = reading
+                        revision += 1
                     columns, height = size()
                     self.columns = columns
                     # The command footer owns the last five rows.  The final
@@ -462,7 +529,8 @@ class Dashboard:
                             if isinstance(rows,StatusRows):
                                 rows.resize(columns-1)
                                 rows.task_page=task_page
-                            visible = _layout(rows,events,output,height,reserved=reserved)
+                            notices = events+(['状态读取中，显示最近快照'] if waiting else [])
+                            visible = _layout(rows,notices,output,height,reserved=reserved)
                             if isinstance(rows,StatusRows):
                                 task_page=rows.task_page
                             for index,text in enumerate(visible):
@@ -555,6 +623,7 @@ class Dashboard:
                     self.write('已返回操作终端。\n')
             return True
         finally:
+            reader.close()
             sys.stdout, sys.stderr, self.shell.stdout = stdout, stderr, shell_stdout
             try:
                 if _state is None:

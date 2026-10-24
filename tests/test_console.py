@@ -9,13 +9,14 @@ import os
 import re
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.cli import Shell
 from remote_compute.console import (Dashboard, FocusRefresh, RowPainter, CommandCompletion,
     format_status, _enable_ansi, _initial_size, _input_view, _layout, _width, _clip,
-    _command_rows, _console_size_probe, _paint_row)
+    _command_rows, _console_size_probe, _paint_row, _StatusReader)
 from remote_compute.commands import SchedulerShell, WorkerShell
 
 
@@ -298,6 +299,107 @@ class ConsoleTests(unittest.TestCase):
                 patch.object(RowPainter,'frame',paint):
             Dashboard(OperatorShell(),lambda:dict(role='worker',cpus=24)).run()
         self.assertEqual(seen[:3],[(160,51),(80,12),(120,24)])
+
+    def test_blocked_initial_status_keeps_resize_and_commands_responsive(self):
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        calls=[];frames=[];geometry=[160,51];shell=OperatorShell()
+        def read():
+            calls.append(1);entered.set()
+            try:
+                release.wait(3)
+                return dict(role='worker',node='device',cpus=8)
+            finally:returned.set()
+        original=RowPainter.frame
+        def paint(painter,rows,columns,height,cursor):
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(returned.is_set())
+            self.assertIn('正在获取状态','\n'.join(rows))
+            self.assertTrue(rows[-2].startswith('test> '))
+            frames.append((columns,height))
+            result=original(painter,rows,columns,height,cursor)
+            geometry[:]=(80,12) if len(frames)==1 else (120,24)
+            return result
+        try:
+            with redirect_stdout(io.StringIO()),patch.dict(sys.modules,msvcrt=Keyboard([*'ping\rquit\r'])), \
+                    patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                    patch('remote_compute.console.time.sleep'), \
+                    patch.object(FocusRefresh,'due',return_value=True), \
+                    patch('remote_compute.console.shutil.get_terminal_size',side_effect=lambda *_:os.terminal_size(geometry)), \
+                    patch.object(RowPainter,'frame',paint):
+                Dashboard(shell,read).run()
+            self.assertEqual(shell.completed,1)
+            self.assertEqual(calls,[1])
+            self.assertEqual(frames[:3],[(160,51),(80,12),(120,24)])
+        finally:
+            release.set();self.assertTrue(returned.wait(1))
+
+    def test_slow_status_retains_last_frame_through_failure_and_recovers(self):
+        blocked,release=threading.Event(),threading.Event()
+        keyboard=Keyboard([]);calls=[];seen=set();geometry=[160,32]
+        deadline=time.monotonic()+4;original=RowPainter.frame
+        def read():
+            calls.append(1)
+            if len(calls)==2:
+                blocked.set();release.wait(3)
+                raise OSError('temporary-read')
+            return dict(role='worker',node='oldnode' if len(calls)==1 else 'newnode',cpus=8)
+        def paint(painter,rows,columns,height,cursor):
+            text='\n'.join(rows)
+            if blocked.is_set() and not release.is_set():
+                self.assertIn('oldnode',text)
+                seen.add('cached');geometry[:]=(100,24);release.set()
+            if 'temporary-read' in text:
+                self.assertIn('oldnode',text);seen.add('error')
+            if 'newnode' in text and 'error' in seen and 'recovered' not in seen:
+                self.assertNotIn('temporary-read',text)
+                seen.add('recovered');keyboard.keys.extend('ping\rquit\r')
+            self.assertTrue(rows[-2].startswith('test> '))
+            return original(painter,rows,columns,height,cursor)
+        try:
+            with redirect_stdout(io.StringIO()),patch.dict(sys.modules,msvcrt=keyboard), \
+                    patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                    patch('remote_compute.console.time.sleep',side_effect=lambda _:threading.Event().wait(.001)), \
+                    patch.object(FocusRefresh,'due',return_value=True), \
+                    patch('remote_compute.console.shutil.get_terminal_size',side_effect=lambda *_:os.terminal_size(geometry)), \
+                    patch.object(RowPainter,'frame',paint):
+                shell=OperatorShell()
+                Dashboard(shell,read,alive=lambda:time.monotonic()<deadline).run()
+            self.assertEqual(seen,{'cached','error','recovered'})
+            self.assertEqual(shell.completed,1)
+        finally:release.set()
+
+    def test_status_reader_close_does_not_wait_for_a_blocked_read_or_queue_another(self):
+        entered,release=threading.Event(),threading.Event();calls=[]
+        def read():
+            calls.append(1);entered.set();release.wait(3)
+            return dict(cpus=8)
+        reader=_StatusReader(read)
+        try:
+            self.assertTrue(entered.wait(1))
+            for _ in range(40):self.assertFalse(reader.request())
+            reader.close()
+            self.assertTrue(reader.thread.is_alive())
+            self.assertFalse(reader.request())
+            self.assertEqual(reader.snapshot(),(0,None,None))
+            self.assertEqual(calls,[1])
+        finally:
+            release.set();reader.close();reader.thread.join(1)
+        self.assertFalse(reader.thread.is_alive())
+
+    def test_status_reader_failure_can_recover_without_retaining_an_exception(self):
+        from test_compute import until
+        read=Mock(side_effect=[OSError('temporary-read'),dict(cpus=8)])
+        reader=_StatusReader(read)
+        try:
+            until(lambda:reader.snapshot()[0]==1)
+            self.assertEqual(reader.snapshot(),(1,None,'temporary-read'))
+            self.assertTrue(reader.request())
+            until(lambda:reader.snapshot()[0]==2)
+            self.assertEqual(reader.snapshot(),(2,dict(cpus=8),None))
+            self.assertEqual(read.call_count,2)
+        finally:
+            reader.close();reader.thread.join(1)
+        self.assertFalse(reader.thread.is_alive())
 
     def test_visible_viewport_ignores_large_buffer_and_environment_dimensions(self):
         kernel = Mock()
