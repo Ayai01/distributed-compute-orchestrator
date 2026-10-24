@@ -830,7 +830,7 @@ class Coordinator:
             if not uncertain and job['cancel'].is_set():return False
             submitting=False
             try:
-                with self._asset_handoff(node,identity,job['task']['assets'].values(),enabled=force):
+                with self._asset_handoff(node,identity,job['task']['assets'].values(),enabled=bool(job['task']['assets'])):
                     self._ensure_assets(node, job['task']['assets'].values(), force=force,
                                         cancel=None if uncertain else job['cancel'].is_set)
                     if not uncertain and job['cancel'].is_set():return False

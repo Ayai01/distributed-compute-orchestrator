@@ -23,14 +23,59 @@ from test_compute import provider, python, scratch, until
 
 
 class BulkIOControlTests(unittest.TestCase):
+    def test_shutdown_during_unpack_does_not_publish_or_leave_an_upload(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            payload=pack({'model':b'original weights'});asset=hashlib.sha256(payload).hexdigest()
+            entered,release=threading.Event(),threading.Event()
+            def delayed(data,directory):
+                entered.set();release.wait(5);return unpack(data,directory)
+            with patch('remote_compute.worker.unpack',side_effect=delayed),ThreadPoolExecutor(max_workers=1) as transfers:
+                pending=transfers.submit(client.request,'/assets/'+asset,payload)
+                try:
+                    self.assertTrue(entered.wait(2));worker.close()
+                finally:release.set()
+                with self.assertRaisesRegex(RemoteError,'Worker is stopping'):pending.result(timeout=3)
+            self.assertFalse((worker.root/'assets'/asset).exists())
+            self.assertFalse((worker.root/'assets'/(asset+'.upload')).exists())
+            self.assertFalse(worker.asset_writes)
+
+    def test_slow_unpack_does_not_block_other_assets_or_jobs_and_same_id_unpacks_once(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            payload=pack({'large':b'original immutable model'});asset=hashlib.sha256(payload).hexdigest()
+            entered,release=threading.Event(),threading.Event();unpacks=[]
+            def delayed(data,directory):
+                if data==payload:
+                    unpacks.append(asset);entered.set();release.wait(5)
+                return unpack(data,directory)
+            with patch('remote_compute.worker.unpack',side_effect=delayed),ThreadPoolExecutor(max_workers=3) as transfers:
+                first=transfers.submit(client.request,'/assets/'+asset,payload)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    duplicate=transfers.submit(client.request,'/assets/'+asset,payload)
+                    small=transfers.submit(client.sync_files,{'small':b'other input'}).result(timeout=2)
+                    identity=transfers.submit(client.submit,python('print("ready")',assets={'data':small})).result(timeout=2)['id']
+                    self.assertEqual(client.wait(identity)['status'],'succeeded')
+                    self.assertEqual(client.fetch(identity)['stdout'].strip(),'ready')
+                    self.assertFalse(first.done());self.assertFalse(duplicate.done())
+                finally:
+                    release.set();first.result(timeout=3)
+                self.assertTrue(duplicate.result(timeout=3)['exists'])
+            self.assertEqual(unpacks,[asset]);self.assertFalse(worker.asset_writes)
+
     def test_waiting_asset_metadata_keeps_a_control_connection_available(self):
-        with scratch() as directory, provider(Path(directory)/'worker') as (_, client):
+        with scratch() as directory, provider(Path(directory)/'worker') as (worker, client):
             entered, release = threading.Event(), threading.Event()
+            original_asset=worker.asset
+            def metadata(identity,payload=None,**options):
+                if identity in {format(i,'064x') for i in range(7)}:
+                    release.wait(5)
+                return original_asset(identity,payload,**options)
             def slow(*args, **kwargs):
                 entered.set()
                 if not release.wait(5):raise AssertionError('Unpack was not released')
                 return unpack(*args, **kwargs)
-            with patch('remote_compute.worker.unpack', side_effect=slow), ThreadPoolExecutor(max_workers=10) as executor:
+            # Saturate metadata connections without depending on a global unpack lock.
+            with patch.object(worker,'asset',side_effect=metadata),patch('remote_compute.worker.unpack', side_effect=slow), ThreadPoolExecutor(max_workers=10) as executor:
                 upload = executor.submit(client.sync_files, {'data':b'original data'})
                 try:
                     self.assertTrue(entered.wait(3))

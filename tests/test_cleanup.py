@@ -203,7 +203,7 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue((worker.root/'assets'/active).exists())
             client.cancel(first);client.wait(first);client.fetch(first)
 
-    def test_slow_asset_handoff_survives_collection_after_both_upload_attempts(self):
+    def test_first_asset_handoff_survives_collection_without_reupload(self):
         self._slow_asset_handoff()
 
     def test_private_worker_has_the_same_slow_asset_handoff(self):
@@ -217,7 +217,10 @@ class CleanupTests(unittest.TestCase):
                 source=client.sync_files({'code.txt':b'source'})
                 model=client.sync_files({'data.txt':b'model'})
                 original=pool.nodes[0].client.submit_bundle
-                attempts=[]
+                original_asset=worker.asset;attempts=[];uploads=[]
+                def counted(asset,payload=None,**options):
+                    if payload is not None:uploads.append(asset)
+                    return original_asset(asset,payload,**options)
                 def delayed(identity,payload,**options):
                     # A collector can run after the five-second upload grace,
                     # while this request is still crossing the network.
@@ -229,12 +232,13 @@ class CleanupTests(unittest.TestCase):
                     return original(identity,payload,**options)
                 task=python("from pathlib import Path;print(Path(r'${asset:code}/code.txt').read_text()+Path(r'${asset:model}/data.txt').read_text())",
                             assets={'code':source,'model':model},retries=0)
-                with patch.object(pool.nodes[0].client,'submit_bundle',side_effect=delayed):
+                with patch.object(worker,'asset',side_effect=counted),patch.object(pool.nodes[0].client,'submit_bundle',side_effect=delayed):
                     identity=client.submit(task)['id']
                     result=client.wait(identity)
                 self.assertEqual(result['status'],'succeeded',result.get('error'))
                 self.assertEqual(set(attempts),{identity})
-                self.assertEqual(len(attempts),2)
+                self.assertEqual(len(attempts),1)
+                self.assertEqual(sorted(uploads),sorted([source,model]))
                 self.assertEqual(client.fetch(identity)['stdout'].strip(),'sourcemodel')
                 self.assertFalse(worker.asset_handoffs)
                 with worker.condition:

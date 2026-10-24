@@ -19,6 +19,7 @@ import ssl
 import sys
 import threading
 import time
+import weakref
 import zipfile
 from urllib.parse import unquote
 
@@ -236,6 +237,7 @@ class Worker:
         self.threads = set()
         self.cleanup_pending = set()
         self.asset_handoffs = {}
+        self.asset_writes = weakref.WeakValueDictionary()
         for path in (self.root / "jobs").glob("*/result.json"):
             saved = json.loads(path.read_text(encoding="utf-8"))
             if clean_tool_snapshot(saved):
@@ -971,20 +973,10 @@ class Worker:
         if job_id is not None and not _ID.fullmatch(job_id):
             raise ValueError('Job id requires 32 lowercase hex characters')
         directory = self.root / "assets" / identity
-        with self.asset_cache.lock:
-            started = time.monotonic()
-            if payload is not None and not directory.is_dir():
-                if hashlib.sha256(payload).hexdigest() != identity:
-                    raise ValueError("Asset digest does not match bundle")
-                temporary = directory.with_suffix(".upload")
-                try:
-                    temporary.mkdir(exist_ok=True)
-                    unpack(payload, temporary)
-                    temporary.replace(directory)
-                finally:
-                    if temporary.exists():
-                        remove_owned(temporary)
-            if directory.is_dir():
+        started = time.monotonic()
+        def published():
+            exists = directory.is_dir()
+            if exists:
                 self.asset_cache.touch(identity)
             with self.condition:
                 now=time.monotonic()
@@ -994,7 +986,31 @@ class Worker:
                 if job_id is not None:
                     held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                     self.asset_handoff(job_id, list(set(held) | {identity}))
-            return {"id": identity, "exists": directory.is_dir()}
+            return {"id": identity, "exists": exists}
+        if payload is None:
+            with self.asset_cache.lock:
+                return published()
+        with self.asset_cache.lock:
+            transfer = self.asset_writes.setdefault(identity, threading.Lock())
+        # Slow unpacking owns only this content ID, not every asset or job submit.
+        with transfer:
+            with self.asset_cache.lock:
+                if directory.is_dir():
+                    return published()
+            if hashlib.sha256(payload).hexdigest() != identity:
+                raise ValueError("Asset digest does not match bundle")
+            temporary = directory.with_suffix(".upload")
+            try:
+                temporary.mkdir(exist_ok=True)
+                unpack(payload, temporary)
+                with self.asset_cache.lock:
+                    if self.stopping:
+                        raise Conflict('Worker is stopping')
+                    temporary.replace(directory)
+                    return published()
+            finally:
+                if temporary.exists():
+                    remove_owned(temporary)
 
     def close(self):
         with self.condition:
