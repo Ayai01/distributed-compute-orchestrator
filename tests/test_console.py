@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 from remote_compute.cli import Shell
 from remote_compute.console import (Dashboard, FocusRefresh, RowPainter, CommandCompletion,
     format_status, _enable_ansi, _initial_size, _input_view, _layout, _width, _clip,
-    _command_rows, _console_size_probe, _paint_row, _StatusReader)
+    _command_rows, _console_size_probe, _paint_row, _StatusReader, _present_console)
 from remote_compute.commands import SchedulerShell, WorkerShell
 
 
@@ -280,6 +280,42 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(painter.rows[-2].startswith('test> quit'))
         for code in ('\x1b[2J','\x1b[?1049h','\x1b[?1049l'):
             self.assertNotIn(code,stream.getvalue())
+
+    def test_startup_presents_one_complete_frame_before_incremental_updates(self):
+        class Terminal(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.writes = []
+            def isatty(self):
+                return True
+            def write(self, text):
+                self.writes.append(text)
+                return super().write(text)
+        stream = Terminal()
+        presented = []
+        def present():
+            first = stream.writes[-1]
+            self.assertTrue(first.startswith('\x1b[?1049h\x1b[2J\x1b[H'))
+            self.assertIn('test> ', first)
+            self.assertIn('\x1b[24;1H', first)
+            presented.append(first)
+        with redirect_stdout(stream), \
+                patch.dict(sys.modules,msvcrt=Keyboard([*'ping\rquit\r'])), \
+                patch('remote_compute.console.os.name','nt'), \
+                patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                patch('remote_compute.console._initial_size'), \
+                patch('remote_compute.console._console_width_probe',return_value=(None,lambda:None)), \
+                patch('remote_compute.console._console_size_probe',return_value=lambda:os.terminal_size((120,24))), \
+                patch('remote_compute.console._focus_probe',return_value=lambda:True), \
+                patch('remote_compute.console._present_console',side_effect=present), \
+                patch('remote_compute.console.time.sleep'):
+            shell = OperatorShell()
+            Dashboard(shell,lambda:dict(role='worker',node='Aya1-ITX',cpus=8)).run()
+        self.assertEqual(shell.completed, 1)
+        self.assertEqual(len(presented), 1)
+        self.assertEqual(stream.getvalue().count('\x1b[?1049h'), 1)
+        self.assertEqual(stream.getvalue().count('\x1b[?1049l'), 1)
+        self.assertTrue(all('\x1b[2J' not in text for text in stream.writes[1:]))
 
     def test_window_resize_reflows_content_without_losing_the_bottom_input(self):
         geometry, seen = [160,51], []
@@ -754,6 +790,21 @@ class ConsoleTests(unittest.TestCase):
         with patch.object(ctypes,'WinDLL',create=True,side_effect=lambda name:kernel if name=='kernel32' else user):
             self.assertFalse(_initial_size())
         kernel.SetConsoleScreenBufferSize.assert_not_called()
+
+    def test_startup_repaint_targets_only_the_visible_classic_console(self):
+        kernel,user=Mock(),Mock()
+        kernel.GetConsoleWindow.return_value=2**40+7
+        user.IsWindowVisible.return_value=True
+        user.RedrawWindow.return_value=True
+        with patch.object(ctypes,'WinDLL',create=True,side_effect=lambda name:kernel if name=='kernel32' else user):
+            self.assertTrue(_present_console())
+            user.RedrawWindow.assert_called_once_with(2**40+7,None,None,0x0081)
+            user.RedrawWindow.reset_mock()
+            user.IsWindowVisible.return_value=False
+            self.assertFalse(_present_console())
+            kernel.GetConsoleWindow.return_value=None
+            self.assertFalse(_present_console())
+        user.RedrawWindow.assert_not_called()
 
     def test_small_dashboard_keeps_both_devices_and_tasks_visible(self):
         nodes=[]

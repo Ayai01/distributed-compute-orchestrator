@@ -297,6 +297,21 @@ def _initial_size(columns=160, rows=50):
     return bool(kernel.SetConsoleWindowInfo(handle,True,c.byref(Rect(0,0,width-1,height-1))))
 
 
+def _present_console():
+    """Invalidate the classic host once after the new screen is fully written."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    kernel, user = c.WinDLL('kernel32'), c.WinDLL('user32')
+    kernel.GetConsoleWindow.restype = w.HWND
+    user.IsWindowVisible.argtypes = [w.HWND]
+    user.RedrawWindow.argtypes = [w.HWND, c.POINTER(w.RECT), w.HRGN, w.UINT]
+    window = kernel.GetConsoleWindow()
+    if not window or not user.IsWindowVisible(window):
+        return False  # ConPTY owns its visible window and its rendering.
+    # Post a paint without erasing the background or waiting on the host.
+    return bool(user.RedrawWindow(window, None, None, 0x0001 | 0x0080))
+
+
 def _focus_probe():
     if os.name!='nt':return lambda:True
     import ctypes
@@ -477,11 +492,10 @@ class Dashboard:
         reader = _StatusReader(self.health)
         received, first_refresh = 0, True
         pending_since, waiting = time.monotonic(), False
+        opening = '\x1b[?1049h\x1b[2J\x1b[H' if _state is None else ''
+        opened = False
         try:
             sys.stdout = sys.stderr = self.shell.stdout = self
-            if _state is None:
-                self.stream.write('\x1b[?1049h\x1b[2J')
-                self.stream.flush()
             size = _console_size_probe() if os.name=='nt' and self.stream.isatty() else lambda: shutil.get_terminal_size((110, 32))
             while True:
                 try:
@@ -548,9 +562,15 @@ class Dashboard:
                     # not let a status/output refresh consume its last row.
                     footer = footer[-reserved:] + ([''] * max(0, reserved-len(footer)))
                     frame = painter.frame(body+footer,columns,height,column)
-                    if frame:
-                        self.stream.write(frame)
+                    if frame or opening:
+                        # Present the complete new screen with the buffer switch;
+                        # later frames can reuse the unchanged rows.
+                        self.stream.write(opening + frame)
                         self.stream.flush()
+                        if opening:
+                            opened, opening = True, ''
+                            if os.name == 'nt' and self.stream.isatty():
+                                _present_console()
                     while msvcrt.kbhit():
                         key = msvcrt.getwch()
                         if key not in ('\t', '\x00', '\xe0'):
@@ -626,7 +646,7 @@ class Dashboard:
             reader.close()
             sys.stdout, sys.stderr, self.shell.stdout = stdout, stderr, shell_stdout
             try:
-                if _state is None:
+                if opened:
                     self.stream.write('\x1b[?1049l')
                     self.stream.flush()
             finally:
