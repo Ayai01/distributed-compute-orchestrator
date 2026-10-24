@@ -4,7 +4,7 @@
 
 ## 设备与能力
 
-192.168.1.11为Aya1-ITX，2026-10-23按用户要求排空并正常关机：中心新派发关闭，16条原任务安全收齐/退役；Y3在完整批次边界暂停，128个搜索设计及20/24正式设计、原费用与剩余4个正式设计的预算/恢复状态保留。Windows关机明确不强制结束应用，系统及DCO端口均已离线；节点保持禁用，停后不探测、唤醒或同步。证明见维护`state.json.ITX_graceful_shutdown`。ITX设备16线程曾受中心遗留limit=8截断，已将该路由上限恢复为自动；配置和在线中心均已更新，实测capacity/reserved/used均达到16。PC、TX与ITX的Windows能力页一致：`ng47 RTL Chisel CIRCT C++ ONNX Py ML Layout bison flex m4 make`；ku26s保留其Linux工具差异，按完整语义能力组合准入。
+192.168.1.11为Aya1-ITX，2026-10-23按用户要求排空并正常关机：中心新派发关闭，16条原任务安全收齐/退役；Y3在完整批次边界暂停，128个搜索设计及20/24正式设计、原费用与剩余4个正式设计的预算/恢复状态保留。Windows关机明确不强制结束应用，系统及DCO端口均已离线；该次关机为历史状态。用户随后手动开机，并于2026-10-24（UTC）确认应正常上线；旧关机限制已撤销，当前目标为正常参与DCO调度，前台服务启动后沿用核心重连接入。证明见维护`state.json.ITX_graceful_shutdown`。ITX设备16线程曾受中心遗留limit=8截断，已将该路由上限恢复为自动；配置和在线中心均已更新，实测capacity/reserved/used均达到16。PC、TX与ITX的Windows能力页一致：`ng47 RTL Chisel CIRCT C++ ONNX Py ML Layout bison flex m4 make`；ku26s保留其Linux工具差异，按完整语义能力组合准入。
 
 四节点已有科学Python、PyG、ONNX、SPICE及RTL实测。Windows版图环境复用已有安装，ku26s额外提供HSPICE。能力不携带引擎哈希，不按设备或OS限制科研路由；旧别名仅服务原请求兼容。证明见`.local/maintenance/continuous-supervision-20261023/capability-alignment-proof.json`与`state.json`。
 
