@@ -9,8 +9,70 @@ from remote_compute import Pool
 from remote_compute.benchmark import BATCH, NAME, _sample, measure
 from remote_compute.client import Node
 from remote_compute.resources import cpu_benchmark
+from remote_compute import resources
 from remote_compute.view import _capabilities, format_status, _width
 from test_compute import provider, scratch
+
+
+class CpuAccountingTests(unittest.TestCase):
+    def test_pdh_rate_warmup_is_nonblocking(self):
+        reader=resources._WindowsFrequency.__new__(resources._WindowsFrequency)
+        reader.started=10
+        reader.api=Mock()
+        with patch.object(resources.time,'monotonic',return_value=10.5):
+            self.assertIsNone(reader())
+        reader.api.PdhCollectQueryData.assert_not_called()
+
+    def test_only_task_cpu_deltas_are_frequency_weighted(self):
+        with patch.object(resources,'cpu_frequency',return_value=dict(ghz=3,source='test')):
+            meter=resources.CpuAccounting()
+            first=meter.update(2)
+            idle=meter.update(2)
+        with patch.object(resources,'cpu_frequency',return_value=dict(ghz=5,source='test')):
+            final=meter.update(3)
+        self.assertEqual(first['cpu_work_ghz_seconds'],6)
+        self.assertEqual(idle['cpu_work_ghz_seconds'],6)
+        self.assertEqual(final['cpu_work_ghz_seconds'],11)
+        self.assertEqual(final['cumulative_cpu_seconds'],3)
+        self.assertAlmostEqual(final['cpu_frequency']['weighted_mean_ghz'],11/3)
+
+    def test_missing_frequency_stays_partial_without_backfill(self):
+        with patch.object(resources,'cpu_frequency',return_value=None):
+            meter=resources.CpuAccounting()
+            missing=meter.update(2)
+        with patch.object(resources,'cpu_frequency',return_value=dict(ghz=4,source='test')):
+            partial=meter.update(3)
+            idle=meter.update(3)
+        self.assertIsNone(missing['cpu_work_ghz_seconds'])
+        self.assertIsNone(partial['cpu_work_ghz_seconds'])
+        self.assertEqual(partial['cpu_frequency']['covered_cpu_seconds'],1)
+        self.assertEqual(partial['cpu_frequency']['observed_ghz_seconds'],4)
+        self.assertEqual(idle['cpu_frequency']['covered_cpu_seconds'],1)
+
+    def test_host_counter_is_shared_and_sampled_at_most_once_per_second(self):
+        reader=Mock(return_value=dict(ghz=4.8,source='test'))
+        with patch.object(resources,'_frequency_sample',(-100,None)), \
+                patch.object(resources,'_frequency_reader',return_value=reader), \
+                patch.object(resources.time,'monotonic',side_effect=[10,10.1,10.9,11.1]):
+            for _ in range(4):self.assertEqual(resources.cpu_frequency()['ghz'],4.8)
+        self.assertEqual(reader.call_count,2)
+
+    def test_invalid_counter_remains_missing(self):
+        reader=Mock(return_value=dict(ghz=float('nan'),source='test'))
+        with patch.object(resources,'_frequency_sample',(-100,None)), \
+                patch.object(resources,'_frequency_reader',return_value=reader):
+            self.assertIsNone(resources.cpu_frequency())
+
+    def test_linux_uses_hardware_khz_and_does_not_use_requested_clock(self):
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='cpu-frequency-') as directory:
+            root=Path(directory);policy=root/'policy0';policy.mkdir()
+            (policy/'scaling_cur_freq').write_text('5000000')
+            with patch.object(resources,'Path',return_value=root):
+                self.assertIsNone(resources._linux_frequency())
+                (policy/'cpuinfo_cur_freq').write_text('4200000')
+                self.assertEqual(resources._linux_frequency()['ghz'],4.2)
 
 
 class BenchmarkTests(unittest.TestCase):

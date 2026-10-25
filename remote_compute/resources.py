@@ -1,6 +1,7 @@
 """CPU and physical-memory observations without third-party dependencies."""
 
 import ctypes as c
+import atexit
 from functools import lru_cache
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import socket
 import threading
 import uuid
 import json
+import math
 import subprocess
 import time
 
@@ -15,6 +17,114 @@ MIB = 1024 * 1024
 DEFAULT_MEMORY_RESERVE_MB = 16 * 1024
 DEFAULT_MEMORY_HEADROOM_MB = 8 * 1024
 MACHINE_ID = socket.gethostname() + ":" + f"{uuid.getnode():012x}"
+_frequency_lock = threading.Lock()
+_frequency_sample = (-math.inf, None)
+
+
+class _WindowsFrequency:
+    def __init__(self):
+        from ctypes import wintypes as w
+        class Value(c.Structure):
+            _fields_ = [('status', w.DWORD), ('value', c.c_double)]
+        self.Value = Value
+        self.api = c.WinDLL('pdh', use_last_error=True)
+        self.api.PdhOpenQueryW.argtypes = [w.LPCWSTR, c.c_size_t, c.POINTER(w.HANDLE)]
+        self.api.PdhAddEnglishCounterW.argtypes = [w.HANDLE, w.LPCWSTR, c.c_size_t, c.POINTER(w.HANDLE)]
+        self.api.PdhCollectQueryData.argtypes = [w.HANDLE]
+        self.api.PdhGetFormattedCounterValue.argtypes = [w.HANDLE, w.DWORD, c.c_void_p, c.POINTER(Value)]
+        self.api.PdhCloseQuery.argtypes = [w.HANDLE]
+        self.query, self.counter = w.HANDLE(), w.HANDLE()
+        if self.api.PdhOpenQueryW(None, 0, c.byref(self.query)):
+            raise OSError('PDH frequency query unavailable')
+        if self.api.PdhAddEnglishCounterW(self.query,
+                r'\Processor Information(_Total)\Actual Frequency', 0, c.byref(self.counter)):
+            self.close()
+            raise OSError('PDH Actual Frequency unavailable')
+        self.api.PdhCollectQueryData(self.query)
+        self.started = time.monotonic()
+        atexit.register(self.close)
+
+    def close(self):
+        if self.query:
+            self.api.PdhCloseQuery(self.query)
+            self.query = None
+
+    def __call__(self):
+        if time.monotonic()-self.started < 1:
+            return None  # A rate counter needs a full initial sampling interval.
+        value = self.Value()
+        if (self.api.PdhCollectQueryData(self.query) or
+                self.api.PdhGetFormattedCounterValue(self.counter, 0x200 | 0x8000, None, c.byref(value)) or
+                value.status not in (0, 1)):
+            return None
+        return dict(ghz=value.value / 1000, source='windows.pdh.actual_frequency',
+                    scope='host_active_average_estimate')
+
+
+def _linux_frequency():
+    values = []
+    for policy in Path('/sys/devices/system/cpu/cpufreq').glob('policy*'):
+        for name in ('cpuinfo_avg_freq', 'cpuinfo_cur_freq'):
+            try:
+                value = float((policy / name).read_text()) / 1e6
+            except (OSError, ValueError):
+                continue
+            if value > 0 and math.isfinite(value):
+                values.append(value)
+                break
+    return dict(ghz=sum(values)/len(values), source='linux.cpufreq.hardware_frequency',
+                scope='host_reported_policy_average_estimate') if values else None
+
+
+@lru_cache(maxsize=1)
+def _frequency_reader():
+    try:
+        return _WindowsFrequency() if os.name == 'nt' else _linux_frequency
+    except OSError:
+        return None
+
+
+def cpu_frequency():
+    """One host observation per second; never substitute a nominal clock."""
+    global _frequency_sample
+    with _frequency_lock:
+        now = time.monotonic()
+        if now - _frequency_sample[0] >= 1:
+            reader = _frequency_reader()
+            try:
+                value = reader() if reader else None
+            except OSError:
+                value = None
+            if value and (not math.isfinite(value['ghz']) or value['ghz'] <= 0):
+                value = None
+            _frequency_sample = (now, value)
+        return _frequency_sample[1]
+
+
+class CpuAccounting:
+    """Integrate task CPU-time deltas using the reported host active clock."""
+    def __init__(self):
+        self.seconds = self.covered = self.work = 0.0
+        self.source = None
+        self.scope = None
+        cpu_frequency()  # Prime the shared counter before launching the child.
+
+    def update(self, seconds):
+        seconds = max(self.seconds, seconds)
+        delta = seconds - self.seconds
+        frequency = cpu_frequency()
+        if delta and frequency:
+            self.covered += delta
+            self.work += delta * frequency['ghz']
+            self.source = frequency['source']
+            self.scope = frequency.get('scope', 'host_active_average_estimate')
+        self.seconds = seconds
+        return dict(cumulative_cpu_seconds=seconds,
+                    cpu_accounting_sampled_at=time.time(),
+                    cpu_work_ghz_seconds=self.work if seconds-self.covered <= 1e-9 else None,
+                    cpu_frequency=dict(source=self.source, scope=self.scope,
+                        covered_cpu_seconds=self.covered, observed_ghz_seconds=self.work,
+                        weighted_mean_ghz=self.work/self.covered if self.covered else None))
 def cpu_benchmark(cpus, executable=None, environment=(), *, force=False):
     """Measure a fixed circuit/RTL/scientific mix at the worker CPU budget."""
     if type(cpus) is not int or cpus < 1:

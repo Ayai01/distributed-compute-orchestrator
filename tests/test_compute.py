@@ -62,6 +62,51 @@ def until(check, seconds=5):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_opt_in_publishes_live_cpu_snapshot_and_final_receipt(self):
+        code=("import json,os,time\nfrom pathlib import Path\n"
+              "p=Path(os.environ['REMOTE_COMPUTE_JOB_DIR'])/'result.json'\n"
+              "end=time.monotonic()+4\n"
+              "while time.monotonic()<end:\n"
+              " data=json.loads(p.read_text())\n"
+              " if data.get('cumulative_cpu_seconds',0)>0:\n"
+              "  Path('observed.json').write_text(json.dumps(data));break\n"
+              " until=time.process_time()+.005\n"
+              " while time.process_time()<until:pass\n"
+              " time.sleep(.01)\n"
+              "else:raise RuntimeError('No live CPU snapshot')\n")
+        task=python(code,env={'DCO_CPU_ACCOUNTING':'1'},outputs=['observed.json'],timeout=6)
+        with patch('remote_compute.resources.cpu_frequency',return_value=dict(ghz=4,source='test')):
+            result=self.client.run(task)
+        self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+        observed=json.loads(result['files']['observed.json'])
+        self.assertGreater(observed['cumulative_cpu_seconds'],0)
+        self.assertEqual(result['cumulative_cpu_seconds'],result['cpu_seconds'])
+        self.assertAlmostEqual(result['cpu_work_ghz_seconds'],4*result['cpu_seconds'])
+        self.assertEqual(result['cpu_frequency']['source'],'test')
+
+    def test_default_tasks_do_not_probe_frequency_or_add_accounting_fields(self):
+        with patch('remote_compute.resources.cpu_frequency',side_effect=AssertionError('Unexpected probe')):
+            result=self.client.run(python("print('ordinary task')"))
+        self.assertEqual(result['status'],'succeeded')
+        self.assertNotIn('cpu_frequency',result)
+
+    def test_live_snapshot_sharing_error_does_not_interrupt_task(self):
+        saved=self.worker._save
+        blocked=[]
+        def save(job):
+            if job['result']['status']=='running' and job['result'].get('cumulative_cpu_seconds',0)>0:
+                blocked.append(True)
+                raise PermissionError('snapshot reader holds the old file')
+            saved(job)
+        task=python("import time;sum(i*i for i in range(100000));time.sleep(1.3)",
+                    env={'DCO_CPU_ACCOUNTING':'1'})
+        with patch.object(self.worker,'_save',side_effect=save), \
+                patch('remote_compute.resources.cpu_frequency',return_value=dict(ghz=4,source='test')):
+            result=self.client.run(task)
+        self.assertTrue(blocked)
+        self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+        self.assertEqual(result['cpu_seconds'],result['cumulative_cpu_seconds'])
+
     def test_configured_temp_root_is_owned_and_reclaimed_after_exit(self):
         with scratch() as directory:
             root=Path(directory)

@@ -196,6 +196,19 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_cpu_accounting_reaches_original_center_receipt(self):
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker), \
+                Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client), \
+                patch('remote_compute.resources.cpu_frequency',return_value=dict(ghz=3.5,source='test')):
+            identity=client.submit(python("sum(i*i for i in range(100000))",
+                                         env={'DCO_CPU_ACCOUNTING':'1'}))['id']
+            finished=client.wait(identity)
+            receipt=client.fetch(identity)
+            self.assertEqual(receipt['id'],identity)
+            self.assertEqual(finished['cumulative_cpu_seconds'],finished['cpu_seconds'])
+            self.assertAlmostEqual(receipt['cpu_work_ghz_seconds'],receipt['cpu_seconds']*3.5)
+            self.assertEqual(receipt['cpu_frequency']['source'],'test')
+
     def test_cold_receipt_and_missing_id_reads_do_not_wait_for_scheduler_lock(self):
         with scratch() as root, provider(Path(root) / 'worker') as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(root) / 'center') as (scheduler, client):

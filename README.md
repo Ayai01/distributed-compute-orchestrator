@@ -167,6 +167,12 @@ center.fetch(job["id"], "./results/maintenance")
 
 `exec` 直接传 argv；需要 shell 语法时显式选择目标 shell。`python` 上传本地脚本，用目标机工具执行，可用 `--tool` 指定登记的 Python。`--stdin` 传文件，`--env NAME=VALUE` 设置变量，`--output` 保存完整日志。API 提供 read_text/write_text/upload/download；上传按文件合并并原子替换文件。日志摘要保留末尾 16 KiB，完整日志随结果取回。`--detach` / `wait=False` 返回任务 ID，调用者随后按原 ID 领取。运维默认 retries=0，避免重复文件副作用。
 
+## 任务CPU计量
+
+新任务在 `task.env` 设置 `DCO_CPU_ACCOUNTING=1`，开启CPU秒与频率工作量计量。子进程读取自己的 `REMOTE_COMPUTE_JOB_DIR/result.json`，按 `REMOTE_COMPUTE_WORKER_JOB_ID` 核worker回执身份；中心原ID继续取 `REMOTE_COMPUTE_JOB_ID`。本地快照最多每秒更新一次且CPU计数变化才写，终态完整回执保留同一组累计值，简短进度轮询不增加字段。
+
+`cumulative_cpu_seconds`与既有`cpu_seconds`一致；`cpu_work_ghz_seconds`单位为GHz·s，`cpu_frequency`给出来源、宿主聚合范围和覆盖量。频率部分缺测时主工作量为null，已覆盖的工作量单列；旧回执继续保持原记录。公式与来源见[DESIGN](docs/DESIGN.md#cpu工作量计量)。普通任务不启用此采集。
+
 ## 同一仓库、设备独立配置
 
 `python -B main.py update --check` 查看更新，`update` 只允许统一仓库 main 快进；已有改动先完成其所属工作。源码更新后运行服务仍用已加载版本，空闲时从看板执行 `restart --wait`，远端用 `restart 节点 --wait`。Python 为 `center.restart(节点或None, wait=True)`；不带 wait 时忙碌服务返回 409。重载保持原终端、配置及未领取结果，通过操作员 health 的 pid/version 核对生效。

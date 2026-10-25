@@ -26,7 +26,7 @@ from urllib.parse import unquote
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
 from . import __version__
 from .process import Process, low_integrity_directory
-from .resources import (Host, process_usage, cpu_benchmark, service_usage,
+from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, service_usage,
                         DEFAULT_MEMORY_RESERVE_MB, DEFAULT_MEMORY_HEADROOM_MB)
 from .telemetry import Activity
 from .client import RemoteError
@@ -259,7 +259,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version','accelerators','asset_handoff']+(['restart'] if self.restart_available else []))
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version','accelerators','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -679,7 +679,12 @@ class Worker:
         deadline = time.monotonic() + task["timeout"]
         state, error = "succeeded", None
         cpu_seconds = 0.0
+        accounting = None
+        accounting_saved = time.monotonic()
+        accounting_saved_cpu = -1.0
         try:
+            if task['env'].get('DCO_CPU_ACCOUNTING') == '1':
+                accounting = CpuAccounting()
             environment = dict(os.environ, **self.env)
             # MSYS2 compiler frontends (cc1plus, clang and their runtime DLLs)
             # are launched as children of the configured tool.  Keep the
@@ -735,13 +740,25 @@ class Worker:
                     try:
                         while process.child.poll() is None:
                             usage = process_usage(process)
+                            total_cpu = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
+                            measured = accounting.update(total_cpu) if accounting else None
                             with self.condition:
                                 # A cached process scan may predate this child.
                                 if usage['rss_mb'] > 0:
                                     job['rss_mb'] = usage['rss_mb']
                                     job['rss_sampled'] = True
                                 result["peak_rss_mb"] = max(result["peak_rss_mb"], usage["rss_mb"])
-                                result["cpu_seconds"] = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
+                                result["cpu_seconds"] = total_cpu
+                                if measured:
+                                    result.update(measured)
+                                    if time.monotonic()-accounting_saved >= 1 and total_cpu != accounting_saved_cpu:
+                                        try:
+                                            self._save(job)
+                                        except OSError:
+                                            pass  # A Windows snapshot reader may briefly hold the old file open.
+                                        else:
+                                            accounting_saved_cpu = total_cpu
+                                        accounting_saved = time.monotonic()
                             if job["cancel"].is_set() or time.monotonic() >= deadline:
                                 state = "cancelled" if job["cancel"].is_set() else "timed_out"
                                 process.stop()
@@ -750,7 +767,11 @@ class Worker:
                         step.update(returncode=process.child.wait(), finished=time.time())
                         usage = process_usage(process)
                         cpu_seconds = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
-                        result["cpu_seconds"] = cpu_seconds
+                        measured = accounting.update(cpu_seconds) if accounting else None
+                        with self.condition:
+                            result["cpu_seconds"] = cpu_seconds
+                            if measured:
+                                result.update(measured)
                     finally:
                         process.close()
                     if state != "succeeded":

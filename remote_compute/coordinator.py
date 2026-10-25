@@ -218,7 +218,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -357,7 +357,7 @@ class Coordinator:
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs)),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -913,7 +913,8 @@ class Coordinator:
         job.update(task=task,auto_cpus=task['cpus']==0,node=None,worker_id=worker_id)
         job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
-        for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_rss_mb','cpu_seconds'):
+        for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_rss_mb','cpu_seconds',
+                    'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency'):
             job['result'].pop(key,None)
         job['result'].update(started=None,stdout='',stderr='',steps=[])
         self.queue.append(identity);self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])

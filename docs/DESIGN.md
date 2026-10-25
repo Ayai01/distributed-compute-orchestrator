@@ -326,6 +326,14 @@ result = client.run(task, files={
 
 中心内部回执包含任务 ID、输入摘要、命令、退出码、资源、时间和工具登记快照。普通工程视图保留任务状态与本任务资源，去掉设备名、URL、工具路径和命令路径；`tools` 仅保留可用性。科学输出使用明文数值协议与容差，不生成或保留能力/执行引擎哈希。科学缓存依据物理输入、数据内容、角点与测量协议复用，不按工具构建或平台分区。接受后的任务通过原 ID 查询，相同 ID 和输入在保留期间只执行一次。
 
+### CPU工作量计量
+
+显式任务环境 `DCO_CPU_ACCOUNTING=1` 复用worker的进程组/Windows Job CPU采样，累计CPU秒包含用户与内核时间；仅对实际CPU秒差分积分 `W = Σ Δt_cpu × f_GHz`，等待和空闲不增加工作量。`cumulative_cpu_seconds`是既有`cpu_seconds`的同口径别名，`cpu_accounting_sampled_at`为采样Unix时间。
+
+Windows用单个标准库PDH查询读取`Processor Information(_Total)/Actual Frequency`，每宿主至多1Hz且冷启动先取得完整初始区间；使用英文计数器API适配系统语言。Processor Frequency及额定频率不作替代。Linux仅读取cpufreq的`cpuinfo_avg_freq`或`cpuinfo_cur_freq`硬件报告；宿主/虚拟机没有该信息时保持缺测。来源参考[Windows PDH](https://learn.microsoft.com/en-us/windows/win32/perfctrs/using-the-pdh-functions-to-consume-counter-data)和[Linux CPUFreq](https://www.kernel.org/doc/html/latest/admin-guide/pm/cpufreq.html)。频率表示宿主活动平均/策略平均的估计范围，`cpu_frequency.scope`分别标明；CPU秒的归属仍为本任务。
+
+`cpu_frequency`保留`source/scope/covered_cpu_seconds/weighted_mean_ghz/observed_ghz_seconds`，加权均值只用已覆盖CPU秒。覆盖完整时`cpu_work_ghz_seconds`给出完整累计值，否则为null，已观察的部分仍在`observed_ghz_seconds`中。未测频率不回填当前值，旧任务不重算。每任务只保留累计量；本地result.json至多1Hz且CPU计数变化时原子发布，读取者核worker原ID和采样时间。临时Windows读共享冲突只推迟这一快照，任务和最终回执继续正常封存；不创建采样日志、线程或额外网络请求。来源及scope/覆盖量随原最终回执走现有通道，简短progress保留原字段；失败重试沿新worker尝试重置此计量。
+
 ### 失联设备与主动发现
 
 Pool按最近一次成功健康握手的单调时钟计时，满60秒将节点标为detached并禁用路由；资源行、旧占用快照和设备通知一起隐藏，普通健康/TCP采样停止。随后每60秒进行一次健康握手，最多5次；成功后恢复原预算，五次失败后等显式add/scan。人工停用不参与自动重连。忽略配置中的reconnect保存已消费次数和下次时间，启动继续剩余次数，不重置额度。显式停用/换址改变连接代次，晚到回复不覆盖操作员决定。配置读、合并及原子写共用跨进程锁，自动重连与手动save不互相覆盖；人工停用立即持久化。
