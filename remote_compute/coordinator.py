@@ -2,6 +2,7 @@
 
 import hashlib
 from contextlib import contextmanager
+from copy import deepcopy
 import io
 import json
 from pathlib import Path
@@ -56,7 +57,7 @@ class Coordinator:
             value = json.loads(path.read_text(encoding="utf-8"))
             if clean_tool_snapshot(value):
                 atomic_json(path, value)
-            job = Job(result=value, directory=path.parent,
+            job = Job(result=value, read_result=deepcopy(value), directory=path.parent,
                       cancel=threading.Event(), node=None)
             self.jobs[value["id"]] = job
             if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
@@ -74,7 +75,7 @@ class Coordinator:
                     value.update(status='dispatching')
                     job['recover']=True
                 value.pop('error',None)
-                atomic_json(path, value)
+                self._save(job)
             else:
                 archive_job(self.jobs, job, startup=True)
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
@@ -444,8 +445,20 @@ class Coordinator:
             self.condition.notify_all()
         return self.health()
 
+    @staticmethod
+    def _publish(job):
+        # Replace one complete view; readers never observe an in-place update.
+        job['read_result'] = deepcopy(job['result'])
+
     def _save(self, job):
+        terminal = job['result']['status'] in TERMINAL
+        if not terminal:
+            self._publish(job)
         atomic_json(job["directory"] / "result.json", job["result"])
+        # Interrupted may be an internal retry transition. Archive publishes
+        # its final outcome after that decision; never expose it mid-retry.
+        if terminal and job['result']['status'] != 'interrupted':
+            self._publish(job)
 
     @staticmethod
     def _restore_accelerator(task, result):
@@ -795,6 +808,7 @@ class Coordinator:
                         raise
                     with self.condition:
                         job['result']['connection_error']=str(error)
+                        self._publish(job)
                     time.sleep(.5)
                     continue
                 with self.condition:
@@ -843,7 +857,9 @@ class Coordinator:
                 # Nothing was sent. Keep the same reservation and ID while the
                 # local transport queue drains, rather than ending the task.
                 if self.stopping:raise
-                with self.condition:job['result']['connection_error']=str(error)
+                with self.condition:
+                    job['result']['connection_error']=str(error)
+                    self._publish(job)
                 if uncertain:
                     time.sleep(.1)
                 elif job['cancel'].wait(.1):
@@ -863,7 +879,9 @@ class Coordinator:
                 # A missing POST reply says nothing about acceptance. Keep the
                 # original worker, ID and grant while querying that same job.
                 while True:
-                    with self.condition:job['result']['connection_error']=str(error)
+                    with self.condition:
+                        job['result']['connection_error']=str(error)
+                        self._publish(job)
                     try:
                         node.client.status(identity,brief=True)
                         return True
@@ -972,6 +990,8 @@ class Coordinator:
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
             self._save(job)
+        else:
+            self._publish(job)
 
     def _callback(self, node):
         if not node.client.url.startswith('local://'):
@@ -1088,6 +1108,7 @@ class Coordinator:
                 node.reserved_memory_mb+=held_memory-old_memory
                 job['task']['cpus']=job['result']['cpus']=held
                 job['task']['memory_mb']=job['result']['memory_mb']=held_memory
+                self._publish(job)
 
             def commit(actual,actual_memory):
                 with self.condition,self.pool.condition:
@@ -1134,9 +1155,20 @@ class Coordinator:
                     or n.client.url == job['result'].get('worker_url')) if assigned else None
 
     def get(self, identity):
+        if isinstance(self.jobs, JobRecords):
+            job = self.jobs.cached(identity)
+            if job is not None and 'read_result' in job:
+                return json.loads(json_bytes(job['read_result']))
+            if identity in self.jobs.history:
+                # Terminal files are atomically replaced. A cold status read
+                # needs neither the scheduler lock nor another cached object.
+                return json.loads((self.jobs.root / identity / 'result.json').read_text(encoding='utf-8'))
+            if job is None:
+                raise KeyError(identity)
         with self.condition:
             job = self.jobs[identity]
-            return json.loads(json_bytes(job["result"]))
+            self._publish(job)
+            return json.loads(json_bytes(job['read_result']))
 
     def public_get(self, identity):
         return self.public_result(self.get(identity))
@@ -1204,7 +1236,7 @@ class Coordinator:
             job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
-            result, client = self.get(identity), self._client(job)
+            result, client = json.loads(json_bytes(job['result'])), self._client(job)
             if result.get('cancelled_before_submit'):client=None
             node=job.get('node') or next((n for n in self.pool.nodes if n.client is client),None)
             if result['status']=='interrupted' and node is not None and (node.detached or not node.enabled):
@@ -1260,7 +1292,7 @@ class Coordinator:
                                 job['result'].pop('error',None)
                                 job['result'].pop('connection_error',None)
                                 self._update(job,remote)
-                                result=self.get(identity)
+                                result=json.loads(json_bytes(job['result']))
             files["result.json"] = json_bytes(self.public_result(result) if public else result)
             return pack(files)
 

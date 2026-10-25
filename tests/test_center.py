@@ -196,6 +196,65 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_cold_receipt_and_missing_id_reads_do_not_wait_for_scheduler_lock(self):
+        with scratch() as root, provider(Path(root) / 'worker') as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(root) / 'center') as (scheduler, client):
+                identity = client.submit(python("print('original-result')"))['id']
+                self.assertEqual(client.wait(identity)['status'], 'succeeded')
+                until(lambda: identity in scheduler.jobs.history)
+                with scheduler.condition:
+                    scheduler.jobs.recent.clear()
+                    scheduler.jobs.live.clear()
+                    before = time.monotonic()
+                    self.assertEqual(client.status(identity)['stdout'].strip(), 'original-result')
+                    with self.assertRaises(RemoteError) as missing:
+                        client.status('0' * 32)
+                    self.assertEqual(missing.exception.status_code, 404)
+                    self.assertLess(time.monotonic() - before, 1.5)
+                    self.assertNotIn(identity, scheduler.jobs.recent)
+                self.assertEqual(client.fetch(identity)['stdout'].strip(), 'original-result')
+
+    def test_status_reads_stay_responsive_during_dispatch_and_terminal_disk_commits(self):
+        from remote_compute.bundle import atomic_json
+        blocked = {status: threading.Event() for status in ('dispatching', 'succeeded')}
+        release = {status: threading.Event() for status in blocked}
+
+        def slow_commit(path, value):
+            status = value['status']
+            if status in blocked and not blocked[status].is_set():
+                blocked[status].set()
+                if not release[status].wait(6):
+                    raise AssertionError('Test did not release the disk commit')
+            return atomic_json(path, value)
+
+        with scratch() as root, provider(Path(root) / 'worker') as (state, worker):
+            with Pool([worker]) as pool, center(pool, Path(root) / 'center') as (scheduler, client):
+                public = Client(client.url, timeout=2)
+                try:
+                    with patch('remote_compute.coordinator.atomic_json', side_effect=slow_commit):
+                        identity = client.submit(python("print('original-result')"))['id']
+                        self.assertTrue(blocked['dispatching'].wait(3))
+                        before = time.monotonic()
+                        self.assertEqual(public.status(identity, brief=True)['status'], 'dispatching')
+                        full = public.status(identity)
+                        self.assertLess(time.monotonic() - before, 1.5)
+                        self.assertNotIn('assigned_node', full)
+                        self.assertNotIn('worker_url', full)
+                        self.assertEqual(list(state.jobs), [])
+                        full['attempts'].append({'unpublished': True})
+                        self.assertEqual(client.status(identity)['attempts'], [])
+                        release['dispatching'].set()
+                        self.assertTrue(blocked['succeeded'].wait(4))
+                        before = time.monotonic()
+                        self.assertNotIn(public.status(identity)['status'], {'succeeded', 'failed', 'interrupted'})
+                        self.assertLess(time.monotonic() - before, 1.5)
+                        release['succeeded'].set()
+                        self.assertEqual(client.wait(identity)['status'], 'succeeded')
+                        self.assertEqual(client.fetch(identity)['stdout'].strip(), 'original-result')
+                finally:
+                    for event in release.values():
+                        event.set()
+
     def test_disabled_idle_node_stops_probes_but_draining_and_maintenance_refresh_work(self):
         with scratch() as root, provider(Path(root)/'worker') as (_, worker):
             with patch.object(worker, 'health', wraps=worker.health) as probe:

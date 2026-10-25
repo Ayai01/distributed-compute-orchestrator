@@ -1,6 +1,7 @@
 """Keep live tasks in memory and retained receipts on their original disk paths."""
 from collections import Counter, OrderedDict
 from collections.abc import MutableMapping
+from copy import deepcopy
 import json
 from pathlib import Path
 import threading
@@ -43,6 +44,11 @@ class JobRecords(MutableMapping):
         while len(self.recent) > self.cache_size:
             self.recent.popitem(last=False)
 
+    def cached(self, identity):
+        """Read an already resident record without disk I/O or LRU mutation."""
+        job = self.active.get(identity)
+        return job if job is not None else self.live.get(identity)
+
     def __setitem__(self, identity, job):
         if identity in self:
             del self[identity]
@@ -82,6 +88,8 @@ class JobRecords(MutableMapping):
             return
         if self.active.get(identity) is not job and self.live.get(identity) is not job:
             return
+        if 'read_result' in job:
+            job['read_result'] = deepcopy(result)
         assets = tuple(set(result.get('assets', {}).values()))
         worker = job.get('worker_id', result.get('worker_id', identity))
         if identity in self.history:

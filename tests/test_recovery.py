@@ -15,6 +15,43 @@ from test_compute import provider,python,scratch,until
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_status_snapshot_hides_interrupted_commit_until_retry_decision(self):
+        from remote_compute.bundle import atomic_json
+        blocked, release = threading.Event(), threading.Event()
+
+        def slow_commit(path, value):
+            if value['status'] == 'interrupted':
+                blocked.set()
+                if not release.wait(6):
+                    raise AssertionError('Test did not release the retry commit')
+            return atomic_json(path, value)
+
+        with scratch() as folder, provider(Path(folder) / 'lost') as (_, lost), \
+                provider(Path(folder) / 'healthy') as (_, healthy):
+            with Pool([lost, healthy], policy='round_robin') as pool, \
+                    center(pool, Path(folder) / 'center') as (_, client):
+                def unavailable(*args, **kwargs):
+                    pool.nodes[0].enabled = False
+                    return dict(status='interrupted', error='Worker stopped', finished=time.time())
+                try:
+                    with patch.object(lost, 'submit_bundle', return_value={}), \
+                            patch.object(lost, 'status', side_effect=unavailable), \
+                            patch('remote_compute.coordinator.atomic_json', side_effect=slow_commit):
+                        accepted = client.submit(python("print('original-result')"))
+                        identity = accepted['id']
+                        self.assertTrue(blocked.wait(3))
+                        before = time.monotonic()
+                        self.assertNotEqual(client.status(identity)['status'], 'interrupted')
+                        self.assertLess(time.monotonic() - before, 1.5)
+                        release.set()
+                        result = client.wait(identity, wait_timeout=10)
+                        self.assertEqual(result['status'], 'succeeded', result)
+                        self.assertEqual(result['request_sha256'], accepted['request_sha256'])
+                        self.assertEqual(len(result['attempts']), 1)
+                        self.assertEqual(client.fetch(identity)['stdout'].strip(), 'original-result')
+                finally:
+                    release.set()
+
     def test_reconnected_gpu_without_local_reservation_stays_accounted_after_profile_returns(self):
         from types import SimpleNamespace
         from remote_compute.client import Node
