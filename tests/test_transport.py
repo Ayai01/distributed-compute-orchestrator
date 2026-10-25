@@ -23,6 +23,24 @@ from test_compute import provider, python, scratch, until
 
 
 class BulkIOControlTests(unittest.TestCase):
+    def test_oversized_request_stops_before_opening_a_connection(self):
+        client=Client('http://127.0.0.1:1')
+        with patch('remote_compute.client.MAX_BODY',64),patch('remote_compute.client.http.client.HTTPConnection') as connection:
+            for body in (b'x'*65,{'value':'x'*64}):
+                with self.subTest(binary=isinstance(body,bytes)):
+                    with self.assertRaisesRegex(ValueError,'protocol limit is 64 bytes'):
+                        client.request('/assets/'+'0'*64,body)
+            connection.assert_not_called()
+
+    def test_request_at_body_limit_and_larger_get_response_remain_valid(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            payload=pack({'data':b'original immutable input'});identity=hashlib.sha256(payload).hexdigest()
+            with patch('remote_compute.client.MAX_BODY',len(payload)):
+                client.request('/assets/'+identity,payload)
+            with patch('remote_compute.client.MAX_BODY',1):
+                self.assertTrue(client.has_asset(identity))
+            self.assertTrue((worker.root/'assets'/identity).is_dir())
+
     def test_shutdown_during_unpack_does_not_publish_or_leave_an_upload(self):
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):
             payload=pack({'model':b'original weights'});asset=hashlib.sha256(payload).hexdigest()

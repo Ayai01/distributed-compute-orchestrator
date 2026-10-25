@@ -23,7 +23,7 @@ import uuid
 import weakref
 import zipfile
 
-from .bundle import PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
+from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
 from .policy import normalize_accelerator_requirement, canonical_capabilities
 from .auth import lan_endpoint
 
@@ -192,6 +192,8 @@ class Client:
             headers['Content-Length']=str(len(data))
         elif data is not None:
             data = json_bytes(data)
+        if data is not None and len(data)>MAX_BODY:
+            raise ValueError('Request body has %d bytes; protocol limit is %d bytes. Use separate content assets for large inputs.'%(len(data),MAX_BODY))
         method = method or ('POST' if data is not None else 'GET')
         partial, etag = bytearray(), None
         attempts = 4 if binary and method == 'GET' else 2
