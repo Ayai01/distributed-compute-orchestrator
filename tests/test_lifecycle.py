@@ -194,6 +194,7 @@ class SharedRamdiskTests(unittest.TestCase):
                     patch.object(ramdisk,'_run') as run, \
                     patch.object(ramdisk.shutil,'disk_usage',return_value=SimpleNamespace(total=4*1024**3-4096)):
                 self.assertEqual(ramdisk.ensure_shared(),root)
+                self.assertEqual(ramdisk.ensure_shared(8),root)
             run.assert_not_called()
             self.assertEqual(cache.read_bytes(),b'existing simulation evidence')
             self.assertEqual(json.loads((root/ramdisk.MARKER).read_text(encoding='utf8'))['capacity_bytes'],4*1024**3)

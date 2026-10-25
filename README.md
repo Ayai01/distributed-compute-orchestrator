@@ -175,7 +175,7 @@ center.fetch(job["id"], "./results/maintenance")
 
 ## 每台设备唯一共享内存盘
 
-Windows 使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1` 在锁内检查/创建唯一共享盘，工程目录独立。`ramdisk_gib` 支持 4、8、16，默认 8；`python -B main.py ramdisk` 检查/创建。ImDisk 驱动放 `.tools/imdisk/` 后，以管理员运行 `ramdisk --install`。安装登记开机重建任务 `RemoteCompute Shared RAM`。容量扩展失败保留现有盘，先处理它；缩容须先排空本机写入、保全文件，再正常卸载并重建同盘符；启动检查保留较大盘及其文件。
+Windows 使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1` 在锁内检查/创建唯一共享盘，工程目录独立。`ramdisk_gib` 支持 4、8、16，默认 8；本机配置优先于科研调用的旧容量参数；`python -B main.py ramdisk` 检查/创建。ImDisk 驱动放 `.tools/imdisk/` 后，以管理员运行 `ramdisk --install`。安装登记开机重建任务 `RemoteCompute Shared RAM`。容量扩展失败保留现有盘，先处理它；缩容须先排空本机写入、保全文件，再正常卸载并重建同盘符；启动检查保留较大盘及其文件。
 
 Linux `ramdisk` 入口创建独立 tmpfs，默认位于 `~/.cache/codex-shared-ramdisk`，可用 `ramdisk_root` 指定位置，容量遵循 `ramdisk_gib`；挂载需要对应权限。使用普通磁盘的 worker 保留显式 `root` 和 `temp_root`，配置 temp_root 后启动直接使用它。状态文件保留普通磁盘，临时目录生命周期见 DESIGN。
 
