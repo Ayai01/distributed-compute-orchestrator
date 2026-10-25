@@ -45,7 +45,11 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
             continue
         if not node.get('enabled',True):continue
         try:
-            node['name'] = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),operator=True).health()['node']
+            actual = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),operator=True).health()['node']
+            if actual != node.get('name'):
+                node['aliases'] = list(dict.fromkeys([*node.get('aliases',[]),*([node['name']] if node.get('name') else [])]))
+                node['aliases'] = [name for name in node['aliases'] if name != actual]
+                node['name'] = actual
         except RemoteError:
             pass
     return value
@@ -313,6 +317,9 @@ def main(argv=None):
     item = sub.add_parser('setup', help='复用系统Python安装科学包；原生工具存放于.tools')
     item.add_argument('--ngspice-source', help='复用已有ngspice目录，省去下载')
     item.add_argument('--rtl-source', help='原位复用已有MSYS2的GCC/Verilator，不复制安装')
+    item = sub.add_parser('setup-https', help='配置本设备公网HTTPS和认证；空闲时在原终端重载')
+    item.add_argument('--public-address', required=True, help='端口映射使用的固定公网IP')
+    item.add_argument('--no-restart', action='store_true', help='只保存配置，稍后在可见终端启动')
     item = sub.add_parser('control', help='在线调整设备资源，保存到设备配置')
     item.add_argument('--node', default=socket.gethostname())
     item.add_argument('--cpus', type=int)
@@ -390,6 +397,11 @@ def main(argv=None):
         if args.action == 'update':
             from .repository import update
             display(update(check=args.update_check))
+            return 0
+        if args.action == 'setup-https':
+            from .tls_setup import configure
+            display(configure(ROOT, args.public_address, args.port if args.port is not None else config.get('port',DEFAULT_PORT),
+                              config_path=path, restart=not args.no_restart))
             return 0
         if args.action == 'setup':
             from .setup_tools import install, reuse_rtl

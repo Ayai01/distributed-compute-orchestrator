@@ -222,6 +222,18 @@ ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不�
 
 非局域网连接必须使用原生 HTTPS 和非空令牌，未配置令牌则拒绝外网请求；SDK不会向公网HTTP地址发送凭据。本机配置 `certfile/keyfile/token`，中心 `nodes.local.json` 对应节点使用 HTTPS URL、`ca_file/token`；校验证书，私钥留 worker。`add 公网IP`自动选择HTTPS和26133端口，复用已保存同地址的证书及节点凭据；首次接入先配置可信CA与节点令牌。证书可放忽略的`.local/certs/`，节点配置继续留本机。显式公网HTTP不会降级接入。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。未安装系统Git的Windows设备可将便携Git放在忽略的 `.tools/git/`，更新命令自动使用它。
 
+首次公网配置在目标设备的工程目录执行，例如将同号端口映射到该设备的26143：
+
+```powershell
+.\start.cmd --port 26143 setup-https --public-address 203.0.113.42
+```
+
+替换为实际公网IP。命令保留已有CPU/RAM、工具、共享目录、任务根和令牌；缺失令牌时生成独立节点令牌。Windows使用系统PowerShell/.NET生成证书，其他系统使用已有OpenSSL；不下载工具。证书覆盖公网IP与回环，存放在不含主机名的固定路径，私钥保留本机。已有证书与令牌重复使用；证书缺少目标IP或已过期时给出具体错误，保留原配置。
+
+空闲worker沿原可见终端重载并验证HTTPS；有在途任务时只保存配置，空闲后重跑同一命令完成重载。尚未运行服务时，配置完成后用`start.cmd`或`sh start.sh`在可见终端启动。返回的`connection_profile`是忽略的私有连接文件，含节点令牌和公钥证书；通过已有私有文件通路交给操作员，令牌不粘贴到聊天或Git，TLS私钥不随此文件导出。中心按完整HTTPS地址/端口登记该节点的CA与令牌，同一公网IP上的其他端口保留各自凭据。
+
+修改系统主机名不会改变IP端口、证书、令牌或任务根；自动重连按已有机器标识的硬件段核对，当前会话保留原路由名和任务引用，新主机名成为可用别名。中心重新加载节点配置时使用实际主机名并保留旧名别名。
+
 Windows 远端端口按部署需要用管理员 PowerShell 放行：
 
 ```powershell

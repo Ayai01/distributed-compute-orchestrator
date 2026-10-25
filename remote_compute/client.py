@@ -778,11 +778,20 @@ class Pool:
             node.error=error
             if not error:
                 previous_name = node.health.get('node')
-                if reconnect and previous_name and value.get('node') != previous_name:
+                previous_machine, current_machine = node.health.get('machine_id'), value.get('machine_id')
+                # machine_id contains hostname:hardware-address. Renaming a
+                # computer leaves the endpoint, credentials and hardware intact.
+                same_worker = (previous_machine.rsplit(':',1)[-1] == current_machine.rsplit(':',1)[-1]
+                               if previous_machine and current_machine else value.get('node') == previous_name)
+                if reconnect and previous_name and not same_worker:
                     node.error = 'Reconnect worker identity differs from the accepted endpoint'
                     return
                 node.last_connected_at=time.monotonic()
                 node.health={**node.health,**value}
+                actual_name = value.get('node')
+                renamed = bool(previous_name and actual_name and actual_name != previous_name
+                               and actual_name != node.name and actual_name not in node.aliases)
+                if renamed:node.aliases.append(actual_name)
                 jobs=value.get('active_jobs') or []
                 running=[job for job in jobs if job['status']=='running']
                 node.external=sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
@@ -795,7 +804,7 @@ class Pool:
                     node.enabled, node.detached = True, False
                     node.reconnect_attempts, node.reconnect_after = 0, 0.0
             self.condition.notify_all()
-        if reconnect:self._save_reconnect(node)
+        if reconnect or (not error and renamed):self._save_reconnect(node)
 
     @staticmethod
     def _network_target(node):

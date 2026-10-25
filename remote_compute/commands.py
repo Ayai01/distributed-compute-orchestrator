@@ -50,6 +50,7 @@ def save_detached_node(path, node):
         for row in value.get('nodes',[]):
             if row.get('name')==node.name or row.get('url','').rstrip('/')==node.client.url:
                 row.update(enabled=node.enabled,url=node.client.url)
+                if getattr(node,'aliases',None):row['aliases']=list(node.aliases)
                 if getattr(node.client,'ca_file',None):row['ca_file']=node.client.ca_file
                 else:row.pop('ca_file',None)
                 if node.detached:

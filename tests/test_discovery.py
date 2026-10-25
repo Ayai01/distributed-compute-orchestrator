@@ -129,6 +129,47 @@ class OfflineTests(unittest.TestCase):
             self.assertFalse(node.enabled);self.assertFalse(node.detached)
             self.assertEqual(pool._retry_detached(time.time()+1000),[])
 
+    def test_renamed_same_machine_reconnects_without_changing_original_references(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, client):
+            path=Path(root)/'nodes.local.json'
+            path.write_text(json.dumps({'nodes':[dict(name='original-route',url=client.url,token='retained',limit=1)]}))
+            with Pool([dict(name='original-route',client=client,limit=1)],refresh=1000,
+                      on_reconnect=lambda n:save_detached_node(path,n)) as pool:
+                pool.stop_event.set();pool.monitor.join()
+                node=pool.nodes[0];value=dict(node.health)
+                value.update(node='new-computer-name',machine_id='new-computer-name:'+value['machine_id'].rsplit(':',1)[-1])
+                node.live_jobs.add('original-id');node.reserved=1;node.last_connected_at=100
+                pool._expire_unreachable(160)
+                with patch.object(client,'health',return_value=value):
+                    pool._retry_detached(node.reconnect_after)
+                    pool.probe_futures[node.name].result(timeout=2)
+                self.assertTrue(node.enabled);self.assertFalse(node.error)
+                self.assertEqual(node.live_jobs,{'original-id'});self.assertEqual(node.reserved,1)
+                self.assertEqual(node.name,'original-route');self.assertIn(value['node'],node.aliases)
+                saved=json.loads(path.read_text())['nodes'][0]
+                self.assertEqual(saved['token'],'retained');self.assertEqual(saved['limit'],1)
+                self.assertIn(value['node'],saved['aliases'])
+                node.live_jobs.clear();node.reserved=0
+
+    def test_different_machine_cannot_rejoin_under_the_previous_computer_name(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,client), Pool([client],refresh=1000) as pool:
+            pool.stop_event.set();pool.monitor.join()
+            node=pool.nodes[0];value=dict(node.health,machine_id='another-machine:ffffffffffff')
+            node.last_connected_at=100;pool._expire_unreachable(160)
+            with patch.object(client,'health',return_value=value):
+                pool._retry_detached(node.reconnect_after)
+                pool.probe_futures[node.name].result(timeout=2)
+            self.assertFalse(node.enabled)
+            self.assertIn('identity differs',node.error)
+
+    def test_startup_retains_the_previous_name_as_an_alias_for_the_same_endpoint(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,client):
+            path=Path(root)/'nodes.local.json'
+            path.write_text(json.dumps({'nodes':[dict(name='old-name',url=client.url,aliases=['older-name'])]}))
+            loaded=load_nodes(path)['nodes'][0]
+            self.assertEqual(loaded['name'],client.health()['node'])
+            self.assertEqual(loaded['aliases'],['older-name','old-name'])
+
     def test_saved_retry_budget_survives_restart_and_manual_off_stays_off(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client):
             future=time.time()+3600
