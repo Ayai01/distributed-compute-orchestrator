@@ -265,13 +265,16 @@ class Client:
                     error.status_code = response.status
                     raise error
                 break
-            except (http.client.HTTPException, OSError) as exc:
+            except (http.client.HTTPException, OSError, RemoteError) as exc:
+                if isinstance(exc,RemoteError) and (not job_upload or getattr(exc,'status_code',None)!=404):
+                    raise
                 connection.close()
                 self.connections.connection = None
                 if not etag:
                     partial.clear()
                 if job_upload:
-                    # Acceptance can finish before its HTTP reply is lost.
+                    # Acceptance can finish before its HTTP reply is lost, or
+                    # an old service's post-acceptance notice can return 404.
                     # Read the original receipt before retransmitting the body;
                     # its digest also prevents accepting a different request.
                     try:
@@ -286,6 +289,8 @@ class Client:
                         if (isinstance(saved,dict) and saved.get('id')==path.rsplit('/',1)[-1]
                                 and saved.get('request_sha256')==request_digest):
                             return json_bytes(saved) if binary else saved
+                if isinstance(exc,RemoteError):
+                    raise  # A failed 404 recovery never resends the POST body.
                 if not retryable or attempt==attempts-1:
                     error=RemoteError(f'{self.url}{path}: {exc}')
                     error.transport_code=getattr(exc,'winerror',None) or getattr(exc,'errno',None)

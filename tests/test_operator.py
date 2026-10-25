@@ -25,8 +25,8 @@ class OperatorTests(unittest.TestCase):
         activity=Activity()
         activity.notify('write source.py','192.168.1.6')
         for i in range(100):
-            activity.submitted(dict(id=str(i),label='candidate'),dict(project='RGCN'),'192.168.1.6')
-        activity.submitted(dict(id='abcdef12',label='machine/exec git'),dict(project='maintenance'),'192.168.1.6')
+            activity.submitted(dict(id=str(i),label='candidate',project='RGCN'),'192.168.1.6')
+        activity.submitted(dict(id='abcdef12',label='machine/exec git',project='maintenance'),'192.168.1.6')
         events=activity.snapshot()['events']
         self.assertEqual(len(events),2)
         self.assertEqual(events[0]['message'],'write source.py')

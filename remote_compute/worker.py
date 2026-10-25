@@ -1266,7 +1266,7 @@ class Handler(BaseHTTPRequestHandler):
                         value = worker.submit(identity,body,callback=json.loads(callback)) if callback else worker.submit(identity,body)
                     if scheduler and not operator and isinstance(value, dict):
                         value = worker.public_result(value)
-                    worker.activity.submitted(value, worker.jobs[identity].get('task', {}), self.client_address[0])
+                    worker.activity.submitted(value, self.client_address[0])
                     return self._reply(value, 202)
                 if len(parts) == 2 and self.command == "GET":
                     value = worker.public_get(identity) if scheduler and not operator else worker.get(identity)

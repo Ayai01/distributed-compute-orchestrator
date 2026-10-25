@@ -39,7 +39,7 @@ class LocalClient(Client):
                     if method == 'POST':
                         callback=json.loads((extra_headers or {}).get('X-DCO-Callback','{}'))
                         result = worker.submit(identity, data,callback=callback)
-                        worker.activity.submitted(result, worker.jobs[identity].get('task', {}), 'local')
+                        worker.activity.submitted(result, 'local')
                         return result
                     if method == 'DELETE':
                         return worker.delete(identity)

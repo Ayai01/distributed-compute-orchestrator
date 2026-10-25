@@ -22,9 +22,10 @@ class Activity:
         with self.lock:
             self.events.append(dict(time=time.time(), ip=address, message=message))
 
-    def submitted(self, result, task, address):
+    def submitted(self, result, address):
+        """Use the accepted receipt; its task may already be archived or collected."""
         label = result.get('label', 'job')
-        if not task.get('project') or label.startswith('machine/'):
+        if not result.get('project') or label.startswith('machine/'):
             self.notify(label + ' [' + result['id'][:8] + ']', address)
 
     def snapshot(self):

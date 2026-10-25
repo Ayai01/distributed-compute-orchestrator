@@ -273,6 +273,76 @@ class OriginalSubmitReceiptTests(unittest.TestCase):
         handler.connection.shutdown(socket.SHUT_RDWR)
         handler.close_connection=True
 
+    def test_submission_notice_does_not_reopen_the_published_job(self):
+        from remote_compute.local import LocalClient
+        from remote_compute.records import JobRecords
+        for role in ('worker','center','local'):
+            with self.subTest(role=role),scratch() as directory,provider(Path(directory)/'worker') as (worker,node):
+                with Pool([node]) as pool,center(pool,Path(directory)/'center') as (scheduler,project):
+                    state,client=(scheduler,project) if role=='center' else (worker,LocalClient(worker) if role=='local' else node)
+                    original_submit,original_read=state.submit,JobRecords.__getitem__
+                    accepted_ids=[]
+                    def submit(identity,*args,**options):
+                        receipt=original_submit(identity,*args,**options)
+                        accepted_ids.append(identity)
+                        return receipt
+                    def read(records,identity):
+                        # Archival can remove an active entry between its two
+                        # unlocked dictionary reads. Acceptance is already done.
+                        if records is state.jobs and identity in accepted_ids and not state.condition._is_owned():
+                            raise KeyError(identity)
+                        return original_read(records,identity)
+                    with patch.object(state,'submit',submit),patch.object(JobRecords,'__getitem__',read):
+                        receipt=client.submit(python('print("once")',project='RGCN'),job_id='1'*32)
+                    self.assertEqual(accepted_ids,['1'*32])
+                    self.assertEqual(receipt['id'],'1'*32)
+                    self.assertEqual(receipt['project'],'RGCN')
+                    self.assertFalse(state.activity.snapshot()['events'])
+                    self.assertEqual(client.wait(receipt['id'])['status'],'succeeded')
+                    self.assertEqual(client.fetch(receipt['id'])['stdout'].strip(),'once')
+
+    def test_post_404_after_acceptance_reads_original_without_resending_body(self):
+        for role in ('worker','center'):
+            with self.subTest(role=role),scratch() as directory,provider(Path(directory)/'worker') as (worker,node):
+                with Pool([node]) as pool,center(pool,Path(directory)/'center') as (scheduler,project):
+                    state,client=(worker,node) if role=='worker' else (scheduler,project)
+                    original=Handler._reply;posts=[];reads=[]
+                    def reply(handler,value,status=200,**options):
+                        if handler.server.worker is state and handler.path=='/jobs/'+'2'*32:
+                            if handler.command=='POST' and status==202:
+                                posts.append(value['id'])
+                                return original(handler,{'error':'submission notice lost its active record'},404)
+                            if handler.command=='GET':reads.append(handler.path)
+                        return original(handler,value,status,**options)
+                    with patch.object(Handler,'_reply',reply):
+                        receipt=client.submit(python('print("original")'),job_id='2'*32)
+                    self.assertEqual(posts,['2'*32])
+                    self.assertEqual(reads,['/jobs/'+'2'*32])
+                    self.assertEqual(receipt['id'],'2'*32)
+                    self.assertEqual(client.wait(receipt['id'])['status'],'succeeded')
+                    self.assertEqual(client.fetch(receipt['id'])['stdout'].strip(),'original')
+
+    def test_unconfirmed_post_404_is_preserved_without_resending_body(self):
+        for exists in (False,True):
+            with self.subTest(existing_original=exists),scratch() as directory,provider(Path(directory)/'worker') as (_,client):
+                identity='3'*32
+                if exists:
+                    client.submit(python('print("paid original")'),job_id=identity)
+                    client.wait(identity)
+                original=Handler.do_POST;posts=[]
+                def post(handler):
+                    if handler.path=='/jobs/'+identity:
+                        posts.append(handler.path)
+                        handler.rfile.read(int(handler.headers['Content-Length']))
+                        return handler._reply({'error':'original 404'},404)
+                    return original(handler)
+                with patch.object(Handler,'do_POST',post):
+                    with self.assertRaises(RemoteError) as caught:
+                        client.submit(python('print("different body")'),job_id=identity)
+                self.assertEqual(caught.exception.status_code,404)
+                self.assertEqual(posts,['/jobs/'+identity])
+                if exists:self.assertEqual(client.fetch(identity)['stdout'].strip(),'paid original')
+
     def test_lost_submit_reply_reads_original_without_resending_worker_or_center_body(self):
         for role in ('worker','center'):
             with self.subTest(role=role),scratch() as directory,provider(Path(directory)/'worker') as (worker,node):
