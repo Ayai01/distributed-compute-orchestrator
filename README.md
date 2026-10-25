@@ -220,7 +220,9 @@ ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不�
 
 局域网节点可直接 `add http://设备IP:26133`，不需要令牌；重复添加会恢复已有节点，保留其预算、权重和在途任务。默认按 TCP 对端的回环、RFC1918、IPv6 ULA/链路本地地址识别局域网，`trusted_networks` 可缩小免令牌网段，例如 `["127.0.0.0/8", "::1/128", "192.168.1.0/24"]`，空列表要求局域网也认证。转发头不改变对端身份。中心操作员权限仍使用独立的本机托管凭据。
 
-非局域网连接必须使用原生 HTTPS 和非空令牌，未配置令牌则拒绝外网请求；SDK不会向公网HTTP地址发送凭据。本机配置 `certfile/keyfile/token`，中心 `nodes.local.json` 对应节点使用 HTTPS URL、`ca_file/token`；校验证书，私钥留 worker。`add 公网IP`自动选择HTTPS和26133端口，复用已保存同地址的证书及节点凭据；首次接入先配置可信CA与节点令牌。证书可放忽略的`.local/certs/`，节点配置继续留本机。显式公网HTTP不会降级接入。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。未安装系统Git的Windows设备可将便携Git放在忽略的 `.tools/git/`，更新命令自动使用它。
+非局域网连接必须使用原生 HTTPS 和非空令牌，未配置令牌则拒绝外网请求；SDK不会向公网HTTP地址发送凭据。本机配置 `certfile/keyfile/token`，中心 `nodes.local.json` 对应节点使用 HTTPS URL、`ca_file/token`；校验证书，私钥留 worker。`add 公网IP`自动选择HTTPS和26133端口，复用已保存同地址的证书及节点凭据；首次接入先配置可信CA与节点令牌。证书可放忽略的`.local/certs/`，节点配置继续留本机。显式公网HTTP不会降级接入。CPU/RAM 借还通过 worker 本地 lease 与中心既有连接，公网 worker 直接使用该通路。Linux 额外看板可用 `--mode worker --url https://127.0.0.1:26133 --config worker.local.json`，原托管终端继续保持。
+
+`start.cmd update` / `python3 -B main.py update`支持Git和ZIP部署。Git部署沿原分支快进，保留本地改动与分支核对；Windows可复用`.tools/git/cmd/git.exe`。ZIP部署直接取得官方源码ZIP，替换包内的发布源文件，保留本机配置、运行目录和包外文件，不安装Git；相同文件不重写，下载包只在内存中消费。`update --check`只读检查。更新后在空闲边界重载，HTTPS初始化也可沿原窗口完成这一步。
 
 首次公网配置在目标设备的工程目录执行，例如将同号端口映射到该设备的26143：
 
