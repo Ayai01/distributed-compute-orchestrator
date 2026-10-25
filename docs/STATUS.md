@@ -1,12 +1,14 @@
 # DCO 当前状态
 
-更新：2026-10-25（UTC）。源码版本0.8.25；运行实例在安全空闲边界加载，实际版本按health核对。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
+更新：2026-10-25（UTC）。源码版本0.8.26；运行实例在安全空闲边界加载，实际版本按health核对。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
 
 ## 设备与能力
 
-192.168.1.11为Aya1-ITX，手动配置8线程。2026-10-24（UTC）最新人类要求将其排空并关机：中心新派发已关闭且保存到本机配置，关机前3条原LDO任务完成并领取/退役，Windows接受不强制关闭应用的正常关机，DCO端口已离线。保持停用，不自动探测、重连、唤醒或同步，后续由人类明确重新上线。原任务及关机回执见维护`state.json.ITX_graceful_shutdown`。Windows设备已验收同一语义工具组合，ku26s保留Linux工具差异，按完整能力组合准入。
+192.168.1.11为Aya1-ITX。2026-10-25（UTC）人类确认已手动恢复并要求重新接入，中心已启用并验证在线，保留设备当前线程设置及可见前台运行。此前排空与正常关机的回执保留于维护`state.json.ITX_graceful_shutdown`；最新恢复记录见`state.json.ITX_manual_restore`。Windows设备已验收同一语义工具组合，ku26s保留Linux工具差异，按完整能力组合准入。
 
 四节点已有科学Python、PyG、ONNX、SPICE及RTL实测。Windows版图环境复用已有安装，ku26s额外提供HSPICE。能力不携带引擎哈希，不按设备或OS限制科研路由；旧别名仅服务原请求兼容。证明见`.local/maintenance/continuous-supervision-20261023/capability-alignment-proof.json`与`state.json`。
+
+新增公网Windows worker已空闲重载0.8.25并完成科研能力验收。RGCN、ARH与FIBER共用Python3.12数值环境，使用CPU版Torch2.14.1/PyG2.8.1及固定ORT1.22.1；版图复用已验证的独立Python3.10环境，排除其中无关Torch。复用已有SPICE、MSYS2、Java、Scala、CIRCT与版图依赖，PDK沿原内容资产传递。实际通过两阶段RGCN前后向及两次参数更新、FIBER的128次合成求值、ARH固定整数YOLO单图的6个原始输出头及检测结果逐值对照，以及SPICE、RTL编译执行、Magic GDS往返和Netgen LVS。移植时补齐原生运行临时目录，Netgen改用可迁移的真实入口并保留Windows路径转换、Tcl描述符上限和版本查询语义；Bench的旧CPython WMI回退问题已修复并通过8项启动回归。新增节点只发布实际CPU能力，原端口、认证及资源设置保持；原任务不重开。安装与验收回执见维护`state.json.new_device_26143.science_setup`。
 
 本机DCO引用RGCN的Windows EDA/Cygwin与ARH的ONNX环境，作为共享在用依赖维护；协调归DCO，科研源码、模型与观测归各工程。沿原路径复用，不复制出另一套环境。
 
@@ -14,6 +16,7 @@ Windows Magic GDS入口已修复：ITX/TX的通用Tcl入口在最小矩形写出
 
 ## 本轮实现与验证
 
+- 0.8.26让CPU性能校准优先使用已登记且可用的标准数值Python能力，保留旧工程别名与系统Python回退。新公网worker只有标准能力名，旧选择逻辑曾跳过完整数值环境而报NumPy缺失；本次复用现有共享解释器，不增加依赖或能力别名。能力与资源校准52项定向回归通过，新增覆盖标准环境优先及不可用时的旧入口回退；实际加载和单核/多核校准记录见维护`state.json.new_device_26143.science_setup`。
 - 0.8.25修复新设备ZIP解压部署执行`update`时依赖不存在的Git而报WinError2：无Git元数据的部署直接使用官方源码ZIP，保留设备配置、运行目录和包外文件；下载包不落盘，相同文件不重写。4项定向回归覆盖私有文件保留、只读检查/无变化、不发布非法包的部分更新，以及原Git快进路径；0.085秒通过。官方实际源码包389,307字节，压缩包自带提交身份，包含HTTPS初始化实现；本轮不安装Git或新增更新监护。PC已在原可见终端加载0.8.24改名兼容修复，0.8.25只影响显式更新入口。
 - 0.8.24针对新公网worker的HTTP403和改名后重连被拒，增加一次性HTTPS初始化并修正已有机器标识核对/名称别名。Windows PowerShell 5.1/.NET实际生成证书，通过真实TLS、公网来源认证、错误/缺失令牌与不可信CA拒绝测试；在途任务不重载，空闲沿原终端重载。目标入口、私有配置及改名重连38项通过（3.335秒）；完整核心543项中538通过、5条件跳过（305.860秒），日志见维护`newnode-0824-core-tests.log`。首次空配置、固定绝对CA路径及重复初始化不换证书/令牌也已验证，5个运行文件通过Python3.7语法检查。部署状态见本机维护`state.json.new_device_26143`，原有映射与其他设备认证保持。
 - 0.8.23在SDK发送前按既有512MiB请求体上限检查最终编码体积，超限直接给出本地错误，避免服务端早拒后出现WinError10053和重复发送。二项合同回归覆盖ZIP/JSON超限不建连接、边界大小上传和GET响应不受请求体上限限制；完整核心535项中530通过、5条件跳过（266.236秒），日志见维护`status-0823-core-tests.log`。服务上限及在途任务保持原配置。

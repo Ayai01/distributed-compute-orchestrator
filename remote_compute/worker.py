@@ -218,7 +218,8 @@ class Worker:
         self._refresh_tags()
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
-        benchmark_python=next((self.tools[name][0] for name in ('bench_python','aop_python','arh_python','rgcn_python','python')
+        benchmark_python=next((self.tools[name][0] for name in ('python_scientific','python_numpy','python_torch_pyg',
+                                                             'bench_python','aop_python','arh_python','rgcn_python','python')
                                if self.tool_info.get(name,{}).get('available')),sys.executable)
         benchmark_env=tuple((name,self.env[name]) for name in ('PATH','LD_LIBRARY_PATH','OPENBLAS_CORETYPE','MKL_ENABLE_INSTRUCTIONS')
                             if name in self.env)

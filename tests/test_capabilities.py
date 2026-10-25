@@ -19,6 +19,25 @@ from test_center import center
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_benchmark_uses_available_semantic_numeric_runtime_before_legacy_or_core(self):
+        for semantic in ('python_scientific', 'python_numpy', 'python_torch_pyg'):
+            with self.subTest(semantic=semantic), scratch() as directory:
+                bindings = {semantic: '/science/python', 'bench_python': '/legacy/python'}
+                def probe(tools):
+                    return tools, {name: {'available': True} for name in tools}
+                with patch.object(Worker, '_probe_tools', side_effect=probe), \
+                        provider(directory, tools=bindings) as (worker, _):
+                    self.assertEqual(worker.benchmark_python, '/science/python')
+
+    def test_benchmark_skips_unavailable_semantic_runtime_and_keeps_legacy_fallback(self):
+        with scratch() as directory:
+            def probe(tools):
+                return tools, {name: {'available': name != 'python_scientific'} for name in tools}
+            with patch.object(Worker, '_probe_tools', side_effect=probe), \
+                    provider(directory, tools={'python_scientific': '/missing/python',
+                                               'bench_python': '/legacy/python'}) as (worker, _):
+                self.assertEqual(worker.benchmark_python, '/legacy/python')
+
     def test_semantic_and_legacy_templates_share_the_registered_binding(self):
         aliases = (('ngspice47', 'ng47'), ('circt-translate', 'circt'),
                    ('onnx_cpu', 'onnx'), ('aop_hspice_python', 'python_numpy'),
