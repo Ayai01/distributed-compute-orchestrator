@@ -200,6 +200,8 @@ class Client:
         retryable=(method=='GET' or method=='POST' and (path=='/admission' or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
+        job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
+        request_digest=None
         for attempt in range(attempts):
             _check_cancelled(cancel)
             if attempt and asset_upload:
@@ -268,6 +270,22 @@ class Client:
                 self.connections.connection = None
                 if not etag:
                     partial.clear()
+                if job_upload:
+                    # Acceptance can finish before its HTTP reply is lost.
+                    # Read the original receipt before retransmitting the body;
+                    # its digest also prevents accepting a different request.
+                    try:
+                        saved=self._request(path,method='GET',cancel=cancel)
+                    except RequestCancelled:
+                        raise
+                    except RemoteError:
+                        pass
+                    else:
+                        if request_digest is None:
+                            request_digest=hashlib.sha256(data).hexdigest()
+                        if (isinstance(saved,dict) and saved.get('id')==path.rsplit('/',1)[-1]
+                                and saved.get('request_sha256')==request_digest):
+                            return json_bytes(saved) if binary else saved
                 if not retryable or attempt==attempts-1:
                     error=RemoteError(f'{self.url}{path}: {exc}')
                     error.transport_code=getattr(exc,'winerror',None) or getattr(exc,'errno',None)

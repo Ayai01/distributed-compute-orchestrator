@@ -542,7 +542,9 @@ class Coordinator:
                     raise Conflict("Scheduler is stopping")
                 return dict(job["result"])
             finally:
-                with self.asset_cache.lock, self.condition:
+                # The published job now owns its assets. Releasing the
+                # acceptance reference must not wait behind cache I/O.
+                with self.condition:
                     self.accepting_assets.clear()
 
     def _queued_candidates(self,budgets):

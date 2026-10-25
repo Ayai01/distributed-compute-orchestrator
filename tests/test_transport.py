@@ -267,6 +267,127 @@ class BulkIOControlTests(unittest.TestCase):
                 client.fetch(identity)
 
 
+class OriginalSubmitReceiptTests(unittest.TestCase):
+    @staticmethod
+    def disconnect(handler):
+        handler.connection.shutdown(socket.SHUT_RDWR)
+        handler.close_connection=True
+
+    def test_lost_submit_reply_reads_original_without_resending_worker_or_center_body(self):
+        for role in ('worker','center'):
+            with self.subTest(role=role),scratch() as directory,provider(Path(directory)/'worker') as (worker,node):
+                with Pool([node]) as pool,center(pool,Path(directory)/'center') as (scheduler,project):
+                    state,client=(worker,node) if role=='worker' else (scheduler,project)
+                    original=Handler._reply;posts=[];reads=[]
+                    def reply(handler,value,status=200,**options):
+                        if handler.server.worker is state and handler.path.startswith('/jobs/'):
+                            if handler.command=='POST' and status==202:
+                                posts.append(value['id']);self.disconnect(handler);return
+                            if handler.command=='GET':reads.append(handler.path)
+                        return original(handler,value,status,**options)
+                    with patch.object(Handler,'_reply',reply):
+                        accepted=client.submit(python('print("once")'),job_id='a'*32)
+                    self.assertEqual(accepted['id'],'a'*32)
+                    self.assertEqual(posts,['a'*32])
+                    self.assertEqual(reads,['/jobs/'+'a'*32])
+                    self.assertEqual(client.wait(accepted['id'])['status'],'succeeded')
+                    self.assertEqual(client.fetch(accepted['id'])['stdout'].strip(),'once')
+
+    def test_missing_original_after_interrupted_upload_retries_only_the_same_id(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (worker,client):
+            original=Handler._handle;paths=[]
+            def handle(handler):
+                if handler.path=='/jobs/'+'b'*32:
+                    paths.append(handler.command)
+                    if paths==['POST']:
+                        self.disconnect(handler);return
+                return original(handler)
+            with patch.object(Handler,'do_POST',handle),patch.object(Handler,'do_GET',handle):
+                accepted=client.submit(python('print("retained")'),job_id='b'*32)
+            self.assertEqual(paths,['POST','GET','POST'])
+            self.assertEqual(accepted['id'],'b'*32)
+            self.assertEqual(client.wait(accepted['id'])['status'],'succeeded')
+            client.fetch(accepted['id'])
+
+    def test_center_acceptance_reply_does_not_wait_for_unrelated_asset_cache_io(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (_,node):
+            with Pool([node]) as pool,center(pool,Path(directory)/'center') as (state,client):
+                state.control({'paused':True})
+                saved,cache_locked,release=threading.Event(),threading.Event(),threading.Event()
+                original=state._save
+                def save(job):
+                    original(job);saved.set()
+                    if not cache_locked.wait(3):raise AssertionError('Cache operation did not start')
+                def cache_io():
+                    if not saved.wait(3):raise AssertionError('Request was not persisted')
+                    with state.asset_cache.lock:
+                        cache_locked.set()
+                        if not release.wait(5):raise AssertionError('Cache operation was not released')
+                with patch.object(state,'_save',save),ThreadPoolExecutor(max_workers=2) as executor:
+                    blocking=executor.submit(cache_io)
+                    accepted=executor.submit(client.submit,python('print("queued")'),job_id='e'*32)
+                    try:
+                        receipt=accepted.result(timeout=2)
+                        self.assertEqual(receipt['id'],'e'*32)
+                        self.assertEqual(receipt['status'],'queued')
+                        self.assertFalse(state.accepting_assets)
+                    finally:
+                        release.set();blocking.result(timeout=2);accepted.result(timeout=2)
+                client.cancel('e'*32);client.fetch('e'*32)
+
+    def test_submit_timeout_after_acceptance_recovers_before_waiting_for_lost_reply(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (_,node):
+            with Pool([node]) as pool,center(pool,Path(directory)/'center') as (state,client):
+                original=Handler._reply;release=threading.Event();posts=[]
+                def reply(handler,value,status=200,**options):
+                    if handler.server.worker is state and handler.command=='POST' and status==202:
+                        posts.append(value['id']);release.wait(3)
+                    return original(handler,value,status,**options)
+                client.timeout=.1
+                try:
+                    with patch.object(Handler,'_reply',reply):
+                        accepted=client.submit(python('print("retained")'),job_id='f'*32)
+                        self.assertEqual(posts,['f'*32])
+                        self.assertEqual(accepted['id'],'f'*32)
+                        self.assertFalse(release.is_set())
+                finally:release.set()
+                self.assertEqual(client.wait(accepted['id'])['status'],'succeeded')
+                client.fetch(accepted['id'])
+
+    def test_lost_conflict_reply_never_accepts_a_different_original_body(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (worker,client):
+            identity='c'*32
+            client.submit(python('print("original")'),job_id=identity)
+            original=Handler._reply;conflicts=[]
+            def reply(handler,value,status=200,**options):
+                if handler.command=='POST' and handler.path=='/jobs/'+identity and status==409:
+                    conflicts.append(status)
+                    if len(conflicts)==1:self.disconnect(handler);return
+                return original(handler,value,status,**options)
+            with patch.object(Handler,'_reply',reply):
+                with self.assertRaises(RemoteError) as caught:
+                    client.submit(python('print("different")'),job_id=identity)
+            self.assertEqual(caught.exception.status_code,409)
+            self.assertEqual(conflicts,[409,409])
+            client.wait(identity)
+            self.assertEqual(client.fetch(identity)['stdout'].strip(),'original')
+
+    def test_recovered_cancelled_receipt_keeps_its_actual_outcome(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (worker,client):
+            worker.control({'paused':True})
+            original=Handler._reply;posts=[]
+            def reply(handler,value,status=200,**options):
+                if handler.command=='POST' and status==202:
+                    posts.append(value['id']);worker.cancel(value['id'])
+                    self.disconnect(handler);return
+                return original(handler,value,status,**options)
+            with patch.object(Handler,'_reply',reply):
+                accepted=client.submit(python('raise RuntimeError("must stay cancelled")'),job_id='d'*32)
+            self.assertEqual(posts,['d'*32])
+            self.assertEqual(accepted['status'],'cancelled')
+            self.assertEqual(client.fetch(accepted['id'])['cpu_seconds'],0)
+
+
 class ArtifactReloadTests(unittest.TestCase):
     def test_legacy_memory_return_only_confirms_an_identical_cpu_grant(self):
         identity='e'*32;url='http://127.0.0.1:12345'
