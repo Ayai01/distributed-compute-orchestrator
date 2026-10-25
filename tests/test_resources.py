@@ -17,7 +17,7 @@ from test_compute import provider, scratch
 class CpuAccountingTests(unittest.TestCase):
     def test_pdh_rate_warmup_is_nonblocking(self):
         reader=resources._WindowsFrequency.__new__(resources._WindowsFrequency)
-        reader.started=10
+        reader.collected_at=10
         reader.api=Mock()
         with patch.object(resources.time,'monotonic',return_value=10.5):
             self.assertIsNone(reader())
@@ -53,9 +53,36 @@ class CpuAccountingTests(unittest.TestCase):
         reader=Mock(return_value=dict(ghz=4.8,source='test'))
         with patch.object(resources,'_frequency_sample',(-100,None)), \
                 patch.object(resources,'_frequency_reader',return_value=reader), \
-                patch.object(resources.time,'monotonic',side_effect=[10,10.1,10.9,11.1]):
+                patch.object(resources.time,'monotonic',side_effect=[10,10,10.1,10.9,11.1,11.1]):
             for _ in range(4):self.assertEqual(resources.cpu_frequency()['ghz'],4.8)
         self.assertEqual(reader.call_count,2)
+
+    def test_cache_period_starts_after_a_slow_counter_read(self):
+        reader=Mock(return_value=dict(ghz=4,source='test'))
+        with patch.object(resources,'_frequency_sample',(-100,None)), \
+                patch.object(resources,'_frequency_reader',return_value=reader), \
+                patch.object(resources.time,'monotonic',side_effect=[10,10.3,11.2]):
+            self.assertEqual(resources.cpu_frequency()['ghz'],4)
+            self.assertEqual(resources.cpu_frequency()['ghz'],4)
+        reader.assert_called_once_with()
+
+    def test_long_pdh_gap_is_reprimed_instead_of_formatting_false_frequency(self):
+        import ctypes
+        class Value(ctypes.Structure):
+            _fields_=[('status',ctypes.c_uint32),('value',ctypes.c_double)]
+        reader=resources._WindowsFrequency.__new__(resources._WindowsFrequency)
+        reader.Value=Value;reader.query=reader.counter=1;reader.collected_at=10
+        def formatted(handle,flags,unused,value):
+            value._obj.status=0;value._obj.value=3920
+            return 0
+        reader.api=SimpleNamespace(PdhCollectQueryData=Mock(return_value=0),
+            PdhGetFormattedCounterValue=Mock(side_effect=formatted))
+        with patch.object(resources.time,'monotonic',side_effect=[100,100.01]):
+            self.assertIsNone(reader())
+        reader.api.PdhGetFormattedCounterValue.assert_not_called()
+        with patch.object(resources.time,'monotonic',side_effect=[101.1,101.11]):
+            self.assertEqual(reader()['ghz'],3.92)
+        reader.api.PdhGetFormattedCounterValue.assert_called_once()
 
     def test_invalid_counter_remains_missing(self):
         reader=Mock(return_value=dict(ghz=float('nan'),source='test'))

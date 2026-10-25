@@ -17,6 +17,7 @@ MIB = 1024 * 1024
 DEFAULT_MEMORY_RESERVE_MB = 16 * 1024
 DEFAULT_MEMORY_HEADROOM_MB = 8 * 1024
 MACHINE_ID = socket.gethostname() + ":" + f"{uuid.getnode():012x}"
+CPU_FREQUENCY_INTERVAL = 1.0
 _frequency_lock = threading.Lock()
 _frequency_sample = (-math.inf, None)
 
@@ -41,7 +42,7 @@ class _WindowsFrequency:
             self.close()
             raise OSError('PDH Actual Frequency unavailable')
         self.api.PdhCollectQueryData(self.query)
-        self.started = time.monotonic()
+        self.collected_at = time.monotonic()
         atexit.register(self.close)
 
     def close(self):
@@ -50,11 +51,19 @@ class _WindowsFrequency:
             self.query = None
 
     def __call__(self):
-        if time.monotonic()-self.started < 1:
+        elapsed = time.monotonic()-self.collected_at
+        if elapsed < CPU_FREQUENCY_INTERVAL:
             return None  # A rate counter needs a full initial sampling interval.
         value = self.Value()
-        if (self.api.PdhCollectQueryData(self.query) or
-                self.api.PdhGetFormattedCounterValue(self.counter, 0x200 | 0x8000, None, c.byref(value)) or
+        status = self.api.PdhCollectQueryData(self.query)
+        collected = time.monotonic()
+        elapsed = collected-self.collected_at
+        self.collected_at = collected
+        # After a quiet gap this rate counter needs a new baseline. On a real
+        # Intel host, formatting the long first window reported a false 41 GHz.
+        if status or elapsed > 2*CPU_FREQUENCY_INTERVAL:
+            return None
+        if (self.api.PdhGetFormattedCounterValue(self.counter, 0x200 | 0x8000, None, c.byref(value)) or
                 value.status not in (0, 1)):
             return None
         return dict(ghz=value.value / 1000, source='windows.pdh.actual_frequency',
@@ -89,7 +98,7 @@ def cpu_frequency():
     global _frequency_sample
     with _frequency_lock:
         now = time.monotonic()
-        if now - _frequency_sample[0] >= 1:
+        if now - _frequency_sample[0] >= CPU_FREQUENCY_INTERVAL:
             reader = _frequency_reader()
             try:
                 value = reader() if reader else None
@@ -97,7 +106,7 @@ def cpu_frequency():
                 value = None
             if value and (not math.isfinite(value['ghz']) or value['ghz'] <= 0):
                 value = None
-            _frequency_sample = (now, value)
+            _frequency_sample = (time.monotonic(), value)
         return _frequency_sample[1]
 
 
