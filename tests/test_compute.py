@@ -73,6 +73,15 @@ class ExecutionTests(unittest.TestCase):
                     self.assertEqual(temporary.parent,worker.temp_root)
                     self.assertFalse(temporary.exists())
                     self.assertEqual(result['status'],'succeeded' if exit_code==0 else 'failed')
+            self.assertFalse(worker.temp_root.exists())
+
+    def test_exit_keeps_nonempty_scratch_namespace(self):
+        with scratch() as directory:
+            root=Path(directory)
+            with provider(root/'disk',temp_root=root/'scratch') as (worker,_client):
+                retained=worker.temp_root/'unfinished.raw'
+                retained.write_bytes(b'uncollected native state')
+            self.assertEqual(retained.read_bytes(),b'uncollected native state')
 
     def test_task_temp_is_reclaimed_before_results_are_collected(self):
         for code,expected in ((0,'succeeded'),(3,'failed')):

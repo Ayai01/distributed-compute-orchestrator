@@ -178,6 +178,39 @@ class LinuxWorkerScratchTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == 'nt', 'Windows shared ImDisk lifecycle')
 class SharedRamdiskTests(unittest.TestCase):
+    def setUp(self):
+        settings=tempfile.TemporaryDirectory(prefix='compute-ramdisk-settings-')
+        self.addCleanup(settings.cleanup)
+        root=patch.object(ramdisk,'ROOT',Path(settings.name))
+        root.start();self.addCleanup(root.stop)
+
+    def test_configured_four_gib_volume_reuses_files_without_growing(self):
+        with tempfile.TemporaryDirectory(prefix='compute-ramdisk-') as directory:
+            root=Path(directory);cache=root/'existing-cache.bin'
+            cache.write_bytes(b'existing simulation evidence')
+            (ramdisk.ROOT/'worker.local.json').write_text('{"ramdisk_gib":4}',encoding='utf8')
+            with patch.object(ramdisk,'shared_volume',return_value=root), \
+                    patch.object(ramdisk,'driver',return_value='imdisk.exe'), \
+                    patch.object(ramdisk,'_run') as run, \
+                    patch.object(ramdisk.shutil,'disk_usage',return_value=SimpleNamespace(total=4*1024**3-4096)):
+                self.assertEqual(ramdisk.ensure_shared(),root)
+            run.assert_not_called()
+            self.assertEqual(cache.read_bytes(),b'existing simulation evidence')
+            self.assertEqual(json.loads((root/ramdisk.MARKER).read_text(encoding='utf8'))['capacity_bytes'],4*1024**3)
+
+    def test_four_gib_request_preserves_larger_disk_until_explicit_maintenance(self):
+        with tempfile.TemporaryDirectory(prefix='compute-ramdisk-') as directory:
+            root=Path(directory);cache=root/'inflight-input'
+            cache.write_bytes(b'active scientific input')
+            with patch.object(ramdisk,'shared_volume',return_value=root), \
+                    patch.object(ramdisk,'driver',return_value='imdisk.exe'), \
+                    patch.object(ramdisk,'_run') as run, \
+                    patch.object(ramdisk.shutil,'disk_usage',return_value=SimpleNamespace(total=8*1024**3-4096)):
+                with self.assertRaisesRegex(OSError,'preserve its files'):
+                    ramdisk.ensure_shared(4)
+            run.assert_not_called()
+            self.assertEqual(cache.read_bytes(),b'active scientific input')
+
     def test_concurrent_starts_create_one_marked_eight_gib_volume(self):
         # Use the real cross-project Win32 mutex, but emulate every disk operation.
         with tempfile.TemporaryDirectory(prefix='compute-ramdisk-') as directory:

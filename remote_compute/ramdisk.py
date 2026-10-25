@@ -104,8 +104,8 @@ def ensure_shared(size_gib=None, *, create=False):
     """Reuse/extend the marked volume; never create a second disk after a failed resize."""
     settings=json.loads((ROOT/'worker.local.json').read_text(encoding='utf-8-sig')) if (ROOT/'worker.local.json').is_file() else {}
     size_gib=settings.get('ramdisk_gib',8) if size_gib is None else size_gib
-    if type(size_gib) is not int or size_gib not in (8,16):
-        raise ValueError('Shared RAM disk capacity must be 8 or 16 GiB')
+    if type(size_gib) is not int or size_gib not in (4,8,16):
+        raise ValueError('Shared RAM disk capacity must be 4, 8 or 16 GiB')
     size=size_gib*1024**3
     if os.name != 'nt':
         if os.environ.get('REMOTE_COMPUTE_WORKER')=='1':

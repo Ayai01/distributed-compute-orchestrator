@@ -40,7 +40,7 @@ CLI 生命周期在 cli/startup/terminal，命令语义在 commands，交互在 
 
 ## 文件与生命周期
 
-任务输入、回执、检查点、引用资产及未领取结果用普通磁盘状态根；可重建 TMP 使用共享 RAM 或设备明确指定的磁盘 temp_root。Windows 每设备复用唯一共享盘和 Global\CodexSharedRamdiskV1 锁，默认 8GiB，设备可配置 16GiB。现有 Linux 普通磁盘 worker 保留其 root/temp_root 配置，独立 tmpfs 在排空及具备挂载权限后切换。
+任务输入、回执、检查点、引用资产及未领取结果用普通磁盘状态根；可重建 TMP 使用共享 RAM 或设备明确指定的磁盘 temp_root。Windows 每设备复用唯一共享盘和 Global\CodexSharedRamdiskV1 锁，默认 8GiB，设备可配置 4GiB 或 16GiB；缩容在排空本机写入、保全文件后正常卸载及重建。现有 Linux 普通磁盘 worker 保留其 root/temp_root 配置，独立 tmpfs 在排空及具备挂载权限后切换。
 
 DCO新生成的状态、计算缓存、执行副本和临时物集中在忽略的`.local/.tools/.projects`目录；RAM中使用DCO专属临时目录。系统运行环境和DCO外已有可用安装、模型及依赖缓存直接引用，不重复复制或下载。主科研工程与正式成果保留原所有权。路径配置显式覆盖默认值，迁移只在所属worker退出后完整重命名，不合并状态或沿链接搬依赖。被多个工程使用的环境由DCO协调维护：本机RGCN的Windows EDA/Cygwin及ARH的ONNX环境属于共享在用依赖，所属目录的清理不独自升级、替换或退役这些实体；先核对worker.local.json与各调用工程的实际引用，在共同空闲窗口一次更新。
 

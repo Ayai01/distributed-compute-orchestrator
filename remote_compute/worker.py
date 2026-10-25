@@ -1032,6 +1032,11 @@ class Worker:
             self._clean_work(job)
         self.asset_handoffs.clear()
         self._prune_assets(recent=False)
+        if self.temp_root:
+            try:
+                self.temp_root.rmdir()
+            except OSError:
+                pass  # Keep any unfinished files; remove only our empty namespace.
         self.root_lock.close()
 
 
