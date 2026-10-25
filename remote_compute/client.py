@@ -220,7 +220,10 @@ class Client:
             if connection is None:
                 factory = http.client.HTTPSConnection if self.endpoint.scheme == 'https' else http.client.HTTPConnection
                 options={'context':getattr(self,'ssl_context',None)} if self.endpoint.scheme=='https' else {}
-                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=network_timeout,**options)
+                # The 8 KiB default repeatedly yields the GIL to a busy
+                # scheduler. Keep uploads bounded without one send per 8 KiB.
+                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=network_timeout,
+                                     blocksize=64*1024,**options)
                 self.connections.connection = connection
             connection.timeout = network_timeout
             if connection.sock is not None:

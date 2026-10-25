@@ -7,6 +7,7 @@ from becoming a second placement API.
 
 import math
 import re
+from functools import lru_cache
 
 MAX_RESOURCE_SHARE = 16.0
 MAX_QUEUE_RATIO = 4.0
@@ -50,9 +51,15 @@ _PLATFORM_TAG = re.compile(
 
 
 def canonical_capability(value, *, registration=False):
-    name = CAPABILITY_ALIASES.get(str(value), str(value))
+    return _canonical_capability(str(value), bool(registration))
+
+
+@lru_cache(maxsize=256)
+def _canonical_capability(value, registration):
+    # Scheduling repeatedly matches the same fixed vocabulary across jobs.
+    name = CAPABILITY_ALIASES.get(value, value)
     if (_IDENTITY_TAG.search(name) or _PLATFORM_TAG.search(name)
-            or registration and _PLATFORM_TAG.search(str(value))):
+            or registration and _PLATFORM_TAG.search(value)):
         raise ValueError('Capabilities require semantic tool names, without hashes or platform selectors')
     return name
 
