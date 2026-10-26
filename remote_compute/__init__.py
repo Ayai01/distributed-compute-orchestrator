@@ -2,9 +2,9 @@
 
 PROJECT_NAME = "Distributed Compute Orchestrator"
 ABBREVIATION = "DCO"
-__version__ = "0.8.38"
+__version__ = "0.8.39"
 
-from .client import Client, Pool, RemoteError
+from .client import Client, Pool, RemoteError, RequestCancelled
 from .tasks import command, ngspice, verilator
 
-__all__ = ["Client", "Pool", "RemoteError", "command", "ngspice", "verilator"]
+__all__ = ["Client", "Pool", "RemoteError", "RequestCancelled", "command", "ngspice", "verilator"]

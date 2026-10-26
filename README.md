@@ -167,6 +167,8 @@ center.wait(job["id"])
 center.fetch(job["id"], "./results/maintenance")
 ```
 
+`Client.wait` 默认从0.15秒轮询开始，同一状态持续较久时逐步放缓，最多5秒；状态或已报告阶段变化后恢复短间隔。`poll`指定最短间隔，`max_poll`指定最长间隔；需要固定节拍时令两者相等。可传入`cancel=stop_event.is_set`，本地等待取消时抛出`RequestCancelled`，远端原任务继续运行；需要结束任务时由调用方明确执行`cancel(原ID)`。`wait_timeout`仍为本次调用的绝对期限，终态返回完整原回执。
+
 `exec` 直接传 argv；需要 shell 语法时显式选择目标 shell。`python` 上传本地脚本，用目标机工具执行，可用 `--tool` 指定登记的 Python。`--stdin` 传文件，`--env NAME=VALUE` 设置变量，`--output` 保存完整日志。API 提供 read_text/write_text/upload/download；上传按文件合并并原子替换文件。日志摘要保留末尾 16 KiB，完整日志随结果取回。`--detach` / `wait=False` 返回任务 ID，调用者随后按原 ID 领取。运维默认 retries=0，避免重复文件副作用。
 
 ## 任务CPU计量

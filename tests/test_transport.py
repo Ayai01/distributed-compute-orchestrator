@@ -566,6 +566,64 @@ def slow_upload_server(*, interrupt=False, started=None):
         server.shutdown();thread.join();server.server_close()
 
 
+class AdaptiveWaitTests(unittest.TestCase):
+    def simulated_wait(self, duration, **options):
+        client=Client();clock=[0.];calls=[];sleeps=[]
+        def status(identity,brief=False):
+            calls.append((clock[0],identity,brief))
+            return dict(id=identity,status='succeeded'if clock[0]>=duration else'running',
+                        **({}if brief else dict(stdout='original output',cpu_seconds=duration)))
+        def sleep(seconds):clock[0]+=seconds;sleeps.append(seconds)
+        with patch.object(client,'status',side_effect=status),patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+            receipt=client.wait('a'*32,**options)
+        return receipt,calls,sleeps
+
+    def test_short_tasks_keep_original_cadence_and_full_terminal_receipt(self):
+        for duration in (2,3):
+            receipt,calls,sleeps=self.simulated_wait(duration)
+            self.assertLess(calls[-1][0]-duration,.151)
+            self.assertTrue(all(abs(delay-.15)<1e-10 for delay in sleeps))
+            self.assertEqual(receipt['stdout'],'original output')
+            self.assertEqual(receipt['cpu_seconds'],duration)
+            self.assertTrue(all(identity=='a'*32 for _,identity,_ in calls))
+            self.assertEqual([brief for _,_,brief in calls[-2:]],[True,False])
+
+    def test_long_task_reduces_status_requests_and_fixed_cadence_remains_available(self):
+        _,calls,sleeps=self.simulated_wait(36000)
+        self.assertLess(len(calls),7400)
+        self.assertLessEqual(max(sleeps),5)
+        self.assertLess(calls[-1][0]-36000,5)
+        _,fixed,fixed_sleeps=self.simulated_wait(120,poll=.5,max_poll=.5)
+        self.assertEqual(len(fixed),242)
+        self.assertEqual(set(fixed_sleeps),{.5})
+
+    def test_status_transition_resets_fast_cadence(self):
+        client=Client();clock=[0.];calls=[]
+        def status(identity,brief=False):
+            calls.append(clock[0])
+            return dict(id=identity,status='queued'if clock[0]<120 else'running')
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(client,'status',side_effect=status),patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+            with self.assertRaisesRegex(RemoteError,'Wait limit reached'):
+                client.wait('b'*32,wait_timeout=121)
+        first=next(i for i,t in enumerate(calls)if t>=120)
+        self.assertAlmostEqual(calls[first+1]-calls[first],.15)
+        self.assertAlmostEqual(clock[0],121)
+
+    def test_cancel_stops_local_wait_without_remote_cancel_or_resubmission(self):
+        for outage in (False,True):
+            with self.subTest(outage=outage):
+                client=Client();clock=[0.];error=RemoteError('offline');error.transport_retryable=True
+                cancelled_at=6.05 if outage else 121.05
+                def sleep(seconds):clock[0]+=seconds
+                response={'id':'c'*32,'status':'running'}
+                with patch.object(client,'status',side_effect=error if outage else None,return_value=response),patch.object(client,'cancel')as remote_cancel,patch.object(client,'submit')as submit,patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+                    with self.assertRaisesRegex(RequestCancelled,'Wait cancelled'):
+                        client.wait('c'*32,cancel=lambda:clock[0]>=cancelled_at)
+                self.assertLess(clock[0],cancelled_at+.101)
+                remote_cancel.assert_not_called();submit.assert_not_called()
+
+
 class StatusReadReconnectTests(unittest.TestCase):
     @staticmethod
     def outage(status=None):

@@ -37,12 +37,25 @@ class PoolBusy(RemoteError):
 
 
 class RequestCancelled(RemoteError):
-    """An optional pre-submission transfer was abandoned by its caller."""
+    """A caller stopped its transfer or local wait, preserving accepted work."""
 
 
 def _check_cancelled(cancel):
     if cancel is not None and cancel():
         raise RequestCancelled('Transfer cancelled before task submission')
+
+
+def _pause(seconds, check=None):
+    if check is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(.1, remaining))
 
 
 class _UploadBody(io.BytesIO):
@@ -453,12 +466,13 @@ class Client:
     def delete(self, identity):
         return self.request("/jobs/" + identity, method="DELETE")
 
-    def _read_reconnecting(self, read, *, deadline=None):
+    def _read_reconnecting(self, read, *, deadline=None, check=None):
         """Keep an existing observation across a bounded transport outage."""
         expires=time.monotonic()+max(120,self.timeout)
         if deadline is not None:expires=min(expires,deadline)
         delay=.2
         while True:
+            if check is not None:check()
             try:
                 return read()
             except RemoteError as error:
@@ -467,21 +481,38 @@ class Client:
                 remaining=expires-time.monotonic()
                 if not transient or remaining<=0:
                     raise
-                time.sleep(min(delay,remaining))
+                _pause(min(delay,remaining),check)
                 delay=min(5,delay*2)
 
-    def wait(self, identity, *, poll=0.15, wait_timeout=None):
+    def wait(self, identity, *, poll=0.15, max_poll=5, wait_timeout=None, cancel=None):
+        """Wait on the original ID; stopping this wait leaves its task running."""
+        if poll <= 0:
+            raise ValueError('poll must be positive')
+        max_poll = max(poll, max_poll)
         started = time.monotonic()
         deadline=None if wait_timeout is None else started+wait_timeout
+        phase_started, phase = started, None
+        def check():
+            if cancel():
+                raise RequestCancelled(f'Wait cancelled; query {self.url}/jobs/{identity}')
+        check = check if cancel is not None else None
         while True:
-            result = self._read_reconnecting(lambda:self.status(identity,brief=True),deadline=deadline)
+            result = self._read_reconnecting(lambda:self.status(identity,brief=True),deadline=deadline,check=check)
             if result["status"] in TERMINAL:
-                result = self._read_reconnecting(lambda:self.status(identity),deadline=deadline)
+                result = self._read_reconnecting(lambda:self.status(identity),deadline=deadline,check=check)
                 result["url"] = self.url
                 return result
-            if wait_timeout is not None and time.monotonic() - started >= wait_timeout:
+            now = time.monotonic()
+            observed = (result['status'], result.get('phase'))
+            if observed != phase:
+                phase_started, phase = now, observed
+            if deadline is not None and now >= deadline:
                 raise RemoteError(f"Wait limit reached; query {self.url}/jobs/{identity}")
-            time.sleep(poll)
+            # Short phases retain the original cadence; long black boxes need
+            # fewer status requests, without watching logs or adding a monitor.
+            delay = min(max_poll, max(poll, (now-phase_started)/20))
+            if deadline is not None:delay=min(delay,deadline-now)
+            _pause(delay,check)
 
     def artifacts(self, identity):
         # A center may first need to retrieve the complete remote ZIP. Keep
