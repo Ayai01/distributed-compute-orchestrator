@@ -4,6 +4,7 @@ import time
 import unittest
 
 from remote_compute import Pool
+from remote_compute.records import Job
 from test_center import center
 from test_compute import provider, python, scratch, until
 
@@ -12,6 +13,62 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class FixedQueueFairnessTests(unittest.TestCase):
+    def test_offline_grant_does_not_block_online_fixed_queue_reservation(self):
+        with scratch() as directory, provider(Path(directory)/'offline',cpus=4) as (_,offline), \
+                provider(Path(directory)/'online',cpus=4) as (_,online):
+            with Pool([offline,online],policy='round_robin',refresh=1000) as pool, \
+                    center(pool,Path(directory)/'center') as (state,client):
+                pool.stop_event.set();pool.monitor.join()
+                accepted=client.submit(python(HOLD,project='wide',cpus=2))
+                original=accepted['id']
+                until(lambda:client.status(original)['status']=='running')
+                lost=state.jobs[original]['node']
+                lost.last_connected_at=time.monotonic()-61
+                pool._expire_unreachable()
+                self.assertTrue(lost.detached)
+                healthy=next(node for node in pool.nodes if node is not lost)
+                running=[client.submit(python(HOLD,project='small'))['id'] for _ in range(4)]
+                until(lambda:all(client.status(key)['status']=='running' for key in running))
+                client.control(paused=True)
+                wide=client.submit(python(HOLD,project='wide',cpus=2))['id']
+                refill=client.submit(python(HOLD,project='small'))['id']
+                resources=state.project_resources()
+                self.assertEqual(resources['wide']['used'],0)
+                self.assertEqual(resources['wide']['target'],2)
+                self.assertIn(healthy.name,state._fixed_queue_claims(resources))
+                self.assertEqual(lost.reserved,2)
+                self.assertEqual(client.status(original)['request_sha256'],accepted['request_sha256'])
+                client.control(paused=False)
+                client.write_job_file(running[0],'release','done');client.wait(running[0])
+                time.sleep(.3)
+                self.assertEqual(client.status(wide)['status'],'queued')
+                self.assertEqual(client.status(refill)['status'],'queued')
+                self.assertEqual(healthy.reserved,3)
+                client.write_job_file(running[1],'release','done');client.wait(running[1])
+                until(lambda:client.status(wide)['status']=='running')
+                self.assertEqual(client.status(wide)['cpus'],2)
+                self.assertEqual(client.status(original)['status'],'running')
+                self.assertEqual(lost.reserved,2)
+                for key in (*running,wide,refill,original):
+                    client.cancel(key);client.wait(key)
+
+    def test_unattached_recovery_does_not_create_online_project_demand(self):
+        with scratch() as directory,provider(Path(directory)/'worker',cpus=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(directory)/'center') as (state,client):
+                client.control(paused=True)
+                for project in ('Bench','ARH'):
+                    client.submit(python(HOLD,project=project,cpus=2))
+                identity='a'*32
+                with state.condition,pool.condition:
+                    state.jobs[identity]=Job(recover=True,result=dict(id=identity,status='running',
+                        worker_url='http://127.0.0.1:1'))
+                    try:
+                        resources=state.project_resources()
+                        self.assertEqual(set(resources),{'Bench','ARH'})
+                        self.assertTrue(all(row['target']==2 for row in resources.values()))
+                    finally:
+                        del state.jobs[identity]
+
     def test_single_cpu_phase_growth_accumulates_under_continuous_refill(self):
         with scratch() as directory, provider(Path(directory)/'worker', cpus=6) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):

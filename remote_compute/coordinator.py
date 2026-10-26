@@ -386,12 +386,16 @@ class Coordinator:
             for job in active_values(self.jobs):
                 if job['result']['status'] in TERMINAL:
                     continue
+                held=job.get('node')
+                # Online quotas exclude disconnected grants. Their original
+                # records retain ownership until actual worker reattachment.
+                if job.get('recover') or (held is not None and held.name not in online):
+                    continue
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
                 demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
                 demand=min(demand,task.get('max_cpus',demand))
-                held=job.get('node')
                 paused=held is not None and held.health.get('paused')
                 if paused:demand=task.get('cpus',0)
                 demands[name] = demands.get(name, 0) + demand
