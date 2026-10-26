@@ -907,12 +907,23 @@ class Coordinator:
                         time.sleep(.5)
 
     def _retry(self, job, outcome):
+        # The interrupted receipt is still a paid attempt, including when the
+        # retry allowance is exhausted. Keep its measurements before resetting.
+        measured={key:deepcopy(outcome.get(key,job['result'].get(key))) for key in (
+            'started','elapsed','cpus','memory_mb','peak_cpus','peak_rss_mb','cpu_seconds',
+            'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds',
+            'cpu_frequency','cost_incomplete') if key in outcome or key in job['result']}
+        if 'cpu_seconds' not in outcome:
+            measured['cost_incomplete']=True  # A live snapshot is only the known prefix.
+        job['result'].update(measured)
         job['result'].update(status='interrupted',error=outcome.get('error','Worker stopped'),finished=outcome.get('finished',time.time()))
+        self._attempt_total(job['result'])
         self._save(job)
         attempts=job['result'].setdefault('attempts',[])
         if len(attempts)>=job['result'].get('max_retries',0):return
         attempts.append(dict(node=job['node'].name,worker_id=job.get('worker_id',job['result']['id']),
-                             status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished')))
+                             status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished'),
+                             **measured))
         identity=job['result']['id']
         with zipfile.ZipFile(job['directory']/'request.zip') as archive:
             task=json.loads(archive.read('task.json'))
@@ -922,13 +933,22 @@ class Coordinator:
         job.update(task=task,auto_cpus=task['cpus']==0,node=None,worker_id=worker_id)
         job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
-        for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_rss_mb','cpu_seconds',
+        for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_cpus','peak_rss_mb','cpu_seconds','total_cpu_seconds','cost_incomplete',
                     'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency'):
             job['result'].pop(key,None)
         job['result'].update(started=None,stdout='',stderr='',steps=[])
         self.queue.append(identity);self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])
         self._save(job)
         self.activity.notify('Worker stopped; retry original task ['+identity[:4]+']')
+
+    @staticmethod
+    def _attempt_total(result):
+        if result.get('attempts'):
+            parts=result['attempts']+[result]
+            values=[part.get('cpu_seconds') for part in parts]
+            result['total_cpu_seconds']=(sum(values) if all(not part.get('cost_incomplete')
+                and type(value) in (int,float) and math.isfinite(value) and value>=0
+                for part,value in zip(parts,values)) else None)
 
     @contextmanager
     def _asset_handoff(self, node, identity, assets, *, enabled):
@@ -999,6 +1019,7 @@ class Coordinator:
             assigned['memory_mb']=job['task']['memory_mb']
             assigned['accelerator']=job['task'].get('accelerator')
         job["result"].update(remote, **assigned, center_submitted=submitted)
+        self._attempt_total(job['result'])
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
             self._save(job)

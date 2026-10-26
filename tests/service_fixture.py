@@ -1,4 +1,4 @@
-"""Isolate terminal discovery in subprocess tests of other service behavior.
+"""Isolate terminal discovery and scratch in subprocess service tests.
 
 The real entry point is exercised without this fixture by test_startup. Copies
 use the same shim across reloads; production has no visibility override flag.
@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory(prefix='dco-service-config-') as directory:
         path=Path(directory)/'worker.json'
         path.write_text('{}',encoding='utf8')
         sys.argv[1:1]=['--config',str(path)]
-    with patch('remote_compute.cli.require_visible'), patch('remote_compute.cli.console_close',return_value=nullcontext()):
+    with patch('remote_compute.cli.require_visible'), patch('remote_compute.cli.console_close',return_value=nullcontext()), patch('remote_compute.ramdisk.scratch',return_value=Path(directory)/'scratch'):
         raise SystemExit(main())
 '''
 

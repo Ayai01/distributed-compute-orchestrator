@@ -559,7 +559,9 @@ def slow_upload_server(*, interrupt=False, started=None):
         connection.sock.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,16384)
     try:
         with patch.object(http.client.HTTPConnection,'connect',connect):
-            yield Client('http://127.0.0.1:'+str(server.server_port),timeout=.3),received
+            # A queued TCP tail still needs time to drain after send() returns.
+            # The 1.3 s receiver loop remains longer than this socket deadline.
+            yield Client('http://127.0.0.1:'+str(server.server_port),timeout=.75),received
     finally:
         server.shutdown();thread.join();server.server_close()
 
@@ -862,9 +864,12 @@ class TransportTests(unittest.TestCase):
             started=time.monotonic()
             result=client.request('/assets/'+identity,payload)
             self.assertGreater(time.monotonic()-started,client.timeout)
-            self.assertEqual(client.timeout,.3)
+            self.assertEqual(client.timeout,.75)
             self.assertEqual(result,dict(bytes=len(payload),sha256=identity))
-            self.assertEqual(received,[('/assets/'+identity,payload,None)])
+            self.assertEqual(len(received),1)
+            self.assertEqual(received[0][0],'/assets/'+identity)
+            self.assertEqual(received[0][1],payload)
+            self.assertIsNone(received[0][2])
 
     def test_interrupted_binary_upload_restarts_same_hash_from_first_byte(self):
         payload=b'asset-content'*160000

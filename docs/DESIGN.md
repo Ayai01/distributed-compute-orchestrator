@@ -330,6 +330,8 @@ result = client.run(task, files={
 
 显式任务环境 `DCO_CPU_ACCOUNTING=1` 复用worker的进程组/Windows Job CPU采样，累计CPU秒包含用户与内核时间；仅对实际CPU秒差分积分 `W = Σ Δt_cpu × f_GHz`，等待和空闲不增加工作量。`cumulative_cpu_seconds`是既有`cpu_seconds`的同口径别名，`cpu_accounting_sampled_at`为采样Unix时间。
 
+中心重试按原ID保存每次已结束尝试的CPU秒、采样与频率覆盖、资源峰值和时间。顶层`cpu_seconds/cumulative_cpu_seconds`继续表示当前worker尝试；有重试时，`total_cpu_seconds`为所有尝试的CPU秒之和，仅在各次都有实测且未标记`cost_incomplete`时给出数值，缺失时为null并保留已有分项。最终回执失联时保留最后一次在线采样，标明它只是已知前缀。重试次数耗尽也保留最后一次的实际计量，不把旧回执缺测填成0；原回执、输入及科学预算不改写。
+
 Windows用单个标准库PDH查询读取`Processor Information(_Total)/Actual Frequency`，每宿主至多1Hz且冷启动先取得完整初始区间；超过两个普通周期的空档先重建PDH基线，缓存间隔从读取完成后起算；使用英文计数器API适配系统语言。Processor Frequency及额定频率不作替代。Linux仅读取cpufreq的`cpuinfo_avg_freq`或`cpuinfo_cur_freq`硬件报告；宿主/虚拟机没有该信息时保持缺测。来源参考[Windows PDH](https://learn.microsoft.com/en-us/windows/win32/perfctrs/using-the-pdh-functions-to-consume-counter-data)和[Linux CPUFreq](https://www.kernel.org/doc/html/latest/admin-guide/pm/cpufreq.html)。频率表示宿主活动平均/策略平均的估计范围，`cpu_frequency.scope`分别标明；CPU秒的归属仍为本任务。
 
 `cpu_frequency`保留`source/scope/covered_cpu_seconds/weighted_mean_ghz/observed_ghz_seconds`，加权均值只用已覆盖CPU秒。覆盖完整时`cpu_work_ghz_seconds`给出完整累计值，否则为null，已观察的部分仍在`observed_ghz_seconds`中。未测频率不回填当前值，旧任务不重算。每任务只保留累计量；本地result.json至多1Hz且CPU计数变化时原子发布，读取者核worker原ID和采样时间。临时Windows读共享冲突只推迟这一快照，任务和最终回执继续正常封存；不创建采样日志、线程或额外网络请求。来源及scope/覆盖量随原最终回执走现有通道，简短progress保留原字段；失败重试沿新worker尝试重置此计量。

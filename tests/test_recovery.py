@@ -15,6 +15,90 @@ from test_compute import provider,python,scratch,until
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_retry_keeps_previous_cpu_measurements_in_receipts_and_artifacts(self):
+        with scratch() as folder,provider(Path(folder)/'lost') as (_,lost), \
+                provider(Path(folder)/'healthy') as (_,healthy), \
+                Pool([lost,healthy],policy='round_robin') as pool, \
+                center(pool,Path(folder)/'center') as (_,client):
+            def stopped(*args,**kwargs):
+                pool.nodes[0].enabled=False
+                return dict(status='interrupted',error='Worker stopped',finished=time.time(),
+                            cpu_seconds=2.5,cumulative_cpu_seconds=2.5,peak_rss_mb=321,
+                            cpu_work_ghz_seconds=7.5,cpu_frequency=dict(source='fixture',covered_cpu_seconds=2.5))
+            with patch.object(lost,'submit_bundle',return_value={}),patch.object(lost,'status',side_effect=stopped):
+                identity=client.submit(python("print('same-original')",retries=1))['id']
+                result=client.wait(identity,wait_timeout=10)
+            self.assertEqual(result['status'],'succeeded')
+            self.assertEqual(result['attempts'][0]['cpu_seconds'],2.5)
+            self.assertEqual(result['attempts'][0]['cumulative_cpu_seconds'],2.5)
+            self.assertEqual(result['attempts'][0]['cpu_frequency']['source'],'fixture')
+            self.assertEqual(result['attempts'][0]['peak_rss_mb'],321)
+            self.assertAlmostEqual(result['total_cpu_seconds'],2.5+result['cpu_seconds'])
+            receipt=client.fetch(identity)
+            self.assertEqual(receipt['id'],identity)
+            self.assertEqual(receipt['total_cpu_seconds'],result['total_cpu_seconds'])
+            self.assertEqual(receipt['stdout'].strip(),'same-original')
+
+    def test_retry_limit_keeps_final_cpu_and_total_after_center_restart(self):
+        with scratch() as folder,provider(Path(folder)/'worker') as (_,worker):
+            root=Path(folder);costs={}
+            with Pool([worker]) as pool,center(pool,root/'center') as (_,client):
+                def stopped(identity,*args,**kwargs):
+                    seconds=costs.setdefault(identity,1.25 if not costs else 2.75)
+                    return dict(id=identity,status='interrupted',error='Worker stopped',finished=time.time(),
+                                cpu_seconds=seconds,cumulative_cpu_seconds=seconds)
+                with patch.object(worker,'submit_bundle',return_value={}),patch.object(worker,'status',side_effect=stopped):
+                    identity=client.submit(python('pass',retries=1))['id']
+                    result=client.wait(identity,wait_timeout=10)
+                self.assertEqual(result['status'],'interrupted')
+                self.assertEqual(result['cpu_seconds'],2.75)
+                self.assertEqual(result['cumulative_cpu_seconds'],2.75)
+                self.assertEqual(result['attempts'][0]['cpu_seconds'],1.25)
+                self.assertEqual(result['total_cpu_seconds'],4.0)
+            with Pool([worker]) as pool,center(pool,root/'center') as (_,client):
+                restored=client.status(identity)
+                self.assertEqual(restored['total_cpu_seconds'],4.0)
+                self.assertEqual(restored['attempts'][0]['cpu_seconds'],1.25)
+
+    def test_missing_or_incomplete_previous_cpu_remains_unknown_after_retry(self):
+        for previous in ({},dict(cpu_seconds=1.5,cost_incomplete=True)):
+            with self.subTest(previous=previous),scratch() as folder,provider(Path(folder)/'lost') as (_,lost), \
+                    provider(Path(folder)/'healthy') as (_,healthy), \
+                    Pool([lost,healthy],policy='round_robin') as pool, \
+                    center(pool,Path(folder)/'center') as (_,client):
+                def stopped(*args,**kwargs):
+                    pool.nodes[0].enabled=False
+                    return dict(status='interrupted',error='Worker disappeared',finished=time.time(),**previous)
+                with patch.object(lost,'submit_bundle',return_value={}),patch.object(lost,'status',side_effect=stopped):
+                    identity=client.submit(python('pass',retries=1))['id']
+                    result=client.wait(identity,wait_timeout=10)
+                self.assertEqual(result['status'],'succeeded')
+                self.assertEqual(result['attempts'][0].get('cpu_seconds'),previous.get('cpu_seconds'))
+                self.assertIsNone(result['total_cpu_seconds'])
+                self.assertIsInstance(result['cpu_seconds'],(int,float))
+
+    def test_lost_final_receipt_keeps_live_cpu_as_incomplete_prefix(self):
+        with scratch() as folder,provider(Path(folder)/'worker') as (_,worker), \
+                Pool([worker]) as pool,center(pool,Path(folder)/'center') as (_,client):
+            seen={};first=[]
+            def status(identity,*args,**kwargs):
+                if not first:first.append(identity)
+                if identity==first[0]:
+                    return dict(status='interrupted',cpu_seconds=1.25,finished=time.time())
+                seen[identity]=seen.get(identity,0)+1
+                if seen[identity]<=2:
+                    return dict(status='running',cpu_seconds=2.0,cumulative_cpu_seconds=2.0)
+                error=RemoteError('lost final receipt');error.status_code=404
+                raise error
+            with patch.object(worker,'submit_bundle',return_value={}),patch.object(worker,'status',side_effect=status):
+                identity=client.submit(python('pass',retries=1))['id']
+                result=client.wait(identity,wait_timeout=10)
+            self.assertEqual(result['status'],'interrupted')
+            self.assertEqual(result['attempts'][0]['cpu_seconds'],1.25)
+            self.assertEqual(result['cpu_seconds'],2.0)
+            self.assertTrue(result['cost_incomplete'])
+            self.assertIsNone(result['total_cpu_seconds'])
+
     def test_status_snapshot_hides_interrupted_commit_until_retry_decision(self):
         from remote_compute.bundle import atomic_json
         blocked, release = threading.Event(), threading.Event()

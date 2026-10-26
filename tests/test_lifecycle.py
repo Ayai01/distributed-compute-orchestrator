@@ -74,7 +74,7 @@ class ServicePowerTests(unittest.TestCase):
                 with self.subTest(mode=mode, child=child), scratch() as directory:
                     root = Path(directory)
                     config = root / 'config.json'
-                    config.write_text('{}', encoding='utf8')
+                    config.write_text(json.dumps(dict(temp_root=str(root/'scratch'))), encoding='utf8')
                     events = []
 
                     @contextmanager
