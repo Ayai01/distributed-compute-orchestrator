@@ -35,11 +35,13 @@ def driver():
 @contextmanager
 def creation_lock():
     kernel = c.WinDLL('kernel32', use_last_error=True)
-    kernel.CreateMutexW.argtypes = [c.c_void_p, w.BOOL, w.LPCWSTR]
-    kernel.CreateMutexW.restype = w.HANDLE
+    kernel.CreateMutexExW.argtypes = [c.c_void_p, w.LPCWSTR, w.DWORD, w.DWORD]
+    kernel.CreateMutexExW.restype = w.HANDLE
     kernel.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
     kernel.ReleaseMutex.argtypes = kernel.CloseHandle.argtypes = [w.HANDLE]
-    handle = kernel.CreateMutexW(None, False, 'Global\\CodexSharedRamdiskV1')
+    # Waiting/releasing needs SYNCHRONIZE; CreateMutexW demands ALL_ACCESS
+    # when another project already created this shared object.
+    handle = kernel.CreateMutexExW(None, 'Global\\CodexSharedRamdiskV1', 0, 0x100000)
     if not handle:
         raise c.WinError(c.get_last_error())
     acquired = False

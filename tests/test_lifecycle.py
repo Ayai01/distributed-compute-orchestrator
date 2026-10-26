@@ -184,6 +184,46 @@ class SharedRamdiskTests(unittest.TestCase):
         root=patch.object(ramdisk,'ROOT',Path(settings.name))
         root.start();self.addCleanup(root.stop)
 
+    def test_existing_sync_only_mutex_does_not_require_all_access(self):
+        import ctypes as c
+        from ctypes import wintypes as w
+        kernel=c.WinDLL('kernel32',use_last_error=True)
+        security=c.WinDLL('advapi32',use_last_error=True)
+        kernel.CreateMutexW.argtypes=[c.c_void_p,w.BOOL,w.LPCWSTR]
+        kernel.CreateMutexW.restype=w.HANDLE
+        kernel.CreateMutexExW.argtypes=[c.c_void_p,w.LPCWSTR,w.DWORD,w.DWORD]
+        kernel.CreateMutexExW.restype=w.HANDLE
+        kernel.CloseHandle.argtypes=[w.HANDLE]
+        kernel.LocalFree.argtypes=[c.c_void_p]
+        security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes=[w.LPCWSTR,w.DWORD,c.POINTER(c.c_void_p),c.c_void_p]
+        security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype=w.BOOL
+        class Attributes(c.Structure):
+            _fields_=[('length',w.DWORD),('descriptor',c.c_void_p),('inherit',w.BOOL)]
+        descriptor=c.c_void_p()
+        self.assertTrue(security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            'D:(A;;0x00100000;;;WD)',1,c.byref(descriptor),None))
+        name='Local\\DCO-test-sync-only-'+ramdisk.ROOT.name
+        attributes=Attributes(c.sizeof(Attributes),descriptor,False)
+        holder=kernel.CreateMutexExW(c.byref(attributes),name,0,0x100000)
+        try:
+            self.assertTrue(holder)
+            old=kernel.CreateMutexW(None,False,name)
+            if old:kernel.CloseHandle(old)
+            self.assertFalse(old)
+            self.assertEqual(c.get_last_error(),5)
+            def create(attributes,requested,flags,rights):
+                self.assertEqual(requested,'Global\\CodexSharedRamdiskV1')
+                return kernel.CreateMutexExW(attributes,name,flags,rights)
+            proxy=SimpleNamespace(CreateMutexExW=create,WaitForSingleObject=kernel.WaitForSingleObject,
+                ReleaseMutex=kernel.ReleaseMutex,CloseHandle=kernel.CloseHandle)
+            # Redirect only this isolated lock name; production Z is untouched.
+            with patch.object(ramdisk.c,'WinDLL',return_value=proxy):
+                with ramdisk.creation_lock():
+                    pass
+        finally:
+            if holder:kernel.CloseHandle(holder)
+            kernel.LocalFree(descriptor)
+
     def test_configured_four_gib_volume_reuses_files_without_growing(self):
         with tempfile.TemporaryDirectory(prefix='compute-ramdisk-') as directory:
             root=Path(directory);cache=root/'existing-cache.bin'

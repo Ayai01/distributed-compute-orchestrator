@@ -389,6 +389,8 @@ worker的可重建资产按LRU管理，启动、任务取回和退出时回收�
 
 默认路径与迁移入口见[README](../README.md#设备预算与配置文件)。库缓存环境按任务env、设备/继承env、DCO默认路径依次取值；外部已有可用工具及模型/依赖缓存原位复用。`temp_root:null`等同缺省，优先共享RAM；普通磁盘回退仍位于DCO目录。一次性`migrate_root_from`仅在旧worker锁可取得、目标位于DCO`.local`且不存在时整体重命名；崩溃后已完成的重命名可继续，不复制数据或合并状态。
 
+Windows共享盘初始化沿用同一个全局互斥对象，以`CreateMutexExW`申请`SYNCHRONIZE`，等待及释放保持原语义，现有对象的权限保持原样。此权限足以使用互斥锁，见[Windows互斥对象访问权](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-openmutexw)。
+
 原生HTTPS worker支持单向资源协商：任务访问本机lease接口，中心按节点合并轮询待处理请求。存在此类在途任务时约每0.2秒检查一次，空闲节点沿用常规采样周期，避免每任务各建高频轮询连接。网络短暂中断保留原授权。
 
 ## 接入与传输约定

@@ -110,18 +110,23 @@ def low_integrity_directory(path):
     kernel=c.WinDLL('kernel32',use_last_error=True)
     security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes=[w.LPCWSTR,w.DWORD,c.POINTER(c.c_void_p),c.POINTER(w.DWORD)]
     security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype=w.BOOL
-    security.SetFileSecurityW.argtypes=[w.LPCWSTR,w.DWORD,c.c_void_p]
-    security.SetFileSecurityW.restype=w.BOOL
+    security.GetSecurityDescriptorSacl.argtypes=[c.c_void_p,c.POINTER(w.BOOL),c.POINTER(c.c_void_p),c.POINTER(w.BOOL)]
+    security.GetSecurityDescriptorSacl.restype=w.BOOL
+    security.SetNamedSecurityInfoW.argtypes=[w.LPWSTR,w.DWORD,w.DWORD,c.c_void_p,c.c_void_p,c.c_void_p,c.c_void_p]
+    security.SetNamedSecurityInfoW.restype=w.DWORD
     kernel.LocalFree.argtypes=[c.c_void_p]
     kernel.LocalFree.restype=c.c_void_p
     descriptor=c.c_void_p()
     if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW('S:(ML;OICI;NW;;;LW)',1,c.byref(descriptor),None):
         raise c.WinError(c.get_last_error())
     try:
-        # Label only a new, empty directory. This preserves DACL inheritance;
-        # files and subdirectories created later inherit the Low label.
-        if not security.SetFileSecurityW(str(path),0x10,descriptor):
-            error=c.get_last_error()
+        # The label-only named API preserves the existing DACL and its
+        # inheritance flags; future files/directories inherit the Low label.
+        present,defaulted,sacl=w.BOOL(),w.BOOL(),c.c_void_p()
+        if not security.GetSecurityDescriptorSacl(descriptor,c.byref(present),c.byref(sacl),c.byref(defaulted)):
+            raise c.WinError(c.get_last_error())
+        error=security.SetNamedSecurityInfoW(str(path),1,0x10,None,None,None,sacl)
+        if error:
             if error in (5,1314):return False
             raise c.WinError(error)
     finally:
