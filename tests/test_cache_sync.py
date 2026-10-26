@@ -307,6 +307,44 @@ class CacheRpcTests(unittest.TestCase):
         client.delete.assert_not_called()
         client.fetch.assert_not_called()
 
+    def test_lost_submit_reply_waits_for_original_id_publication_after_404(self):
+        client, accepted, rpc = self.fixture()
+        missing = RemoteError('original ID not yet published')
+        missing.status_code = 404
+        def accepted_without_reply(*args, **kwargs):
+            accepted.append(kwargs['job_id'])
+            raise missing
+        client.machine.return_value.python.side_effect = accepted_without_reply
+        client.status.side_effect = [missing, missing, dict(status='succeeded'),
+                                     dict(status='succeeded')]
+        self.assertEqual(rpc.call(node('worker', Path('fixture')), 'arh', 'manifest')
+                         ['key']['digest'], 'abc')
+        client.machine.return_value.python.assert_called_once()
+        self.assertEqual({call.args[0] for call in client.status.call_args_list}, set(accepted))
+        client.fetch.assert_called_once_with(accepted[0], delete=False)
+        client.delete.assert_called_once_with(accepted[0])
+        self.assertEqual(rpc.pending, {})
+
+    def test_receipt_404_retries_original_id_but_permission_denial_fails_immediately(self):
+        for code, expected_reads in ((404, 3), (403, 1)):
+            with self.subTest(code=code):
+                client, accepted, rpc = self.fixture()
+                unavailable = RemoteError('receipt unavailable')
+                unavailable.status_code = code
+                receipt = client.fetch.return_value
+                client.fetch.side_effect = [unavailable, unavailable, receipt]
+                if code == 404:
+                    self.assertEqual(rpc.call(node('worker', Path('fixture')), 'arh', 'manifest')
+                                     ['key']['digest'], 'abc')
+                    client.delete.assert_called_once_with(accepted[0])
+                else:
+                    with self.assertRaises(RemoteError):
+                        rpc.call(node('worker', Path('fixture')), 'arh', 'manifest')
+                    client.delete.assert_not_called()
+                self.assertEqual(client.fetch.call_count, expected_reads)
+                client.machine.return_value.python.assert_called_once()
+                self.assertEqual({call.args[0] for call in client.fetch.call_args_list}, set(accepted))
+
     def test_transient_read_failure_retries_same_id_without_new_execution(self):
         client, accepted, rpc = self.fixture()
         response = client.fetch.return_value

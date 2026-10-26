@@ -40,7 +40,9 @@ class _RPC:
                 return operation()
             except RemoteError as error:
                 status = getattr(error, 'status_code', None)
-                if attempt == 2 or status is not None and status < 500:
+                # These reads follow our own submitted ID. Old services can
+                # briefly hide it while publishing acceptance or the receipt.
+                if attempt == 2 or status is not None and status < 500 and status != 404:
                     raise
                 self.stop.wait(attempt + 1)
 
