@@ -252,6 +252,50 @@ class OfflineTests(unittest.TestCase):
                 self.assertEqual(pool._retry_detached(node.reconnect_after),[])
             self.assertIn('disk full',node.error)
 
+    def test_detached_accepted_job_waits_for_core_reconnect_without_more_job_rpcs(self):
+        from test_center import center
+        from test_compute import python,until
+        reached,release,read_finished=threading.Event(),threading.Event(),threading.Event()
+        with scratch() as root,provider(Path(root)/'worker') as (worker,remote):
+            with Pool([remote],refresh=1000) as pool,center(pool,Path(root)/'center') as (_,client):
+                pool.stop_event.set();pool.monitor.join()
+                node=pool.nodes[0]
+                original_status=node.client.status
+
+                def first_read(*args,**kwargs):
+                    reached.set()
+                    if not release.wait(5):raise AssertionError('first read was not released')
+                    result=original_status(*args,**kwargs)
+                    read_finished.set()
+                    return result
+
+                try:
+                    with patch.object(node.client,'status',side_effect=first_read) as reads, \
+                         patch.object(node.client,'submit_bundle',wraps=node.client.submit_bundle) as submits:
+                        identity=client.submit(python("import time;time.sleep(2);print('original-result')"))['id']
+                        self.assertTrue(reached.wait(3))
+                        with pool.condition:
+                            node.last_connected_at=time.monotonic()-61
+                            pool._expire_unreachable()
+                        self.assertTrue(node.detached)
+                        release.set()
+                        self.assertTrue(read_finished.wait(3))
+                        threading.Event().wait(.7)
+                        self.assertEqual(reads.call_count,1)
+                        until(lambda:worker.jobs[identity]['result']['status']=='succeeded')
+                        self.assertEqual(client.status(identity,brief=True)['status'],'running')
+                        self.assertEqual(reads.call_count,1)
+                        pool.configure(node.name,enabled=True);pool.refresh(nodes=[node])
+                        result=client.wait(identity,wait_timeout=4)
+                        self.assertEqual(result['status'],'succeeded',result)
+                        self.assertEqual(result['id'],identity)
+                        self.assertEqual(result.get('attempts',[]),[])
+                        self.assertEqual(submits.call_count,1)
+                        self.assertEqual(len(worker.jobs),1)
+                        self.assertEqual(client.fetch(identity)['stdout'].strip(),'original-result')
+                finally:
+                    release.set()
+
     def test_cancelled_detached_job_finishes_drain_and_retains_unknown_cost_until_reconnect(self):
         from test_center import center
         from test_compute import python,until

@@ -784,6 +784,11 @@ class Coordinator:
                                 remote_cancel_pending=True,cost_incomplete=True)
                             self._save(job)
                         break
+                    if node.detached:
+                        # The pool owns bounded reconnection probes. Keep this
+                        # accepted ID without a separate offline polling loop.
+                        job['cancel'].wait(.5)
+                        continue
                     if job["cancel"].is_set() and not cancel_sent:
                         node.client.cancel(identity)
                         cancel_sent=True
