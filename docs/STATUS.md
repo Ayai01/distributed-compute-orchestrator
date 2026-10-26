@@ -1,10 +1,12 @@
 # DCO 当前状态
 
-更新：2026-10-25（HST）。源码版本0.8.35；运行实例在安全空闲边界加载，实际版本按health核对。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
+更新：2026-10-26（HST）。源码版本0.8.36；运行实例在安全空闲边界加载，实际版本按health核对。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
 
 ## 设备与能力
 
-192.168.1.11为Aya1-ITX。人类最新要求的一次性排空关机已完成，并确认机箱关机；中心暂时停用该节点，没有待重放的关机命令。后续人类手动启动时正常接入并保持开着，保留设备线程设置及可见前台运行。此前恢复记录见维护`state.json.ITX_manual_restore`，本次结算见`state.json.ITX_one_time_shutdown_20261025`。Windows设备已验收同一语义工具组合，ku26s保留Linux工具差异，按完整能力组合准入。
+0.8.36修复设备名称未染紫色的问题：看板从当前设备快照取得名称及实际表格缩写，不再按固定主机名前缀识别。任务ID继续青色，标签保持原文；名称变化使现有行重画，不新增网络查询或缓存。52项终端测试通过，覆盖126kf、任意主机名、中文/长名缩写、纯数字/十六进制设备名、任务ID和标签边界、变名后重画；运行模块通过Python3.7语法检查。源码已验证，PC有在途任务时继续保留当前实例。
+
+192.168.1.11为Aya1-ITX。此前一次性排空关机已完成，人类现已手动启动并恢复接入，保持开着，没有待重放的关机命令。PC重启后已恢复可见中心并加载0.8.35；ITX与公网26143的126kf已通过微型任务及临时文件读写验收。126kf只保留当前名称，原端口、证书和认证材料沿用。TX已连通，但Z盘专属临时目录创建失败，暂时暂停新派发，保留24GiB预算，待本机修复目录权限。实测和恢复状态见维护`state.json.post_reboot_reconnection_20261026`。Windows设备已验收同一语义工具组合，ku26s保留Linux工具差异，按完整能力组合准入。
 
 四节点已有科学Python、PyG、ONNX、SPICE及RTL实测。Windows版图环境复用已有安装，ku26s额外提供HSPICE。能力不携带引擎哈希，不按设备或OS限制科研路由；旧别名仅服务原请求兼容。证明见`.local/maintenance/continuous-supervision-20261023/capability-alignment-proof.json`与`state.json`。
 

@@ -14,7 +14,7 @@ _COLOR_ENABLED = False
 _RESET = '\x1b[0m'
 
 
-def _paint_row(row):
+def _paint_row(row, device_names=()):
     """Add restrained ANSI hierarchy after width calculation.
 
     Rows remain plain strings in the painter cache, so ANSI bytes never affect
@@ -38,7 +38,9 @@ def _paint_row(row):
     hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
     number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?)(?![\w.])')
     state_pattern = re.compile(r'运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
-    device_pattern = re.compile(r'(?<![\w])(?:Aya1-[A-Za-z0-9_-]+|ku26s|Server(?:-[A-Za-z0-9_-]+)?|device)(?![\w])')
+    names = sorted(set(device_names) - {'', '-'}, key=lambda name: (-len(name), name))
+    device_pattern = (re.compile(r'(?<![\w])(?:' + '|'.join(re.escape(name) for name in names) + r')(?![\w])')
+                      if names else None)
     state_colors = {
         '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
         '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
@@ -59,11 +61,13 @@ def _paint_row(row):
         matches.append((*task.span('id'), '\x1b[36m'))
     for match in re.finditer(r'\[([0-9a-f]{4})\]', row[:paint_end], re.I):
         matches.append((*match.span(1), '\x1b[36m'))
-    for pattern in (hash_pattern, number_pattern, state_pattern, device_pattern):
+    if device_pattern:
+        matches.extend((match.start(), match.end(), '\x1b[35;1m')
+                       for match in device_pattern.finditer(row, 0, paint_end))
+    for pattern in (hash_pattern, number_pattern, state_pattern):
         for match in pattern.finditer(row, 0, paint_end):
             token = match.group()
             color = ('\x1b[36m' if hash_pattern.fullmatch(token) else
-                     '\x1b[35;1m' if device_pattern.fullmatch(token) else
                      state_colors.get(token.casefold(), '\x1b[33m'))
             matches.append((match.start(), match.end(), color))
     result, position = [], 0
@@ -241,12 +245,14 @@ class RowPainter:
         self.rows=()
         self.size=None
         self.cursor=None
+        self.device_names=()
 
-    def frame(self, rows, columns, height, cursor):
+    def frame(self, rows, columns, height, cursor, *, device_names=()):
+        device_names=tuple(sorted(set(device_names)))
         rows=tuple(_clip(row,max(0,columns-1)) for row in rows[:height])
         rows+=('',)*max(0,height-len(rows))
-        previous=self.rows if self.size==(columns,height) else ()
-        changes=[f'\x1b[{i+1};1H'+_paint_row(row)+'\x1b[K' for i,row in enumerate(rows)
+        previous=self.rows if self.size==(columns,height) and self.device_names==device_names else ()
+        changes=[f'\x1b[{i+1};1H'+_paint_row(row,device_names)+'\x1b[K' for i,row in enumerate(rows)
                  if i>=len(previous) or row!=previous[i]]
         position=(height,min(max(0,cursor),max(0,columns-2))+1)
         result=''
@@ -257,6 +263,7 @@ class RowPainter:
         if changes:
             result+='\x1b[?25h'
         self.rows,self.size,self.cursor=rows,(columns,height),position
+        self.device_names=device_names
         return result
 
 
@@ -561,7 +568,8 @@ class Dashboard:
                     # The footer is an independent fixed-height viewport.  Do
                     # not let a status/output refresh consume its last row.
                     footer = footer[-reserved:] + ([''] * max(0, reserved-len(footer)))
-                    frame = painter.frame(body+footer,columns,height,column)
+                    frame = painter.frame(body+footer,columns,height,column,
+                                          device_names=rows.device_labels if isinstance(rows,StatusRows) else ())
                     if frame or opening:
                         # Present the complete new screen with the buffer switch;
                         # later frames can reuse the unchanged rows.

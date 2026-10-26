@@ -372,6 +372,18 @@ class StatusRows(list):
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}"])
 
+    @property
+    def device_labels(self):
+        labels={self.value.get('node') or ''}
+        width=max([11]+[_width(f'#{r[10]} ')+self.node_width for _,r in self.devices])
+        for _,record in self.devices:
+            name=record[0]
+            labels.update((name,_short(name,self.node_width)))
+            prefix=f'#{record[10]} '
+            rendered=_short(prefix+name,width)
+            if rendered.startswith(prefix):labels.add(rendered[len(prefix):])
+        return labels-{'','-'}
+
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:

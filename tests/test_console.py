@@ -94,14 +94,54 @@ class ConsoleTests(unittest.TestCase):
                     row = next(row for row in rows if row.startswith('+ '+title))
                     self.assertIn('probe', row)
                     boundary = len(_clip(row, 56))
-                    painted = _paint_row(row)
-                    self.assertEqual(painted, blue+row[:boundary]+reset+_paint_row(row[boundary:]))
+                    painted = _paint_row(row, ('Aya1-PC',))
+                    self.assertEqual(painted, blue+row[:boundary]+reset+_paint_row(row[boundary:], ('Aya1-PC',)))
                     self.assertNotIn(blue, painted[len(blue)+boundary+len(reset):])
                     self.assertIn('\x1b[35;1mAya1-PC'+reset, painted)
                     self.assertIn('probe', painted)
                     if width >= 160:
                         self.assertIn('\x1b[32m运行'+reset, painted)
                     self.assertEqual(re.sub(r'\x1b\[[0-9;]*m', '', painted), row)
+
+    def test_device_colors_follow_snapshot_names_and_visible_abbreviations(self):
+        import remote_compute.console as console
+        names=('126kf','DESKTOP-AB12345','计算机甲','deadbeef','12345678')
+        value=dict(role='scheduler',node='center',nodes=[dict(name=name,capacity=8) for name in names])
+        with patch.object(console,'_COLOR_ENABLED',True):
+            for width in (54,110,160,200):
+                rows=format_status(value,width=width)
+                for name in names:
+                    self.assertIn(name,rows.device_labels)
+                for label in rows.device_labels:
+                    for row in rows:
+                        if label in row and not row.startswith('+ '):
+                            painted=_paint_row(row,rows.device_labels)
+                            self.assertIn('\x1b[35;1m'+label+'\x1b[0m',painted)
+                            self.assertEqual(re.sub(r'\x1b\[[0-9;]*m','',painted),row)
+
+    def test_device_color_keeps_task_ids_cyan_and_labels_opaque(self):
+        import remote_compute.console as console
+        job=dict(id='1234'+'a'*28,project='Bench',cpus=1,memory_mb=128,status='running',
+                 label='126kf 1234 运行')
+        rows=format_status(dict(role='scheduler',node='center',
+            nodes=[dict(name='1234',capacity=8,active_jobs=[job])]),width=160)
+        with patch.object(console,'_COLOR_ENABLED',True):
+            row=next(row for row in rows if job['label'] in row)
+            painted=_paint_row(row,rows.device_labels)
+            self.assertIn('\x1b[36m1234\x1b[0m',painted)
+            self.assertIn('\x1b[35;1m1234\x1b[0m',painted)
+            self.assertIn(job['label'],painted)
+
+    def test_device_context_change_repaints_unchanged_text(self):
+        import remote_compute.console as console
+        painter=RowPainter()
+        rows=['| 126kf |']
+        with patch.object(console,'_COLOR_ENABLED',True):
+            painter.frame(rows,30,1,0)
+            colored=painter.frame(rows,30,1,0,device_names=('126kf',))
+            self.assertIn('\x1b[35;1m126kf\x1b[0m',colored)
+            self.assertEqual(painter.frame(rows,30,1,0,device_names=('126kf',)),'')
+            self.assertNotIn('\x1b[35;1m',painter.frame(rows,30,1,0))
 
     def test_adjacent_panel_titles_keep_their_own_color_spans(self):
         import remote_compute.console as console
@@ -231,12 +271,12 @@ class ConsoleTests(unittest.TestCase):
         for columns, height in ((80,1),(80,3),(80,4),(44,8),(80,16),(120,24),(160,51)):
             with self.subTest(size=(columns,height)), redirect_stdout(io.StringIO()):
                 frames = []
-                def paint(painter, rows, width, count, cursor):
+                def paint(painter, rows, width, count, cursor, **options):
                     self.assertEqual(len(rows),height)
                     self.assertTrue(rows[-2 if height >= 5 else -1].startswith('test> '))
                     self.assertTrue(all(_width(row)<=columns-1 for row in rows[-min(4,height):]))
                     frames.append(list(rows))
-                    return original(painter,rows,width,count,cursor)
+                    return original(painter,rows,width,count,cursor,**options)
                 dashboard = Dashboard(OperatorShell(),lambda:health)
                 for i in range(30):
                     dashboard.write(f'output {i}\n')
@@ -320,11 +360,11 @@ class ConsoleTests(unittest.TestCase):
     def test_window_resize_reflows_content_without_losing_the_bottom_input(self):
         geometry, seen = [160,51], []
         original = RowPainter.frame
-        def paint(painter, rows, columns, height, cursor):
+        def paint(painter, rows, columns, height, cursor, **options):
             self.assertEqual(len(rows),height)
             self.assertTrue(rows[-2].startswith('test> '))
             seen.append((columns,height))
-            result=original(painter,rows,columns,height,cursor)
+            result=original(painter,rows,columns,height,cursor,**options)
             geometry[:] = (80,12) if len(seen)==1 else (120,24)
             return result
         with redirect_stdout(io.StringIO()), \
@@ -346,13 +386,13 @@ class ConsoleTests(unittest.TestCase):
                 return dict(role='worker',node='device',cpus=8)
             finally:returned.set()
         original=RowPainter.frame
-        def paint(painter,rows,columns,height,cursor):
+        def paint(painter,rows,columns,height,cursor,**options):
             self.assertTrue(entered.wait(1))
             self.assertFalse(returned.is_set())
             self.assertIn('正在获取状态','\n'.join(rows))
             self.assertTrue(rows[-2].startswith('test> '))
             frames.append((columns,height))
-            result=original(painter,rows,columns,height,cursor)
+            result=original(painter,rows,columns,height,cursor,**options)
             geometry[:]=(80,12) if len(frames)==1 else (120,24)
             return result
         try:
@@ -379,7 +419,7 @@ class ConsoleTests(unittest.TestCase):
                 blocked.set();release.wait(3)
                 raise OSError('temporary-read')
             return dict(role='worker',node='oldnode' if len(calls)==1 else 'newnode',cpus=8)
-        def paint(painter,rows,columns,height,cursor):
+        def paint(painter,rows,columns,height,cursor,**options):
             text='\n'.join(rows)
             if blocked.is_set() and not release.is_set():
                 self.assertIn('oldnode',text)
@@ -390,7 +430,7 @@ class ConsoleTests(unittest.TestCase):
                 self.assertNotIn('temporary-read',text)
                 seen.add('recovered');keyboard.keys.extend('ping\rquit\r')
             self.assertTrue(rows[-2].startswith('test> '))
-            return original(painter,rows,columns,height,cursor)
+            return original(painter,rows,columns,height,cursor,**options)
         try:
             with redirect_stdout(io.StringIO()),patch.dict(sys.modules,msvcrt=keyboard), \
                     patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
