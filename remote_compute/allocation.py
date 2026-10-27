@@ -2,6 +2,12 @@
 import math
 
 
+def elastic_cpus(task):
+    """The accepted request can change width beyond its startup grant."""
+    initial=task.get('cpus',1)
+    return initial==0 or task.get('max_cpus',initial)>initial
+
+
 def plan_resize(cpus, memory_mb, base_memory_mb, memory_per_cpu_mb, memory_limit_mb, available_mb):
     """Fit a phase's linear RAM demand before granting its CPU count."""
     if base_memory_mb is None and memory_per_cpu_mb is None:

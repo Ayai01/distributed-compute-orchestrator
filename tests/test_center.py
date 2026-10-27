@@ -19,6 +19,69 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
+    def test_small_start_elastic_jobs_spread_across_idle_devices(self):
+        state=self.center([20,30,52,16,16]);pool=state.pool
+        pool.closed=False;pool.policy='adaptive'
+        for node,percent,logical in zip(pool.nodes,[12.1,6.7,.2,6.2,0],[28,32,104,24,16]):
+            node.health.update(cpu_percent=percent,logical_cpus=logical)
+        selected=[]
+        for index in range(5):
+            task=dict(steps=[['echo']],cpus=1,max_cpus=128,memory_mb=64)
+            node=pool._acquire(task,block=False,job_id=str(index))
+            selected.append(node.name)
+            self.assertEqual(task['cpus'],1)
+        self.assertEqual(len(set(selected)),5)
+
+    def test_small_start_elastic_peers_share_finite_phase_requests(self):
+        state=self.center([52]);node=state.pool.nodes[0];node.reserved=52
+        state.jobs={key:dict(task=dict(steps=[['echo']],cpus=cpus,max_cpus=128,memory_mb=64,project='A'),
+            auto_cpus=False,elastic_cpus=True,node=node,cancel=threading.Event(),
+            result=dict(status='running'),desired_cpus=52) for key,cpus in [('a',50),('b',1),('c',1)]}
+        resources=state.project_resources()
+        targets=[state._cooperative_cpu_target(key,52,resources) for key in state.jobs]
+        self.assertEqual(sum(targets),52)
+        self.assertEqual(sorted(targets),[17,17,18])
+        state.jobs['waiting']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=128,memory_mb=64,project='A'),
+            auto_cpus=False,elastic_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued'))
+        self.assertEqual(state._cooperative_cpu_target('a',52,state.project_resources()),13)
+
+    def test_returned_small_start_elastic_advice_can_reborrow(self):
+        state=self.center([16]);node=state.pool.nodes[0];node.reserved=1
+        state.jobs={'active':dict(task=dict(steps=[['echo']],cpus=1,max_cpus=128,memory_mb=64,project='A'),
+            auto_cpus=False,elastic_cpus=True,node=node,cancel=threading.Event(),
+            desired_cpus=1,result=dict(status='running'))}
+        self.assertEqual(state.admission(dict(project='A',cpus=1,max_cpus=128,job_id='active'))['recommended_cpus'],16)
+        self.assertEqual(state.jobs['active']['desired_cpus'],1)
+
+    def test_finite_elastic_resize_yields_at_boundary_and_reclaims_after_peer_finishes(self):
+        state=self.center([52]);node=state.pool.nodes[0]
+        node.health['capabilities']=['resize'];node.reserved=52;node.reserved_memory_mb=192
+        node.live_jobs.update(['a','b','c']);state.stopping=False
+        state._publish=lambda job:None;state._save=lambda job:None
+        node.client.resize=lambda identity,cpus:dict(id=identity,cpus=cpus,memory_mb=64)
+        state.jobs={key:dict(task=dict(steps=[['echo']],cpus=cpus,max_cpus=128,memory_mb=64,project='A'),
+            auto_cpus=False,elastic_cpus=True,node=node,cancel=threading.Event(),desired_cpus=52,
+            result=dict(id=key,status='running',cpus=cpus,memory_mb=64)) for key,cpus in [('a',50),('b',1),('c',1)]}
+        grants=[state.resize(key,52)['cpus'] for key in ('a','b','c')]
+        self.assertEqual(sorted(grants),[17,17,18])
+        self.assertEqual(node.reserved,52)
+        state.jobs['d']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=128,memory_mb=64,project='A'),
+            auto_cpus=False,elastic_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued'))
+        self.assertEqual(state.resize('a',52)['cpus'],13)
+        self.assertEqual(node.reserved,47)
+        del state.jobs['d']
+        for key in ('b','c'):
+            node.reserved-=state.jobs[key]['task']['cpus'];del state.jobs[key];node.live_jobs.remove(key)
+        self.assertEqual(state.resize('a',52)['cpus'],52)
+        self.assertEqual(node.reserved,52)
+
+    def test_fixed_width_jobs_retain_load_based_placement(self):
+        state=self.center([20,30,52,16,16]);pool=state.pool;pool.closed=False;pool.policy='adaptive'
+        for node,percent,logical in zip(pool.nodes,[12.1,6.7,.2,6.2,0],[28,32,104,24,16]):
+            node.health.update(cpu_percent=percent,logical_cpus=logical)
+        selected=[pool._acquire(dict(steps=[['echo']],cpus=1,max_cpus=1,memory_mb=64),block=False).name for unused in range(3)]
+        self.assertEqual(selected,['2','2','2'])
+
     def test_returned_auto_task_advice_can_reborrow_without_mutating_its_demand(self):
         state=self.center([16]);node=state.pool.nodes[0];node.reserved=1
         job=dict(task=dict(steps=[['echo']],cpus=1,memory_mb=64,project='A'),

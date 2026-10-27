@@ -27,6 +27,7 @@ from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle,
 from .policy import (normalize_accelerator_requirement, canonical_capabilities,
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids)
 from .auth import lan_endpoint
+from .allocation import elastic_cpus
 
 
 class RemoteError(RuntimeError):
@@ -1180,6 +1181,15 @@ class Pool:
                         node = next((n for n in self.nodes[self.rotation:] + self.nodes[:self.rotation] if n in ready))
                         self.rotation = (self.nodes.index(node) + 1) % len(self.nodes)
                     else:
+                        if elastic_cpus(task):
+                            # A small startup grant is not its future phase
+                            # width. Spread expandable jobs before filling a
+                            # device; preserve load/speed ordering within it.
+                            def idle(node):
+                                machine=node.health.get('machine_id',node.client.url)
+                                return not any(n.reserved or n.external for n in self.nodes
+                                    if n.health.get('machine_id',n.client.url)==machine)
+                            ready=[n for n in ready if idle(n)] or ready
                         pressures = {n.name: self._cpu_pressure(n, cpus) for n in ready}
                         least = min(ready, key=lambda n: pressures[n.name])
                         logical = lambda n: n.health.get('logical_cpus') or n.capacity

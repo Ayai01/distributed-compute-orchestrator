@@ -21,7 +21,7 @@ from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      public_capabilities, normalize_accelerator_requirement,
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks)
 from .telemetry import Activity
-from .allocation import weighted_node_threads, plan_resize
+from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .compat import unlink
 from .cleanup import AssetCache, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
@@ -32,6 +32,10 @@ import re
 import secrets
 from urllib.parse import urlsplit
 from . import __version__
+
+
+def _elastic_job(job):
+    return job.get('elastic_cpus',job.get('auto_cpus',False))
 
 
 class Coordinator:
@@ -66,7 +70,7 @@ class Coordinator:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
                 self._restore_accelerator(task, value)
-                job.update(task=task,auto_cpus=task['cpus']==0)
+                job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
                 value.setdefault('max_retries',task.get('retries',2))
                 if value['status']=='queued' or not value.get('worker_url'):
                     if value.get('worker_id'):job['worker_id']=value['worker_id']
@@ -160,10 +164,10 @@ class Coordinator:
                 resource=self.project_resources()[project]
                 # Advice must describe the new phase's opportunity. Using the
                 # previous one-CPU demand here prevents an idle pool reborrowing.
-                preview=dict(resource,target=target,node_targets=grants[project]) if job.get('auto_cpus') else resource
+                preview=dict(resource,target=target,node_targets=grants[project]) if _elastic_job(job) else resource
                 advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
                                   preview['target']-resource['used']+old,node.capacity-node.reserved-node.external+old))
-                if job.get('auto_cpus'):
+                if _elastic_job(job):
                     advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,{project:preview}))
                 advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
                             current_cpus=old,current_memory_mb=old_memory,
@@ -407,13 +411,13 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
+                demand = job.get('desired_cpus',largest if _elastic_job(job) else task.get('cpus', 1))
                 demand=min(demand,task.get('max_cpus',demand))
                 paused=held is not None and held.health.get('paused')
                 if paused:demand=task.get('cpus',0)
                 demands[name] = demands.get(name, 0) + demand
                 available=rooms.setdefault(name,{})
-                wanted={**task,'cpus':0} if job.get('auto_cpus') else task
+                wanted={**task,'cpus':0} if _elastic_job(job) else task
                 if paused and held.name in online:
                     # Pausing stops new work; existing grants still occupy
                     # their project's share until their tasks release them.
@@ -536,7 +540,8 @@ class Coordinator:
                 directory = self.root / "jobs" / identity
                 directory.mkdir()
                 (directory / "request.zip").write_bytes(payload)
-                job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0, "cancel": threading.Event(), "node": None,
+                job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0,
+                           "elastic_cpus": elastic_cpus(task), "cancel": threading.Event(), "node": None,
                        "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
                                   "single_thread_weight": task.get('single_thread_weight',1.0),
                                   "accelerator": task.get('accelerator'),
@@ -728,10 +733,10 @@ class Coordinator:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
                 self._restore_accelerator(task, job['result'])
-                automatic=task['cpus']==0
+                automatic=task['cpus']==0;elastic=elastic_cpus(task)
                 grant=remote or job['result']
                 task.update(cpus=grant['cpus'],memory_mb=grant['memory_mb'])
-                job.update(task=task,auto_cpus=automatic,node=node,reattach=True,worker_id=worker_id)
+                job.update(task=task,auto_cpus=automatic,elastic_cpus=elastic,node=node,reattach=True,worker_id=worker_id)
                 was_known=worker_id in node.known_jobs
                 if remote and not was_known:
                     node.external=max(0,node.external-(task['cpus'] if remote['status']=='running' else 0))
@@ -945,7 +950,7 @@ class Coordinator:
         task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
         self._restore_accelerator(task, job['result'])
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
-        job.update(task=task,auto_cpus=task['cpus']==0,node=None,worker_id=worker_id)
+        job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task),node=None,worker_id=worker_id)
         job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
         for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_cpus','peak_rss_mb','cpu_seconds','total_cpu_seconds','cost_incomplete',
@@ -1051,7 +1056,7 @@ class Coordinator:
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
     def _cooperative_cpu_target(self, identity, desired, resources):
-        """Share a project's node budget at a drained automatic phase boundary.
+        """Share a project's node budget at a drained elastic phase boundary.
 
         Running peers keep their grants until their own boundary. Fixed-width
         ready work is placed whole before dividing the remaining automatic work.
@@ -1071,7 +1076,7 @@ class Coordinator:
         fixed=[];demands={};rooms={}
         for key,job in members.items():
             task=job['task'];held=job.get('node')
-            automatic=key==identity or job.get('auto_cpus')
+            automatic=key==identity or _elastic_job(job)
             if held is not None and (not automatic or task.get('priority',0)<priority):
                 if held.name in capacities:capacities[held.name]=max(0,capacities[held.name]-task['cpus'])
                 continue
@@ -1125,8 +1130,8 @@ class Coordinator:
                 previous_memory=job.get('phase_memory')
                 job['desired_cpus']=desired
                 granted=desired
-                cooperative=cpus==0 or job.get('auto_cpus',False)
-                # Automatic jobs may report a finite useful phase width.
+                cooperative=cpus==0 or _elastic_job(job)
+                # Elastic jobs may report a finite useful phase width.
                 # Repeating that width is still a drained boundary; returning
                 # to one CPU stays cheap for synchronous microkernels.
                 if desired>old or cpus==0 or (cooperative and desired>1):
