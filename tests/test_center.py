@@ -43,7 +43,18 @@ class AdmissionPlanningTests(unittest.TestCase):
         self.assertEqual(sorted(targets),[17,17,18])
         state.jobs['waiting']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=128,memory_mb=64,project='A'),
             auto_cpus=False,elastic_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued'))
-        self.assertEqual(state._cooperative_cpu_target('a',52,state.project_resources()),13)
+        self.assertEqual(state._cooperative_cpu_target('a',52,state.project_resources()),17)
+
+    def test_unrequested_elastic_maximum_does_not_withhold_compute_threads(self):
+        state=self.center([52]);node=state.pool.nodes[0];node.reserved=52
+        def job(cpus,held=None):
+            return dict(task=dict(steps=[['echo']],cpus=cpus,max_cpus=128,memory_mb=64,project='A'),
+                auto_cpus=False,elastic_cpus=True,node=held,cancel=threading.Event(),
+                result=dict(status='running'if held else'queued'))
+        state.jobs={'active':job(52,node)};state.jobs['active']['desired_cpus']=52
+        for index in range(4):state.jobs[str(index)]=job(1)
+        self.assertEqual(state.project_resources()['A']['demand'],56)
+        self.assertEqual(state._cooperative_cpu_target('active',52,state.project_resources()),48)
 
     def test_returned_small_start_elastic_advice_can_reborrow(self):
         state=self.center([16]);node=state.pool.nodes[0];node.reserved=1
@@ -67,8 +78,8 @@ class AdmissionPlanningTests(unittest.TestCase):
         self.assertEqual(node.reserved,52)
         state.jobs['d']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=128,memory_mb=64,project='A'),
             auto_cpus=False,elastic_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued'))
-        self.assertEqual(state.resize('a',52)['cpus'],13)
-        self.assertEqual(node.reserved,47)
+        self.assertEqual(state.resize('a',52)['cpus'],17)
+        self.assertEqual(node.reserved,51)
         del state.jobs['d']
         for key in ('b','c'):
             node.reserved-=state.jobs[key]['task']['cpus'];del state.jobs[key];node.live_jobs.remove(key)

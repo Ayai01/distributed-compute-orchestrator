@@ -411,7 +411,7 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                demand = job.get('desired_cpus',largest if _elastic_job(job) else task.get('cpus', 1))
+                demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
                 demand=min(demand,task.get('max_cpus',demand))
                 paused=held is not None and held.health.get('paused')
                 if paused:demand=task.get('cpus',0)
@@ -1093,7 +1093,10 @@ class Coordinator:
             if not automatic:
                 fixed.append((key,task,eligible,job['result'].get('submitted',0)))
                 continue
-            demand=desired if key==identity else job.get('desired_cpus',max(nodes[n].capacity for n in eligible))
+            # A positive startup width has not requested its whole ceiling.
+            # Reserve peer demand only after it declares a useful phase width.
+            demand=desired if key==identity else job.get('desired_cpus',
+                max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else task.get('cpus',1))
             demands[key]=min(demand,task.get('max_cpus',demand))
             rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
         for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-row[1].get('priority',0),len(row[2]),row[3])):
