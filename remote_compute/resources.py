@@ -135,7 +135,7 @@ class CpuAccounting:
                         covered_cpu_seconds=self.covered, observed_ghz_seconds=self.work,
                         weighted_mean_ghz=self.work/self.covered if self.covered else None))
 def cpu_benchmark(cpus, executable=None, environment=(), *, force=False):
-    """Measure a fixed circuit/RTL/scientific mix at the worker CPU budget."""
+    """Read a cached score; force=True is reserved for manual calibration."""
     if type(cpus) is not int or cpus < 1:
         raise ValueError('Benchmark cpus must be a positive integer')
     if force:

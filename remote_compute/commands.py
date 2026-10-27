@@ -812,7 +812,7 @@ class SchedulerShell(Shell):
         self.do_nodes("")
 
     def do_calibrate(self, line):
-        """calibrate [设备]：在调度中心触发 native-mixed-v4 算力校准，空闲后自动运行。"""
+        """calibrate [设备]：人工请求 native-mixed-v4 算力校准，已有任务排空后执行本次请求。"""
         names = words(line)
         if len(names) > 1:
             raise ValueError('calibrate [设备]')

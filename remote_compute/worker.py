@@ -226,7 +226,7 @@ class Worker:
         self.benchmark_python = benchmark_python
         self.benchmark_env = benchmark_env
         self.benchmark = dict(cpu_benchmark(self.capacity,benchmark_python,benchmark_env))
-        self.benchmark_state = 'ready'
+        self.benchmark_state = 'ready' if self.benchmark.get('available') else 'unavailable'
         self.benchmark_thread = None
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)

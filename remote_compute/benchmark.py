@@ -155,6 +155,7 @@ def cpu_identity(cpus):
 
 
 def calibrated(cpus, *, executable=None, environment=(), cache_file=None, force=False):
+    """Read a matching score; only an explicit manual request measures it."""
     from .bundle import atomic_json
     from .resources import cpu_ticks
     cache=Path(cache_file) if cache_file else Path(os.environ.get('DCO_BENCHMARK_DIR',str(Path(__file__).resolve().parents[1]/'.local/benchmarks')))/(str(cpus)+'.json')
@@ -165,10 +166,11 @@ def calibrated(cpus, *, executable=None, environment=(), cache_file=None, force=
             if saved.get('identity')==identity and saved.get('benchmark',{}).get('available'):
                 return saved['benchmark']
         except (FileNotFoundError,ValueError):pass
+        return _unavailable('Manual calibration required; use calibrate when idle')
     before=cpu_ticks();time.sleep(.6);after=cpu_ticks()
     total=after[0]-before[0]
     load=100*(1-(after[1]-before[1])/total) if total else 100
-    if load>20:return _unavailable('CPU busy; calibration deferred until an idle startup')
+    if load>20:return _unavailable('CPU busy; request manual calibration again when idle')
     print('DCO: CPU '+str(round(load,1))+'%, calibrating 1/'+str(cpus)+' threads (single 60s + multi 60s)...',flush=True)
     result=measure(cpus,executable=executable,environment=environment)
     if result.get('available'):

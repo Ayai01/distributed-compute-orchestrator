@@ -82,7 +82,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `status` / `nodes` / `jobs` / `jobs ab12` | 资源、节点、任务及明细 |
 | `cpus 16` / `memory 8G` | 当前本机预算，保存到设备配置 |
 | `cpus Aya1-TX 16` / `memory Aya1-TX 8G` | 指定设备预算 |
-| `calibrate` / `calibrate Aya1-TX` | 全部/指定设备的原生算力校准 |
+| `calibrate` / `calibrate Aya1-TX` | 人工触发全部/指定设备校准；启动、重连及定期更新均不自动校准 |
 | `logs ab12` / `cancel ab12` | 查看日志 / 取消任务 |
 | `fetch ab12 "D:/结果"` | 取回并清理任务副本 |
 | `pause Aya1-TX` / `resume Aya1-TX` | 停止/恢复接收新任务，已有任务继续 |

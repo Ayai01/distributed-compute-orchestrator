@@ -307,7 +307,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
             path=Path(directory)/'calibration.json';identity=dict(cpu='test',threads=12)
             result=dict(name=NAME,available=True,threads=12,score=5)
             with patch('remote_compute.benchmark.cpu_identity',return_value=identity),patch('remote_compute.resources.cpu_ticks',side_effect=[(100,80),(200,170)]) as ticks,patch('remote_compute.benchmark.time.sleep'),patch('remote_compute.benchmark.measure',return_value=result) as measure:
-                self.assertEqual(calibrated(12,cache_file=path),result)
+                self.assertEqual(calibrated(12,cache_file=path,force=True),result)
                 self.assertEqual(calibrated(12,cache_file=path),result)
                 self.assertEqual(ticks.call_count,2);measure.assert_called_once()
             with patch('remote_compute.benchmark.cpu_identity',return_value=dict(cpu='test',threads=24)),patch('remote_compute.resources.cpu_ticks',side_effect=[(100,80),(200,90)]),patch('remote_compute.benchmark.time.sleep'),patch('remote_compute.benchmark.measure') as measure:

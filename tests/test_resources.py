@@ -103,6 +103,37 @@ class CpuAccountingTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_missing_or_stale_cache_never_starts_automatic_calibration(self):
+        from pathlib import Path
+        from remote_compute.benchmark import calibrated
+        with scratch() as directory:
+            path=Path(directory)/'score.json'
+            for saved in (None, {'identity':{'threads':2},'benchmark':{'available':True}}):
+                if saved is not None:path.write_text(json.dumps(saved))
+                with patch('remote_compute.benchmark.cpu_identity',return_value={'threads':4}), \
+                        patch('remote_compute.benchmark.measure',side_effect=AssertionError('automatic measurement')), \
+                        patch('remote_compute.resources.cpu_ticks',side_effect=AssertionError('automatic load sampling')):
+                    result=calibrated(4,cache_file=path)
+                self.assertFalse(result['available'])
+                self.assertIn('Manual',result['reason'])
+
+    def test_cached_score_is_reused_and_manual_request_replaces_it(self):
+        from pathlib import Path
+        from remote_compute.benchmark import calibrated
+        with scratch() as directory:
+            path=Path(directory)/'score.json';identity={'threads':4}
+            old={'available':True,'score':2};new={'available':True,'score':3}
+            path.write_text(json.dumps({'identity':identity,'benchmark':old}))
+            with patch('remote_compute.benchmark.cpu_identity',return_value=identity), \
+                    patch('remote_compute.benchmark.measure',return_value=new) as measure, \
+                    patch('remote_compute.resources.cpu_ticks',side_effect=[(100,50),(200,150)]), \
+                    patch('remote_compute.benchmark.time.sleep'):
+                self.assertEqual(calibrated(4,cache_file=path),old)
+                measure.assert_not_called()
+                self.assertEqual(calibrated(4,cache_file=path,force=True),new)
+                measure.assert_called_once()
+            self.assertEqual(json.loads(path.read_text())['benchmark'],new)
+
     def test_forced_calibration_bypasses_and_invalidates_memoized_result(self):
         cpu_benchmark.cache_clear()
         self.addCleanup(cpu_benchmark.cache_clear)
@@ -114,7 +145,7 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(cpu_benchmark(4),4)
         self.assertEqual(kernel.call_count,4)
 
-    def test_startup_calls_native_measurement_once_per_budget(self):
+    def test_startup_reads_cached_score_once_per_budget(self):
         cpu_benchmark.cache_clear()
         result=dict(name=NAME,score=2.5,unit='Miter/s',threads=24,seconds=1.9,total_seconds=2.0)
         try:
