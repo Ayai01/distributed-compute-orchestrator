@@ -1,6 +1,8 @@
 # DCO 当前状态
 
-更新：2026-10-26（HST）。源码版本0.8.39；运行实例在安全空闲边界加载，实际版本按health核对。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
+更新：2026-10-26（HST）。源码版本0.8.40；运行实例在安全空闲边界加载，实际版本按health核对。运行入口见[README](../README.md)，机制见[DESIGN](DESIGN.md)，历史见[HISTORY](HISTORY.md)。实时任务、设备预算和已加载版本由操作员小型health/capabilities及看板查询，不把一次采样的核数写成长期配置。
+
+0.8.40统一工程准备队列与已知ID采集：显式ready_tasks独立于实际CPU/RAM/GPU，消费者共用pending及available背压；中心project_active_tasks仅作活跃提示，终态未发布和受理未明的原ID继续占消费者窗口。statuses每128ID一次简要查询、wait_any单循环采集，旧中心回退已知ID查询和SDK准备窗口，原wait/fetch及费用保持。RemoteError的HTTP/传输字段固定存在，修复调用者在传输错误上读取status_code失败的问题。最终核心602项（597通过、5环境跳过，316.304秒），其中12项覆盖队列、兼容、待发布终态、取消/超时、原ID及真实HTTP128状态/1请求；所有运行模块通过Python3.7语法。源码已验证，运行中心和worker保留在途实例，各宿主在原控制器逐项接入，服务端批查询在安全空闲加载后生效。
 
 ## 设备与能力
 

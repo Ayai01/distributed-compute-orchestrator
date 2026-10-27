@@ -11,6 +11,8 @@ from functools import lru_cache
 
 MAX_RESOURCE_SHARE = 16.0
 MAX_QUEUE_RATIO = 4.0
+MAX_READY_TASKS = 4096
+MAX_STATUS_BATCH = 128
 MAX_SINGLE_THREAD_WEIGHT = 8.0
 MIN_PRIORITY = -1000
 MAX_PRIORITY = 1000
@@ -19,6 +21,20 @@ MAX_REQUIREMENT_LENGTH = 64
 MAX_TOOL_CONSTRAINTS = 32
 MAX_ACCELERATORS = 16
 MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
+
+
+def validate_ready_tasks(value):
+    if value is not None and (type(value) is not int or not 1 <= value <= MAX_READY_TASKS):
+        raise ValueError('ready_tasks requires an integer from 1 to %d' % MAX_READY_TASKS)
+    return value
+
+
+def validate_status_ids(identities):
+    if (not isinstance(identities, list) or not 1 <= len(identities) <= MAX_STATUS_BATCH
+            or any(not isinstance(identity, str) or not re.fullmatch('[0-9a-f]{32}', identity)
+                   for identity in identities)):
+        raise ValueError('ids requires 1..%d original 32-character job IDs' % MAX_STATUS_BATCH)
+    return identities
 
 # Capability names are part of the project-facing contract.  Keep the older
 # tool labels accepted at the boundary while publishing compact canonical
@@ -174,6 +190,8 @@ def public_capabilities():
     """Names of the stable project-facing capability concepts."""
     return [
         "admission",
+        "admission_ready_tasks",
+        "batch_status",
         "artifact_fetch",
         "max_cpus",
         "resize",

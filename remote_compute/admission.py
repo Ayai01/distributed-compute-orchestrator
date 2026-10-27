@@ -18,3 +18,9 @@ class AdmissionWindow:
                 self.maximum=self.value.get('max_in_flight',self.value['in_flight'])
                 self.updated=time.monotonic()
             return max(1,min(self.maximum,self.value['in_flight']))
+
+    def available(self, pending):
+        """Credits after the caller counts all submitted but unconsumed IDs."""
+        if type(pending) is not int or pending < 0:
+            raise ValueError('pending requires a nonnegative project-wide count')
+        return max(0, self.current()-pending)

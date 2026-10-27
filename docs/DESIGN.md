@@ -120,7 +120,7 @@ subprocess.run([*binding['argv'], *arguments], check=True)
 {"resource_share": 1.0, "queue_ratio": 1.0}
 ```
 
-AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。调用方按窗口上界创建线程池，按当前窗口限制已送中心且未收齐回执的任务；本地准备future另有队列界限，AOP为2×maximum。长任务等待期间也定期补位，其他工程结束后可扩大在途窗口。窗口缩小时已接受任务继续完成。RGCN 按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
+AOP 按角点、RGCN 按候选/PVT、Bench 按算法与种子预取。原动态窗口调用方按上界创建有限线程池，按当前窗口限制已送中心且未收齐回执的任务；本地准备future另有队列界限，AOP为2×maximum。显式ready_tasks的控制器使用小型准备/提交池和一个批状态采集循环，准备深度不决定线程数；pending及背压见[提交与查询窗口](#向中心提交与查询窗口)。长任务等待期间也定期补位，其他工程结束后可扩大原动态窗口。窗口缩小时已接受任务继续完成。RGCN 按输入顺序返回结果。ARH-DSE 整轮进入中心，轮内保留原生请求队列与构建复用机制。
 
 Bench 默认每种子声明 1 CPU，由动态窗口决定并发，不受工程 workers 限制。同步Class-AB物理批次和方向输出内核在计算前借线程、finally归还至1；任务尾部可继续借用其他任务释放的线程。`remote_compute.max_task_cpus`可设单任务借用上界；异步求值池在启动前申请固定额度，pending收齐后归还。`remote_compute.task_cpus`指定初始额度，0表示中心初始自动授予；关闭顶层`adaptive_threads`后保持固定额度。取消批次会停止后续提交、取消并收齐已接受任务。
 
@@ -246,7 +246,28 @@ result = center.run(task, inputs="my-batch")
 print(result["status"], result["cpus"])
 ```
 
-同一工程的任务保持相同 project 和 resource_share；多个调用者各自的有限窗口由调用者维护，中心统一控制执行资源。
+同一工程的任务保持相同 project 和 resource_share；工程内任务优先级用 priority 表达。多个生产者共用一个控制器及 pending 计数，中心统一控制执行资源。
+
+`admission/window(..., ready_tasks=N)` 显式指定整个工程已经提交、尚未持久发布并收齐的任务上限，N为1–4096。它与执行核数分开；中心仍按能力、公平份额、CPU/RAM/GPU决定实际启动量。不设置时保留原 queue_ratio 动态窗口；设置后 in_flight/max_in_flight 为N，queue_ratio 不再决定准备深度。此值是控制器的提交约定，不是一次资源预留。`running_tasks/queued_tasks` 是窗口内的执行/准备建议，`project_active_tasks` 仅为中心当前非终态数；它不代表消费者尚未发布的全部结果。
+
+`window.available(pending)` 返回 `max(0, window.current()-pending)`。pending 由工程在提交前登记稳定原ID，受理结果未明、排队、派发、运行及终态尚未发布的ID均占一个位置；原结果持久发布、费用入账并清理远端后再移除。缩小窗口只停止继续提交，保留已受理工作。准备中的本地输入另设小上限，不提前生成整个未来研究批次；不把256个准备位置变成256个轮询线程。多个控制器不能各领一份完整工程窗口。
+
+```python
+window = center.window("my-project", cpus=1, requires=["python_numpy"], ready_tasks=256)
+credits = window.available(len(pending))  # pending 从本工程持久恢复账本载入
+states = center.statuses(pending)         # 一个调用只查询这些原ID，不读全量jobs
+
+# 原控制器收集循环；publish_to_project 是宿主已有的持久发布/费用入账步骤。
+for identity, state in center.wait_any(pending, wait_timeout=30).items():
+    receipt = center.fetch(identity, delete=False)
+    publish_to_project(identity, receipt)
+    center.delete(identity)
+    pending.pop(identity)
+```
+
+`statuses(ids)` 返回按原ID索引的简要状态，每次请求最多128个，较长列表由SDK分块；空列表不请求。`POST /jobs/status` 只按给定ID读取原快照及冷回执，返回进度字段，不包含日志、工具清单或全任务历史。缺失ID显示 `status=unknown,status_code=404`，不触发新提交。`wait_any` 单循环自适应等待任意终态，返回简要状态；完整尝试、实际CPU和科学结果仍由 fetch 领取。等待取消或超时只结束本地等待；unknown 留原恢复账本，由调用者核对原受理/领取事实。
+
+`batch_status` 和 `admission_ready_tasks` 分别协商服务端支持。新SDK面对旧中心时，ready_tasks 在同一工程计数器上实施，CPU/RAM/GPU仍由旧中心准入，reply 的 ready_source 为 sdk_legacy；批状态回退到已知ID的 brief读取，不访问全量jobs。服务升级后 ready_source 为 center，批状态按128合并；部署继续使用安全空闲边界。RemoteError 对HTTP和传输错误都提供 status_code 与 transport_retryable：HTTP为实际状态码，传输无HTTP码时为None；只读查询可沿既有有界重连恢复，受理身份和科学重算由原协议判定。
 
 ### 同步内核在阶段边界借还资源
 

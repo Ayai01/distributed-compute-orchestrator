@@ -19,7 +19,7 @@ from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
-                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot)
+                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
@@ -111,6 +111,7 @@ class Coordinator:
         ratio = request.get('queue_ratio', 1.0)
         cpus = request.get('cpus', 1)
         maximum_cpus = request.get('max_cpus')
+        ready_tasks = validate_ready_tasks(request.get('ready_tasks'))
         requires = canonical_capabilities(request.get('requires', []))
         accelerator = normalize_accelerator_requirement(request.get('accelerator'))
         if not operator and request.get('node') is not None:
@@ -200,11 +201,22 @@ class Coordinator:
                     extra=slots(credits) or int(room>0)
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
-        return dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
+        value = dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
                     accelerator=accelerator,fallback_capable_cpus=fallback_capable,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
+        if ready_tasks is not None:
+            # Queue depth is transport preparation, not another CPU reservation.
+            # All producers of a project share this outstanding-work bound.
+            with self.condition:
+                active = sum((job.get('task', {}).get('project') or 'default') == project
+                             and job['result']['status'] not in TERMINAL for job in active_values(self.jobs))
+            running = min(ready_tasks, value['running_tasks'])
+            value.update(ready_tasks=ready_tasks, ready_source='center', queue_scope='project',
+                         project_active_tasks=active, running_tasks=running,
+                         queued_tasks=ready_tasks-running, in_flight=ready_tasks, max_in_flight=ready_tasks)
+        return value
 
     def restart_node(self, name):
         node = next((n for n in self.pool.nodes if n.name == name), None)
@@ -218,7 +230,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 

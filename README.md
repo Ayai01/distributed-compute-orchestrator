@@ -56,6 +56,8 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 
 `TASK_ID` 换成实际 ID。单任务成功返回 0，任务失败返回 1，配置/通信错误返回 2。自动化保存返回 ID，用原 ID 查状态、日志和取回结果；短暂断连继续查询原任务。成功取回默认清理服务端副本，`--keep` 用于显式保留。任务 JSON、SDK 与恢复语义见 [DESIGN](docs/DESIGN.md)。
 
+工程控制器可用 `client.window(project, ready_tasks=256, ...)` 设置整个工程的待收齐任务窗口，由中心继续分配实际 CPU/RAM/GPU。`window.available(len(pending))` 提供提交背压；pending 包括已排队、运行、尚未发布的终态及受理结果未明的原 ID。`client.statuses(ids)` 每128个已知 ID 合并查询，`wait_any(ids)` 在一个采集循环等终态，完整费用随 `fetch` 领取。旧中心继续兼容，接口、共享计数与结果发布示例见 [DESIGN：提交与查询窗口](docs/DESIGN.md#向中心提交与查询窗口)。
+
 <a id="终端操作"></a>
 
 ## 实时终端与运行中控制

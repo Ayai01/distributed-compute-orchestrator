@@ -24,12 +24,16 @@ import weakref
 import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
-from .policy import normalize_accelerator_requirement, canonical_capabilities
+from .policy import (normalize_accelerator_requirement, canonical_capabilities,
+                     MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids)
 from .auth import lan_endpoint
 
 
 class RemoteError(RuntimeError):
-    pass
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.status_code = None
+        self.transport_retryable = False
 
 
 class PoolBusy(RemoteError):
@@ -210,7 +214,7 @@ class Client:
         method = method or ('POST' if data is not None else 'GET')
         partial, etag = bytearray(), None
         attempts = 4 if binary and method == 'GET' else 2
-        retryable=(method=='GET' or method=='POST' and (path=='/admission' or bool(re.fullmatch(
+        retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status') or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
@@ -406,11 +410,13 @@ class Client:
             raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, accelerator=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, accelerator=None, ready_tasks=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         if node is not None and not self.operator:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,cpus=cpus,requires=list(requires))
+        if ready_tasks is not None:
+            request['ready_tasks'] = validate_ready_tasks(ready_tasks)
         if accelerator is not None:
             request['accelerator'] = accelerator
         if node:
@@ -421,8 +427,17 @@ class Client:
         # Both forms ask for advice; unlike a resource resize, neither changes a grant.
         if os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'):
             identity=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',os.environ['REMOTE_COMPUTE_JOB_ID'])
-            return self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission')))
-        return self._read_reconnecting(lambda:self.request('/admission',request))
+            value = self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission')))
+        else:
+            value = self._read_reconnecting(lambda:self.request('/admission',request))
+        if ready_tasks is not None and 'ready_tasks' not in value:
+            # Old centers already own execution admission and accept queued work.
+            # Keep the same local project counter until their normal idle reload.
+            running = min(ready_tasks, value['running_tasks'])
+            value.update(ready_tasks=ready_tasks, ready_source='sdk_legacy', queue_scope='project',
+                         running_tasks=running, queued_tasks=ready_tasks-running,
+                         in_flight=ready_tasks, max_in_flight=ready_tasks)
+        return value
 
     def window(self, project, **options):
         from .admission import AdmissionWindow
@@ -441,6 +456,60 @@ class Client:
             if time.monotonic()-stamp<=2 and identity in active:
                 return dict(active[identity])
         return self.request("/jobs" + ("/" + identity if identity else ""), brief=brief)
+
+    def statuses(self, identities):
+        """Brief states of known original IDs; never list the global job table."""
+        identities = list(identities)
+        for offset in range(0, len(identities), MAX_STATUS_BATCH):
+            validate_status_ids(identities[offset:offset+MAX_STATUS_BATCH])
+        identities = list(dict.fromkeys(identities))
+        if not identities:
+            return {}
+        if self._capabilities is None:
+            self.health(brief=True)
+        values = {}
+        for offset in range(0, len(identities), MAX_STATUS_BATCH):
+            batch = identities[offset:offset+MAX_STATUS_BATCH]
+            if 'batch_status' in self._capabilities:
+                values.update(self.request('/jobs/status', {'ids': batch}))
+            else:
+                for identity in batch:
+                    try:
+                        values[identity] = self.status(identity, brief=True)
+                    except RemoteError as error:
+                        if getattr(error, 'status_code', None) != 404:
+                            raise
+                        values[identity] = dict(id=identity, status='unknown', status_code=404)
+        return values
+
+    def wait_any(self, identities, *, poll=.5, max_poll=5, wait_timeout=None, cancel=None):
+        """Collect terminal brief states in one loop; fetch keeps full receipts."""
+        identities = tuple(dict.fromkeys(identities))
+        if not identities or poll <= 0:
+            raise ValueError('wait_any requires original IDs and a positive poll interval')
+        started = time.monotonic()
+        deadline = None if wait_timeout is None else started+wait_timeout
+        def check():
+            if cancel is not None and cancel():
+                raise RequestCancelled('Batch wait cancelled; original tasks continue')
+        while True:
+            states = self._read_reconnecting(lambda:self.statuses(identities), deadline=deadline, check=check)
+            finished = {identity: state for identity, state in states.items() if state['status'] in TERMINAL}
+            if finished:
+                return finished
+            missing = [identity for identity, state in states.items() if state['status'] == 'unknown']
+            if missing:
+                error = RemoteError('Original job missing; reconcile before submitting: '+','.join(missing))
+                error.status_code = 404
+                error.missing_ids = missing
+                raise error
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                raise RemoteError('Batch wait limit reached; original tasks continue')
+            delay = min(max(poll, max_poll), max(poll, (now-started)/20))
+            if deadline is not None:
+                delay = min(delay, deadline-now)
+            _pause(delay, check)
 
     def cancel(self, identity):
         return self.request("/jobs/" + identity + "/cancel", {})

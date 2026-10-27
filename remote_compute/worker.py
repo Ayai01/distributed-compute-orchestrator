@@ -34,7 +34,7 @@ from .cleanup import AssetCache, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
 from .paths import cache_environment
 from .allocation import plan_resize
-from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS,
+from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement,
                      normalize_accelerators, aggregate_accelerators, canonical_capabilities, PYTHON_RUNTIME_ALIASES,
@@ -259,7 +259,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','job_file_version','accelerators','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -1237,6 +1237,17 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.restart_node(request['node'])
                 else:
                     raise ValueError("Restart requires a supervised service")
+            elif parts == ['jobs','status'] and self.command == 'POST':
+                request = json.loads(body)
+                identities = validate_status_ids(request.get('ids') if isinstance(request, dict) else None)
+                value = {}
+                for identity in identities:
+                    try:
+                        result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
+                    except KeyError:
+                        value[identity] = dict(id=identity, status='unknown', status_code=404)
+                    else:
+                        value[identity] = progress(result)
             elif parts == ["jobs"] and self.command == "GET":
                 with worker.condition:
                     identities = tuple(worker.jobs)
