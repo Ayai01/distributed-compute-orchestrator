@@ -15,6 +15,20 @@ from test_compute import provider, python, scratch, until
 
 
 class CleanupTests(unittest.TestCase):
+    def test_late_terminal_response_cannot_recreate_a_collected_directory(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_,node):
+            with Pool([node]) as pool, center(pool,Path(directory)/'center') as (state,client):
+                identity=client.submit(python("print('paid result')"))['id']
+                receipt=client.wait(identity)
+                job=state.jobs[identity]
+                client.fetch(identity)
+                with state.condition:
+                    state._update(job,receipt)
+                    state._save(job)
+                    state._retry(job,dict(status='interrupted',error='late worker 404'))
+                self.assertNotIn(identity,state.jobs)
+                self.assertFalse(job['directory'].exists())
+
     def test_center_reclaims_scoped_inputs_only_after_all_producers_and_receipts_release(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (_, node):
             with Pool([node]) as pool, center(pool, Path(directory)/'center') as (state, client):

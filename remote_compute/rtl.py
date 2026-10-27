@@ -15,27 +15,11 @@ import sys
 
 def msys_workspace(path):
     """Allow the installed low-integrity MSYS binaries to write this job's files."""
-    import ctypes as c
-    from ctypes import wintypes as w
-    security = c.WinDLL("advapi32", use_last_error=True)
-    kernel = c.WinDLL("kernel32", use_last_error=True)
-    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [w.LPCWSTR, w.DWORD, c.POINTER(c.c_void_p), c.c_void_p]
-    security.GetSecurityDescriptorSacl.argtypes = [c.c_void_p, c.POINTER(w.BOOL), c.POINTER(c.c_void_p), c.POINTER(w.BOOL)]
-    security.SetNamedSecurityInfoW.argtypes = [w.LPWSTR, c.c_int, w.DWORD, c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p]
-    security.SetNamedSecurityInfoW.restype = w.DWORD
-    kernel.LocalFree.argtypes = [c.c_void_p]
-    descriptor = c.c_void_p()
-    if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW("S:(ML;OICI;NW;;;LW)", 1, c.byref(descriptor), None):
-        raise c.WinError(c.get_last_error())
-    try:
-        present, defaulted, acl = w.BOOL(), w.BOOL(), c.c_void_p()
-        if not security.GetSecurityDescriptorSacl(descriptor, c.byref(present), c.byref(acl), c.byref(defaulted)):
-            raise c.WinError(c.get_last_error())
-        code = security.SetNamedSecurityInfoW(str(Path(path).resolve()), 1, 0x10, None, None, None, acl)
-        if code:
-            raise c.WinError(code)
-    finally:
-        kernel.LocalFree(descriptor)
+    if __package__:
+        from .process import low_integrity_directory
+    else:
+        from process import low_integrity_directory
+    return low_integrity_directory(Path(path).resolve())
 
 
 def main(arguments=None):

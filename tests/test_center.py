@@ -169,8 +169,8 @@ class AdmissionPlanningTests(unittest.TestCase):
 
 
 @contextmanager
-def center(pool, root):
-    state = Coordinator(pool, root)
+def center(pool, root, **options):
+    state = Coordinator(pool, root, **options)
     server = Server(('127.0.0.1', 0), state)
     thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
     thread.start()
@@ -196,6 +196,30 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_paused_start_restores_receipts_without_dispatching_old_queue(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, worker), Pool([worker]) as pool:
+            home = Path(root)/'center'
+            with center(pool, home) as (_, client):
+                complete = client.submit(python("print('paid-result')"))['id']
+                client.wait(complete)
+                client.control(paused=True)
+                waiting = client.submit(python("print('resumed-original')"))['id']
+                receipt = (home/'jobs'/waiting/'result.json').read_bytes()
+            # Restore the queued receipt left by a host interruption, before
+            # the orderly fixture shutdown cancelled its queue.
+            (home/'jobs'/waiting/'result.json').write_bytes(receipt)
+            with center(pool, home, paused=True) as (_, client):
+                time.sleep(.15)
+                self.assertTrue(client.health()['paused'])
+                self.assertEqual(client.status(waiting)['status'], 'queued')
+                self.assertEqual(client.fetch(complete)['stdout'].strip(), 'paid-result')
+                self.assertEqual(client.status(waiting)['status'], 'queued')
+                client.control(paused=False)
+                client.wait(waiting)
+                result = client.fetch(waiting)
+                self.assertEqual((result['id'], result['stdout'].strip()), (waiting, 'resumed-original'))
+                self.assertFalse(result.get('attempts'))
+
     def test_cpu_accounting_reaches_original_center_receipt(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,worker), \
                 Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client), \

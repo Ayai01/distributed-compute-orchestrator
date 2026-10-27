@@ -271,6 +271,34 @@ raise SystemExit(main())
             self.assertEqual(main(['--url', 'http://127.0.0.1:26133', '--no-dashboard']), 0)
             self.assertTrue(run.call_args.args[0].no_dashboard)
 
+    def test_start_paused_uses_device_setting_and_explicit_flag(self):
+        from remote_compute.cli import main
+        with scratch() as directory:
+            config = Path(directory)/'device.json'
+            config.write_text(json.dumps(dict(mode='scheduler', start_paused=True)), encoding='utf-8')
+            with patch('remote_compute.cli.require_visible'), \
+                    patch('remote_compute.cli.single_instance', return_value=nullcontext()), \
+                    patch('remote_compute.cli.console_close', return_value=nullcontext()), \
+                    patch('remote_compute.cli.keep_awake', return_value=nullcontext()), \
+                    patch('remote_compute.cli.handoff_python', return_value=False), \
+                    patch('remote_compute.cli.resolve', return_value=None), \
+                    patch('remote_compute.cli.run_scheduler', return_value=0) as run:
+                self.assertEqual(main(['--config', str(config), '--service-child']), 0)
+                self.assertTrue(run.call_args.args[0].start_paused)
+                self.assertEqual(main(['--config', str(config), '--url', 'http://127.0.0.1:26133', 'jobs']), 0)
+                self.assertFalse(run.call_args.args[0].start_paused)
+                for action in (['run', 'task.json', '--output', 'unused'],
+                               ['batch', 'batch.json', 'unused']):
+                    run.reset_mock()
+                    with redirect_stderr(io.StringIO()) as errors:
+                        self.assertNotEqual(main(['--config', str(config)] + action), 0)
+                    self.assertIn('start_paused blocks new computation', errors.getvalue())
+                    run.assert_not_called()
+                config.write_text(json.dumps(dict(mode='scheduler', start_paused=False)), encoding='utf-8')
+                self.assertEqual(main(['--config', str(config), '--service-child', '--start-paused']), 0)
+                self.assertTrue(run.call_args.args[0].start_paused)
+
+
     def test_redirected_output_and_hidden_windows_are_rejected(self):
         with patch.object(terminal.sys.stdin, 'isatty', return_value=True), \
                 patch.object(terminal.sys.stdout, 'isatty', return_value=False), \

@@ -115,7 +115,8 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
         else:
             root = Path(args.root) / "scheduler" if args.root else ROOT / '.local/state/scheduler'
             coordinator = Coordinator(pool, root, token=args.local_token,
-                                      operator_token=getattr(args, 'operator_token', '') or None)
+                                      operator_token=getattr(args, 'operator_token', '') or None,
+                                      paused=bool(getattr(args, 'start_paused', False)))
             port = args.center_port if args.center_port is not None else (args.port if args.port is not None else DEFAULT_PORT)
             if args.mode == "scheduler" and args.port is not None and args.center_port is None:
                 port = args.port
@@ -299,6 +300,8 @@ def main(argv=None):
     parser.add_argument("--headless", "--no-browser", dest="no_browser", action="store_true",
                         help="不弹浏览器；DCO为终端服务，该选项不关闭看板或服务")
     parser.add_argument("--no-dashboard", action="store_true", help="关闭交互看板；仍在可见终端前台运行并输出日志")
+    parser.add_argument("--start-paused", action="store_true", default=None,
+                        help="中心以暂停派发状态启动，保留原任务与成果供维护领取；完成后用control(paused=False)恢复")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument('--on-port-conflict', choices=('ask', 'reuse', 'kill', 'admin-kill', 'cancel'),
                         default='ask', help='端口冲突处理；交互终端默认询问，admin-kill请求管理员权限')
@@ -375,6 +378,12 @@ def main(argv=None):
         args.mode = args.mode or ('scheduler' if args.url else config.get('mode', 'hybrid'))
         if args.mode not in {'scheduler', 'hybrid', 'worker'}:
             raise ValueError('mode must be scheduler, hybrid or worker')
+        if args.start_paused is None:
+            args.start_paused = bool(config.get('start_paused', False)) if not args.url and args.mode != 'worker' else False
+        if args.start_paused and (args.mode == 'worker' or args.url):
+            raise ValueError('--start-paused applies to a new scheduler or hybrid center')
+        if args.start_paused and args.action in {'run', 'spice', 'rtl', 'batch'}:
+            raise ValueError('start_paused blocks new computation: start the maintenance center, then explicitly resume it before submitting')
         if args.action is None and not (args.test or args.test_native or args.check):
             if args.url:
                 endpoint = args.url

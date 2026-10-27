@@ -23,7 +23,7 @@ from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize
 from .compat import unlink
-from .cleanup import AssetCache
+from .cleanup import AssetCache, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
 import socket
 import math
@@ -35,7 +35,7 @@ from . import __version__
 
 
 class Coordinator:
-    def __init__(self, pool, root, *, token="", operator_token=None):
+    def __init__(self, pool, root, *, token="", operator_token=None, paused=False):
         self.pool, self.token = pool, token
         self.activity = Activity()
         self.root = Path(root).resolve()
@@ -50,7 +50,8 @@ class Coordinator:
         self.jobs, self.queue, self.threads = JobRecords(self.root / 'jobs'), [], set()
         self.asset_handoffs = {}
         self.legacy_assets = set()
-        self.stopping = self.paused = False
+        self.stopping = False
+        self.paused = bool(paused)
         self.restart_available = False
         self.callback_address = None
         for path in (self.root / "jobs").glob("*/result.json"):
@@ -467,6 +468,7 @@ class Coordinator:
         job['read_result'] = deepcopy(job['result'])
 
     def _save(self, job):
+        if job.get('retired'):return
         terminal = job['result']['status'] in TERMINAL
         if not terminal:
             self._publish(job)
@@ -706,7 +708,7 @@ class Coordinator:
                         thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
                         self.threads.add(thread)
                         thread.start()
-                self.condition.wait(0.05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None)
+                self.condition.wait(.5 if self.paused else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None)
 
     def _recover_running(self):
         """Reattach accepted work from fresh worker snapshots; never resubmit it."""
@@ -919,6 +921,7 @@ class Coordinator:
                         time.sleep(.5)
 
     def _retry(self, job, outcome):
+        if job.get('retired'):return
         # The interrupted receipt is still a paid attempt, including when the
         # retry allowance is exhausted. Keep its measurements before resetting.
         measured={key:deepcopy(outcome.get(key,job['result'].get(key))) for key in (
@@ -1018,6 +1021,7 @@ class Coordinator:
                 transfer.release()
 
     def _update(self, job, remote):
+        if job.get('retired'):return
         clean_tool_snapshot(remote)
         if remote.get('status') in TERMINAL and remote['status']!='interrupted':
             job['result'].pop('remote_cancel_pending',None)
@@ -1360,8 +1364,9 @@ class Coordinator:
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404:
                         raise
-            shutil.rmtree(job["directory"])
             with self.condition:
+                remove_owned(job["directory"])
+                job['retired']=True
                 del self.jobs[identity]
         self._prune_assets()
         return {"deleted": identity}
