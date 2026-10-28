@@ -2,6 +2,7 @@
 from collections import Counter, OrderedDict
 from collections.abc import MutableMapping
 from copy import deepcopy
+from itertools import islice
 import json
 from pathlib import Path
 import threading
@@ -73,6 +74,29 @@ class JobRecords(MutableMapping):
 
     def __len__(self):
         return len(self.active) + len(self.history)
+
+    def page(self, *, limit=256, offset=0):
+        """Return a bounded recent-first identity page without loading results.
+
+        The complete receipt history stays on disk and remains addressable by
+        original ID.  Operator views must not materialize every receipt just
+        to paint a task table, especially after a long research campaign.
+        Callers hold the worker condition while taking this identity snapshot.
+        """
+        limit = max(1, min(int(limit), 512))
+        offset = max(0, int(offset))
+        active = tuple(self.active)
+        total = len(active) + len(self.history)
+        ids = []
+        if offset < len(active):
+            take = min(limit, len(active) - offset)
+            ids.extend(active[offset:offset + take])
+        remaining = limit - len(ids)
+        if remaining:
+            history_offset = max(0, offset - len(active))
+            ids.extend(islice(reversed(self.history), history_offset,
+                              history_offset + remaining))
+        return ids, total
 
     @staticmethod
     def _drop(counter, keys):

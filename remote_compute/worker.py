@@ -21,7 +21,7 @@ import threading
 import time
 import weakref
 import zipfile
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,
                      tree, unpack, progress, progress_fields)
@@ -1198,7 +1198,7 @@ class Handler(BaseHTTPRequestHandler):
         if scheduler and self.headers.get('X-DCO-Role') == 'operator' and not operator_auth:
             return self._reply({"error": "Operator token required"}, 403)
         worker.activity.access(self.client_address[0], self.connection.getsockname()[0])
-        parts = self.path.strip("/").split("/")
+        parts = urlsplit(self.path).path.strip("/").split("/")
         try:
             body = None
             if self.command == "POST":
@@ -1252,17 +1252,41 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         value[identity] = progress(result)
             elif parts == ["jobs"] and self.command == "GET":
-                with worker.condition:
-                    identities = tuple(worker.jobs)
-                # Large retained histories must not hold up grants or replies.
-                # Each get copies one result; cleanup can remove later IDs.
-                value = []
-                for identity in identities:
+                query = parse_qs(urlsplit(self.path).query)
+                if 'limit' in query or 'offset' in query:
                     try:
-                        result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
-                    except KeyError:
-                        continue
-                    value.append(result)
+                        limit = max(1, min(512, int(query.get('limit', ['256'])[0])))
+                        offset = max(0, int(query.get('offset', ['0'])[0]))
+                    except (TypeError, ValueError):
+                        raise ValueError('jobs page requires integer limit and offset')
+                    with worker.condition:
+                        if hasattr(worker.jobs, 'page'):
+                            identities, total = worker.jobs.page(limit=limit, offset=offset)
+                        else:
+                            all_ids = tuple(worker.jobs)
+                            total = len(all_ids)
+                            identities = all_ids[offset:offset + limit]
+                    items = []
+                    for identity in identities:
+                        try:
+                            result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
+                        except KeyError:
+                            continue
+                        items.append(result)
+                    value = dict(items=items, total=total, offset=offset,
+                                 limit=limit, has_more=offset + len(items) < total)
+                else:
+                    with worker.condition:
+                        identities = tuple(worker.jobs)
+                    # Legacy callers retain the full-list contract. New
+                    # operator views use the bounded page above.
+                    value = []
+                    for identity in identities:
+                        try:
+                            result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
+                        except KeyError:
+                            continue
+                        value.append(result)
             elif len(parts) == 2 and parts[0] == "assets" and self.command in {"GET", "POST"}:
                 job_id = self.headers.get('X-DCO-Asset-Job')
                 value = worker.asset(parts[1], body, **({'job_id':job_id} if job_id else {}))

@@ -17,7 +17,7 @@ import socket
 import ssl
 import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.parse import urlsplit
 import uuid
 import weakref
@@ -475,6 +475,21 @@ class Client:
             if time.monotonic()-stamp<=2 and identity in active:
                 return dict(active[identity])
         return self.request("/jobs" + ("/" + identity if identity else ""), brief=brief)
+
+    def status_page(self, *, limit=256, offset=0, brief=False):
+        """Read a bounded recent task page without scanning retained receipts."""
+        limit = max(1, min(int(limit), 512))
+        offset = max(0, int(offset))
+        value = self.request('/jobs?' + urlencode({'limit': limit, 'offset': offset}),
+                             brief=brief)
+        # Older centers return a plain list; keep the page API usable while
+        # those processes drain and make the truncation explicit to callers.
+        if isinstance(value, dict) and 'items' in value:
+            return value
+        return dict(items=value if isinstance(value, list) else [],
+                    total=len(value) if isinstance(value, list) else 0,
+                    offset=offset, limit=limit, has_more=False,
+                    legacy_center=True)
 
     def statuses(self, identities):
         """Brief states of known original IDs; never list the global job table."""

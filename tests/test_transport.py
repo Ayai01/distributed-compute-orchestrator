@@ -935,6 +935,22 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual([row['id'] for row in client.status()], [first])
             self.assertEqual(client.status(first)['status'], 'succeeded')
 
+    def test_paged_retained_job_listing_is_bounded_and_recent_first(self):
+        with scratch() as root, provider(Path(root)/'worker') as (worker, client):
+            identities = []
+            for label in ('first', 'second', 'third'):
+                identity = client.submit(python(f"print('{label}')"))['id']
+                client.wait(identity)
+                identities.append(identity)
+            page = client.status_page(limit=2)
+            self.assertEqual(page['total'], 3)
+            self.assertEqual(page['limit'], 2)
+            self.assertTrue(page['has_more'])
+            self.assertEqual([row['id'] for row in page['items']], identities[-2:][::-1])
+            tail = client.status_page(limit=2, offset=2)
+            self.assertFalse(tail['has_more'])
+            self.assertEqual([row['id'] for row in tail['items']], [identities[0]])
+
     def test_slow_binary_upload_keeps_progress_past_the_socket_timeout(self):
         payload=b'asset-content'*160000
         identity=hashlib.sha256(payload).hexdigest()

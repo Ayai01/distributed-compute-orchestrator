@@ -549,14 +549,20 @@ class SchedulerShell(Shell):
                     for part in wrap_lines(row,width):
                         print(part)
                 return
-            rows = [{**item, "node": item.get("assigned_node", "queued")} for item in self.center.status()]
+            page = self.center.status_page(limit=256)
+            rows = [{**item, "node": item.get("assigned_node", "queued")} for item in page['items']]
             table(rows, ["node", "id", "status", "label", "cpus", "memory_mb"])
+            if page.get('has_more'):
+                print(f"仅显示最近 {page['limit']} 条；保留回执仍可用完整ID查询。")
             return
         for node in self.pool.nodes:
             if line.strip() and node.name != line.strip():
                 continue
             try:
-                rows.extend({**item, "node": node.name} for item in node.client.status())
+                page = node.client.status_page(limit=256)
+                rows.extend({**item, "node": node.name} for item in page['items'])
+                if page.get('has_more'):
+                    print(f"{node.name}: 仅显示最近 {page['limit']} 条；保留回执仍可用完整ID查询。")
             except RemoteError as error:
                 print(error)
         table(rows, ["node", "id", "status", "label", "cpus"])
