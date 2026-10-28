@@ -147,7 +147,7 @@ class ConsoleTests(unittest.TestCase):
         import remote_compute.console as console
         from remote_compute.view import _line, _rule
         blue, reset = '\x1b[34;1m', '\x1b[0m'
-        right = _rule('当前任务 20 个 | Ctrl+Tab 翻页', 80)
+        right = _rule('当前任务 20 个 | 1/2页', 80)
         with patch.object(console, '_COLOR_ENABLED', True):
             left = _rule('设备资源', 56)
             row = left+right[1:]
@@ -155,7 +155,7 @@ class ConsoleTests(unittest.TestCase):
             left = _line('Aya1-PC 运行', 56)[:-1]
             row = left+right
             self.assertEqual(_paint_row(row), _paint_row(left)+blue+right+reset)
-            clipped = _rule('当前任务 20 个 | Ctrl+Tab 翻页', 20)
+            clipped = _rule('当前任务 20 个 | 1/2页', 20)
             self.assertEqual(_paint_row(clipped), blue+clipped+reset)
 
     def test_command_suggestions_use_cached_nodes_ids_and_real_parser_options(self):
@@ -768,8 +768,18 @@ class ConsoleTests(unittest.TestCase):
             if width>=120:
                 self.assertTrue(any('设备资源' in row and '当前任务' in row for row in first))
 
-    def test_tab_changes_task_pages_while_preserving_input_and_output_history(self):
-        keyboard=Keyboard(['\t','\x00','\x0f',*'ping\rquit\r'])
+    def test_task_progress_uses_recorded_steps_without_extra_sampling(self):
+        job = dict(id='abcd'+'a'*28, project='Bench', label='progress-task', cpus=2,
+                   memory_mb=512, status='running', total_steps=4,
+                   steps=[{'finished': 1, 'returncode': 0}, {'finished': 2, 'returncode': 0}])
+        value = dict(role='worker', node='Aya1-PC', cpus=8, used_cpus=2,
+                     active_jobs=[job])
+        text = '\n'.join(format_status(value, width=200).fit(30))
+        self.assertIn('Prog', text)
+        self.assertIn('2/4', text)
+
+    def test_page_keys_change_task_pages_while_preserving_input_and_output_history(self):
+        keyboard=Keyboard(['\x00','Q','\x00','Q',*'ping\rquit\r'])
         jobs=[dict(id=f'{i:04x}'+'b'*28,label=f'unique-task-{i}',cpus=1,status='running') for i in range(50)]
         with redirect_stdout(io.StringIO()) as stream:
             shell=OperatorShell()
@@ -918,7 +928,7 @@ class ConsoleTests(unittest.TestCase):
         restore.assert_called_once()
 
     def test_output_history_can_be_paged_without_discarding_commands(self):
-        keyboard = Keyboard(['\xe0', 'I', '\xe0', 'Q', *'quit\r'])
+        keyboard = Keyboard(['\x00', '\x95', '\x00', '\x96', *'quit\r'])
         with redirect_stdout(io.StringIO()) as stream:
             shell = OperatorShell()
             dashboard = Dashboard(shell, lambda: {'node': 'device', 'cpus': 3})

@@ -2,6 +2,7 @@
 
 import io
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -15,10 +16,43 @@ TERMINAL = frozenset({"succeeded", "failed", "cancelled", "timed_out", "interrup
 MAX_BODY = 512 * 1024 * 1024
 
 
+def progress_fields(value):
+    """Return cheap progress fields already present in a task snapshot."""
+    fields = {}
+    progress = value.get('progress')
+    if isinstance(progress, (int, float)) and math.isfinite(float(progress)):
+        fields['progress'] = progress
+    elif isinstance(progress, dict):
+        compact = {key: progress[key] for key in ('ratio', 'fraction', 'percent')
+                   if isinstance(progress.get(key), (int, float))
+                   and math.isfinite(float(progress[key]))}
+        if compact:
+            fields['progress'] = compact
+    for key in ('phase', 'stage'):
+        if isinstance(value.get(key), str) and value[key]:
+            fields[key] = value[key][:64]
+    for key in ('completed', 'total', 'current', 'target', 'nfe', 'budget'):
+        candidate = value.get(key)
+        if isinstance(candidate, (int, float)) and math.isfinite(float(candidate)):
+            fields[key] = candidate
+    if not any(key in fields for key in ('progress', 'completed', 'current', 'nfe')):
+        total = value.get('total_steps')
+        if isinstance(total, int) and total > 0:
+            steps = value.get('steps') or ()
+            completed = sum(1 for step in steps
+                            if isinstance(step, dict)
+                            and (step.get('finished') is not None
+                                 or step.get('returncode') is not None))
+            fields.update(completed=min(completed, total), total=total)
+    return fields
+
+
 def progress(value):
     """Small polling view; full provenance remains in the final result."""
-    return {key: value[key] for key in ('id','status','label','cpus','memory_mb','submitted','started',
+    result = {key: value[key] for key in ('id','status','label','cpus','memory_mb','submitted','started',
              'finished','elapsed','assigned_node','worker_url','center_submitted','dispatched','resource_request') if key in value}
+    result.update(progress_fields(value))
+    return result
 
 
 def json_bytes(value):

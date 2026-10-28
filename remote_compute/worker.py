@@ -23,7 +23,8 @@ import weakref
 import zipfile
 from urllib.parse import unquote
 
-from .bundle import MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack, tree, unpack, progress
+from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,
+                     tree, unpack, progress, progress_fields)
 from . import __version__
 from .process import Process, low_integrity_directory
 from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, service_usage,
@@ -280,7 +281,8 @@ class Worker:
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started', 'accelerator')},
-                                     'rss_mb':round(j.get('rss_mb',0),2),**({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
+                                     'rss_mb':round(j.get('rss_mb',0),2), **progress_fields(j['result']),
+                                     **({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in active_values(self.jobs) if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
             if sample:
@@ -630,6 +632,7 @@ class Worker:
                           'initial_cpus':task['cpus'],'peak_cpus':task['cpus'],'resize_count':0,
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
+                          "total_steps": len(task["steps"]),
                           "stdout": "", "stderr": "", "tools": self.tool_info,
                           "assets": task["assets"], "cwd": cwd.as_posix(),
                           "accelerator": task.get('accelerator')}

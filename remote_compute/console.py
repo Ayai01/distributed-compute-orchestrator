@@ -127,9 +127,9 @@ class CommandCompletion:
 
 
 def _command_rows(shell, line, cursor, width, context, completion):
-    usage = context['usage'] or ('Tab 补全命令 | Ctrl+Tab 翻任务 | Enter 执行 | Esc 清空 | help 命令'
+    usage = context['usage'] or ('Tab 补全命令 | PgUp/PgDn 翻任务 | Enter 执行 | Esc 清空 | help 命令'
                                  if line.strip() else
-                                 'Tab 补全命令 | Ctrl+Tab 翻任务 | PgUp/PgDn 输出 | 上下键 历史 | help 命令')
+                                 'Tab 补全命令 | PgUp/PgDn 翻任务 | Ctrl+PgUp/PgDn 翻输出 | 上下键 历史 | help 命令')
     matches = completion.matches if completion.last == (line, cursor) else context['matches']
     selected = completion.index if completion.last == (line, cursor) else -1
     candidates = []
@@ -144,7 +144,7 @@ def _command_rows(shell, line, cursor, width, context, completion):
         if candidates and _width('候选: ' + '  '.join(candidates + [label])) > width-4:
             break
         candidates.append(label)
-    choices = '候选: ' + '  '.join(candidates) if candidates else 'Tab 补全命令 | Ctrl+Tab 翻任务 | Enter 执行 | Esc 清空'
+    choices = '候选: ' + '  '.join(candidates) if candidates else '输入命令，按 Tab 查看候选'
     prompt, column = _input_view(shell.prompt, line, cursor, width)
     return [_rule('用法: ' + usage, width), _line(choices, width), _rule('', width), prompt], column
 
@@ -423,11 +423,11 @@ class _PosixKeyboard:
         self.decoder=codecs.getincrementaldecoder('utf-8')();self.buffer=''
         self.keys={'\x1b[A':'H','\x1b[B':'P','\x1b[C':'M','\x1b[D':'K','\x1b[H':'G','\x1b[F':'O',
                    '\x1b[3~':'S','\x1b[5~':'I','\x1b[6~':'Q','\x1b[Z':'\x0f',
-                   # Terminals differ in how they encode Ctrl+Tab.  Normalize
-                   # the common xterm/kitty forms to the Windows-style code
-                   # consumed by the dashboard loop.
-                   '\x1b[27;5;9~':'\x94','\x1b[9;5~':'\x94',
-                   '\x1b[9;5u':'\x94','\x1b[1;5I':'\x94'}
+                   # Plain PageUp/PageDown change task pages.  Modified page
+                   # keys keep the output-history viewport independent.
+                   '\x1b[5;3~':'\x95','\x1b[6;3~':'\x96',
+                   '\x1b[5;5~':'\x95','\x1b[6;5~':'\x96',
+                   '\x1b[5;6~':'\x95','\x1b[6;6~':'\x96'}
     def kbhit(self):
         import select
         if select.select([self.fd],[],[],0)[0]:self.buffer+=self.decoder.decode(os.read(self.fd,128))
@@ -489,7 +489,6 @@ class Dashboard:
         line, cursor = state.get('line', ''), state.get('cursor', 0)
         history, selected = state.get('history', []), state.get('selected', 0)
         last, offset, page_size, task_page = 0, state.get('offset', 0), 6, state.get('task_page', 0)
-        empty_tab = False
         completion = CommandCompletion()
         painter=state.get('painter') or RowPainter()
         rows, events, value = ['正在获取状态…'], [], {}
@@ -582,38 +581,29 @@ class Dashboard:
                     while msvcrt.kbhit():
                         key = msvcrt.getwch()
                         if key not in ('\t', '\x00', '\xe0'):
-                            empty_tab = False
-                        if key not in ('\t', '\x00', '\xe0'):
                             completion.last = None
                         if key in ('\x00', '\xe0'):
                             key = msvcrt.getwch()
-                            if key not in ('\x0f','\x94'):
+                            if key not in ('\x0f','\x84','\x86','\x95','\x96'):
                                 completion.last = None
                             if key == 'K': cursor = max(0, cursor - 1)
                             elif key == 'M': cursor = min(len(line), cursor + 1)
                             elif key == 'G': cursor = 0
                             elif key == 'O': cursor = len(line)
                             elif key == 'S': line = line[:cursor] + line[cursor + 1:]
-                            elif key == 'I': offset += page_size
-                            elif key == 'Q': offset = max(0, offset - page_size)
-                            elif key == '\x94':
+                            elif key == 'I':
+                                task_page -= 1
+                                offset = 0
+                            elif key == 'Q':
                                 task_page += 1
-                                empty_tab = False
+                                offset = 0
+                            elif key in ('\x84','\x95'):
+                                offset = max(0, offset - page_size)
+                            elif key in ('\x86','\x96'):
+                                offset += page_size
                             elif key == '\x0f':
                                 if line.strip():
                                     line, cursor = completion.apply(line,cursor,self.shell.suggest(line,cursor,value),reverse=True)
-                                elif empty_tab:
-                                    # Older Windows console hosts report
-                                    # Ctrl+Tab as the same extended code as
-                                    # Shift+Tab.  A preceding root Tab makes
-                                    # that intent unambiguous while Tab itself
-                                    # still only exposes command candidates.
-                                    task_page += 1
-                                    empty_tab = False
-                                else:
-                                    # Shift+Tab is a convenient reverse page
-                                    # gesture when the command line is empty.
-                                    task_page -= 1
                             elif key in ('H', 'P') and history:
                                 selected = max(0, min(len(history), selected + (-1 if key == 'H' else 1)))
                                 line = history[selected] if selected < len(history) else ''
@@ -627,7 +617,6 @@ class Dashboard:
                                 # in the footer instead of inserting an
                                 # arbitrary command.
                                 completion.last = None
-                                empty_tab = True
                         elif key == '\r':
                             if line.strip():
                                 self.write(self.shell.prompt + line + '\n')

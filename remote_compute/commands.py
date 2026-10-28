@@ -344,7 +344,7 @@ class Shell(cmd.Cmd):
         all_commands = line.strip() == 'all'
         if line.strip() and not all_commands:
             return super().do_help(line)
-        print('命令树（Tab 补全命令，Ctrl+Tab 翻当前任务）：')
+        print('命令树（Tab 补全命令，PgUp/PgDn 翻当前任务）：')
         allowed = {command for _title, commands in self.command_groups for command in commands.split()}
         for title, tree_commands in COMMAND_TREE:
             selected = [command for command in tree_commands if command in allowed and (all_commands or command in {
@@ -372,7 +372,7 @@ class Shell(cmd.Cmd):
             print('  cpus 16                 将本设备预算设为16线程')
             print('  logs ab12               查看4位任务ID的日志')
         print('  help cpus               查看单条指令的参数和例子')
-        print('help all 查看其余指令。Tab 补全；Ctrl+Tab/Shift+Tab 翻任务页；PgUp/PgDn 翻输出；↑/↓ 历史。')
+        print('help all 查看其余指令。Tab 补全；PgUp/PgDn 翻任务页；Ctrl+PgUp/Ctrl+PgDn 翻输出；↑/↓ 历史。')
 
     def default(self, line):
         import difflib

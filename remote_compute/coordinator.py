@@ -12,7 +12,7 @@ import time
 import weakref
 import zipfile
 
-from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack
+from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff
 from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
@@ -347,6 +347,7 @@ class Coordinator:
                 known_ids.add(job.get('worker_id', result.get('worker_id', result['id'])))
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
                     item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb','started')}
+                    item.update(progress_fields(result))
                     item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
                     item['project'] = job.get('task',{}).get('project','')
                     item.update({key:job['task'].get(key,default) for key,default in
@@ -548,7 +549,8 @@ class Coordinator:
                                   "max_retries": task.get('retries',2), "attempts": [],
                                   "memory_mb": task["memory_mb"], "request_sha256": digest,
                                   "submitted": time.time(), "started": None, "finished": None,
-                                  "stdout": "", "stderr": "", "steps": [], "assets": task["assets"]}})
+                                  "stdout": "", "stderr": "", "steps": [],
+                                  "total_steps": len(task["steps"]), "assets": task["assets"]}})
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
                 self._save(job)

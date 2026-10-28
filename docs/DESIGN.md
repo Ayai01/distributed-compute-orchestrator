@@ -269,7 +269,7 @@ for identity, state in center.wait_any(pending, wait_timeout=30).items():
     pending.pop(identity)
 ```
 
-`statuses(ids)` 返回按原ID索引的简要状态，每次请求最多128个，较长列表由SDK分块；空列表不请求。`POST /jobs/status` 只按给定ID读取原快照及冷回执，返回进度字段，不包含日志、工具清单或全任务历史。缺失ID显示 `status=unknown,status_code=404`，不触发新提交。`wait_any` 单循环自适应等待任意终态，返回简要状态；完整尝试、实际CPU和科学结果仍由 fetch 领取。等待取消或超时只结束本地等待；unknown 留原恢复账本，由调用者核对原受理/领取事实。
+`statuses(ids)` 返回按原ID索引的简要状态，每次请求最多128个，较长列表由SDK分块；空列表不请求。`POST /jobs/status` 只按给定ID读取原快照及冷回执，返回进度字段，不包含日志、工具清单或全任务历史。任务若声明了显式比例，或结果含顺序命令步数，则简要状态可附 `progress` 或 `completed/total`；这些字段只复用已有状态，不新增采样、线程或网络请求。缺失ID显示 `status=unknown,status_code=404`，不触发新提交。`wait_any` 单循环自适应等待任意终态，返回简要状态；完整尝试、实际CPU和科学结果仍由 fetch 领取。等待取消或超时只结束本地等待；unknown 留原恢复账本，由调用者核对原受理/领取事实。
 
 `batch_status` 和 `admission_ready_tasks` 分别协商服务端支持。新SDK面对旧中心时，ready_tasks 在同一工程计数器上实施，CPU/RAM/GPU仍由旧中心准入，reply 的 ready_source 为 sdk_legacy；批状态回退到已知ID的 brief读取，不访问全量jobs。服务升级后 ready_source 为 center，批状态按128合并；部署继续使用安全空闲边界。RemoteError 对HTTP和传输错误都提供 status_code 与 transport_retryable：HTTP为实际状态码，传输无HTTP码时为None；只读查询可沿既有有界重连恢复，受理身份和科学重算由原协议判定。
 

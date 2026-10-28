@@ -59,6 +59,36 @@ def _short(text, width):
     return _clip(text,left)+'...'+tail
 
 
+def _progress_label(job):
+    """Format an explicit task ratio without estimating from wall time."""
+    progress = job.get('progress')
+    if isinstance(progress, dict):
+        for key in ('ratio', 'fraction', 'percent'):
+            value = progress.get(key)
+            if isinstance(value, (int, float)):
+                ratio = float(value) / (100 if key == 'percent' or value > 1 else 1)
+                return f'{max(0, min(1, ratio)) * 100:.0f}%'
+        job = {**job, **progress}
+    for done_key, total_key in (('completed', 'total'), ('current', 'target'),
+                                ('nfe', 'budget')):
+        done, total = job.get(done_key), job.get(total_key)
+        if isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
+            return f'{max(0, min(total, done)):g}/{total:g}'
+    total = job.get('total_steps')
+    if isinstance(total, int) and total > 0:
+        steps = job.get('steps') or ()
+        done = sum(1 for step in steps
+                   if isinstance(step, dict)
+                   and (step.get('finished') is not None
+                        or step.get('returncode') is not None))
+        return f'{min(done, total)}/{total}'
+    value = job.get('progress')
+    if isinstance(value, (int, float)):
+        ratio = float(value) / (100 if value > 1 else 1)
+        return f'{max(0, min(1, ratio)) * 100:.0f}%'
+    return '—'
+
+
 def _cell(text, width, right=False):
     text = _short(text,width)
     padding = ' '*max(0,width-_width(text))
@@ -370,7 +400,8 @@ class StatusRows(list):
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"1/{job.get('cpus',0)}",
                                  _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),_label(job),
                                  str(max(0,int(now-started))) if started is not None else '-',
-                                 f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}"])
+                                 f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
+                                 _progress_label(job)])
 
     @property
     def device_labels(self):
@@ -467,23 +498,33 @@ class StatusRows(list):
         self.task_page%=self.page_count
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         records=[r if len(r)>7 else [*r,'-'] for r in records]
-        if width>=110:
+        def tag(record):
+            return record[6] if record[9] == '—' else f'{record[9]} {record[6]}'
+        # The full progress column appears only when the task panel has room
+        # for it.  Narrow panes retain every existing identity/resource field;
+        # the same ratio remains available in the status/API payload.
+        show_progress = width >= 140
+        if width>=110 and not show_progress:
             table=_table(['ID','Node','Proj','Share/Pri','Jobs/CPU','RAM','Sec','St','Tag'],
-                         [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5,6)] for r in records],
+                         [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5)]+[tag(r)] for r in records],
                          [4,self.node_width,6,11,9,4,6,4,None],width,right=(3,4,5,6))
+        elif width>=110:
+            table=_table(['ID','Node','Proj','Share/Pri','Jobs/CPU','RAM','Sec','St','Prog','Tag'],
+                         [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5,9,6)] for r in records],
+                         [4,self.node_width,6,11,9,4,6,4,6,None],width,right=(3,4,5,6,7))
         elif width>=80:
             table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
-                         [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
+                         [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
                          [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
         elif width>=54:
-            table=_table(['ID','Node','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,1,3,7,6)] for r in records],
+            table=_table(['ID','Node','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
                          [4,self.node_width,9,6,None],width,right=(2,3))
         elif width>=38:
-            table=_table(['ID','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,3,7,6)] for r in records],
+            table=_table(['ID','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
                          [4,9,6,None],width,right=(1,2))
         else:
-            table=[_line('ID 任务/线程 运行秒 标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {r[6]}',width) for r in records]
-        title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页 | Ctrl+Tab 翻页'
+            table=[_line('ID 任务/线程 运行秒 进度/标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {tag(r)}',width) for r in records]
+        title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页'
         if not self.records:
             table.append(_line('空闲',width))
         return _panel(title,table,width,framed=True)
@@ -546,7 +587,7 @@ def _layout(status, events, output, height, *, reserved=2):
         count=min(6,max(1,(budget-reserve-2*sections)//sections)) if sections else 0
         def footer_rows(count):
             return ((_panel('最近通知',events[-count:],status.width) if events else []) +
-                    (_panel('命令输出 | PgUp/PgDn',output[-count:],status.width) if output else []))
+                    (_panel('命令输出',output[-count:],status.width) if output else []))
         footer=footer_rows(count)
         head=status.fit(max(0,budget-len(footer)))
         if sections:
@@ -557,7 +598,7 @@ def _layout(status, events, output, height, *, reserved=2):
         return (head+footer)[-budget:]
     count=min(6,max(1,(budget-3-sections)//sections)) if sections else 0
     footer=(['最近操作（最多6条）:']+events[-count:] if events else [])
-    footer+=(['终端输出（PgUp/PgDn翻页）:']+output[-count:] if output else [])
+    footer+=(['终端输出：']+output[-count:] if output else [])
     remaining=max(0,budget-len(footer));head=status[:remaining]
     if len(status)>remaining and head:
         head[-1]='… status 查看完整资源；help 查看操作'
