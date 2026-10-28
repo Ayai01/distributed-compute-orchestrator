@@ -70,6 +70,8 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 
 `TASK_ID` 换成实际 ID。单任务成功返回 0，任务失败返回 1，配置/通信错误返回 2。自动化保存返回 ID，用原 ID 查状态、日志和取回结果；短暂断连继续查询原任务。成功取回默认清理服务端副本，`--keep` 用于显式保留。任务 JSON、SDK 与恢复语义见 [DESIGN](docs/DESIGN.md)。
 
+任务总表不要在长时间运行的中心上读取全部历史。CLI `jobs` 使用最近页；SDK 可用 `client.status_page(limit=256, offset=0)` 读取有界页，返回 `items/total/offset/limit/has_more`，按完整 ID继续查单项。旧 `status()` 全量接口保留兼容，但不用于高频巡检或大历史中心。
+
 工程控制器可用 `client.window(project, ready_tasks=256, ...)` 设置整个工程的待收齐任务窗口，由中心继续分配实际 CPU/RAM/GPU。`window.available(len(pending))` 提供提交背压；pending 包括已排队、运行、尚未发布的终态及受理结果未明的原 ID。`client.statuses(ids)` 每128个已知 ID 合并查询，`wait_any(ids)` 在一个采集循环等终态，完整费用随 `fetch` 领取。旧中心继续兼容，接口、共享计数与结果发布示例见 [DESIGN：提交与查询窗口](docs/DESIGN.md#向中心提交与查询窗口)。
 
 <a id="终端操作"></a>
@@ -137,7 +139,7 @@ Tab 在空输入时显示根命令候选，有输入时补全；PgUp/PgDn 翻任
 
 旧worker状态迁入DCO时，在本机配置中将`root`设为新的`.local/state/...`路径，并临时添加`migrate_root_from`旧根。排空后正常重载；启动会先验证旧worker已退出，再在同一文件系统整体重命名并移除迁移字段。目标目录须尚不存在，原ID、回执、输入及链接原样保留；不合并两套状态、不复制工具目录。
 
-资源协商使用独立的 `lease_timeout`，默认取普通 `timeout` 与130秒中的较大值：远端 worker 的初始 lease 和本机直连中心的 resize 都使用这一期限，worker 可等待中心回复120秒。普通请求及中心的资源答复保持普通期限，`pool_timeout` 只管理本地连接排队。lease 或 resize 超时均不自动重发，资源变更可能已生效；先按原ID核对实际授予和任务状态。任务跟进使用 `status(id)`，全量 `status()` 读取全部保留历史，勿用于高频轮询或费用总账；已显式删除的任务由调用工程保存原回执与费用。
+资源协商使用独立的 `lease_timeout`，默认取普通 `timeout` 与130秒中的较大值：远端 worker 的初始 lease 和本机直连中心的 resize 都使用这一期限，worker 可等待中心回复120秒。普通请求及中心的资源答复保持普通期限，`pool_timeout` 只管理本地连接排队。lease 或 resize 超时均不自动重发，资源变更可能已生效；先按原ID核对实际授予和任务状态。任务跟进使用 `status(id)` 或有界的 `status_page()`，全量 `status()` 只为兼容旧调用保留，勿用于高频轮询或费用总账；已显式删除的任务由调用工程保存原回执与费用。
 
 部署改名后核对 tools/shared/env、`.tools/science.json`、`.tools/rtl.json` 和联接目标。`worker.local.json`、`nodes.local.json`、`.local/`、`.tools/`、`.projects/`、`.runtime/`、结果均留本机；令牌、证书私钥保留在设备配置。服务配置使用私密原子写入。
 
