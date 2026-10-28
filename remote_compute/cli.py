@@ -188,7 +188,11 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
         elif args.action == "nodes":
             display(dispatch.nodes() if dispatch else pool.snapshot())
         elif args.action == "jobs":
-            display(dispatch.status() if dispatch else {n.name: n.client.status() for n in pool.nodes if not n.error})
+            # Keep the operator CLI bounded on long campaigns.  Full history
+            # remains available by exact ID or through the paged API.
+            display(dispatch.status_page(limit=256) if dispatch else {
+                n.name: n.client.status_page(limit=256) for n in pool.nodes if not n.error
+            })
         elif args.action == "sync":
             print((dispatch or pool).sync(args.source))
         elif args.action in MACHINE_ACTIONS:
