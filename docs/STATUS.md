@@ -1,6 +1,6 @@
 # DCO 当前状态
 
-更新：2026-10-28（HST）。本机及四个工作节点运行0.8.43，DCO源码新增启动历史索引与分页 brief 兼容修复，提交为`cddb4bd`。算力校准仅手动触发，启动、重连和资源变化均不自动校准。运行入口见[README](../README.md)，协议见[DESIGN](DESIGN.md)，旧版本记录见[HISTORY](HISTORY.md)。
+更新：2026-10-28（HST）。本机及四个工作节点运行0.8.43，DCO源码新增启动历史索引与分页 brief 兼容修复，提交为`cddb4bd`，CLI有界任务表补丁为`0d2d13c`。算力校准仅手动触发，启动、重连和资源变化均不自动校准。运行入口见[README](../README.md)，协议见[DESIGN](DESIGN.md)，旧版本记录见[HISTORY](HISTORY.md)。
 
 ## 本轮修复
 
