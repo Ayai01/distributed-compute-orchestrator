@@ -1244,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
                 for identity in identities:
                     try:
                         result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
-                    except KeyError:
+                    except (KeyError, FileNotFoundError):
                         value[identity] = dict(id=identity, status='unknown', status_code=404)
                     else:
                         value[identity] = progress(result)

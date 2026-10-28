@@ -369,6 +369,8 @@ result = client.run(task, files={
 
 提交回应和首次查询同时遇到瞬态传输失败时，SDK在原有有界重连窗口内先查询原ID，并核对请求包摘要；已受理就直接沿原状态继续。仅查询明确返回404时才以同ID、同输入补交。请求冲突、取消及计算失败保留原结局，传输重连不增加科研评价次数。
 
+批量状态逐个原ID返回结果。已领取任务在并发清理时消失，该项返回`unknown/404`，其余任务继续返回；SDK对旧中心由此产生的整批404只重读一次同批ID。调用工程以自己的持久终态和待领取清单核对缺失项，不重新创建已付计算。
+
 ### CPU工作量计量
 
 显式任务环境 `DCO_CPU_ACCOUNTING=1` 复用worker的进程组/Windows Job CPU采样，累计CPU秒包含用户与内核时间；仅对实际CPU秒差分积分 `W = Σ Δt_cpu × f_GHz`，等待和空闲不增加工作量。`cumulative_cpu_seconds`是既有`cpu_seconds`的同口径别名，`cpu_accounting_sampled_at`为采样Unix时间。

@@ -10,6 +10,33 @@ from test_compute import provider, python, scratch
 
 
 class ReadyQueueTests(unittest.TestCase):
+    def test_batch_retirement_race_keeps_other_original_states(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (_,node):
+            with Pool([node]) as pool,centers.center(pool,Path(directory)/'center') as (state,client):
+                state.control({'paused':True})
+                identity=client.submit(python('print("queued")'))['id']
+                absent='f'*32;original=state.public_get
+                def get(key):
+                    if key==absent:raise FileNotFoundError('retired result.json')
+                    return original(key)
+                with patch.object(state,'public_get',side_effect=get):
+                    values=client.statuses([absent,identity])
+                self.assertEqual(values[absent]['status'],'unknown')
+                self.assertEqual(values[identity]['status'],'queued')
+                client.cancel(identity);client.fetch(identity)
+
+    def test_legacy_batch_retirement_retries_once_without_submitting_work(self):
+        client=Client();client._capabilities=['batch_status'];identity='e'*32
+        failure=RemoteError('result.json removed during status');failure.status_code=404
+        expected={identity:dict(id=identity,status='unknown',status_code=404)}
+        with patch.object(client,'request',side_effect=[failure,expected]) as request:
+            self.assertEqual(client.statuses([identity]),expected)
+            self.assertEqual(request.call_count,2)
+            self.assertTrue(all(c.args==('/jobs/status',{'ids':[identity]})for c in request.call_args_list))
+        with patch.object(client,'request',side_effect=failure) as request:
+            with self.assertRaises(RemoteError):client.statuses([identity])
+            self.assertEqual(request.call_count,2)
+
     def test_ready_depth_does_not_change_cpu_fairness_or_reservations(self):
         state = centers.AdmissionPlanningTests().center([16])
         state.jobs = {name: dict(task=dict(steps=[['echo']], cpus=4, memory_mb=64, project=name),

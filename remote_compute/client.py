@@ -490,7 +490,14 @@ class Client:
         for offset in range(0, len(identities), MAX_STATUS_BATCH):
             batch = identities[offset:offset+MAX_STATUS_BATCH]
             if 'batch_status' in self._capabilities:
-                values.update(self.request('/jobs/status', {'ids': batch}))
+                try:
+                    states=self.request('/jobs/status', {'ids': batch})
+                except RemoteError as error:
+                    if error.status_code!=404:raise
+                    # Older centers can lose a cold terminal file to concurrent
+                    # collection. Re-read this batch after retirement finishes.
+                    states=self.request('/jobs/status', {'ids': batch})
+                values.update(states)
             else:
                 for identity in batch:
                     try:
