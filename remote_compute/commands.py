@@ -549,7 +549,11 @@ class SchedulerShell(Shell):
                     for part in wrap_lines(row,width):
                         print(part)
                 return
-            page = self.center.status_page(limit=256)
+            try:
+                page = self.center.status_page(limit=256)
+            except RemoteError as error:
+                print(f"当前中心尚未加载有界任务页（{error}）；请用 jobs <完整ID> 查询，空闲重载后恢复任务总表。")
+                return
             rows = [{**item, "node": item.get("assigned_node", "queued")} for item in page['items']]
             table(rows, ["node", "id", "status", "label", "cpus", "memory_mb"])
             if page.get('has_more'):
@@ -559,7 +563,11 @@ class SchedulerShell(Shell):
             if line.strip() and node.name != line.strip():
                 continue
             try:
-                page = node.client.status_page(limit=256)
+                try:
+                    page = node.client.status_page(limit=256)
+                except RemoteError as error:
+                    print(f"{node.name}: 尚未加载有界任务页（{error}）；请用完整ID查询。")
+                    continue
                 rows.extend({**item, "node": node.name} for item in page['items'])
                 if page.get('has_more'):
                     print(f"{node.name}: 仅显示最近 {page['limit']} 条；保留回执仍可用完整ID查询。")
