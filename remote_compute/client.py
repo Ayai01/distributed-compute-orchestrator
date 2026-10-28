@@ -363,10 +363,28 @@ class Client:
         return self.submit_bundle(identity, task_bundle(task, inputs, files))
 
     def submit_bundle(self, identity, payload, *, callback=None):
-        if callback:
-            return self.request('/jobs/'+identity,payload,
-                                extra_headers={'X-DCO-Callback':json.dumps(callback)})
-        return self.request("/jobs/" + identity, payload)
+        path='/jobs/'+identity
+        options={'extra_headers':{'X-DCO-Callback':json.dumps(callback)}} if callback else {}
+        try:
+            return self.request(path,payload,**options)
+        except RemoteError as error:
+            if not (error.transport_retryable or error.status_code in (502,503)):
+                raise
+        # A busy center can accept a task while both its reply and the first
+        # receipt read time out. Reconcile that paid ID before another upload.
+        digest=hashlib.sha256(payload).hexdigest()
+        def reconcile():
+            try:
+                saved=self.request(path)
+            except RemoteError as error:
+                if error.status_code!=404:raise
+                return self.request(path,payload,**options)
+            if saved.get('id')==identity and saved.get('request_sha256')==digest:
+                return saved
+            conflict=RemoteError('Original job request differs: '+identity)
+            conflict.status_code=409
+            raise conflict
+        return self._read_reconnecting(reconcile)
 
     def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         """Borrow/return resources at a safe boundary; use the actual returned grant."""

@@ -379,6 +379,26 @@ class OriginalSubmitReceiptTests(unittest.TestCase):
             self.assertEqual(client.wait(accepted['id'])['status'],'succeeded')
             client.fetch(accepted['id'])
 
+    def test_submission_reconciles_original_after_initial_reply_and_reads_are_lost(self):
+        with scratch() as directory,provider(Path(directory)/'worker') as (worker,client):
+            original=Handler._reply;posts=[];reads=[];identity='d'*32
+            def reply(handler,value,status=200,**options):
+                if handler.path=='/jobs/'+identity:
+                    if handler.command=='POST' and status==202:
+                        posts.append(value['id']);self.disconnect(handler);return
+                    if handler.command=='GET':
+                        reads.append(handler.path)
+                        if len(reads)<=4:self.disconnect(handler);return
+                return original(handler,value,status,**options)
+            with patch.object(Handler,'_reply',reply):
+                accepted=client.submit(python('print("one paid execution")'),job_id=identity)
+            self.assertEqual(accepted['id'],identity)
+            self.assertEqual(posts,[identity,identity])
+            self.assertEqual(len(reads),5)
+            self.assertEqual(len(worker.jobs),1)
+            self.assertEqual(client.wait(identity)['status'],'succeeded')
+            self.assertEqual(client.fetch(identity)['stdout'].strip(),'one paid execution')
+
     def test_center_acceptance_reply_does_not_wait_for_unrelated_asset_cache_io(self):
         with scratch() as directory,provider(Path(directory)/'worker') as (_,node):
             with Pool([node]) as pool,center(pool,Path(directory)/'center') as (state,client):
