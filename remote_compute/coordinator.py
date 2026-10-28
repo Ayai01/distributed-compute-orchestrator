@@ -51,38 +51,68 @@ class Coordinator:
         self.submission_lock = threading.RLock()
         self.accepting_assets = set()
         self.asset_writes = weakref.WeakValueDictionary()
-        self.jobs, self.queue, self.threads = JobRecords(self.root / 'jobs'), [], set()
+        self.jobs, self.queue, self.threads = JobRecords(
+            self.root / 'jobs', index_path=self.root / 'history.index.jsonl'), [], set()
         self.asset_handoffs = {}
         self.legacy_assets = set()
         self.stopping = False
         self.paused = bool(paused)
         self.restart_available = False
         self.callback_address = None
-        for path in (self.root / "jobs").glob("*/result.json"):
-            value = json.loads(path.read_text(encoding="utf-8"))
+        indexed = self.jobs.load_index()
+
+        def restore_live(path, value):
             if clean_tool_snapshot(value):
                 atomic_json(path, value)
             job = Job(result=value, read_result=deepcopy(value), directory=path.parent,
                       cancel=threading.Event(), node=None)
-            self.jobs[value["id"]] = job
-            if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
-                with zipfile.ZipFile(path.parent/'request.zip') as archive:
-                    task=json.loads(archive.read('task.json'))
-                task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
-                self._restore_accelerator(task, value)
-                job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
-                value.setdefault('max_retries',task.get('retries',2))
-                if value['status']=='queued' or not value.get('worker_url'):
-                    if value.get('worker_id'):job['worker_id']=value['worker_id']
-                    value.update(status='queued')
-                    self.queue.append(value['id'])
-                else:
-                    value.update(status='dispatching')
-                    job['recover']=True
-                value.pop('error',None)
-                self._save(job)
+            # The index already accounts for terminal receipts.  Only live
+            # entries need objects in memory after a fast restart.
+            self.jobs.active[value["id"]] = job
+            with zipfile.ZipFile(path.parent/'request.zip') as archive:
+                task=json.loads(archive.read('task.json'))
+            task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+            self._restore_accelerator(task, value)
+            job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
+            value.setdefault('max_retries',task.get('retries',2))
+            if value['status']=='queued' or not value.get('worker_url'):
+                if value.get('worker_id'):job['worker_id']=value['worker_id']
+                value.update(status='queued')
+                self.queue.append(value['id'])
             else:
-                archive_job(self.jobs, job, startup=True)
+                value.update(status='dispatching')
+                job['recover']=True
+            value.pop('error',None)
+            self._save(job)
+
+        if indexed:
+            # A bounded startup touches only the small set of non-terminal
+            # jobs recorded in the index.  Terminal receipts stay addressable
+            # by ID through their original directories.
+            for identity in tuple(self.jobs.pending):
+                path = self.root / 'jobs' / identity / 'result.json'
+                if not path.is_file():
+                    continue
+                value = json.loads(path.read_text(encoding='utf-8'))
+                if value.get('status') in TERMINAL and not (value.get('status') == 'interrupted' and value.get('finished') is None):
+                    job = Job(result=value, directory=path.parent, cancel=threading.Event(), node=None)
+                    self.jobs.active[identity] = job
+                    archive_job(self.jobs, job, startup=True)
+                else:
+                    restore_live(path, value)
+        else:
+            # One-time migration path for an older state root.  It preserves
+            # the established recovery semantics, then writes the compact
+            # index so later starts do not rescan every terminal receipt.
+            for path in (self.root / "jobs").glob("*/result.json"):
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
+                    restore_live(path, value)
+                else:
+                    job = Job(result=value, directory=path.parent, cancel=threading.Event(), node=None)
+                    self.jobs.active[value["id"]] = job
+                    archive_job(self.jobs, job, startup=True)
+            self.jobs.write_index()
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)

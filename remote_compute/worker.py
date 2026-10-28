@@ -232,7 +232,10 @@ class Worker:
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
-        self.jobs = JobRecords(self.root / 'jobs')
+        # Keep one bounded history index per worker root.  Sharing the parent
+        # index would mix local-fresh (and any future worker roots) and force
+        # startup to reopen unrelated job directories.
+        self.jobs = JobRecords(self.root / 'jobs', index_path=self.root / 'history.index.jsonl')
         self.queue = deque()
         self.used = 0
         self.stopping = False
@@ -240,7 +243,12 @@ class Worker:
         self.cleanup_pending = set()
         self.asset_handoffs = {}
         self.asset_writes = weakref.WeakValueDictionary()
-        for path in (self.root / "jobs").glob("*/result.json"):
+        indexed = self.jobs.load_index()
+        candidates = tuple(self.jobs.pending) if indexed else None
+        paths = ((self.root / 'jobs' / identity / 'result.json') for identity in candidates) if candidates is not None else (self.root / "jobs").glob("*/result.json")
+        for path in paths:
+            if not path.is_file():
+                continue
             saved = json.loads(path.read_text(encoding="utf-8"))
             if clean_tool_snapshot(saved):
                 atomic_json(path, saved)
@@ -248,11 +256,15 @@ class Worker:
             if interrupted:
                 saved.update(status="interrupted", finished=time.time(), error="Worker stopped before completion")
                 atomic_json(path, saved)
-            self.jobs[saved["id"]] = Job(result=saved, cancel=threading.Event(), directory=path.parent)
-            self._clean_temp(self.jobs[saved['id']])
+            identity = saved["id"]
+            job = Job(result=saved, cancel=threading.Event(), directory=path.parent)
+            self.jobs.active[identity] = job
+            self._clean_temp(job)
             if interrupted or saved.get('input_cleanup_error'):
-                self._clean_work(self.jobs[saved['id']])
-            archive_job(self.jobs, self.jobs[saved['id']], startup=True)
+                self._clean_work(job)
+            archive_job(self.jobs, job, startup=True)
+        if not indexed:
+            self.jobs.write_index()
         self.asset_cache = AssetCache(self.root / 'assets')
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
@@ -1345,7 +1357,14 @@ class Handler(BaseHTTPRequestHandler):
                 if parts == ['health']:
                     value={k:value[k] for k in ('protocol','node','role','version','capabilities') if k in value}
                 elif parts == ['jobs']:
-                    value = [progress(row) for row in value]
+                    # Paged job views are mappings; the legacy view remains a
+                    # list.  Normalize only the rows so X-DCO-Brief cannot
+                    # iterate pagination keys (``items``, ``total``...) as if
+                    # they were result objects.
+                    if isinstance(value, dict) and 'items' in value:
+                        value = {**value, 'items': [progress(row) for row in value['items']]}
+                    else:
+                        value = [progress(row) for row in value]
                 elif len(parts) == 2 and parts[0] == 'jobs':
                     value = progress(value)
             self._reply(value)

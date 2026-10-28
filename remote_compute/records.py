@@ -16,7 +16,7 @@ class Job(dict):
 
 
 class JobRecords(MutableMapping):
-    def __init__(self, root, cache_size=64):
+    def __init__(self, root, cache_size=64, *, index_path=None):
         self.root = Path(root)
         self.active = {}
         self.history = {}
@@ -25,16 +25,114 @@ class JobRecords(MutableMapping):
         self.cache_size = cache_size
         self.assets = Counter()
         self.workers = Counter()
+        # Terminal receipts remain on disk.  The append-only index lets a
+        # restart rebuild the cheap identity/asset view without opening every
+        # result.json in a long campaign.  A missing index keeps the legacy
+        # scan path and is rebuilt after that scan.
+        self.index_path = Path(index_path) if index_path is not None else self.root.parent / 'history.index.jsonl'
+        self.index_loaded = False
+        self.pending = []
+        self.deleted = set()
+
+    def _append_index(self, record):
+        if not self.index_loaded:
+            return
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.index_path.open('a', encoding='utf-8', newline='\n') as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+
+    def load_index(self):
+        """Load the durable identity index, returning whether it was usable."""
+        if not self.index_path.is_file():
+            return False
+        entries = {}
+        order = []
+        self.deleted = set()
+        try:
+            with self.index_path.open('r', encoding='utf-8') as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        # A torn final append is harmless; the result file is
+                        # still the source of truth for direct ID recovery.
+                        continue
+                    identity = row.get('id')
+                    if not isinstance(identity, str) or not identity:
+                        continue
+                    if row.get('op') == 'delete':
+                        entries.pop(identity, None)
+                        self.deleted.add(identity)
+                        continue
+                    if identity not in entries:
+                        order.append(identity)
+                    entries[identity] = row
+        except OSError:
+            return False
+        self.history.clear()
+        self.assets.clear()
+        self.workers.clear()
+        self.pending = []
+        for identity in order:
+            row = entries.get(identity)
+            if row is None:
+                continue
+            if row.get('terminal', True):
+                assets = tuple(x for x in row.get('assets', ()) if isinstance(x, str))
+                worker = row.get('worker') or identity
+                self.history[identity] = (assets, worker)
+                self.assets.update(assets)
+                self.workers.update((worker,))
+            else:
+                self.pending.append(identity)
+        self.index_loaded = True
+        return True
+
+    def write_index(self):
+        """Atomically materialize the current compact index after migration."""
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.index_path.with_suffix(self.index_path.suffix + '.tmp')
+        with temporary.open('w', encoding='utf-8', newline='\n') as stream:
+            for identity, (assets, worker) in self.history.items():
+                stream.write(json.dumps({'id': identity, 'terminal': True,
+                                         'assets': list(assets), 'worker': worker},
+                                        ensure_ascii=False, separators=(',', ':')) + '\n')
+            for identity, job in self.active.items():
+                result = job.get('result', {})
+                stream.write(json.dumps({'id': identity, 'terminal': False,
+                                         'assets': list(set(result.get('assets', {}).values())),
+                                         'worker': job.get('worker_id', result.get('worker_id', identity))},
+                                        ensure_ascii=False, separators=(',', ':')) + '\n')
+        temporary.replace(self.index_path)
+        self.index_loaded = True
 
     def __getitem__(self, identity):
         if identity in self.active:
             return self.active[identity]
-        self.history[identity]  # A deleted ID must remain a KeyError.
+        if identity in self.deleted:
+            raise KeyError(identity)
         job = self.live.get(identity)
         if job is None:
-            directory = self.root / identity
-            result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
-            job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
+            if identity not in self.history:
+                directory = self.root / identity
+                result_path = directory / 'result.json'
+                if not result_path.is_file():
+                    raise KeyError(identity)
+                result = json.loads(result_path.read_text(encoding='utf-8'))
+                if result.get('status') not in TERMINAL:
+                    raise KeyError(identity)
+                job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
+                assets = tuple(set(result.get('assets', {}).values()))
+                worker = result.get('worker_id', identity)
+                self.history[identity] = (assets, worker)
+                self.assets.update(assets)
+                self.workers.update((worker,))
+                self._append_index({'id': identity, 'terminal': True,
+                                    'assets': list(assets), 'worker': worker})
+            else:
+                directory = self.root / identity
+                result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
+                job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
         self._cache(identity, job)
         return job
 
@@ -53,7 +151,12 @@ class JobRecords(MutableMapping):
     def __setitem__(self, identity, job):
         if identity in self:
             del self[identity]
+        self.deleted.discard(identity)
         self.active[identity] = job
+        result = job.get('result', {})
+        self._append_index({'id': identity, 'terminal': False,
+                            'assets': list(set(result.get('assets', {}).values())),
+                            'worker': job.get('worker_id', result.get('worker_id', identity))})
 
     def __delitem__(self, identity):
         if identity in self.active:
@@ -64,6 +167,8 @@ class JobRecords(MutableMapping):
             self._drop(self.workers, (worker,))
         self.recent.pop(identity, None)
         self.live.pop(identity, None)
+        self.deleted.add(identity)
+        self._append_index({'id': identity, 'op': 'delete'})
 
     def __contains__(self, identity):
         return identity in self.active or identity in self.history
@@ -121,9 +226,12 @@ class JobRecords(MutableMapping):
             self._drop(self.assets, old_assets)
             self._drop(self.workers, (old_worker,))
         self.history[identity] = (assets, worker)
+        self.deleted.discard(identity)
         self.assets.update(assets)
         self.workers.update((worker,))
         self.active.pop(identity, None)
+        self._append_index({'id': identity, 'terminal': True,
+                            'assets': list(assets), 'worker': worker})
         if not startup:
             self._cache(identity, job)
 

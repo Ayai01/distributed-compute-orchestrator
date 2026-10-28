@@ -20,6 +20,7 @@ from .startup import Cancelled, resolve, single_instance
 from .process import keep_awake
 from .terminal import console_close, require_visible
 from .records import active_values
+from . import __version__
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 26133
@@ -137,6 +138,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
             api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             api_thread.start()
             print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}", flush=True)
+            print(f"DCO已就绪 version={__version__} paused={'true' if coordinator.paused else 'false'} calibration=manual", flush=True)
             dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token, operator=True,
                               operator_token=coordinator.operator_token)
         if args.action is None:
