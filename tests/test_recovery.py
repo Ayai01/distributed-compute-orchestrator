@@ -201,6 +201,8 @@ class RecoveryTests(unittest.TestCase):
                 result = json.loads(path.read_text())
                 result.update(status=status, finished=None)
                 path.write_text(json.dumps(result))
+            # Simulate legacy crash receipts, before the history index existed.
+            (root/'center/history.index.jsonl').unlink()
             from remote_compute.policy import normalize_accelerators
             worker.accelerators = normalize_accelerators([
                 dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])])
@@ -314,6 +316,7 @@ class RecoveryTests(unittest.TestCase):
                 result.update(status=status,finished=None)
                 result.pop('max_retries',None)  # Upgrade an existing 0.8.2 receipt.
                 path.write_text(json.dumps(result))
+            (root/'center/history.index.jsonl').unlink()
             with Pool([node]) as pool,center(pool,root/'center') as (_,client):
                 for identity,output in ((finished,'original result'),(queued,'queued result')):
                     self.assertEqual(client.wait(identity,wait_timeout=10)['status'],'succeeded')
@@ -367,6 +370,7 @@ finally:
                 until(lambda:identity in worker.jobs and worker.get(identity)['status']=='running')
                 until(lambda:(worker.jobs[identity]['directory']/'input/pid.txt').exists())
                 original_pid=client.read_job_file(identity,'pid.txt')
+                self.assertEqual(client.resize(identity,2)['cpus'],2)
                 process.kill();process.communicate()
                 process,client=start()
                 until(lambda:client.status(identity)['status']=='running')

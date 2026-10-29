@@ -621,7 +621,7 @@ class Coordinator:
                     yield key,borrowing
 
     def _growth_headroom(self, task, resources):
-        """Keep newly freed slots for acknowledged, unfilled phase demand.
+        """Give existing elastic work its first four useful threads.
 
         This holds no worker lease and never changes an active pool. Its owner
         claims the slots with the next drained resize; lowering demand or
@@ -630,9 +630,10 @@ class Coordinator:
         protected,groups={},{}
         for identity,job in sorted(active_items(self.jobs),key=lambda row:-row[1].get('task',{}).get('priority',0)):
             held=job.get('node');current=job.get('task',{})
-            desired=job.get('desired_cpus',0);old=current.get('cpus',0)
+            startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
+            desired=min(4,job.get('desired_cpus',startup));old=current.get('cpus',0)
             if (held is None or desired<=old
-                    or job['result']['status']!='running' or job['cancel'].is_set()
+                    or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
                     or current.get('priority',0)<task.get('priority',0)
                     or held.error or not held.enabled or held.health.get('paused')):
                 continue
@@ -723,8 +724,8 @@ class Coordinator:
                             for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
                                 headroom[name] = max(headroom.get(name, 0), count)
                             node = self.pool._acquire(job["task"], block=False,
-                                cpu_limit=room if room > 0 else None,
-                                partial_cpus=time.time()-job['result']['submitted']>=1,job_id=job.get('worker_id',identity),
+                                cpu_limit=1 if job.get('auto_cpus') else room if room > 0 else None,
+                                partial_cpus=True,job_id=job.get('worker_id',identity),
                                 node_headroom=headroom)
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
@@ -1090,8 +1091,10 @@ class Coordinator:
     def _cooperative_cpu_target(self, identity, desired, resources):
         """Share a project's node budget at a drained elastic phase boundary.
 
-        Running peers keep their grants until their own boundary. Fixed-width
-        ready work is placed whole before dividing the remaining automatic work.
+        Running peers keep their grants until their own boundary. Within the
+        project share, existing work gets up to four useful threads, ready work
+        enters at its startup width, then idle slots widen running work. Explicit
+        fixed-width requests retain their indivisible admission contract.
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
         resource=resources[group];priority=current['task'].get('priority',0)
@@ -1105,7 +1108,7 @@ class Coordinator:
             held=sum(job['task']['cpus'] for job in members.values() if job.get('node') is node)
             capacities[name]=max(0,min(resource['node_targets'].get(name,0),
                 node.capacity-node.external-node.reserved+held))
-        fixed=[];demands={};rooms={}
+        fixed=[];demands={};rooms={};waiting={}
         for key,job in members.items():
             task=job['task'];held=job.get('node')
             automatic=key==identity or _elastic_job(job)
@@ -1128,16 +1131,28 @@ class Coordinator:
             # A positive startup width has not requested its whole ceiling.
             # Reserve peer demand only after it declares a useful phase width.
             demand=desired if key==identity else job.get('desired_cpus',
-                max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else task.get('cpus',1))
+                max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(4,task.get('cpus',1)))
             demands[key]=min(demand,task.get('max_cpus',demand))
             rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
+            if held is None:waiting[key]=task.get('cpus',1)or 1
         for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-row[1].get('priority',0),len(row[2]),row[3])):
             choices=[name for name in eligible if capacities[name]>=task['cpus']]
             if choices:
                 selected=max(choices,key=lambda name:capacities[name])
                 capacities[selected]-=task['cpus']
-        plan=weighted_node_threads(capacities,{key:1. for key in demands},demands,rooms)
-        return max(1,plan.get(identity,{}).get(current['node'].name,0))
+        running={key:value for key,value in demands.items() if key not in waiting}
+        shares={key:1. for key in running}
+        warm=weighted_node_threads(capacities,shares,{key:min(4,value) for key,value in running.items()},rooms)
+        spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
+        entrants=weighted_node_threads(spare,{key:1. for key in waiting},waiting,rooms)
+        # A ready entrant owns this opportunity until the scheduler admits it.
+        # Wider running phases may still use other nodes with no ready entrant.
+        for name in spare:
+            if any(row.get(name,0) for row in entrants.values()):spare[name]=0
+        extra={key:max(0,value-sum(warm[key].values())) for key,value in running.items()}
+        wide=weighted_node_threads(spare,shares,extra,rooms)
+        name=current['node'].name
+        return max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0))
 
     def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:

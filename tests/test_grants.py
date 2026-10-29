@@ -24,7 +24,7 @@ class GrantTests(unittest.TestCase):
                 task=python(HOLD,cpus=0,max_cpus=2)
                 accepted=client.submit(task); identity=accepted['id']
                 until(lambda:client.status(identity)['status']=='running')
-                self.assertEqual(client.status(identity)['cpus'],2)
+                self.assertEqual(client.status(identity)['cpus'],1)
                 self.assertEqual(client.resize(identity,99)['cpus'],2)
                 self.assertEqual(worker.resize(identity,99)['cpus'],2)
                 self.assertEqual(client.submit(task,job_id=identity)['request_sha256'],accepted['request_sha256'])

@@ -1,5 +1,7 @@
 # DCO 协作约定
 
+当前弹性调度合同（0.8.44）：已有任务先扩至最多4个有用线程，就绪任务随后以1线程进入，没有可进入任务时再扩现有任务。worker须在排空边界按实际grant调整线程池。版本更新后先排空并收齐原ID，再完整重启中心和全部工作节点、核对同一版本后开放正式实验。
+
 ## 入口与责任
 
 正式名称为 Distributed Compute Orchestrator，简称 DCO；仓库 distributed-compute-orchestrator，保留 remote_compute 包及 REMOTE_COMPUTE_* 协议名。服务和终端保持 Python 标准库实现，日常使用系统标准 GIL x64 CPython 3.14，源码保持 3.7–3.15 兼容。

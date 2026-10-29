@@ -381,6 +381,7 @@ class PoolTests(unittest.TestCase):
             # Reconstruct an interrupted on-disk state as left by an abrupt shutdown.
             result_file = root / "jobs" / identity / "result.json"
             result_file.write_text(json.dumps(saved))
+            (root / 'history.index.jsonl').unlink()
             with provider(root) as (_, client):
                 self.assertEqual(client.status(identity)["status"], "interrupted")
                 self.assertEqual(client.fetch(identity)["status"], "interrupted")

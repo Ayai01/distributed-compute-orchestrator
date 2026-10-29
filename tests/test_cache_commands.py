@@ -125,6 +125,7 @@ class CacheCommandTests(unittest.TestCase):
         client.health.return_value = dict(node='center', role=role)
         client.nodes.return_value = dict(nodes=[])
         client.status.return_value = dict(jobs=[])
+        client.status_page.return_value = dict(jobs=[])
         pool = Mock(closed=False)
         sync = Mock(return_value=dict(status=status, projects=[]))
         with scratch() as directory, \
