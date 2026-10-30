@@ -72,6 +72,19 @@ class AdmissionPlanningTests(unittest.TestCase):
         self.assertEqual(state.admission(dict(project='A',cpus=1,max_cpus=128,job_id='active'))['recommended_cpus'],16)
         self.assertEqual(state.jobs['active']['desired_cpus'],1)
 
+    def test_project_budget_covers_running_warmup_before_waiter_admission(self):
+        state=self.center([16]);node=state.pool.nodes[0];node.reserved=4
+        for index in range(6):
+            state.jobs[str(index)]=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=16,memory_mb=64,project='A'),
+                elastic_cpus=True,node=node if index<4 else None,cancel=threading.Event(),
+                result=dict(status='dispatching'if index<4 else'queued'))
+        resources=state.project_resources()
+        self.assertEqual(resources['A']['demand'],18)
+        self.assertEqual(resources['A']['target'],16)
+        self.assertEqual(state._growth_headroom(state.jobs['4']['task'],resources),{'0':12})
+        state.jobs['0']['desired_cpus']=1
+        self.assertEqual(state.project_resources()['A']['demand'],15)
+
     def test_finite_elastic_resize_yields_at_boundary_and_reclaims_after_peer_finishes(self):
         state=self.center([52]);node=state.pool.nodes[0]
         node.health['capabilities']=['resize'];node.reserved=52;node.reserved_memory_mb=192
@@ -280,6 +293,24 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_simultaneous_one_thread_admissions_protect_four_thread_warmup(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=16)as (_,worker):
+            with Pool([dict(name='only',url=worker.url)],refresh=60)as pool:
+                with center(pool,Path(root)/'center',paused=True)as (state,client):
+                    ids=[client.submit(python('import time;time.sleep(30)',cpus=1,max_cpus=16,
+                        project='warmup',retries=0))['id']for _ in range(6)]
+                    try:
+                        client.control(paused=False)
+                        until(lambda:sum(state.get(key)['status']=='running'for key in ids)>=4)
+                        statuses=[state.get(key)['status']for key in ids]
+                        self.assertEqual(statuses.count('running'),4)
+                        self.assertEqual(statuses.count('queued'),2)
+                        self.assertEqual(state.project_resources()['warmup']['target'],16)
+                    finally:
+                        client.control(paused=True)
+                        for key in ids:client.cancel(key)
+                        for key in ids:client.wait(key,poll=.01)
+
     def test_paused_start_restores_receipts_without_dispatching_old_queue(self):
         with scratch() as root, provider(Path(root)/'worker') as (_, worker), Pool([worker]) as pool:
             home = Path(root)/'center'

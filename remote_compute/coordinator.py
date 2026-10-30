@@ -442,7 +442,9 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                demand = job.get('desired_cpus',largest if job.get('auto_cpus') else task.get('cpus', 1))
+                startup=task.get('cpus',1)
+                if held is not None and _elastic_job(job):startup=max(4,startup)
+                demand = job.get('desired_cpus',largest if job.get('auto_cpus') else startup)
                 demand=min(demand,task.get('max_cpus',demand))
                 paused=held is not None and held.health.get('paused')
                 if paused:demand=task.get('cpus',0)
@@ -742,6 +744,12 @@ class Coordinator:
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              dispatched=time.time(), cpus=job['task']['cpus'])
+                        # Admission turns a one-thread waiter into warmup demand.
+                        # Recompute the same budget mapping before admitting its
+                        # next peer, so the four-thread headroom has a real share.
+                        if _elastic_job(job):
+                            budgets.clear()
+                            budgets.update(self.project_resources())
                         self._save(job)
                         thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
                         self.threads.add(thread)
@@ -1128,8 +1136,8 @@ class Coordinator:
             if not automatic:
                 fixed.append((key,task,eligible,job['result'].get('submitted',0)))
                 continue
-            # A positive startup width has not requested its whole ceiling.
-            # Reserve peer demand only after it declares a useful phase width.
+            # Before its first phase request, an elastic peer gets four-thread
+            # warmup demand, bounded by its useful ceiling.
             demand=desired if key==identity else job.get('desired_cpus',
                 max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(4,task.get('cpus',1)))
             demands[key]=min(demand,task.get('max_cpus',demand))

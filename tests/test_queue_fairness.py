@@ -75,6 +75,9 @@ class FixedQueueFairnessTests(unittest.TestCase):
                 accepted = client.submit(python(HOLD, project='growing', cpus=1, max_cpus=3, memory_mb=64))
                 identity = accepted['id']
                 until(lambda: client.status(identity)['status']=='running')
+                # Explicitly enter a one-thread preparation phase before the
+                # later growth request; default warmup now protects its ceiling.
+                self.assertEqual(client.resize(identity,1)['cpus'],1)
                 peers = [client.submit(python(HOLD, project='small', memory_mb=64))['id'] for _ in range(5)]
                 until(lambda: all(client.status(key)['status']=='running' for key in peers))
                 refill = client.submit(python(HOLD, project='small', memory_mb=64))['id']
