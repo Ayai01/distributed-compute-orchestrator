@@ -888,7 +888,7 @@ class Coordinator:
                     job['result'].pop('connection_error',None)
                     # Retry is one atomic state transition. A client must not
                     # collect/delete a transient interrupted outcome mid-retry.
-                    if remote['status']!='interrupted':self._update(job, remote)
+                    if remote['status']!='interrupted' or job['cancel'].is_set():self._update(job, remote)
                 if remote["status"] in TERMINAL:
                     result = remote
                     retry=remote['status']=='interrupted'
