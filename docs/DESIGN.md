@@ -107,7 +107,11 @@ subprocess.run([*binding['argv'], *arguments], check=True)
 
 中心声明`admission_job`时，`admission(project, job_id=原任务ID)`返回该任务的`recommended_cpus`、`current_cpus`、`current_memory_mb`和`available_memory_mb`，供阶段边界先判断是否值得调整工作池。此查询不改变授权；需要调整时排空当前池，再调用`resize`并按实际回执建池。运行中的worker任务通过同一lease通路查询。
 
-`queue_ratio`（默认 1.0）控制提前排队比例。`Client.admission()` 返回当前窗口及 `max_in_flight` 安全上界；`Client.window()` 每秒至多刷新一次当前份额和上界，节点新增、能力登记和预算变化都会反映到窗口：
+`queue_ratio`（默认 1.0）控制提前排队比例。`Client.admission()` 返回当前窗口及 `max_in_flight` 安全上界；`Client.window()` 每秒至多刷新一次当前份额和上界，节点新增、能力登记和预算变化都会反映到窗口。
+
+中心受理按原任务ID互斥；同ID核对完整请求摘要，独立ID的持久请求和回执写盘可以重叠。受理引用按当前发送线程保存资产集合，发布或失败时只释放自己的集合，原任务发布后接管引用。暖启动扩核预留在一次准入调用内按工程/优先级复用完整分配；该局部缓存随调用结束释放，任务、份额、内存或队列变化后的下一次准入重新计算。
+
+动态窗口按以下关系计算：
 
 ```text
 固定线程波次槽位 = max(1, sum(floor(各设备份额 / 单任务线程)))

@@ -24,6 +24,7 @@ from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .compat import unlink
 from .cleanup import AssetCache, remove_owned
+from .acceptance import SubmissionAssets, SubmissionLocks
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
 import socket
 import math
@@ -48,8 +49,8 @@ class Coordinator:
         (self.root / "assets").mkdir(exist_ok=True)
         self.operator_token = self._load_operator_token(operator_token)
         self.condition = threading.Condition(threading.RLock())
-        self.submission_lock = threading.RLock()
-        self.accepting_assets = set()
+        self.submission_lock = SubmissionLocks()
+        self.accepting_assets = SubmissionAssets()
         self.asset_writes = weakref.WeakValueDictionary()
         self.jobs, self.queue, self.threads = JobRecords(
             self.root / 'jobs', index_path=self.root / 'history.index.jsonl'), [], set()
@@ -544,7 +545,7 @@ class Coordinator:
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
-        with self.submission_lock:
+        with self.submission_lock.hold(identity):
             with self.condition:
                 if self.stopping:
                     raise Conflict("Scheduler is stopping")
@@ -630,6 +631,7 @@ class Coordinator:
         finishing makes them available to queued work immediately.
         """
         protected,groups={},{}
+        warm_cache={}
         for identity,job in sorted(active_items(self.jobs),key=lambda row:-row[1].get('task',{}).get('priority',0)):
             held=job.get('node');current=job.get('task',{})
             startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
@@ -643,7 +645,7 @@ class Coordinator:
             room=max(0,resource['target']-resource['used']-groups.get(group,0))
             free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
             if not room or not free:continue
-            target=self._cooperative_cpu_target(identity,desired,resources)
+            target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=warm_cache)
             available_memory=current['memory_mb']+max(0,min(held.memory_free,self.pool._host_memory_free(held)))
             model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
             model.update(job.get('phase_memory',dict(memory_mb=current['memory_mb'])))
@@ -1096,7 +1098,7 @@ class Coordinator:
         host='127.0.0.1' if host=='0.0.0.0' else host
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
-    def _cooperative_cpu_target(self, identity, desired, resources):
+    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None):
         """Share a project's node budget at a drained elastic phase boundary.
 
         Running peers keep their grants until their own boundary. Within the
@@ -1106,6 +1108,8 @@ class Coordinator:
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
         resource=resources[group];priority=current['task'].get('priority',0)
+        if warm_cache is not None and (group,priority) in warm_cache:
+            return max(1,warm_cache[group,priority].get(identity,{}).get(current['node'].name,0))
         members={key:job for key,job in active_items(self.jobs)
                  if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
                  and (job['task'].get('project') or 'default')==group}
@@ -1151,6 +1155,12 @@ class Coordinator:
         running={key:value for key,value in demands.items() if key not in waiting}
         shares={key:1. for key in running}
         warm=weighted_node_threads(capacities,shares,{key:min(4,value) for key,value in running.items()},rooms)
+        if warm_cache is not None:
+            # One growth pass asks each elastic peer for its first four useful
+            # threads. The same group/priority has one unchanged warm plan;
+            # wider idle growth is handled separately at the phase boundary.
+            warm_cache[group,priority]=warm
+            return max(1,warm.get(identity,{}).get(current['node'].name,0))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
         entrants=weighted_node_threads(spare,{key:1. for key in waiting},waiting,rooms)
         # A ready entrant owns this opportunity until the scheduler admits it.
