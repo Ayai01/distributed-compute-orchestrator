@@ -28,7 +28,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (ValueError, UnicodeError) as error:
+        raise ValueError('Invalid JSON in ' + str(Path(path).resolve()) + ': ' + str(error)) from None
 
 
 @contextmanager

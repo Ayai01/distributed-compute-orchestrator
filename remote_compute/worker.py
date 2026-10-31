@@ -33,6 +33,7 @@ from .telemetry import Activity
 from .client import RemoteError
 from .cleanup import AssetCache, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
+from .receipts import read_receipt
 from .paths import cache_environment
 from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
@@ -248,22 +249,26 @@ class Worker:
         indexed = self.jobs.load_index()
         candidates = tuple(self.jobs.pending) if indexed else None
         paths = ((self.root / 'jobs' / identity / 'result.json') for identity in candidates) if candidates is not None else (self.root / "jobs").glob("*/result.json")
+        self.startup_recoveries = []
         for path in paths:
-            if not path.is_file():
-                continue
-            saved = json.loads(path.read_text(encoding="utf-8"))
+            saved = read_receipt(path, assets=self.jobs.pending_assets.get(path.parent.name, ()))
             if clean_tool_snapshot(saved):
                 atomic_json(path, saved)
             interrupted = saved["status"] not in TERMINAL
             if interrupted:
-                saved.update(status="interrupted", finished=time.time(), error="Worker stopped before completion")
+                saved.update(status="interrupted", finished=time.time(), cost_incomplete=True,
+                             error="Worker stopped before completion")
                 atomic_json(path, saved)
             identity = saved["id"]
             job = Job(result=saved, cancel=threading.Event(), directory=path.parent)
             self.jobs.active[identity] = job
-            self._clean_temp(job)
-            if interrupted or saved.get('input_cleanup_error'):
-                self._clean_work(job)
+            if saved.get('receipt_recovery'):
+                self.startup_recoveries.append(identity)
+                self.activity.notify('原回执损坏，保留任务目录并隔离恢复 ' + identity, 'local')
+            else:
+                self._clean_temp(job)
+                if interrupted or saved.get('input_cleanup_error'):
+                    self._clean_work(job)
             archive_job(self.jobs, job, startup=True)
         if not indexed:
             self.jobs.write_index()
@@ -288,6 +293,7 @@ class Worker:
                     "accelerator_jobs": sum(bool(items) for items in self.accelerator_reservations.values()),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "configuration_revision": self.configuration_revision,
+                    "startup_recoveries": self.startup_recoveries,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
                     "service": service_usage(),
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
@@ -623,6 +629,9 @@ class Worker:
             directory = work.parent
             try:
                 directory.mkdir()
+            except FileExistsError:
+                raise Conflict('Original job directory already exists; retain it and recover the original id') from None
+            try:
                 low_integrity_directory(directory)
                 unpack(payload, directory)
                 work.mkdir(exist_ok=True)
@@ -642,6 +651,12 @@ class Worker:
                 job = Job({"result": result, "cancel": threading.Event(), "task": task,
                        "commands": commands, "directory": directory, "cwd": cwd,
                        'callback':dict(self.callback if callback is None else callback)})
+                # This small immutable admission record survives damage to a
+                # later progress receipt. Never snapshot inputs or full tools.
+                admission = {key: result[key] for key in (
+                    'id', 'request_sha256', 'submitted', 'label', 'project',
+                    'initial_cpus', 'memory_mb', 'assets', 'total_steps')}
+                atomic_json(directory / 'admission.json', admission)
                 self._save(job)
                 with self.condition:
                     if self.stopping:
@@ -973,6 +988,10 @@ class Worker:
             for name in ("stdout.log", "stderr.log"):
                 if (directory / name).exists():
                     files[name] = directory / name
+            if job['result'].get('receipt_recovery'):
+                for name in ('receipt-recovery.json', job['result']['receipt_recovery'].get('damaged_file')):
+                    if name and inside(directory, name).is_file():
+                        files['recovery/' + name] = inside(directory, name)
             return pack(files)
 
     def delete(self, identity):

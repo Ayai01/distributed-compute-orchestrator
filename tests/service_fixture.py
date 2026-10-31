@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory(prefix='dco-service-config-') as directory:
         path=Path(directory)/'worker.json'
         path.write_text('{}',encoding='utf8')
         sys.argv[1:1]=['--config',str(path)]
-    with patch('remote_compute.cli.require_visible'), patch('remote_compute.cli.console_close',return_value=nullcontext()), patch('remote_compute.ramdisk.scratch',return_value=Path(directory)/'scratch'):
+    with patch('remote_compute.cli.require_visible'), patch('remote_compute.cli.console_close',return_value=nullcontext()), patch('remote_compute.ramdisk.scratch',return_value=Path(directory)/'scratch'), patch('remote_compute.resources.memory',return_value=(48*1024,40*1024)), patch('remote_compute.resources.commit_memory',return_value=None):
         raise SystemExit(main())
 '''
 

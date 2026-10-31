@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import socket
+import traceback
 from urllib.parse import urlsplit
 
 from .client import Client, Pool, RemoteError
@@ -309,7 +310,7 @@ def main(argv=None):
     parser.add_argument("--start-paused", action="store_true", default=None,
                         help="中心以暂停派发状态启动，保留原任务与成果供维护领取；完成后用control(paused=False)恢复")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument('--on-port-conflict', choices=('ask', 'reuse', 'kill', 'admin-kill', 'cancel'),
+    parser.add_argument('--on-port-conflict', choices=('ask', 'restart', 'reuse', 'kill', 'admin-kill', 'cancel'),
                         default='ask', help='端口冲突处理；交互终端默认询问，admin-kill请求管理员权限')
     parser.add_argument("--check", action="store_true", help="检查本机仿真工具")
     parser.add_argument("--test", action="store_true", help="运行核心回归")
@@ -399,7 +400,23 @@ def main(argv=None):
                 endpoint = 'center:' + str(args.center_port if args.center_port is not None else
                                            args.port if args.port is not None else DEFAULT_PORT)
             if not args.service_child:
-                lifetime.enter_context(single_instance(endpoint, wait=30.0 if handoff else 0.0))
+                if not args.url:
+                    # Resolve the original service before its supervisor's
+                    # console lock. Killing/reloading only the listener after
+                    # taking that lock could never reach the old supervisor.
+                    role = 'worker' if args.mode == 'worker' else 'scheduler'
+                    port = (args.port if args.port is not None else DEFAULT_PORT) if role == 'worker' else (
+                        args.center_port if args.center_port is not None else
+                        args.port if args.port is not None else DEFAULT_PORT)
+                    token = os.environ.get('REMOTE_COMPUTE_TOKEN', config.get('token', ''))
+                    existing = resolve(args.host or config.get('host', '127.0.0.1'), port,
+                        policy=args.on_port_conflict, token=token, reuse_role=role,
+                        ca_file=(config.get('ca_file') or config.get('certfile')) if role == 'worker' else None,
+                        tls=role == 'worker' and bool(config.get('certfile')),
+                        operator_token=_operator_token(args, config.get('operator_token', '')))
+                    if existing:
+                        raise Cancelled('DCO已在运行，请使用原窗口：' + existing)
+                lifetime.enter_context(single_instance(endpoint, wait=30.0 if handoff or not args.url else 0.0))
         if args.action=='scan':
             if not args.scan_add:
                 from .commands import scan_devices
@@ -502,6 +519,8 @@ def main(argv=None):
             args.local_token = os.environ.get("REMOTE_COMPUTE_TOKEN", config.get("token", ""))
             options["token"] = args.local_token
             worker = Worker(root, args.cpus if args.cpus is not None else config.get("cpus", 0), **options)
+            if worker.startup_recoveries:
+                print('已隔离恢复损坏回执：' + ', '.join(worker.startup_recoveries) + '；原任务目录保留，费用未知项已标记。', flush=True)
             def save_settings(changes):
                 if changes:
                     saved = read_json(path) if path.exists() else {}
@@ -555,6 +574,14 @@ def main(argv=None):
         return 0
     except (ValueError, OSError, RuntimeError, StopIteration) as error:
         print("操作失败:", error, file=sys.stderr)
+        if not args.url and args.action is None and not (args.test or args.test_native or args.check):
+            diagnostic = ROOT / '.local/diagnostics/startup-error.log'
+            try:
+                diagnostic.parent.mkdir(parents=True, exist_ok=True)
+                diagnostic.write_text(traceback.format_exc(), encoding='utf-8')
+                print('详细错误：' + str(diagnostic), file=sys.stderr)
+            except OSError:
+                pass
         if args.url and ('10061' in str(error) or 'Connection refused' in str(error)):
             print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py；统一连接地址 http://127.0.0.1:26133。', file=sys.stderr)
         return 2

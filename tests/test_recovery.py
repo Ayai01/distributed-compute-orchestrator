@@ -165,8 +165,12 @@ class RecoveryTests(unittest.TestCase):
             with provider(root/'lost') as (_, lost), provider(root/'gpu',
                     accelerators=[dict(kind='cuda', count=1, memory_mb=8192, ids=['0'])]) as (_, healthy):
                 with Pool([lost, healthy], policy='round_robin') as pool, center(pool, root/'center') as (_, client):
+                    # GPU-first admission would correctly use an already
+                    # available GPU directly. Make it available only on retry.
+                    pool.nodes[1].enabled = False
                     def unavailable(*args, **kwargs):
                         pool.nodes[0].enabled = False
+                        pool.nodes[1].enabled = True
                         return dict(status='interrupted', error='Worker stopped', finished=time.time())
                     with patch.object(lost, 'submit_bundle', return_value={}), patch.object(
                             lost, 'status', side_effect=unavailable):
@@ -180,7 +184,7 @@ class RecoveryTests(unittest.TestCase):
                     self.assertEqual(len(result['attempts']), 1)
                     self.assertIsNone(result['accelerator'])
                     self.assertEqual(result['stdout'].strip(), '0')
-                    self.assertEqual(result['accelerator_fallback']['reason'], 'queue_timeout')
+                    self.assertEqual(result['accelerator_fallback']['reason'], 'unavailable')
 
     def test_cpu_fallback_survives_queued_restart_and_running_reattachment(self):
         with scratch() as temporary, provider(Path(temporary)/'worker') as (worker, remote):

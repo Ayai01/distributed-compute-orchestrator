@@ -76,14 +76,19 @@ class PrivateJsonTests(unittest.TestCase):
                 atomic_json(root / 'worker.local.json', {'cpus': float('nan')}, private=True)
             self.assertEqual(list(root.iterdir()), [])
 
-    def test_ordinary_results_keep_default_publication_path(self):
+    def test_ordinary_results_flush_unique_temporary_file_before_publication(self):
         with scratch() as directory:
             target = Path(directory) / 'result.json'
-            with patch('remote_compute.bundle.tempfile.mkstemp') as create:
-                atomic_json(target, {'answer': 42})
-            create.assert_not_called()
+            replace = Path.replace
+            with patch('remote_compute.bundle.os.fsync', wraps=os.fsync) as flush:
+                def publish(pending, destination):
+                    flush.assert_called_once()
+                    self.assertEqual(json.loads(pending.read_text()), {'answer': 42})
+                    return replace(pending, destination)
+                with patch.object(Path, 'replace', publish):
+                    atomic_json(target, {'answer': 42})
             self.assertEqual(json.loads(target.read_text()), {'answer': 42})
-            self.assertFalse(target.with_suffix('.tmp').exists())
+            self.assertEqual(list(Path(directory).iterdir()), [target])
 
     def test_setup_saves_worker_config_privately_without_starting_service(self):
         with scratch() as directory:

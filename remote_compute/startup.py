@@ -183,16 +183,18 @@ def terminate(pids, *, admin=False):
     print((result.stdout or '已结束端口占用进程。').strip())
 
 
-def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None, tls=False):
+def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None, tls=False, operator_token=None):
     """Return a reusable local service URL, or None when the port is free."""
     if available(host, port):
         return None
     local_host = '127.0.0.1' if host in {'0.0.0.0', ''} else '::1' if host == '::' else host
     url = f"{'https' if tls else 'http'}://{'[' + local_host + ']' if ':' in local_host else local_host}:{port}"
     reusable = False
+    observed = {}
     if reuse_role:
         try:
-            reusable = Client(url, token, timeout=1,ca_file=ca_file).health().get('role') == reuse_role
+            observed = Client(url, token, timeout=1,ca_file=ca_file).health()
+            reusable = observed.get('role') == reuse_role
         except RemoteError:
             pass
     print(f'端口冲突：{host}:{port}')
@@ -203,13 +205,31 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
     if choice == 'ask':
         if not sys.stdin.isatty():
             raise RuntimeError('非交互启动已取消；使用 --on-port-conflict reuse|kill|admin-kill|cancel 选择处理方式。')
-        options = '[r] reuse 复用已有服务 / ' if reusable else ''
+        options = '[u] restart 原窗口重载 / [r] reuse 复用已有服务 / ' if reusable else ''
         try:
             choice = input(options + '[k] kill / [a] admin-kill 管理员结束 / [c] cancel 取消（默认）：').strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise Cancelled('已取消启动，已有进程继续运行。') from None
-        choice = {'r': 'reuse', 'k': 'kill', 'a': 'admin-kill', 'c': 'cancel',
+        choice = {'u': 'restart', 'r': 'reuse', 'k': 'kill', 'a': 'admin-kill', 'c': 'cancel',
                   '': 'cancel'}.get(choice, choice)
+    if choice == 'restart' and reusable:
+        client = Client(url, token, timeout=3, ca_file=ca_file, operator=True, operator_token=operator_token)
+        try:
+            client.restart()
+        except RemoteError as error:
+            if error.status_code == 409:
+                raise Cancelled('DCO原窗口仍有任务；保持运行，收齐后在原窗口重载。') from None
+            raise
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            try:
+                current = client.health()
+                if current.get('pid') and current['pid'] != observed.get('pid') and current.get('role') == reuse_role:
+                    raise Cancelled('DCO已在原窗口完成重载：' + url + '；版本 ' + str(current.get('version', '')))
+            except RemoteError:
+                pass
+            time.sleep(.2)
+        raise RuntimeError('原窗口正在重载，请检查原窗口和启动诊断：' + url)
     if choice == 'reuse' and reusable:
         print('复用已有服务：' + url)
         return url

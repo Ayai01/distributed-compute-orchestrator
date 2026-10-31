@@ -9,6 +9,7 @@ import threading
 import weakref
 
 from .bundle import TERMINAL
+from .receipts import read_receipt
 
 
 class Job(dict):
@@ -32,6 +33,7 @@ class JobRecords(MutableMapping):
         self.index_path = Path(index_path) if index_path is not None else self.root.parent / 'history.index.jsonl'
         self.index_loaded = False
         self.pending = []
+        self.pending_assets = {}
         self.deleted = set()
 
     def _append_index(self, record):
@@ -57,6 +59,8 @@ class JobRecords(MutableMapping):
                         # A torn final append is harmless; the result file is
                         # still the source of truth for direct ID recovery.
                         continue
+                    if not isinstance(row, dict):
+                        continue
                     identity = row.get('id')
                     if not isinstance(identity, str) or not identity:
                         continue
@@ -73,6 +77,7 @@ class JobRecords(MutableMapping):
         self.assets.clear()
         self.workers.clear()
         self.pending = []
+        self.pending_assets = {}
         for identity in order:
             row = entries.get(identity)
             if row is None:
@@ -85,6 +90,7 @@ class JobRecords(MutableMapping):
                 self.workers.update((worker,))
             else:
                 self.pending.append(identity)
+                self.pending_assets[identity] = tuple(x for x in row.get('assets', ()) if isinstance(x, str))
         self.index_loaded = True
         return True
 
@@ -118,7 +124,7 @@ class JobRecords(MutableMapping):
                 result_path = directory / 'result.json'
                 if not result_path.is_file():
                     raise KeyError(identity)
-                result = json.loads(result_path.read_text(encoding='utf-8'))
+                result = read_receipt(result_path)
                 if result.get('status') not in TERMINAL:
                     raise KeyError(identity)
                 job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
@@ -131,7 +137,7 @@ class JobRecords(MutableMapping):
                                     'assets': list(assets), 'worker': worker})
             else:
                 directory = self.root / identity
-                result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
+                result = read_receipt(directory / 'result.json', assets=self.history[identity][0])
                 job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
         self._cache(identity, job)
         return job
