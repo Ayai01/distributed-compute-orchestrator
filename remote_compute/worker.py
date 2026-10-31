@@ -37,7 +37,7 @@ from .paths import cache_environment
 from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
-                     MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement,
+                     MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
                      normalize_accelerators, aggregate_accelerators, canonical_capabilities, PYTHON_RUNTIME_ALIASES,
                      canonical_capability, clean_tool_snapshot)
 
@@ -193,6 +193,8 @@ class Worker:
         self.configuration_revision = 0
         self.token = token
         self.accelerators = normalize_accelerators(accelerators)
+        for profile in self.accelerators:
+            profile['tags'] = canonical_capabilities(profile['tags'] + ['gpu:shared'])
         self.accelerator_reservations = {}
         self.configured_tags = set(canonical_capabilities(tags))
         self.paused = False
@@ -282,7 +284,8 @@ class Worker:
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "accelerators": self.accelerators,
-                    "accelerator_used": sum(len(items) for items in self.accelerator_reservations.values()),
+                    "accelerator_used": len({unit[:2] for items in self.accelerator_reservations.values() for unit in items}),
+                    "accelerator_jobs": sum(bool(items) for items in self.accelerator_reservations.values()),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
                     "configuration_revision": self.configuration_revision,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
@@ -311,29 +314,14 @@ class Worker:
         return units
 
     def _match_accelerator(self, requirement):
-        requirement=normalize_accelerator_requirement(requirement)
-        if requirement is None:
-            return []
-        used={unit[:2] for items in self.accelerator_reservations.values() for unit in items}
-        matches=[]
-        for unit in self._accelerator_units():
-            if unit[:2] in used:
-                continue
-            _,_,kind,memory,tags,_=unit
-            if requirement['kind'] not in ('any', kind):
-                continue
-            if memory < requirement['memory_mb'] or not set(requirement['requires']).issubset(tags):
-                continue
-            matches.append(unit)
-            if len(matches) >= requirement['count']:
-                return matches
-        return None
+        used=[unit for items in self.accelerator_reservations.values() for unit in items]
+        return select_accelerator_units(self._accelerator_units(), requirement, used)
 
     def _accelerator_environment(self, job_id, environment):
         # Only reservations grant access; inherited or task-supplied values
         # must not make a CPU job appear to own an accelerator.
         denied = dict(DCO_ACCELERATOR_KIND='', DCO_ACCELERATOR_COUNT='0',
-                      DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='',
+                      DCO_ACCELERATOR_MEMORY_MB='0', DCO_ACCELERATOR_IDS='', DCO_ACCELERATOR_SHARING='',
                       CUDA_VISIBLE_DEVICES='-1')
         # Windows treats environment names case-insensitively, even when
         # the Python input mapping contains both upper- and lower-case keys.
@@ -348,7 +336,8 @@ class Worker:
         ids=[unit[5] for unit in units]
         environment.update(DCO_ACCELERATOR_KIND=kind,
                            DCO_ACCELERATOR_COUNT=str(len(units)),
-                           DCO_ACCELERATOR_MEMORY_MB=str(min(unit[3] for unit in units)),
+                           DCO_ACCELERATOR_MEMORY_MB=str(min(unit[6]['memory_mb'] if len(unit)>6 else unit[3] for unit in units)),
+                           DCO_ACCELERATOR_SHARING='memory' if all(len(unit)>6 for unit in units) else 'exclusive',
                            DCO_ACCELERATOR_IDS=','.join(ids))
         if kind == 'cuda':
             environment['CUDA_VISIBLE_DEVICES']=','.join(ids)

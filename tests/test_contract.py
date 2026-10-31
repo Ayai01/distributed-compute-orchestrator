@@ -91,7 +91,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                 project = Client(operator.url)
                 capabilities = project.capabilities()
                 self.assertEqual(capabilities['accelerators'], [
-                    dict(kind='cuda', count=1, memory_mb=8192, tags=['gpu', 'gpu:training'])])
+                    dict(kind='cuda', count=1, memory_mb=8192, tags=['gpu', 'gpu:shared', 'gpu:training'])])
                 request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
                 self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 2)
                 first = project.submit(python('import time; time.sleep(.35)', project='gpu', accelerator=request))['id']

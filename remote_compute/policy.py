@@ -137,6 +137,15 @@ def normalize_accelerator_requirement(value):
         raise ValueError('accelerator requires kind, count 1..16, memory_mb and short capability tags')
     normalized = dict(kind=kind, count=count, memory_mb=memory_mb,
                       requires=canonical_capabilities(requires))
+    sharing = value.get('sharing', 'exclusive')
+    if sharing not in ('exclusive', 'memory'):
+        raise ValueError('accelerator sharing must be exclusive or memory')
+    if sharing == 'memory':
+        maximum = value.get('max_jobs', 2)
+        if memory_mb < 1 or type(maximum) is not int or not 1 <= maximum <= 16:
+            raise ValueError('shared accelerator requires positive memory_mb and max_jobs 1..16')
+        normalized.update(sharing='memory', max_jobs=maximum,
+                          requires=canonical_capabilities(requires + ['gpu:shared']))
     if 'fallback_after_seconds' in value:
         wait = value['fallback_after_seconds']
         if (isinstance(wait, bool) or not isinstance(wait, (int, float))
@@ -144,6 +153,37 @@ def normalize_accelerator_requirement(value):
             raise ValueError('accelerator fallback_after_seconds must be finite and nonnegative')
         normalized['fallback_after_seconds'] = wait
     return normalized
+
+
+def select_accelerator_units(units, requirement, reserved=()):
+    """Reserve either a whole device or an explicit memory share on that device."""
+    requirement = normalize_accelerator_requirement(requirement)
+    if requirement is None:
+        return []
+    shared = requirement.get('sharing') == 'memory'
+    matches = []
+    for unit in units:
+        if (requirement['kind'] not in ('any', unit[2]) or unit[3] < requirement['memory_mb']
+                or not set(requirement['requires']).issubset(unit[4])):
+            continue
+        occupied = [item for item in reserved if item[:2] == unit[:2]]
+        if not shared:
+            if occupied:
+                continue
+            selected = unit
+        else:
+            if any(len(item) < 7 for item in occupied):
+                continue
+            maximum = min([requirement['max_jobs']] + [item[6]['max_jobs'] for item in occupied])
+            memory = sum(item[6]['memory_mb'] for item in occupied) + requirement['memory_mb']
+            headroom = max(512, unit[3] // 16)
+            if len(occupied) >= maximum or memory > unit[3] - headroom:
+                continue
+            selected = unit + (dict(memory_mb=requirement['memory_mb'], max_jobs=requirement['max_jobs']),)
+        matches.append(selected)
+        if len(matches) == requirement['count']:
+            return matches
+    return None
 
 
 def normalize_accelerators(value):
@@ -208,4 +248,5 @@ def public_capabilities():
         "asset_cache",
         "accelerators",
         "accelerator_fallback",
+        "accelerator_memory_sharing",
     ]

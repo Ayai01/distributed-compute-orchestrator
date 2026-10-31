@@ -532,8 +532,13 @@ class Coordinator:
             return
         now = time.time()
         with self.pool.condition:
-            online = any(not node.error and node.enabled and not node.health.get('paused')
-                         for node in self.pool._matching(job['task']))
+            matching = [node for node in self.pool._matching(job['task'])
+                        if not node.error and node.enabled and not node.health.get('paused')]
+            online = bool(matching)
+            if requirement['fallback_after_seconds'] == 0 and any(
+                    node.can_match_accelerator(requirement) and node.memory_free >= job['task']['memory_mb']
+                    for node in matching):
+                return
         reason = ('unavailable' if not online else
                   'queue_timeout' if now - result['submitted'] >= requirement['fallback_after_seconds'] else None)
         if reason is not None:

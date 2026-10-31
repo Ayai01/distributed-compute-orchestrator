@@ -58,11 +58,15 @@ task = command(["${tool:python_torch_pyg}", "train.py"], cpus=4, memory_mb=8192,
                                              "requires":["gpu:training"]})
 ```
 
-调度器按配置档案中的类型、每卡容量与标签匹配，并以整卡单元独占预留；`memory_mb` 表示每张卡须满足的最低容量，计账按占用卡数，实际显存用量由执行后端管理。卡号来自设备配置的 `ids`，同一物理卡只登记一次；配置拒绝同类型重复ID，CUDA部署使用完整GPU UUID，避免序号与UUID混登记。运行环境提供 `DCO_ACCELERATOR_KIND`、`DCO_ACCELERATOR_COUNT`、`DCO_ACCELERATOR_MEMORY_MB`、`DCO_ACCELERATOR_IDS`；CUDA 任务同时得到 `CUDA_VISIBLE_DEVICES`。worker 每次执行都从本次授权重写这些变量：无授权时分别为空、0、0、空，并将 `CUDA_VISIBLE_DEVICES` 设为`-1`。Windows实机CUDA会把空值当作未设置，明确禁用值保证未授予任务看不到CUDA设备。工程依据本任务授权选择后端。训练、GPU 仿真和通用 GPU 任务可用不同标签；无GPU设备配置空档案，CPU任务照常使用。
+调度器按配置档案中的类型、每卡容量与标签匹配，默认整卡独占；此时`memory_mb`表示每张卡须满足的最低容量。声明`sharing:"memory", max_jobs:2`时，`memory_mb`改为每个任务的显存预留，中心与worker使用同一份额账本；每卡同时任务数受所有参与者中最小max_jobs约束，显存总预留另留至少512MiB或卡容量1/16的余量。新能力为`accelerator_memory_sharing`，实际支持的GPU档案带`gpu:shared`；旧独占授予继续占整卡，作者明确授权的在途RGCN任务可由操作员记录`accelerator_share_grant`后转为共享额度，原ID、请求包和训练进程保持。物理卡数、占用卡数及GPU任务数分别计数。
+
+卡号来自设备配置的`ids`，同一物理卡只登记一次；配置拒绝同类型重复ID，CUDA部署使用完整GPU UUID。环境提供`DCO_ACCELERATOR_KIND/COUNT/MEMORY_MB/IDS/SHARING`；共享时MEMORY_MB是本任务预留，SHARING为memory，独占时为exclusive。CUDA任务另得`CUDA_VISIBLE_DEVICES`；无授予时上述值清空或归0，并把CUDA_VISIBLE_DEVICES设为-1，覆盖继承或任务伪造值。工程依据本任务实际授权选择后端；无GPU设备配置空档案，CPU任务照常使用。
 
 GPU档案与执行解释器一起验收：工具登记的同一解释器须具备完整数值依赖及CUDA构建，随后验证CPU无授予、GPU实际计算、数值等价和结束释放。调用方在授予后选择逻辑`cuda:0`，批量复用驻留模型和数据，按完整阶段计时，包括准备、数据搬运、输出及检查点；单个矩阵核的速度不作为工程加速依据。小批NumPy搜索、SPICE及RTL保持原CPU路径，后端选择不更改研究输入、预算或已接受任务。
 
 兼容CPU执行的任务先检查中心是否声明 `accelerator_fallback`，再在同一份 admission/任务 `accelerator` 对象中加入 `fallback_after_seconds`（有限非负秒数）。该字段由调用方显式提供；省略时保持强制加速器。无匹配在线GPU时立即改为CPU；仍未派发的任务到达队列阈值时改为CPU，同一任务ID、请求包和输入摘要保持不变。首次派发后执行选择冻结，重试和恢复沿用该选择。CPU回退回执含 `accelerator: null`、原需求 `requested_accelerator`，以及 `accelerator_fallback: {"reason":"unavailable"或"queue_timeout","at":Unix秒}`。admission 的 `fallback_capable_cpus` 表示CPU路径匹配的在线预算。
+
+阈值0表示GPU优先且不等待满额GPU：GPU显存份额可用时先走GPU准入，已有弹性CPU任务在同步边界让出启动线程；份额满时立即回退CPU。CPU的暂时扩核占用不等同于GPU份额满。短CPU执行段在完整状态边界结束后，可用新执行ID优先申请GPU并承接原剩余工作。
 
 ARH 的 `tensor_backend=auto` 声明一张CUDA卡和30秒阈值；旧中心未声明上述能力时，ARH提示并以CPU执行。显式 `torch_cuda` 省略阈值、保持强制GPU。DCO负责授予资源，调用工程负责CPU/GPU计算路径及结果身份。
 

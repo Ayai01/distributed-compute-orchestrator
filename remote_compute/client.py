@@ -24,7 +24,7 @@ import weakref
 import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
-from .policy import (normalize_accelerator_requirement, canonical_capabilities,
+from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids)
 from .auth import lan_endpoint
 from .allocation import elastic_cpus
@@ -804,26 +804,11 @@ class Node:
         semantic requirements; ids are used after dispatch and never leave the
         operator view.
         """
-        requirement=normalize_accelerator_requirement(requirement)
-        if requirement is None:
-            return []
-        used=set()
+        used=list(extra_used)
         if include_reserved:
-            used.update(unit[:2] for items in self.accelerator_reservations.values() for unit in items)
-            used.update(unit[:2] for unit in self.external_accelerator_reservations)
-        used.update(unit[:2] for unit in extra_used)
-        selected=[]
-        needed_tags=set(requirement['requires'])
-        for unit in self.accelerator_units():
-            if unit[:2] in used:
-                continue
-            if (requirement['kind'] in ('any',unit[2])
-                    and unit[3] >= requirement['memory_mb']
-                    and needed_tags.issubset(unit[4])):
-                selected.append(unit)
-                if len(selected) == requirement['count']:
-                    return selected
-        return None
+            used.extend(unit for items in self.accelerator_reservations.values() for unit in items)
+            used.extend(self.external_accelerator_reservations)
+        return select_accelerator_units(self.accelerator_units(), requirement, used)
 
     def refresh_external_accelerators(self, jobs):
         """Rebuild reservations for work accepted outside this scheduler."""
@@ -1161,7 +1146,8 @@ class Pool:
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
                  "accelerators": n.health.get("accelerators", []),
-                 "accelerator_reserved": sum(len(items) for items in n.accelerator_reservations.values()),
+                 "accelerator_reserved": len({unit[:2] for items in n.accelerator_reservations.values() for unit in items}),
+                 "accelerator_jobs": sum(bool(items) for items in n.accelerator_reservations.values()),
                  "accelerator_used": n.health.get("accelerator_used", 0),
                  "network": dict(getattr(n, 'network', {}) or {}),
                  "shared_paths": n.health.get("shared_paths", {}),
