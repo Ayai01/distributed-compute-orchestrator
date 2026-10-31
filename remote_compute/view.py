@@ -121,7 +121,12 @@ def _table(headers, records, widths, width, right=()):
     flexible = widths.index(None)
     widths[flexible] = max(1,width-4-3*(len(widths)-1)-sum(n or 0 for n in widths))
     def row(values):
-        return ' | '.join(_cell(value,size,index in right) for index,(value,size) in enumerate(zip(values,widths)))
+        cells=[]
+        for index,(value,size) in enumerate(zip(values,widths)):
+            if headers[index]=='Tag' and _width(value)>size:
+                value=re.sub(r' ~[\d.]+k?s$','',str(value))
+            cells.append(_cell(value,size,index in right))
+        return ' | '.join(cells)
     divider = '+' + '+'.join('-'*(size+2) for size in widths) + '+'
     return [_line(row(headers),width), divider, *[_line(row(record),width) for record in records]]
 
@@ -215,8 +220,18 @@ def _tag_name(text):
 
 
 def _label(job):
-    parts = job.get('label','').replace('\\','/').split('/')
     project = (job.get('project') or '').casefold()
+    text=job.get('label','')
+    text=re.sub(r'\b(\d+) (?:new )?real designs\b',r'ng:\1',text,flags=re.I)
+    text=re.sub(r'\b(\d+) evaluations\b',r'ev:\1',text,flags=re.I)
+    if project in {'rgcn','arh-dse','bench','analog-opt-bench','aop'}:
+        text=re.sub(r'\b[0-9a-f]{12,64}\b',lambda m:m[0][-4:],text,flags=re.I)
+    if project=='rgcn':
+        legacy=re.fullmatch(r'(LDO|FSA|AB|BGR) paper_prediction fast \w+ f\d+ s',text)
+        if legacy:return legacy[1]+' PRED :'+job.get('id','????')[-4:]
+        if re.match(r'^(LDO|FSA|AB|BGR) \S+ s\d+(?:b\d+|:[0-9a-f]{4})?(?: |$)',text):
+            return text
+    parts = text.replace('\\','/').split('/')
     positions = [i for i,part in enumerate(parts) if project and part.casefold()==project]
     if positions:
         parts = parts[positions[-1]+1:]
@@ -499,19 +514,19 @@ class StatusRows(list):
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         records=[r if len(r)>7 else [*r,'-'] for r in records]
         def tag(record):
-            return record[6] if record[9] == '—' else f'{record[9]} {record[6]}'
+            return record[6] if record[9] in ('—','0/1','1/1') else f'{record[9]} {record[6]}'
         # The full progress column appears only when the task panel has room
         # for it.  Narrow panes retain every existing identity/resource field;
         # the same ratio remains available in the status/API payload.
         show_progress = width >= 140
         if width>=110 and not show_progress:
-            table=_table(['ID','Node','Proj','Share/Pri','Jobs/CPU','RAM','Sec','St','Tag'],
-                         [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,11,9,4,6,4,None],width,right=(3,4,5,6))
+            table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
+                         [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
+                         [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
         elif width>=110:
-            table=_table(['ID','Node','Proj','Share/Pri','Jobs/CPU','RAM','Sec','St','Prog','Tag'],
-                         [[r[i] for i in (0,1,2)]+[r[8] if len(r)>8 else '-']+[r[i] for i in (3,4,7,5,9,6)] for r in records],
-                         [4,self.node_width,6,11,9,4,6,4,6,None],width,right=(3,4,5,6,7))
+            table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Prog','Tag'],
+                         [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
+                         [4,self.node_width,6,9,4,6,4,6,None],width,right=(3,4,5,6))
         elif width>=80:
             table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
