@@ -9,6 +9,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 from . import ABBREVIATION
 from .policy import canonical_capabilities
+from .task_tags import compact_tag
 
 
 _ambiguous_width = None
@@ -123,8 +124,7 @@ def _table(headers, records, widths, width, right=()):
     def row(values):
         cells=[]
         for index,(value,size) in enumerate(zip(values,widths)):
-            if headers[index]=='Tag' and _width(value)>size:
-                value=re.sub(r' ~[\d.]+k?s$','',str(value))
+            if headers[index]=='Tag':value=compact_tag({'label':value},size,measure=_width)
             cells.append(_cell(value,size,index in right))
         return ' | '.join(cells)
     divider = '+' + '+'.join('-'*(size+2) for size in widths) + '+'
@@ -413,7 +413,7 @@ class StatusRows(list):
             state=job.get('status','running')
             started=job.get('started')
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"1/{job.get('cpus',0)}",
-                                 _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),_label(job),
+                                 _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),compact_tag(job,preferred=_label(job),measure=_width),
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
                                  _progress_label(job)])
@@ -538,7 +538,11 @@ class StatusRows(list):
             table=_table(['ID','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
                          [4,9,6,None],width,right=(1,2))
         else:
-            table=[_line('ID 任务/线程 运行秒 进度/标签',width)]+[_line(f'{r[0]} {r[3]} {r[7]} {tag(r)}',width) for r in records]
+            table=[_line('ID CPU Tag',width)]
+            for r in records:
+                prefix=f'{r[0]} {r[3]} '
+                fitted=compact_tag({'label':tag(r)},max(1,width-4-_width(prefix)),measure=_width)
+                table.append(_line(prefix+fitted,width))
         title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页'
         if not self.records:
             table.append(_line('空闲',width))

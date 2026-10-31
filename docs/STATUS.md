@@ -1,6 +1,6 @@
 # DCO 当前状态
 
-2026-10-31显示维护：Share/Pri任务列已移除，Tag支持紧凑工作量、短身份及估算时间；窄面板省略单脚本0/1并优先省估算时间。53项终端回归、4项短Tag/GPU阻塞与CPU就绪准入夹具通过，原PID25844仅更新_table/_label/StatusRows._tasks三个显示函数；服务、worker与科学任务保持。生效证据在`.local/maintenance/rgcn-compact-tags-20261031/live-view-application-v2.json`。
+2026-10-31显示维护：Share/Pri任务列已移除，所有工程Tag统一最长24单元格，再按实际Tag列宽缩写，禁止省略号。保留对象/条件、算法/对照、短seed或批次、工作量；宽度不足先省可选耗时。60项终端/跨工程显示检查通过，覆盖20—200列窗口。原PID25844已只更新显示模块，163×53实际窗口中在途任务Tag最长23字符；调度与worker模块身份、原请求和任务ID保持。生效证据在`.local/maintenance/short-tags-20261031/live-validation.json`。
 
 2026-10-31最终验收：核心635项完成，5项环境跳过，310.469秒，完整入口通过。补齐取消后收到worker `interrupted`终态的发布：取消已经关闭重试路径时，沿原ID保存实际状态与CPU，避免中心留在running。新增回归覆盖0及非零CPU费用，原ID、单次取消和无重试均保持。ARH原停滞项已从worker领取权威中断/0CPU回执并按原ID归档；节点原路由已恢复。该源码分支留待下一次正常加载，本轮没有重启或再次热加载；Windows提交余量检查已在Aya1-PC原进程生效。下段634项为较早的分阶段资格记录。
 
