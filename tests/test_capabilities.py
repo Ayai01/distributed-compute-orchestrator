@@ -19,6 +19,19 @@ from test_center import center
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_cached_capability_sequences_keep_live_inputs_and_fresh_list_results(self):
+        from remote_compute.policy import _canonical_capabilities_tuple
+        values=['ngspice47','cpu','cpu']
+        first=canonical_capabilities(values)
+        self.assertEqual(first,['cpu','ng47'])
+        first.append('caller-local')
+        self.assertEqual(canonical_capabilities(iter(values)),['cpu','ng47'])
+        values.append('python_numpy')
+        self.assertEqual(canonical_capabilities(values),['cpu','ng47','python_numpy'])
+        for index in range(300):canonical_capabilities(['cpu','capability'+str(index)])
+        self.assertEqual(_canonical_capabilities_tuple.cache_info().maxsize,256)
+        self.assertLessEqual(_canonical_capabilities_tuple.cache_info().currsize,256)
+
     def test_benchmark_uses_available_semantic_numeric_runtime_before_legacy_or_core(self):
         for semantic in ('python_scientific', 'python_numpy', 'python_torch_pyg'):
             with self.subTest(semantic=semantic), scratch() as directory:

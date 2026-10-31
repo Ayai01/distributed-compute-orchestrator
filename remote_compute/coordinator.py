@@ -1108,6 +1108,10 @@ class Coordinator:
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
         resource=resources[group];priority=current['task'].get('priority',0)
+        if desired==1:
+            # The plan grants at most the requested width and at least one.
+            # A one-thread phase therefore has the exact target without a plan.
+            return 1
         if warm_cache is not None and (group,priority) in warm_cache:
             return max(1,warm_cache[group,priority].get(identity,{}).get(current['node'].name,0))
         members={key:job for key,job in active_items(self.jobs)

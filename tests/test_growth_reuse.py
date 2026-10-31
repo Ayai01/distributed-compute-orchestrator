@@ -14,6 +14,16 @@ class UncachedCenter(module.Coordinator):
 
 
 class GrowthReuseTests(unittest.TestCase):
+    def test_one_thread_request_has_its_exact_target_without_global_allocation(self):
+        state=center_fixtures.AdmissionPlanningTests().center([16])
+        node=state.pool.nodes[0];node.reserved=1
+        state.jobs['one']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=16,
+            memory_mb=64,project='A'),elastic_cpus=True,node=node,
+            cancel=threading.Event(),result=dict(status='running'))
+        resources=state.project_resources()
+        with patch.object(module,'weighted_node_threads',side_effect=AssertionError('Redundant one-thread allocation')):
+            self.assertEqual(state._cooperative_cpu_target('one',1,resources),1)
+
     def test_cached_warm_plan_matches_independent_per_job_plans(self):
         rng=random.Random(74219)
         fixture=center_fixtures.AdmissionPlanningTests()

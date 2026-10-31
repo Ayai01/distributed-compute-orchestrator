@@ -81,7 +81,12 @@ def _canonical_capability(value, registration):
 
 
 def canonical_capabilities(values):
-    return sorted({canonical_capability(value) for value in (values or ())})
+    return list(_canonical_capabilities_tuple(tuple(str(value) for value in (values or ()))))
+
+
+@lru_cache(maxsize=256)
+def _canonical_capabilities_tuple(values):
+    return tuple(sorted({canonical_capability(value) for value in values}))
 
 
 def clean_tool_snapshot(result):
