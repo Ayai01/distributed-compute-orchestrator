@@ -50,7 +50,7 @@ class LaunchHandoffTests(unittest.TestCase):
     def test_existing_service_is_resolved_before_the_supervisor_lock(self):
         with scratch() as folder:
             config = Path(folder) / 'worker.json'; config.write_text('{}')
-            with patch.object(cli, 'require_visible'), patch.object(cli, 'resolve', side_effect=startup.Cancelled('原窗口已重载')) as resolve, \
+            with patch.object(cli, 'ROOT', Path(folder)), patch.object(cli, 'require_visible'), patch.object(cli, 'resolve', side_effect=startup.Cancelled('原窗口已重载')) as resolve, \
                  patch.object(cli, 'single_instance', side_effect=AssertionError('old supervisor still owns this lock')), \
                  redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(['--config', str(config), '--mode', 'worker', '--on-port-conflict', 'restart']), 0)

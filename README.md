@@ -43,7 +43,7 @@ python -B main.py --help
 
 启动报错先查看 `.local/diagnostics/startup-error.log`；Windows启动脚本遇错保留窗口。更新命令 `python -B main.py update` 独立于worker启动，Git/ZIP安装均保留本机配置、状态与工具。单条损坏回执会自动同目录隔离：原ID、输入、输出及引用资产保留，`receipt-recovery.json`说明恢复来源；无可恢复的完整回执时，状态为`failed/error_kind=receipt_corrupt`，未知费用记为`null`及`cost_incomplete`，由原调用工程收取并决定续行。无需删除状态根或重装工具。
 
-Windows重复运行`start.cmd`时，先定位已有同角色服务，再通过`restart`在原窗口完整重载，等待新PID就绪后退出第二个入口；有在途任务时继续使用原窗口。直接运行Python可指定`--on-port-conflict restart`。端口处理先于单实例锁，旧服务结束时等待其锁释放；显式`kill/admin-kill`继续由操作员选择。
+Windows重复运行`start.cmd`时，先定位已有同角色服务，再通过`restart`在原窗口完整重载，等待新PID就绪后退出第二个入口；有在途任务时继续使用原窗口。最近的复用／取消结果写入`.local/diagnostics/startup-status.json`，与真正启动错误分开。直接运行Python可指定`--on-port-conflict restart`。端口处理先于单实例锁，旧服务结束时等待其锁释放；显式`kill/admin-kill`继续由操作员选择。启动输出和交互看板均在端口后显示运行服务版本。
 
 服务保持一个可见前台终端，窗口可失焦或最小化。聊天应用或编辑器主窗口可见，不代表其中的工具终端可见。`--headless` / `--no-browser` 仅表示不弹浏览器；DCO本身为终端服务，这两个同义选项不改变看板或服务。只关闭交互看板使用 `--no-dashboard`，仍保留前台日志和终端要求。隐藏窗口、重定向输入输出、nohup 和无终端 systemd/计划任务会在启动检查中退出。一次性 CLI、Python API 和测试支持管道。桌面自启动使用登录后终端快捷方式；Linux `.desktop` 使用 `Terminal=true`。旧隐藏服务先保留在途任务和未领取结果，排空后从可见入口迁回。
 

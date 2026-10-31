@@ -138,7 +138,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
                          trusted_networks=getattr(args, 'trusted_networks', None))
             api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             api_thread.start()
-            print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}", flush=True)
+            print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}  DCO {__version__}", flush=True)
             print(f"DCO已就绪 version={__version__} paused={'true' if coordinator.paused else 'false'} calibration=manual", flush=True)
             dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token, operator=True,
                               operator_token=coordinator.operator_token)
@@ -550,7 +550,7 @@ def main(argv=None):
                                  certfile=config.get('certfile'),keyfile=config.get('keyfile'),
                                  trusted_networks=args.trusted_networks)
                 worker_url=f'{"https" if config.get("certfile") else "http"}://{host}:{server.server_port}'
-                print(f"算力提供者 {worker_url}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
+                print(f"算力提供者 {worker_url}  DCO {__version__}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
                 thread.start()
             else:
@@ -571,6 +571,14 @@ def main(argv=None):
         return run_scheduler(args, LocalClient(worker) if worker else None, restarting, stopping)
     except Cancelled as error:
         print(error)
+        if not args.url and args.action is None and not (args.test or args.test_native or args.check):
+            try:
+                diagnostic = ROOT / '.local/diagnostics/startup-status.json'
+                diagnostic.parent.mkdir(parents=True, exist_ok=True)
+                atomic_json(diagnostic, {'at': time.time(), 'pid': os.getpid(),
+                                        'status': 'existing_service_or_cancelled', 'detail': str(error)})
+            except OSError:
+                pass
         return 0
     except (ValueError, OSError, RuntimeError, StopIteration) as error:
         print("操作失败:", error, file=sys.stderr)
