@@ -183,7 +183,7 @@ worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`�
 
 任务还可设置 `priority` 和 `requires`。较大的 `priority` 先启动；`requires` 要求汇总能力标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选供给。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
 
-中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度。新 worker 声明 `memory_accounting=rss`：首次进程树采样前及未反映到健康快照的派发按申报量预留，采样后按当前 RSS 记账；设备预算与系统实时 8GiB 可用余量共同约束新任务准入。旧 worker 沿用其预留规则，允许逐节点在空闲边界更新。任务取消只向 worker 发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
+中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度。新 worker 声明 `memory_accounting=rss`：首次进程树采样前及未反映到健康快照的派发按申报量预留，采样后按当前 RSS 记账；设备预算与配置的系统可用余量共同约束新任务准入，默认8GiB。Windows同时读取物理可用RAM及提交额度余量，按两者较小值减去系统余量和未采样预留，得到新任务可用量；`host_memory_available_mb`继续表示物理RAM，另列`host_commit_limit_mb`与`host_commit_available_mb`。既有授予保持，余量恢复后正常准入；Linux及未提供可选字段的旧worker沿原物理RAM规则。旧worker沿用其预留规则，允许逐节点在空闲边界更新。任务取消只向worker发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
 
 用 `label` 区分电路、保真度或相近工作量的批次，使同类耗时具有可比性。执行中的任务保留原节点。短暂断连时保留原任务ID和资源预留，状态中的 `connection_error` 显示连接问题；重连后继续查询该任务，不重新执行。已知节点暂时离线时，匹配该节点的待执行工作继续排队，其余在线节点照常服务。
 

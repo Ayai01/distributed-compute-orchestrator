@@ -420,7 +420,8 @@ class ControlLifecycleTests(unittest.TestCase):
             write_entry(copied)
             shutil.copytree(ROOT/'remote_compute',copied/'remote_compute',ignore=shutil.ignore_patterns('__pycache__'))
             config=copied/'worker.local.json'
-            config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False)),encoding='utf8')
+            config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False,
+                memory_mb=256,memory_reserve_mb=0,memory_headroom_mb=0)),encoding='utf8')
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
             client=Client(f'http://127.0.0.1:{port}',timeout=1,operator=True)

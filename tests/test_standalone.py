@@ -72,7 +72,8 @@ class StandaloneTests(unittest.TestCase):
             copied.mkdir()
             write_entry(copied)
             shutil.copytree(ROOT/'remote_compute', copied/'remote_compute', ignore=shutil.ignore_patterns('__pycache__'))
-            config = {'shared': {'old-project': str(root/'missing')}, 'cpus': 1, 'memory_mb': 512}
+            config = {'shared': {'old-project': str(root/'missing')}, 'cpus': 1, 'memory_mb': 512,
+                      'memory_reserve_mb': 0, 'memory_headroom_mb': 0}
             (copied/'worker.local.json').write_text(json.dumps(config), encoding='utf-8')
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1', 0))

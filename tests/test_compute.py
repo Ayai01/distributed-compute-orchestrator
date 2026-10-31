@@ -33,19 +33,23 @@ def scratch():
 def provider(root, cpus=1, *, trusted_networks=None, **options):
     # Transport/accounting tests should not benchmark every fixture or consume
     # a production-sized CPU budget; the actual kernel has its own regression.
-    with patch('remote_compute.worker.cpu_benchmark',side_effect=lambda n,*args:
-               dict(name='test-kernel',score=1000.0,unit='kiter/s',threads=n,seconds=2.0)):
-        worker = Worker(root, cpus, **options)
-    server = Server(("127.0.0.1", 0), worker, trusted_networks=trusted_networks)
-    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
-    thread.start()
-    try:
-        yield worker, Client(f"http://127.0.0.1:{server.server_port}", options.get("token", ""))
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
-        worker.close()
+    # Host commit pressure from concurrent research belongs to the dedicated
+    # capacity regressions, not these isolated HTTP/process fixtures.
+    with patch('remote_compute.resources.memory',return_value=(48*1024,40*1024)), \
+            patch('remote_compute.resources.commit_memory',return_value=None):
+        with patch('remote_compute.worker.cpu_benchmark',side_effect=lambda n,*args:
+                   dict(name='test-kernel',score=1000.0,unit='kiter/s',threads=n,seconds=2.0)):
+            worker = Worker(root, cpus, **options)
+        server = Server(("127.0.0.1", 0), worker, trusted_networks=trusted_networks)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        try:
+            yield worker, Client(f"http://127.0.0.1:{server.server_port}", options.get("token", ""))
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+            worker.close()
 
 
 def python(code, **options):

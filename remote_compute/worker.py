@@ -480,8 +480,10 @@ class Worker:
         running = [j for j in active_values(self.jobs) if j["result"]["status"] == "running"]
         reserved = sum(j['rss_mb'] if j.get('rss_sampled') else j['task']['memory_mb'] for j in running)
         unallocated = sum(j['task']['memory_mb'] for j in running if not j.get('rss_sampled'))
+        host_available = min(host["host_memory_available_mb"],
+                             host.get("host_commit_available_mb", host["host_memory_available_mb"]))
         available = max(0, min(self.memory_capacity - reserved,
-                               host["host_memory_available_mb"] - self.memory_headroom - unallocated))
+                               host_available - self.memory_headroom - unallocated))
         return {**host, "memory_capacity_mb": self.memory_capacity, "memory_reserved_mb": round(reserved, 2),
                 "memory_available_mb": int(available), "memory_reserve_mb": self.memory_reserve,
                 "memory_headroom_mb": self.memory_headroom, "memory_budget_mb":self.memory_budget,

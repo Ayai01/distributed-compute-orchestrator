@@ -1602,7 +1602,8 @@ class CenterTests(unittest.TestCase):
         from remote_compute.worker import Worker
         import remote_compute.worker as module
         with scratch() as root:
-            worker = Worker(Path(root)/'worker',cpus=2)
+            worker = Worker(Path(root)/'worker',cpus=2,memory_mb=256,
+                            memory_reserve_mb=0,memory_headroom_mb=0)
             try:
                 local = LocalClient(worker)
                 with self.assertRaises(RemoteError):

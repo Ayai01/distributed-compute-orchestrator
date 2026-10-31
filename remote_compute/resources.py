@@ -172,6 +172,21 @@ def memory():
     return values["MemTotal"], values["MemAvailable"]
 
 
+def commit_memory():
+    """Windows allocation headroom can run out while physical RAM is free."""
+    if os.name != "nt":
+        return None
+    class Memory(c.Structure):
+        _fields_ = [("length", c.c_ulong), ("load", c.c_ulong),
+                    *[(name, c.c_uint64) for name in ("total", "available", "page_total", "page_available",
+                                                     "virtual_total", "virtual_available", "extended")]]
+    value = Memory()
+    value.length = c.sizeof(value)
+    if not c.windll.kernel32.GlobalMemoryStatusEx(c.byref(value)):
+        raise c.WinError()
+    return value.page_total // MIB, value.page_available // MIB
+
+
 @lru_cache(maxsize=1)
 def _service_api():
     from ctypes import wintypes as w
@@ -235,6 +250,7 @@ class Host:
         self.lock = threading.Lock()
     def sample(self):
         total_mb, available_mb = memory()
+        commit = commit_memory()
         with self.lock:
             if time.monotonic() - self.sampled >= 0.5:
                 current = cpu_ticks()
@@ -242,9 +258,12 @@ class Host:
                 if elapsed:
                     self.cpu_percent = round(max(0, min(100, 100 * (1 - idle / elapsed))), 2)
                 self.previous, self.sampled = current, time.monotonic()
-        return {"machine_id": MACHINE_ID, "logical_cpus": os.cpu_count() or 1,
+        result = {"machine_id": MACHINE_ID, "logical_cpus": os.cpu_count() or 1,
                 "cpu_percent": self.cpu_percent, "temperature_c": None,
                 "memory_total_mb": total_mb, "host_memory_available_mb": available_mb}
+        if commit is not None:
+            result.update(host_commit_limit_mb=commit[0], host_commit_available_mb=commit[1])
+        return result
 
 
 def process_usage(process):
