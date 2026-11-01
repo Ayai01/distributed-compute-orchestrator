@@ -1213,8 +1213,13 @@ class Coordinator:
                 # to one CPU stays cheap for synchronous microkernels.
                 if desired>old or cpus==0 or (cooperative and desired>1):
                     resources=self.project_resources();group=job['task'].get('project') or 'default'
-                    target=resources[group]['target']
-                    room=target-resources[group]['used']+old
+                    resource=resources.get(group)
+                    if resource is None:
+                        # Disconnected grants are absent from the online quota
+                        # projection, but still belong to their original worker.
+                        return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
+                    target=resource['target']
+                    room=target-resource['used']+old
                     available=node.capacity-node.reserved-node.external+old
                     floor=1 if cooperative else old
                     granted=max(floor,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old

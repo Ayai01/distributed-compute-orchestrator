@@ -1,6 +1,6 @@
 # DCO 后续方向
 
-0.8.46统一维护已完成，中心及五节点沿维护凭证运行；原版本/源码/新PID和原ID闭合证据见`.local/maintenance/fleet-restart-20261031/maintenance-state.json`。当前按总调度每2小时巡检、三个工程各70分钟自检监督已授权路线，入口为`.local/maintenance/project-supervision-20261031/current.json`。健康服务保持运行；真实DCO故障才进入受影响范围暂停新增、排空、修复验证、统一部署与完整重启流程。原状态根、配置、输入、回执和工具保持。
+0.8.47本轮维护、统一版本/源码、新进程与原ID恢复的权威入口为`.local/maintenance/fiber-project-keyerror-20261101/maintenance-state.json`，按其中阶段和科学放行状态执行。此前0.8.46统一维护已闭合，原凭证在`.local/maintenance/fleet-restart-20261031/maintenance-state.json`。当前按总调度每2小时巡检、三个工程各70分钟自检监督已授权路线，入口为`.local/maintenance/project-supervision-20261031/current.json`。健康服务保持运行；真实DCO故障进入受影响范围暂停新增、排空、修复验证、统一部署与完整重启流程。原状态根、配置、输入、回执和工具保持。
 
 ## 持续维护
 
