@@ -57,11 +57,12 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
     return value
 
 
-def _operator_token(args, configured_token=''):
+def _operator_token(args, configured_token='', *, url=None):
     operator_token = getattr(args, 'operator_token', '')
-    if operator_token or not args.url:
+    target_url = args.url if url is None else url
+    if operator_token or not target_url:
         return operator_token or configured_token
-    host = urlsplit(args.url).hostname
+    host = urlsplit(target_url).hostname
     try:
         local = ipaddress.ip_address(host).is_loopback
     except ValueError:
@@ -383,6 +384,7 @@ def main(argv=None):
                 args.port if args.port is not None else DEFAULT_PORT)
             args.url = f"http://{args.host or '127.0.0.1'}:{port}"
         args.mode = args.mode or ('scheduler' if args.url else config.get('mode', 'hybrid'))
+        args.operator_token = os.environ.get('REMOTE_COMPUTE_OPERATOR_TOKEN', '')
         if args.mode not in {'scheduler', 'hybrid', 'worker'}:
             raise ValueError('mode must be scheduler, hybrid or worker')
         if args.start_paused is None:
@@ -409,11 +411,15 @@ def main(argv=None):
                         args.center_port if args.center_port is not None else
                         args.port if args.port is not None else DEFAULT_PORT)
                     token = os.environ.get('REMOTE_COMPUTE_TOKEN', config.get('token', ''))
-                    existing = resolve(args.host or config.get('host', '127.0.0.1'), port,
+                    probe_host = args.host or config.get('host') or '127.0.0.1'
+                    local_host = '127.0.0.1' if probe_host == '0.0.0.0' else '::1' if probe_host == '::' else probe_host
+                    scheme = 'https' if role == 'worker' and config.get('certfile') else 'http'
+                    probe_url = f"{scheme}://{'[' + local_host + ']' if ':' in local_host else local_host}:{port}"
+                    existing = resolve(probe_host, port,
                         policy=args.on_port_conflict, token=token, reuse_role=role,
                         ca_file=(config.get('ca_file') or config.get('certfile')) if role == 'worker' else None,
                         tls=role == 'worker' and bool(config.get('certfile')),
-                        operator_token=_operator_token(args, config.get('operator_token', '')))
+                        operator_token=_operator_token(args, config.get('operator_token', ''), url=probe_url))
                     if existing:
                         raise Cancelled('DCO已在运行，请使用原窗口：' + existing)
                 lifetime.enter_context(single_instance(endpoint, wait=30.0 if handoff or not args.url else 0.0))
@@ -489,7 +495,7 @@ def main(argv=None):
                         raise Cancelled(f'DCO 已在运行：{existing}；请使用现有窗口。端口固定为 {center_port}。')
                     args.mode, args.url = 'scheduler', existing
             if args.mode == 'worker':
-                existing_worker = resolve(args.host or config.get('host', '127.0.0.1'),
+                existing_worker = resolve(args.host or config.get('host') or '127.0.0.1',
                                           args.port if args.port is not None else DEFAULT_PORT,
                                           policy=args.on_port_conflict, token=args.local_token,
                                           reuse_role='worker',ca_file=config.get('ca_file') or config.get('certfile'),
@@ -544,7 +550,7 @@ def main(argv=None):
                     restarting.set()
                     threading.Thread(target=server.shutdown, daemon=True).start()
             if args.mode == 'worker':
-                host = args.host or config.get("host", "127.0.0.1")
+                host = args.host or config.get("host") or "127.0.0.1"
                 worker.restart_available = args.service_child
                 server = Server((host, port), worker, restart=restart_worker if args.service_child else None,
                                  certfile=config.get('certfile'),keyfile=config.get('keyfile'),
@@ -580,7 +586,7 @@ def main(argv=None):
             except OSError:
                 pass
         return 0
-    except (ValueError, OSError, RuntimeError, StopIteration) as error:
+    except (ValueError, OSError, RuntimeError, StopIteration, TypeError) as error:
         print("操作失败:", error, file=sys.stderr)
         if not args.url and args.action is None and not (args.test or args.test_native or args.check):
             diagnostic = ROOT / '.local/diagnostics/startup-error.log'

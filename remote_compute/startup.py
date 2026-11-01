@@ -185,7 +185,10 @@ def terminate(pids, *, admin=False):
 
 def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None, tls=False, operator_token=None):
     """Return a reusable local service URL, or None when the port is free."""
-    if available(host, port):
+    if port == 0:
+        return None
+    bind_free = available(host, port)
+    if bind_free and not reuse_role:
         return None
     local_host = '127.0.0.1' if host in {'0.0.0.0', ''} else '::1' if host == '::' else host
     url = f"{'https' if tls else 'http'}://{'[' + local_host + ']' if ':' in local_host else local_host}:{port}"
@@ -197,6 +200,10 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
             reusable = observed.get('role') == reuse_role
         except RemoteError:
             pass
+    # Windows can permit a specific-IP bind beside an existing wildcard
+    # listener. A responding original DCO is stronger evidence than that probe.
+    if bind_free and not observed:
+        return None
     print(f'端口冲突：{host}:{port}')
     processes = owners(port)
     for process in processes:
@@ -214,6 +221,8 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
                   '': 'cancel'}.get(choice, choice)
     if choice == 'restart' and reusable:
         client = Client(url, token, timeout=3, ca_file=ca_file, operator=True, operator_token=operator_token)
+        before = client.health()
+        original_pid = before.get('pid')
         try:
             client.restart()
         except RemoteError as error:
@@ -224,7 +233,7 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
         while time.monotonic() < deadline:
             try:
                 current = client.health()
-                if current.get('pid') and current['pid'] != observed.get('pid') and current.get('role') == reuse_role:
+                if current.get('pid') and current['pid'] != original_pid and current.get('role') == reuse_role:
                     raise Cancelled('DCO已在原窗口完成重载：' + url + '；版本 ' + str(current.get('version', '')))
             except RemoteError:
                 pass
