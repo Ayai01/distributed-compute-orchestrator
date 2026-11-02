@@ -19,6 +19,31 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
+    def test_running_warmup_precedes_another_projects_new_task(self):
+        state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
+        state.jobs={
+            'active':dict(task=dict(steps=[['echo']],cpus=1,max_cpus=8,memory_mb=64,project='A',priority=0),
+                          auto_cpus=False,elastic_cpus=True,node=node,cancel=threading.Event(),
+                          desired_cpus=8,result=dict(status='running')),
+            'waiting':dict(task=dict(steps=[['echo']],cpus=1,max_cpus=1,memory_mb=64,project='B',priority=0),
+                           auto_cpus=False,node=None,cancel=threading.Event(),result=dict(status='queued')),
+        }
+        budgets=state.project_resources()
+        self.assertEqual(budgets['A']['target'],4)
+        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{'0':3})
+        # A truly serial phase returns its standing demand as well as its
+        # lease; it must not hold three unusable slots against new work.
+        state.jobs['active']['desired_cpus']=1
+        budgets=state.project_resources()
+        self.assertEqual(budgets['A']['target'],1)
+        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{})
+        # Explicit priority still outranks the default four-thread warmup.
+        state.jobs['active']['desired_cpus']=8
+        state.jobs['waiting']['task']['priority']=1
+        budgets=state.project_resources()
+        self.assertEqual(budgets['B']['target'],1)
+        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{})
+
     def test_small_start_elastic_jobs_spread_across_idle_devices(self):
         state=self.center([20,30,52,16,16]);pool=state.pool
         pool.closed=False;pool.policy='adaptive'

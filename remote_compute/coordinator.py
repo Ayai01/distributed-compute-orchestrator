@@ -15,7 +15,7 @@ import zipfile
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff
-from .policy import (MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
+from .policy import (MIN_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
@@ -427,11 +427,15 @@ class Coordinator:
 
     def project_resources(self):
         shares, demands, used, queued, rooms = {}, {}, {}, {}, {}
+        warm_demands, warm_rooms = {}, {}
         online={n.name:n for n in self.pool.nodes if not n.error and n.enabled
                 and (not n.health.get('paused') or n.reserved)}
         capacities={name:node.reserved if node.health.get('paused') else node.capacity for name,node in online.items()}
         largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
         with self.condition,self.pool.condition:
+            waiting_priority=max((job.get('task',{}).get('priority',0) for job in active_values(self.jobs)
+                if job.get('node') is None and job['result']['status']=='queued'
+                and not (job.get('cancel') and job['cancel'].is_set())),default=MIN_PRIORITY)
             for job in active_values(self.jobs):
                 if job['result']['status'] in TERMINAL:
                     continue
@@ -450,6 +454,13 @@ class Coordinator:
                 paused=held is not None and held.health.get('paused')
                 if paused:demand=task.get('cpus',0)
                 demands[name] = demands.get(name, 0) + demand
+                if (held is not None and not paused and _elastic_job(job)
+                        and task.get('priority',0)>=waiting_priority
+                        and not (job.get('cancel') and job['cancel'].is_set())):
+                    width=min(4,demand)
+                    warm_demands[name]=warm_demands.get(name,0)+width
+                    edge=warm_rooms.setdefault(name,{})
+                    edge[held.name]=edge.get(held.name,0)+width
                 available=rooms.setdefault(name,{})
                 wanted={**task,'cpus':0} if _elastic_job(job) else task
                 if paused and held.name in online:
@@ -464,7 +475,17 @@ class Coordinator:
                 queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
         names={node for available in rooms.values() for node in available}
         ceilings={name:sum(min(capacities[node],demand) for node,demand in rooms[name].items()) for name in shares}
-        grants=weighted_node_threads({name:capacities[name] for name in names},shares,demands,rooms)
+        # Queued demand from another project must not spend an existing
+        # elastic task's first four useful threads before its next boundary.
+        warm=weighted_node_threads({name:capacities[name] for name in names},
+            {name:shares[name] for name in warm_demands},warm_demands,warm_rooms)
+        remaining={node:capacities[node]-sum(row.get(node,0) for row in warm.values()) for node in names}
+        extra={name:demands[name]-sum(warm.get(name,{}).values()) for name in shares}
+        edges={name:{node:max(0,width-warm.get(name,{}).get(node,0)) for node,width in row.items()}
+               for name,row in rooms.items()}
+        grants=weighted_node_threads(remaining,shares,extra,edges)
+        for name,row in warm.items():
+            for node,count in row.items():grants[name][node]=grants[name].get(node,0)+count
         quotas={name:sum(grants[name].values()) for name in shares}
         return {name: dict(resource_share=shares[name], target=quotas[name], demand=demands[name], used=used[name], queued=queued[name],
                            capacity=ceilings[name],eligible_nodes=sorted(rooms[name]),node_demands=rooms[name],
