@@ -1,6 +1,6 @@
 # DCO 后续方向
 
-0.8.48四线程优先维护沿`.local/maintenance/four-thread-priority-20261102/maintenance-state.json`执行。0.8.47此前维护、统一版本/源码、新进程与原ID恢复的权威入口为`.local/maintenance/fiber-project-keyerror-20261101/maintenance-state.json`，按其中阶段和科学放行状态执行。此前0.8.46统一维护已闭合，原凭证在`.local/maintenance/fleet-restart-20261031/maintenance-state.json`。总调度每2小时巡检，三个工程的错开自检间隔以`.local/maintenance/project-supervision-20261031/current.json`的automations和实际定时设置为准；阶段进度与分配保存在所属current。健康服务保持运行；真实DCO故障进入受影响范围暂停新增、排空、修复验证、统一部署与完整重启流程。原状态根、配置、输入、回执和工具保持。
+0.8.49标准能力迁移及四线程优先维护沿`.local/maintenance/four-thread-priority-20261102/maintenance-state.json`执行。0.8.47此前维护、统一版本/源码、新进程与原ID恢复的权威入口为`.local/maintenance/fiber-project-keyerror-20261101/maintenance-state.json`，按其中阶段和科学放行状态执行。此前0.8.46统一维护已闭合，原凭证在`.local/maintenance/fleet-restart-20261031/maintenance-state.json`。总调度每2小时巡检，三个工程的错开自检间隔以`.local/maintenance/project-supervision-20261031/current.json`的automations和实际定时设置为准；阶段进度与分配保存在所属current。健康服务保持运行；真实DCO故障进入受影响范围暂停新增、排空、修复验证、统一部署与完整重启流程。原状态根、配置、输入、回执和工具保持。
 
 ## 持续维护
 

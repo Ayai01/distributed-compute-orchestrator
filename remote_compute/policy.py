@@ -46,6 +46,7 @@ PYTHON_RUNTIME_ALIASES = {
     'aop_hspice_python': 'python_numpy',
     'aop-hs': 'python_numpy',
     'bench_python': 'python_scientific',
+    'python_fiber_reproducible': 'python_scientific',
     'rgcn_train': 'python_torch_pyg',
     'rgcn_fiber': 'python_torch_pyg',
 }
@@ -64,6 +65,8 @@ _IDENTITY_TAG = re.compile(
 _PLATFORM_TAG = re.compile(
     r'(?:^|[_:+.-])(?:win\d*|windows\d*|linux\d*|darwin|macos|posix|nt|ubuntu|debian|centos|rhel|'
     r'x86_64|amd64|aarch64|arm64)(?:$|[_:+.-])', re.I)
+_QUALIFICATION_TAG = re.compile(
+    r'(?:^|[_:+.-])(?:reproducible|qualified|qualification|validated|verified|certified)(?:$|[_:+.-])', re.I)
 
 
 def canonical_capability(value, *, registration=False):
@@ -77,6 +80,8 @@ def _canonical_capability(value, registration):
     if (_IDENTITY_TAG.search(name) or _PLATFORM_TAG.search(name)
             or registration and _PLATFORM_TAG.search(value)):
         raise ValueError('Capabilities require semantic tool names, without hashes or platform selectors')
+    if _QUALIFICATION_TAG.search(name) or registration and _QUALIFICATION_TAG.search(value):
+        raise ValueError('Capabilities describe tools and dependencies, not qualification status')
     return name
 
 

@@ -14,7 +14,7 @@ DCO 提供统一计算调度、远程任务执行和设备运维。调用工程�
 
 看板任务行的 `1/8` 表示1个任务、授予8核；实际并行度由项目执行器配置，并按进程/线程CPU样本核对。
 
-`cpus: 1, max_cpus: N`适用于低核启动、计算阶段再扩核的任务。默认顺序为：现有弹性任务先取得最多4个有用线程（跨工程同样优先于新任务，显式更高优先级除外）；就绪任务随后以1线程进入；没有可进入任务时，再扩展现有任务至有用并行上限和可用核心数。`cpus: 0`也以1线程启动。线程池在完整工作边界按实际授予调整，调度优先分散到空闲兼容设备。固定串行任务使用`cpus: 1, max_cpus: 1`，显式固定宽度任务保留整组准入。具体规则见[设计合同](docs/DESIGN.md)。
+`cpus: 1, max_cpus: N`适用于低核启动、计算阶段再扩核的任务。默认顺序为：现有弹性任务先取得最多4个有用线程（跨工程同样优先于新任务，实际资源就绪的更高优先级除外）；就绪任务随后以1线程进入；没有可进入任务时，再扩展现有任务至有用并行上限和可用核心数。`cpus: 0`也以1线程启动。线程池在完整工作边界按实际授予调整，调度优先分散到空闲兼容设备。固定串行任务使用`cpus: 1, max_cpus: 1`，显式固定宽度任务保留整组准入。具体规则见[设计合同](docs/DESIGN.md)。
 
 当前工程因节点短暂失联而缺少在线配额时，边界调核返回原worker持有的CPU/RAM授予；原任务继续，在线投影恢复后再按实时份额调核。运维按原ID核worker实际终态，收齐最终成果与CPU费用，再由调用工程持久发布和正常领取。现场维护与恢复证据见[STATUS](docs/STATUS.md)。
 
@@ -234,7 +234,7 @@ Python 能力按实际运行环境登记；新增算法先复用已有环境，�
 
 每个环境分别用实际解释器验证，不能把不同解释器中的包合起来当成同一环境就绪。`python` 只承诺 Python 标准库，不隐含上述包。CatBoost 等可选后端按实际调用检查，不作为所有神经任务的统一门槛。Magic、Netgen、ng47、Verilator、CIRCT、Java/Scala 和 C++ 仍是独立的真实工具需求。
 
-旧 `aop_python/arh_python/rgcn_python/aop_hspice_python` 等价于 `python_numpy`，`bench_python` 等价于 `python_scientific`，`rgcn_train/rgcn_fiber` 等价于 `python_torch_pyg`；`onnx_cpu/circt-translate/ngspice47` 分别等价于 `onnx/circt/ng47`。旧请求和模板继续兼容，已接受的原 ID、输入及执行绑定保持；新准入和能力汇总使用规范名。新部署先登记已实测的新绑定，忙碌实例保留旧绑定，空闲重载后再退出重复登记。
+旧 `aop_python/arh_python/rgcn_python/aop_hspice_python` 等价于 `python_numpy`，`bench_python`及已退役的`python_fiber_reproducible`请求等价于`python_scientific`，`rgcn_train/rgcn_fiber` 等价于 `python_torch_pyg`；`onnx_cpu/circt-translate/ngspice47` 分别等价于 `onnx/circt/ng47`。旧请求和模板继续兼容，已接受的原 ID、输入及执行绑定保持；新准入和能力汇总使用规范名；设备能力只描述工具和依赖，拒绝可复现/已验证等资格状态标签。新部署先登记已实测的新绑定，忙碌实例保留旧绑定，空闲重载后再退出重复登记。
 
 GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行路径的调用方可协商 `accelerator_fallback`，具体请求和回执见 [DESIGN](docs/DESIGN.md#工程接口边界)；ARH 的 auto 使用30秒未派发队列阈值，显式 torch_cuda 保持强制GPU。`shared` 只登记真实部署目录，ARH 工具/模型及持久统计可通过 `shared:arh` 复用。
 

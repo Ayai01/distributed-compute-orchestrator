@@ -433,9 +433,18 @@ class Coordinator:
         capacities={name:node.reserved if node.health.get('paused') else node.capacity for name,node in online.items()}
         largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
         with self.condition,self.pool.condition:
-            waiting_priority=max((job.get('task',{}).get('priority',0) for job in active_values(self.jobs)
-                if job.get('node') is None and job['result']['status']=='queued'
-                and not (job.get('cancel') and job['cancel'].is_set())),default=MIN_PRIORITY)
+            waiting_priority=MIN_PRIORITY
+            for job in active_values(self.jobs):
+                task=job.get('task',{});priority=task.get('priority',0)
+                if (priority<=waiting_priority or job.get('node') is not None or job.get('recover')
+                        or job['result']['status']!='queued'
+                        or job.get('cancel') and job['cancel'].is_set()):continue
+                for node in self.pool._matching(task):
+                    if (node.name not in online or node.health.get('paused')
+                            or task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node)))
+                            or task.get('accelerator') and node._select_accelerator(task['accelerator']) is None):continue
+                    waiting_priority=priority
+                    break
             for job in active_values(self.jobs):
                 if job['result']['status'] in TERMINAL:
                     continue

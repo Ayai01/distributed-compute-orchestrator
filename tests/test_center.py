@@ -19,6 +19,23 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
+    def test_unmatched_priority_waiter_does_not_disable_cross_project_warmup(self):
+        state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
+        def queued(project,priority=0,requires=()):
+            return dict(task=dict(steps=[['echo']],cpus=1,max_cpus=1,memory_mb=64,
+                project=project,priority=priority,requires=list(requires)),node=None,
+                cancel=threading.Event(),result=dict(status='queued'))
+        state.jobs={
+            'active':dict(task=dict(steps=[['echo']],cpus=1,max_cpus=8,memory_mb=64,project='A',priority=0),
+                          auto_cpus=False,elastic_cpus=True,node=node,cancel=threading.Event(),
+                          desired_cpus=8,result=dict(status='running')),
+            'unmatched':queued('B',priority=1,requires=['missing']),
+            'waiting':queued('C'),
+        }
+        budgets=state.project_resources()
+        self.assertEqual(budgets['A']['target'],4)
+        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{'0':3})
+
     def test_running_warmup_precedes_another_projects_new_task(self):
         state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
         state.jobs={
@@ -318,6 +335,27 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_cross_project_four_thread_lease_precedes_new_dispatch(self):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                first=client.submit(python('import time;time.sleep(30)',cpus=1,max_cpus=8,project='A'))['id']
+                try:
+                    until(lambda:client.status(first)['status']=='running')
+                    second=client.submit(python('print("new-project")',cpus=1,max_cpus=1,project='B'))['id']
+                    self.assertEqual(client.status(second)['status'],'queued')
+                    self.assertEqual(client.resize(first,4)['cpus'],4)
+                    self.assertEqual(worker.status(first)['cpus'],4)
+                    self.assertEqual(client.status(second)['status'],'queued')
+                    # An explicit drained serial phase releases the protected
+                    # slots and allows the other project's original ID in.
+                    self.assertEqual(client.resize(first,1)['cpus'],1)
+                    result=client.wait(second)
+                    self.assertEqual(result['status'],'succeeded',result)
+                    self.assertEqual(result['stdout'].strip(),'new-project')
+                    client.fetch(second)
+                finally:
+                    client.cancel(first);client.wait(first);client.fetch(first)
+
     def test_simultaneous_one_thread_admissions_protect_four_thread_warmup(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=16)as (_,worker):
             with Pool([dict(name='only',url=worker.url)],refresh=60)as pool:
@@ -880,14 +918,14 @@ class CenterTests(unittest.TestCase):
                 identity=client.submit(python('import time;time.sleep(30)'))['id']
                 until(lambda:client.status(identity)['status']=='running')
                 before=worker.status(identity)['tools']
-                client.control(node='node1',worker={'tools':{'verified_python':[sys.executable]}})
-                self.assertIn('verified_python',worker.health()['tags'])
-                result=client.run(dict(python('print(42)'),requires=['verified_python'],steps=[['${tool:verified_python}','-c','print(42)']]))
+                client.control(node='node1',worker={'tools':{'additional_python':[sys.executable]}})
+                self.assertIn('additional_python',worker.health()['tags'])
+                result=client.run(dict(python('print(42)'),requires=['additional_python'],steps=[['${tool:additional_python}','-c','print(42)']]))
                 self.assertEqual(result['status'],'succeeded',result)
-                self.assertNotIn('verified_python',worker.status(identity)['tools'])
+                self.assertNotIn('additional_python',worker.status(identity)['tools'])
                 self.assertEqual(worker.status(identity)['tools'],before)
-                client.control(node='node1',worker={'tools':{'verified_python':None}})
-                self.assertNotIn('verified_python',worker.health()['tags'])
+                client.control(node='node1',worker={'tools':{'additional_python':None}})
+                self.assertNotIn('additional_python',worker.health()['tags'])
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_auto_resize_rechecks_budget_after_a_partial_initial_grant(self):

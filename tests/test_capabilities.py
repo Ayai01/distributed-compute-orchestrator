@@ -19,6 +19,32 @@ from test_center import center
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_qualification_labels_are_not_runtime_capabilities(self):
+        from remote_compute.policy import canonical_capability
+        self.assertEqual(canonical_capabilities(['python_fiber_reproducible']),['python_scientific'])
+        for label in ('python_fiber_reproducible','python_qualified','science_verified','runtime_certified'):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError,'qualification status'):
+                canonical_capability(label,registration=True)
+        with self.assertRaisesRegex(ValueError,'qualification status'):
+            canonical_capability('python_someproject_reproducible')
+
+    def test_legacy_fiber_request_runs_on_standard_scientific_provider(self):
+        with scratch() as directory, provider(Path(directory)/'worker',
+                tools={'python_scientific':sys.executable}) as (_,worker):
+            with Pool([worker]) as pool, center(pool,Path(directory)/'center') as (_,client):
+                result=client.run(command(['${tool:python_fiber_reproducible}','-c','print("standard")'],
+                    requires=['python_fiber_reproducible'],project='legacy'))
+                self.assertEqual(result['status'],'succeeded',result)
+                self.assertEqual(result['stdout'].strip(),'standard')
+                self.assertNotIn('python_fiber_reproducible',client.capabilities()['tags'])
+
+    def test_retired_alias_prefers_canonical_runtime_over_another_legacy_binding(self):
+        worker=Worker.__new__(Worker)
+        worker.tools={'bench_python':['old'],'python_scientific':['standard']}
+        worker.tool_info={name:{'available':True}for name in worker.tools}
+        self.assertEqual(worker._tool_argv('python_fiber_reproducible'),['standard'])
+        self.assertEqual(worker._tool_argv('bench_python'),['old'])
+
     def test_cached_capability_sequences_keep_live_inputs_and_fresh_list_results(self):
         from remote_compute.policy import _canonical_capabilities_tuple
         values=['ngspice47','cpu','cpu']

@@ -492,8 +492,8 @@ class Worker:
     def _tool_argv(self, name):
         """Resolve one semantic capability for commands and path variables."""
         canonical = canonical_capability(name)
-        names = ([name] if name in self.tools else []) + [
-            alias for alias in self.tools if alias != name and canonical_capability(alias) == canonical]
+        names = [key for key in dict.fromkeys((name,canonical)) if key in self.tools]
+        names += [alias for alias in self.tools if alias not in names and canonical_capability(alias) == canonical]
         for alias in names:
             if self.tool_info[alias]['available']:
                 return self.tools[alias]
