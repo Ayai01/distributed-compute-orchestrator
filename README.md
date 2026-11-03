@@ -1,6 +1,6 @@
 # Distributed Compute Orchestrator（DCO）
 
-当前源码0.8.51补齐中心坏回执恢复、历史冷读并发和索引崩溃恢复。启动会在已恢复全部原ID后压缩大量失效墓碑的派生索引；原任务、结果和工具不参与压缩。运行版本与维护放行以[STATUS](docs/STATUS.md)指向的实际账本为准。
+当前源码0.8.52增加滚动子任务池的活动CPU下限，保留较早任务前4个有用核，尾项释放单核后新任务进入也不会摊薄旧暖启动。`Client.resize(id, desired, min_cpus=active)`沿中心／worker保护仍在计算的子任务，完成一个即可让核和补位。历史冷读及索引恢复继续沿原合同。运行版本与维护放行以[STATUS](docs/STATUS.md)指向的实际账本为准。
 
 DCO 提供统一计算调度、远程任务执行和设备运维。调用工程保留科学测量、评分、实验预算和结果缓存；DCO 负责能力匹配、CPU/RAM/加速器授权、任务生命周期与传输。服务、SDK、终端只依赖 Python 标准库，日常使用系统标准 GIL x64 CPython 3.14；源码兼容 3.7–3.15，科学工具另按任务安装。
 
@@ -135,7 +135,7 @@ Tab 在空输入时显示根命令候选，有输入时补全；PgUp/PgDn 翻任
 
 这是示例预算，按设备设置。复制 [worker.example.json](worker.example.json) 为 `worker.local.json` 后默认启动才会读取。`memory_mb=0` 默认使用物理内存减 16GiB，显式数值为设备计算预算；`memory_headroom_mb=8192` 为系统实时保留至少 8GiB 可用 RAM。运行任务首次取得进程树 RSS 后按实际占用准入；尚在派发或启动采样前按申报量预留。任务的阶段需求仍保留在回执中，实际用量增长继续计入设备预算。缺失共享路径标记为 `unavailable_shared`，其他能力继续提供。
 
-持久任务、输入、资产及未领取结果放在普通磁盘 `.local/state`：中心为 `scheduler/`，hybrid 本机 worker 为 `local/`，独立 worker 按端口隔离。设备 JSON 的 `root` 只指定 worker 状态根；CLI `--root` 同时指定 worker 根和中心的 `scheduler/` 子目录。`temp_root` 缺省或null均使用共享RAM的DCO专属TMP；没有RAM盘时回落到工程`.local/tmp`。显式磁盘路径继续生效。
+持久任务、输入、资产及未领取结果放在普通磁盘 `.local/state`：中心为 `scheduler/`，hybrid 本机 worker 为 `local/`，独立 worker 按端口隔离。设备 JSON 的 `root` 只指定 worker 状态根；CLI `--root` 同时指定 worker 根和中心的 `scheduler/` 子目录。`temp_root` 缺省或null均使用已可用共享RAM的DCO专属TMP；没有可用共享RAM时回落到工程`.local/tmp`。显式路径优先生效；Linux复用系统运行时目录时显式配置`temp_root`，见下文。
 
 | DCO目录 | 内容与回收规则 |
 | --- | --- |
@@ -211,11 +211,15 @@ center.fetch(job["id"], "./results/maintenance")
 
 远端更新用上述 `machine(...).execute(["git", "pull", "--ff-only"])` 或项目的 update 入口；cwd 取 `nodes` 实际部署路径，先检查活跃任务与相关会话。先更新并重载 worker，再重载中心。
 
-## 每台设备唯一共享内存盘
+## 共享RAM临时目录：Windows共享盘与Linux运行时目录
 
 Windows 使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1` 在锁内检查/创建唯一共享盘，工程目录独立。`ramdisk_gib` 支持 4、8、16，默认 8；本机配置优先于科研调用的旧容量参数；`python -B main.py ramdisk` 检查/创建。ImDisk 驱动放 `.tools/imdisk/` 后，以管理员运行 `ramdisk --install`。安装登记开机重建任务 `RemoteCompute Shared RAM`。容量扩展失败保留现有盘，先处理它；缩容须先排空本机写入、保全文件，再正常卸载并重建同盘符；启动检查保留较大盘及其文件。
 
-Linux `ramdisk` 入口创建独立 tmpfs，默认位于 `~/.cache/codex-shared-ramdisk`，可用 `ramdisk_root` 指定位置，容量遵循 `ramdisk_gib`；挂载需要对应权限。使用普通磁盘的 worker 保留显式 `root` 和 `temp_root`，配置 temp_root 后启动直接使用它。状态文件保留普通磁盘，临时目录生命周期见 DESIGN。
+**Linux优先复用系统已有的运行时目录，无需独立内存盘或额外挂载。** 取当前worker用户的`XDG_RUNTIME_DIR`（通常为`/run/user/<UID>`），在其中使用DCO专属子目录；例如UID为1000时，在设备JSON中写入`"temp_root": "/run/user/1000/dco/tmp"`。填写实际绝对路径，JSON中的`$UID`和`$XDG_RUNTIME_DIR`不会由shell展开。使用该用户已有、可写的运行时目录无需sudo，也无需运行`ramdisk`。
+
+运行时目录的实际文件系统、容量和生命周期由系统管理；使用已有tmpfs的可用空间，不要求它本身是独立挂载点，也不套用Windows的4/8/16GiB容量约定。这里只放可重建TMP，输入、回执、检查点及未领取结果继续留在普通磁盘状态根。运行时目录不可用时沿用显式磁盘`temp_root`或普通磁盘回退，不把创建新挂载作为启动条件。
+
+现有Linux `ramdisk` 子命令保留为操作员主动创建独立tmpfs的可选入口，默认位置为仓库`.local/ramdisk`，可用`ramdisk_root`覆盖；它的挂载权限及`ramdisk_gib`约束只适用于该可选入口。已有worker切换`temp_root`在排空后进行，临时目录生命周期见DESIGN。
 
 ## 工程内工具安装
 
@@ -254,7 +258,7 @@ ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不�
 
 ## 部署到其他设备
 
-源码和 Python 即可启动独立 worker；能力按实际任务补齐。设备使用系统 hostname，配置 host/port、CPU/RAM、tools/shared/env。Linux 普通磁盘示例为 `root=/home/user/.local/state/dco/worker`、`temp_root=/home/user/.local/state/dco/tmp`，在可见终端运行 `python3 -B main.py --config worker.local.json`。
+源码和 Python 即可启动独立 worker；能力按实际任务补齐。设备使用系统 hostname，配置 host/port、CPU/RAM、tools/shared/env。Linux示例为`root=/home/user/.local/state/dco/worker`、`temp_root=/run/user/1000/dco/tmp`，UID与目录取实际worker用户；普通磁盘TMP也可显式配置。在可见终端运行`python3 -B main.py --config worker.local.json`。
 
 局域网节点可直接 `add http://设备IP:26133`，不需要令牌；重复添加会恢复已有节点，保留其预算、权重和在途任务。默认按 TCP 对端的回环、RFC1918、IPv6 ULA/链路本地地址识别局域网，`trusted_networks` 可缩小免令牌网段，例如 `["127.0.0.0/8", "::1/128", "192.168.1.0/24"]`，空列表要求局域网也认证。转发头不改变对端身份。中心操作员权限仍使用独立的本机托管凭据。
 

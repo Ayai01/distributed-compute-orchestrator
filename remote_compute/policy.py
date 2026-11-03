@@ -248,6 +248,7 @@ def public_capabilities():
         "resize_auto",
         "resize_memory",
         "resize_memory_model",
+        "resize_min_cpus",
         "semantic_requires",
         "single_thread_weight",
         "asset_cache",

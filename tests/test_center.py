@@ -843,13 +843,14 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.resize(first,0)['cpus'],4)
                 second=client.submit(python(hold,project='B',cpus=0,memory_mb=64))['id']
                 self.assertEqual(client.status(first)['cpus'],4)
-                # Arrival alone keeps the running pool intact. Its next
-                # drained finite request participates in project fairness.
-                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],2)
-                grant=client.resize(first,0,memory_mb=64)
-                self.assertEqual(grant['cpus'],2)
+                # The first four useful threads precede a queued entrant.
+                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],4)
+                self.assertEqual(client.resize(first,1,memory_mb=64)['cpus'],1)
                 until(lambda:client.status(second)['status']=='running')
                 self.assertEqual(client.status(second)['cpus'],1)
+                # With both jobs active on a four-thread provider, their next
+                # drained boundaries share the node's available warmup.
+                self.assertEqual(client.resize(first,0,memory_mb=64)['cpus'],2)
                 self.assertEqual(client.resize(second,0)['cpus'],2)
                 for identity in (first,second):
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
@@ -1333,11 +1334,12 @@ class CenterTests(unittest.TestCase):
                 client.control(paused=False)
                 until(lambda:all(client.status(i)['status']=='running'for i in (other,queued)))
                 client.resize(other,0)
-                self.assertEqual(client.status(other)['cpus'],11)
+                self.assertEqual(client.status(other)['cpus'],8)
                 self.assertEqual(client.status(queued)['cpus'],1)
+                self.assertEqual(client.resize(queued,0)['cpus'],4)
                 resources=client.health()['projects']
                 self.assertEqual({name:(row['target'],row['used']) for name,row in resources.items()},
-                                 {'A':(12,13),'B':(12,11)})
+                                 {'A':(16,16),'B':(8,8)})
                 for identity in (existing,other):
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
                 until(lambda:client.status(queued)['status']=='running')
@@ -1923,7 +1925,7 @@ class CenterTests(unittest.TestCase):
                 client.resize(identities[0],0)
                 until(lambda: sum(p['used'] for p in client.health()['projects'].values()) == 7)
                 allocations=client.health()['projects']
-                self.assertEqual({k:v['used'] for k,v in allocations.items()},dict(A=3,B=2,C=2))
+                self.assertEqual({k:v['used'] for k,v in allocations.items()},dict(A=4,B=2,C=1))
                 for identity in identities:
                     client.wait(identity);client.fetch(identity)
 

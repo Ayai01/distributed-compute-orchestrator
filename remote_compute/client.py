@@ -386,19 +386,24 @@ class Client:
             raise conflict
         return self._read_reconnecting(reconcile)
 
-    def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+    def resize(self, identity, cpus, *, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         """Borrow/return resources at a safe boundary; use the actual returned grant."""
+        if min_cpus is not None and (type(min_cpus) is not int or min_cpus<0):
+            raise ValueError('resize min_cpus must be a nonnegative integer')
         modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
-        if memory_mb is not None or cpus==0 or modeled:
+        if min_cpus is not None or memory_mb is not None or cpus==0 or modeled:
             if getattr(self, '_capabilities', None) is None:
                 self._read_reconnecting(lambda: self.health(brief=True))
             if (memory_mb is not None and not ({'resize_memory','memory_resize'} & set(self._capabilities))
                     or cpus==0 and not ({'resize_auto','cpu_auto_resize'} & set(self._capabilities))
-                    or modeled and not ({'resize_memory_model','memory_resize_model'} & set(self._capabilities))):
+                    or modeled and not ({'resize_memory_model','memory_resize_model'} & set(self._capabilities))
+                    or min_cpus is not None and 'resize_min_cpus' not in self._capabilities):
                 state=self._read_reconnecting(lambda: self.status(identity,brief=True))
                 return dict(id=identity,node=state.get('assigned_node',state.get('node')),
                             cpus=state['cpus'],memory_mb=state['memory_mb'],requested_cpus=cpus,supported=False)
         request = dict(cpus=cpus)
+        if min_cpus is not None:
+            request['min_cpus'] = min_cpus
         if memory_mb is not None:
             request['memory_mb'] = memory_mb
         if modeled:

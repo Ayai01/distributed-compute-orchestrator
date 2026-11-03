@@ -280,7 +280,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -524,11 +524,13 @@ class Worker:
             return Path(prefix[0]).as_posix()
         return _VAR.sub(substitute, text)
 
-    def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+    def resize(self, identity, cpus, *, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:
             raise ValueError('resize cpus must be nonnegative; 0 uses the current worker budget')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
+        if min_cpus is not None and (type(min_cpus) is not int or min_cpus<0):
+            raise ValueError('resize min_cpus must be a nonnegative integer')
         with self.condition:
             job=self.jobs[identity];task,result=job['task'],job['result']
             if self.stopping or job['cancel'].is_set() or result['status']!='running':
@@ -537,10 +539,13 @@ class Worker:
             old_memory=task['memory_mb']
             requested_cpus=cpus
             cpus=min(cpus or self.capacity,task.get('max_cpus',self.capacity))
+            floor=max(1,min_cpus or 0)
+            if min_cpus is not None and (min_cpus>old or min_cpus>cpus):
+                raise ValueError('min_cpus must fit the existing grant and requested width')
             granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
             granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
                                       min(self.memory_capacity,old_memory+max(0,self._memory_state()['memory_available_mb'])))
-            if granted<1:raise Conflict('Insufficient RAM for one phase worker; existing grant retained')
+            if granted<floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
             memory=old_memory if memory is None else memory
             extra=max(0,memory-old_memory)
             if memory>self.memory_capacity or (extra and extra>self._memory_state()['memory_available_mb']):
@@ -1343,7 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
                         value = worker.public_result(value)
                 elif parts[2:] == ['resize'] and self.command == 'POST':
                     request = json.loads(body)
-                    options={k:request[k] for k in ('memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
+                    options={k:request[k] for k in ('min_cpus','memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
                     value = worker.resize(identity, request['cpus'], **options)
                     if scheduler and not operator and isinstance(value, dict):
                         value = worker.public_result(value)

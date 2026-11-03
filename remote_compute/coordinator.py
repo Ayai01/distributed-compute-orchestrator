@@ -266,7 +266,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_min_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -406,7 +406,7 @@ class Coordinator:
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs)),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_min_cpus','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -1202,6 +1202,18 @@ class Coordinator:
         running={key:value for key,value in demands.items() if key not in waiting}
         shares={key:1. for key in running}
         warm=weighted_node_threads(capacities,shares,{key:min(4,value) for key,value in running.items()},rooms)
+        # A one-slot tail can admit a new one-thread job. Its later four-slot
+        # warmup must not dilute older jobs back to two or three threads.
+        # Running work is pinned to its current node, so preserve warmup in
+        # admission order on nodes whose combined warm demand does not fit.
+        for name,capacity in capacities.items():
+            pinned=[key for key in running if name in rooms[key]]
+            if sum(min(4,running[key])for key in pinned)<=capacity:continue
+            remaining=capacity
+            for key in sorted(pinned,key=lambda key:(-members[key]['task'].get('priority',0),
+                    members[key]['result'].get('submitted',0),key)):
+                count=min(remaining,4,running[key],rooms[key][name])
+                warm[key]={name:count};remaining-=count
         if warm_cache is not None:
             # One growth pass asks each elastic peer for its first four useful
             # threads. The same group/priority has one unchanged warm plan;
@@ -1219,11 +1231,13 @@ class Coordinator:
         name=current['node'].name
         return max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0))
 
-    def resize(self, identity, cpus, *, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+    def resize(self, identity, cpus, *, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:
             raise ValueError('resize cpus must be nonnegative; 0 uses the current node budget')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
+        if min_cpus is not None and (type(min_cpus) is not int or min_cpus<0):
+            raise ValueError('resize min_cpus must be a nonnegative integer')
         with self.condition:
             resize_lock=self.jobs[identity].setdefault('resize_lock',threading.Lock())
         # A slow worker must not hold up health, admission or other tasks.
@@ -1236,11 +1250,15 @@ class Coordinator:
                 old_memory=job['task']['memory_mb']
                 modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
                 capabilities=node.health.get('capabilities',[])
-                if 'resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities):
+                if ('resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities)
+                        or min_cpus is not None and 'resize_min_cpus' not in capabilities):
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus,supported=False)
                 desired=min(cpus or node.capacity,job['task'].get('max_cpus',node.capacity))
+                active_floor=max(1,min_cpus or 0)
+                if min_cpus is not None and (min_cpus>old or min_cpus>desired):
+                    raise ValueError('min_cpus must fit the existing grant and requested width')
                 desired,_=plan_resize(desired,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,node.memory_capacity)
-                if desired<1:raise Conflict('Insufficient RAM for one phase worker; existing grant retained')
+                if desired<active_floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
                 previous_desired=job.get('desired_cpus')
                 previous_memory=job.get('phase_memory')
                 job['desired_cpus']=desired
@@ -1263,11 +1281,14 @@ class Coordinator:
                     granted=max(floor,min(desired,room,available)) if node.enabled and not node.health.get('paused') else old
                     if cooperative and node.enabled and not node.health.get('paused'):
                         granted=min(granted,self._cooperative_cpu_target(identity,desired,resources))
+                # In-flight children keep already-owned slots. Their owner
+                # lowers this floor as children finish, before refilling.
+                granted=max(active_floor,granted)
                 granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
                     old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
                 memory=old_memory if memory is None else memory
                 extra=max(0,memory-old_memory)
-                if granted<1 or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
+                if granted<active_floor or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
                     if previous_desired is None:job.pop('desired_cpus',None)
                     else:job['desired_cpus']=previous_desired
                     raise Conflict('Insufficient memory for resource resize; existing grant retained')
@@ -1298,8 +1319,10 @@ class Coordinator:
 
             try:
                 worker_id=job.get('worker_id',identity)
-                result=(node.client.resize(worker_id,granted,memory_mb=memory) if memory_mb is not None or modeled
-                        else node.client.resize(worker_id,granted))
+                options={}
+                if memory_mb is not None or modeled:options['memory_mb']=memory
+                if min_cpus is not None:options['min_cpus']=min_cpus
+                result=node.client.resize(worker_id,granted,**options)
             except RemoteError as error:
                 if getattr(error,'status_code',None) is not None:
                     with self.condition:

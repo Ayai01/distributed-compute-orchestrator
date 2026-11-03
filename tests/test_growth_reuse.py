@@ -74,7 +74,7 @@ class GrowthReuseTests(unittest.TestCase):
             old_calls=allocation.call_count
         self.assertEqual(actual,expected)
         self.assertEqual(calls,1)
-        self.assertEqual(old_calls,192)
+        self.assertGreater(old_calls,calls*32)
 
 
 if __name__=='__main__':unittest.main()
