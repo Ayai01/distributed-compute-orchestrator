@@ -1,5 +1,7 @@
 # Distributed Compute Orchestrator（DCO）
 
+当前源码0.8.51补齐中心坏回执恢复、历史冷读并发和索引崩溃恢复。启动会在已恢复全部原ID后压缩大量失效墓碑的派生索引；原任务、结果和工具不参与压缩。运行版本与维护放行以[STATUS](docs/STATUS.md)指向的实际账本为准。
+
 DCO 提供统一计算调度、远程任务执行和设备运维。调用工程保留科学测量、评分、实验预算和结果缓存；DCO 负责能力匹配、CPU/RAM/加速器授权、任务生命周期与传输。服务、SDK、终端只依赖 Python 标准库，日常使用系统标准 GIL x64 CPython 3.14；源码兼容 3.7–3.15，科学工具另按任务安装。
 
 仓库名为 `distributed-compute-orchestrator`，Python 包仍为 `remote_compute`，环境变量仍为 `REMOTE_COMPUTE_*`。源码来自 [Ayai01/distributed-compute-orchestrator](https://github.com/Ayai01/distributed-compute-orchestrator)。

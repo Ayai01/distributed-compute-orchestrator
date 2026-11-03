@@ -1,10 +1,10 @@
 # DCO 后续方向
 
-0.8.49标准能力迁移及四线程优先维护沿`.local/maintenance/four-thread-priority-20261102/maintenance-state.json`执行。0.8.47此前维护、统一版本/源码、新进程与原ID恢复的权威入口为`.local/maintenance/fiber-project-keyerror-20261101/maintenance-state.json`，按其中阶段和科学放行状态执行。此前0.8.46统一维护已闭合，原凭证在`.local/maintenance/fleet-restart-20261031/maintenance-state.json`。总调度每2小时巡检，三个工程的错开自检间隔以`.local/maintenance/project-supervision-20261031/current.json`的automations和实际定时设置为准；阶段进度与分配保存在所属current。健康服务保持运行；真实DCO故障进入受影响范围暂停新增、排空、修复验证、统一部署与完整重启流程。原状态根、配置、输入、回执和工具保持。
+当前0.8.51框架维护沿`.local/maintenance/framework-audit-20261103/maintenance-state.json`执行；本轮不启动具体工程实验、不恢复已关闭的科研窗口或定时任务。0.8.47—0.8.50原维护凭证保留在各自目录，最新运行／源码／原ID与放行状态以监督current及实际health为准。真实DCO故障沿排空、最小修复、必要检查、统一部署和完整重启流程处理，原状态根、配置、输入、回执和工具保持。
 
 ## 持续维护
 
-0.8.50的中心清理锁修复沿下一自然空闲窗口统一部署；在途科研保持运行。补丁、3项必要检查及真实取样位于`.local/maintenance/result-throughput-20261103/`，监督current和维护账本记录实际部署阶段，不重复资格或整套计时。
+0.8.50清理锁修复已统一上线；0.8.51补齐同类历史冷读、坏回执和索引边界，并在启动边界收敛失效墓碑。已通过的调度、标准能力、GPU／提交内存及传输资格按未变部分复用，后续只对实际调用问题补受影响检查。
 
 长科研任务由原Owner接入完整状态分段、发起端紧凑缓存及结果消费后释放。工作段按实测规划，30分钟用于复查粒度而非强制截断，保留现有就绪供给和原科研预算；DCO复用原子文件、版本领取及结果发布合同。先验连续与分段的下一候选/状态/NFE/费用一致，再在安全边界迁移，不为传输另开全量实验。
 

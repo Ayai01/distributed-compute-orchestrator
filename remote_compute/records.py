@@ -4,6 +4,7 @@ from collections.abc import MutableMapping
 from copy import deepcopy
 from itertools import islice
 import json
+import os
 from pathlib import Path
 import threading
 import weakref
@@ -35,23 +36,34 @@ class JobRecords(MutableMapping):
         self.pending = []
         self.pending_assets = {}
         self.deleted = set()
+        self.loading = weakref.WeakValueDictionary()
+        self.loading_lock = threading.Lock()
 
     def _append_index(self, record):
         if not self.index_loaded:
             return
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.index_path.open('a', encoding='utf-8', newline='\n') as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+        with self.index_path.open('a+b') as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell():
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b'\n':
+                    stream.write(b'\n')
+            stream.write((json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8'))
+            # An acknowledged admission or deletion must survive a restart.
+            # A terminal update can be recovered from its durable live entry.
+            if not record.get('terminal', True) or record.get('op') == 'delete':
+                stream.flush()
+                os.fsync(stream.fileno())
 
     def load_index(self):
         """Load the durable identity index, returning whether it was usable."""
         if not self.index_path.is_file():
             return False
         entries = {}
-        order = []
         self.deleted = set()
         try:
-            with self.index_path.open('r', encoding='utf-8') as stream:
+            with self.index_path.open('rb') as stream:
                 for line in stream:
                     try:
                         row = json.loads(line)
@@ -68,8 +80,7 @@ class JobRecords(MutableMapping):
                         entries.pop(identity, None)
                         self.deleted.add(identity)
                         continue
-                    if identity not in entries:
-                        order.append(identity)
+                    self.deleted.discard(identity)
                     entries[identity] = row
         except OSError:
             return False
@@ -78,10 +89,7 @@ class JobRecords(MutableMapping):
         self.workers.clear()
         self.pending = []
         self.pending_assets = {}
-        for identity in order:
-            row = entries.get(identity)
-            if row is None:
-                continue
+        for identity, row in entries.items():
             if row.get('terminal', True):
                 assets = tuple(x for x in row.get('assets', ()) if isinstance(x, str))
                 worker = row.get('worker') or identity
@@ -109,8 +117,20 @@ class JobRecords(MutableMapping):
                                          'assets': list(set(result.get('assets', {}).values())),
                                          'worker': job.get('worker_id', result.get('worker_id', identity))},
                                         ensure_ascii=False, separators=(',', ':')) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(self.index_path)
         self.index_loaded = True
+
+    def compact_index(self):
+        """Compact superseded identities before the service starts its threads."""
+        if len(self.deleted) <= max(1024, len(self)):
+            return False
+        if any(identity not in self for identity in self.pending):
+            return False  # Startup still has original live entries to recover.
+        self.write_index()
+        self.deleted.clear()
+        return True
 
     def __getitem__(self, identity):
         if identity in self.active:
@@ -119,28 +139,70 @@ class JobRecords(MutableMapping):
             raise KeyError(identity)
         job = self.live.get(identity)
         if job is None:
-            if identity not in self.history:
-                directory = self.root / identity
-                result_path = directory / 'result.json'
-                if not result_path.is_file():
-                    raise KeyError(identity)
-                result = read_receipt(result_path)
-                if result.get('status') not in TERMINAL:
-                    raise KeyError(identity)
-                job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
-                assets = tuple(set(result.get('assets', {}).values()))
-                worker = result.get('worker_id', identity)
-                self.history[identity] = (assets, worker)
-                self.assets.update(assets)
-                self.workers.update((worker,))
-                self._append_index({'id': identity, 'terminal': True,
-                                    'assets': list(assets), 'worker': worker})
-            else:
-                directory = self.root / identity
-                result = read_receipt(directory / 'result.json', assets=self.history[identity][0])
-                job = Job(result=result, directory=directory, cancel=threading.Event(), node=None)
+            job = self._read_job(identity, self.history.get(identity))
+            return self._remember(identity, job)
         self._cache(identity, job)
         return job
+
+    def _read_job(self, identity, known):
+        directory = self.root / identity
+        path = directory / 'result.json'
+        if known is None and not path.is_file():
+            raise KeyError(identity)
+        result = read_receipt(path, assets=known[0] if known is not None else ())
+        if known is None and result.get('status') not in TERMINAL:
+            raise KeyError(identity)
+        return Job(result=result, read_result=deepcopy(result), directory=directory,
+                   cancel=threading.Event(), node=None, artifact_lock=self.record_lock(identity))
+
+    def record_lock(self, identity):
+        with self.loading_lock:
+            return self.loading.setdefault(identity, threading.RLock())
+
+    def read_result(self, identity):
+        """Read indexed terminal receipts without taking the scheduler lock."""
+        with self.record_lock(identity):
+            if identity in self.deleted or identity not in self.history:
+                raise KeyError(identity)
+            return read_receipt(self.root / identity / 'result.json',
+                                assets=self.history[identity][0])
+
+    def _remember(self, identity, job):
+        if identity not in self.history:
+            result = job['result']
+            assets = tuple(set(result.get('assets', {}).values()))
+            worker = result.get('worker_id', identity)
+            self.history[identity] = (assets, worker)
+            self.assets.update(assets)
+            self.workers.update((worker,))
+            self._append_index({'id': identity, 'terminal': True,
+                                'assets': list(assets), 'worker': worker})
+        self._cache(identity, job)
+        return job
+
+    def load(self, identity, condition):
+        """Read cold receipts under one ID lock, outside live control locks."""
+        with condition:
+            job = self.cached(identity)
+            if job is not None:
+                return job
+            if identity in self.deleted:
+                raise KeyError(identity)
+            lock = self.record_lock(identity)
+        with lock:
+            with condition:
+                job = self.cached(identity)
+                if job is not None:
+                    return job
+                if identity in self.deleted:
+                    raise KeyError(identity)
+                known = self.history.get(identity)
+            job = self._read_job(identity, known)
+            with condition:
+                if identity in self.deleted:
+                    raise KeyError(identity)
+                current = self.cached(identity)
+                return current if current is not None else self._remember(identity, job)
 
     def _cache(self, identity, job):
         self.live[identity] = job
@@ -158,6 +220,7 @@ class JobRecords(MutableMapping):
         if identity in self:
             del self[identity]
         self.deleted.discard(identity)
+        job.setdefault('artifact_lock', self.record_lock(identity))
         self.active[identity] = job
         result = job.get('result', {})
         self._append_index({'id': identity, 'terminal': False,
@@ -250,6 +313,13 @@ class JobRecords(MutableMapping):
 def active_items(records):
     # Small isolated allocation fixtures also use ordinary dictionaries.
     return (records.active if isinstance(records, JobRecords) else records).items()
+
+
+def load_job(records, condition, identity):
+    if isinstance(records, JobRecords):
+        return records.load(identity, condition)
+    with condition:
+        return records[identity]
 
 
 def active_values(records):

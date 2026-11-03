@@ -32,7 +32,7 @@ from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, servi
 from .telemetry import Activity
 from .client import RemoteError
 from .cleanup import AssetCache, remove_owned
-from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
+from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .receipts import read_receipt
 from .paths import cache_environment
 from .allocation import plan_resize
@@ -272,6 +272,7 @@ class Worker:
             archive_job(self.jobs, job, startup=True)
         if not indexed:
             self.jobs.write_index()
+        self.jobs.compact_index()
         self.asset_cache = AssetCache(self.root / 'assets')
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
@@ -593,8 +594,11 @@ class Worker:
             with self.condition:
                 if self.stopping:
                     raise Conflict("Worker is stopping")
-                if identity in self.jobs:
-                    result = self.jobs[identity]["result"]
+                existing = identity in self.jobs
+            if existing:
+                job = load_job(self.jobs, self.condition, identity)
+                with self.condition:
+                    result = job["result"]
                     if result["request_sha256"] != digest:
                         raise Conflict("Job id already contains a different request")
                     return dict(result)
@@ -897,12 +901,13 @@ class Worker:
                     self.cleanup_pending.discard(job['result']['id'])
 
     def get(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            return json.loads(json_bytes(self.jobs[identity]["result"]))
+            return json.loads(json_bytes(job["result"]))
 
     def job_file(self, identity, name, data=None):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             result_lock = job.setdefault('artifact_lock', threading.RLock())
         with result_lock:
             with self.condition:
@@ -918,8 +923,8 @@ class Worker:
             return {'written': name, 'bytes': len(data)}
 
     def job_file_version(self, identity, name, version=None):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             result_lock = job.setdefault('artifact_lock', threading.RLock())
         with result_lock:
             with self.condition:
@@ -932,8 +937,8 @@ class Worker:
                 return dict(version=current,changed=current!=version,data=stream.read() if current!=version else None)
 
     def logs(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             result_lock = job.setdefault('artifact_lock', threading.RLock())
         with result_lock:
             with self.condition:
@@ -952,9 +957,9 @@ class Worker:
             return result
 
     def cancel(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         queued = False
         with self.condition:
-            job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 job["cancel"].set()
                 if job["result"]["status"] == "queued" and identity in self.queue:
@@ -971,8 +976,8 @@ class Worker:
         return self.get(identity)
 
     def artifacts(self, identity, *, result=None):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             result_lock = job.setdefault('artifact_lock', threading.RLock())
@@ -995,8 +1000,8 @@ class Worker:
             return pack(files)
 
     def delete(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Cancel and wait for the job before deleting it")
             result_lock = job.setdefault('artifact_lock', threading.RLock())

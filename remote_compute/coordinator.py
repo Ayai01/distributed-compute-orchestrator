@@ -25,7 +25,8 @@ from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .compat import unlink
 from .cleanup import AssetCache, remove_owned
 from .acceptance import SubmissionAssets, SubmissionLocks
-from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references
+from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
+from .receipts import read_receipt
 import socket
 import math
 import os
@@ -92,9 +93,7 @@ class Coordinator:
             # by ID through their original directories.
             for identity in tuple(self.jobs.pending):
                 path = self.root / 'jobs' / identity / 'result.json'
-                if not path.is_file():
-                    continue
-                value = json.loads(path.read_text(encoding='utf-8'))
+                value = read_receipt(path, assets=self.jobs.pending_assets.get(identity, ()))
                 if value.get('status') in TERMINAL and not (value.get('status') == 'interrupted' and value.get('finished') is None):
                     job = Job(result=value, directory=path.parent, cancel=threading.Event(), node=None)
                     self.jobs.active[identity] = job
@@ -106,7 +105,7 @@ class Coordinator:
             # the established recovery semantics, then writes the compact
             # index so later starts do not rescan every terminal receipt.
             for path in (self.root / "jobs").glob("*/result.json"):
-                value = json.loads(path.read_text(encoding="utf-8"))
+                value = read_receipt(path)
                 if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
                     restore_live(path, value)
                 else:
@@ -114,6 +113,7 @@ class Coordinator:
                     self.jobs.active[value["id"]] = job
                     archive_job(self.jobs, job, startup=True)
             self.jobs.write_index()
+        self.jobs.compact_index()
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
         self._prune_assets()
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
@@ -584,8 +584,11 @@ class Coordinator:
             with self.condition:
                 if self.stopping:
                     raise Conflict("Scheduler is stopping")
-                if identity in self.jobs:
-                    saved = self.jobs[identity]["result"]
+                existing = identity in self.jobs
+            if existing:
+                job = load_job(self.jobs, self.condition, identity)
+                with self.condition:
+                    saved = job["result"]
                     if saved["request_sha256"] != digest:
                         raise Conflict("Job id already contains a different request")
                     return dict(saved)
@@ -621,6 +624,11 @@ class Coordinator:
                                   "total_steps": len(task["steps"]), "assets": task["assets"]}})
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
+                admission = {
+                    key: job['result'][key] for key in ('id', 'status', 'request_sha256', 'assets', 'label',
+                        'project', 'cpus', 'memory_mb', 'submitted', 'total_steps')}
+                admission['initial_cpus'] = task['cpus']
+                atomic_json(directory / 'admission.json', admission)
                 self._save(job)
                 with self.condition:
                     stopping = self.stopping
@@ -1326,13 +1334,11 @@ class Coordinator:
             if job is not None and 'read_result' in job:
                 return json.loads(json_bytes(job['read_result']))
             if identity in self.jobs.history:
-                # Terminal files are atomically replaced. A cold status read
-                # needs neither the scheduler lock nor another cached object.
-                return json.loads((self.jobs.root / identity / 'result.json').read_text(encoding='utf-8'))
+                return self.jobs.read_result(identity)
             if job is None:
                 raise KeyError(identity)
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             self._publish(job)
             return json.loads(json_bytes(job['read_result']))
 
@@ -1340,8 +1346,8 @@ class Coordinator:
         return self.public_result(self.get(identity))
 
     def logs(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             client = self._client(job)
         if client:
             try:
@@ -1352,8 +1358,9 @@ class Coordinator:
         return {"stdout": "", "stderr": ""}
 
     def job_file(self, identity, name, data=None):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job=self.jobs[identity];client = self._client(job)
+            client = self._client(job)
         if not client:
             raise Conflict('Job has not been assigned yet')
         try:
@@ -1364,8 +1371,9 @@ class Coordinator:
             raise Conflict(str(error)) from None
 
     def job_file_version(self, identity, name, version=None):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job=self.jobs[identity];client=self._client(job);worker_id=job.get('worker_id',identity)
+            client=self._client(job);worker_id=job.get('worker_id',identity)
         if not client:raise Conflict('Job has not been assigned yet')
         from .local import LocalClient
         if isinstance(client,LocalClient):return client.worker.job_file_version(worker_id,name,version)
@@ -1377,8 +1385,8 @@ class Coordinator:
             raise
 
     def cancel(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 job["cancel"].set()
                 if identity in self.queue:
@@ -1398,8 +1406,8 @@ class Coordinator:
             return self.get(identity)
 
     def artifacts(self, identity, *, is_connected=None, public=False):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             result, client = json.loads(json_bytes(job['result'])), self._client(job)
@@ -1463,8 +1471,8 @@ class Coordinator:
             return pack(files)
 
     def delete(self, identity):
+        job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            job = self.jobs[identity]
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Cancel and wait before deleting the job")
             client = self._client(job)
