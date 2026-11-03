@@ -335,6 +335,38 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_receipt_cleanup_does_not_block_another_jobs_file_read(self):
+        from remote_compute import coordinator
+        with scratch() as root,provider(Path(root)/'worker') as (_,worker):
+            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                first=client.run(python('print("finished")'),keep=True)['id']
+                second=client.run(python('from pathlib import Path;Path("answer").write_bytes(b"ready")',outputs=['answer']),keep=True)['id']
+                entered=threading.Event();release=threading.Event();received=threading.Event()
+                cleanup=coordinator.remove_owned;errors=[];files=[]
+                def slow(path):
+                    if path==state.jobs[first]['directory']:
+                        entered.set();release.wait(5)
+                    cleanup(path)
+                def delete():
+                    try:client.delete(first)
+                    except BaseException as error:errors.append(error)
+                def read():
+                    try:files.append(client.read_job_file_changed(second,'answer')['data'])
+                    except BaseException as error:errors.append(error)
+                    finally:received.set()
+                with patch.object(coordinator,'remove_owned',side_effect=slow):
+                    deleter=threading.Thread(target=delete);deleter.start();reader=None
+                    try:
+                        self.assertTrue(entered.wait(2),'Deletion did not reach receipt cleanup')
+                        reader=threading.Thread(target=read);reader.start()
+                        self.assertTrue(received.wait(1),'Unrelated file read waited for another receipt cleanup')
+                    finally:
+                        release.set();deleter.join(3)
+                        if reader is not None:reader.join(3)
+                self.assertFalse(errors,errors);self.assertEqual(files,[b'ready'])
+                with self.assertRaisesRegex(RemoteError,'404'):client.status(first)
+                client.delete(second)
+
     def test_cross_project_four_thread_lease_precedes_new_dispatch(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):

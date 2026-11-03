@@ -1481,8 +1481,10 @@ class Coordinator:
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404:
                         raise
+            # The per-ID lock fences collection and deletion. Recursive disk
+            # cleanup must leave other jobs' status, leases and files flowing.
+            remove_owned(job["directory"])
             with self.condition:
-                remove_owned(job["directory"])
                 job['retired']=True
                 del self.jobs[identity]
         self._prune_assets()
