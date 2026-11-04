@@ -235,10 +235,11 @@ Python 能力按实际运行环境登记；新增算法先复用已有环境，�
 | `python_numpy` | NumPy；用于 AOP、ARH 普通执行及 RGCN 原生测量 |
 | `python_scientific` | NumPy、SciPy、Numba、pymoo、moocore、threadpoolctl、scikit-learn、umap-learn；用于完整科学计算环境 |
 | `python_torch_pyg` | NumPy、Torch、PyG、SciPy、Numba、moocore、threadpoolctl；用于当前完整神经与数值环境 |
+| `python_torch_scientific` | NumPy、SciPy、Numba、scikit-learn、Torch、pymoo、moocore、threadpoolctl；用于同时依赖Torch和科学优化库的算法 |
 | `onnx` | 经调用工程数值验收的 NumPy、ONNX、ONNX Runtime CPU 与 OpenCV 环境；固定 INT8 继续使用已有兼容解释器 |
 | `layout_python` | NumPy、gdstk、GLayout、gdsfactory、rectpack 及实际所需符号；PDK 由任务材料资产提供 |
 
-每个环境分别用实际解释器验证，不能把不同解释器中的包合起来当成同一环境就绪。`python` 只承诺 Python 标准库，不隐含上述包。CatBoost 等可选后端按实际调用检查，不作为所有神经任务的统一门槛。Magic、Netgen、ng47、Verilator、CIRCT、Java/Scala 和 C++ 仍是独立的真实工具需求。
+每个组合能力均由一个实际解释器同时提供所列依赖，登记前逐项导入并验证接口组合。`python_torch_scientific`可复用完整的CPU科学环境或Torch环境；其执行入口与requires使用同一名称。`python` 只承诺 Python 标准库，不隐含上述包。CatBoost 等可选后端按实际调用检查，不作为所有神经任务的统一门槛。Magic、Netgen、ng47、Verilator、CIRCT、Java/Scala 和 C++ 仍是独立的真实工具需求。
 
 旧 `aop_python/arh_python/rgcn_python/aop_hspice_python` 等价于 `python_numpy`，`bench_python`及已退役的`python_fiber_reproducible`请求等价于`python_scientific`，`rgcn_train/rgcn_fiber` 等价于 `python_torch_pyg`；`onnx_cpu/circt-translate/ngspice47` 分别等价于 `onnx/circt/ng47`。旧请求和模板继续兼容，已接受的原 ID、输入及执行绑定保持；新准入和能力汇总使用规范名；设备能力只描述工具和依赖，拒绝可复现/已验证等资格状态标签。新部署先登记已实测的新绑定，忙碌实例保留旧绑定，空闲重载后再退出重复登记。
 

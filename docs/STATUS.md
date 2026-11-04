@@ -20,3 +20,9 @@ Client.cpu_lease按在途已授权线程及就绪需求借还核心，长尾归�
 - 统一源码、节点重启、原ID收齐和现场租约验收记录保存在同一维护目录。维护验收使用独立运维任务，科学计划由所属工程继续执行。
 
 维护日志、源码清单、原ID回执与实际加载事实均在上述权威目录，不将维护过程追加到日常使用规范。
+
+## Torch与科学优化组合
+
+`python_torch_scientific`在同一解释器内提供Torch、scikit-learn、pymoo、moocore、Numba、SciPy、NumPy和threadpoolctl。五节点逐项导入及Torch/NumPy桥接、scikit-learn核函数、pymoo指标接口已验收。组合能力、持久绑定、实际依赖版本及原ID回执保存在`.local/maintenance/torch-scientific-20261104/`。
+
+完整环境优先复用现有解释器；现有库版本保持，缺失依赖在对应Torch环境补齐。运行中的科研任务持续执行，科学评价次数为0。

@@ -206,7 +206,7 @@ Windows新建作业目录设置可继承的Low完整性标签，允许现有带L
 | AOP_v2 | `--compute-center URL` 或 `compute.center`；网页选本地调度器 / 本地工程 | 每角点任务；源码、模型按内容同步，沿用原测量与解析。 |
 | RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | 原生阶段使用`python_numpy/ng47`，训练使用`python_torch_pyg`；共享观测操作另需`shared:rgcn`，POST另需实际布局工具。源码/模型闭包同步，保留原ID及检查点。 |
 | ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务使用`python_numpy`及相应RTL/编译工具；`shared:arh`复用预部署工具、模型与持久统计缓存。冻结源码的执行与校验使用同一内容资产。 |
-| Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码内容同步，科学数组环境使用`python_scientific`。 |
+| Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码内容同步，科学数组环境使用`python_scientific`，同时依赖Torch和科学优化库的算法使用`python_torch_scientific`。 |
 
 仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告，将验证结果与正式结果分开。日常正式运行仍按各工程规则更新当前成功报告。
 
