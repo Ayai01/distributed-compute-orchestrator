@@ -1,4 +1,4 @@
-"""Project queue preparation, known-ID collection and old-service compatibility."""
+"""Project queue preparation and original-ID result collection."""
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -73,15 +73,26 @@ class ReadyQueueTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     state.admission(dict(project='A', ready_tasks=value))
 
-    def test_new_sdk_keeps_ready_queue_on_old_center_without_extra_poll(self):
+    def test_sdk_uses_the_center_project_window_without_extra_poll(self):
         client = Client()
-        original = dict(running_tasks=2, queued_tasks=2, in_flight=4, max_in_flight=8, target_cpus=8)
+        original = dict(running_tasks=2, queued_tasks=254, in_flight=256, max_in_flight=256,
+                        target_cpus=8, ready_source='center')
         with patch.object(client, 'request', return_value=original.copy()) as request:
             window = client.window('A', cpus=4, ready_tasks=256)
             self.assertEqual((window.maximum, window.current()), (256, 256))
             self.assertEqual(window.value['target_cpus'], 8)
-            self.assertEqual(window.value['ready_source'], 'sdk_legacy')
+            self.assertEqual(window.value['ready_source'], 'center')
             self.assertEqual(request.call_count, 1)
+
+    def test_default_queue_covers_threads_and_keeps_more_than_128_ready_slots(self):
+        for capacities in ([4], [24,30,96,16,16]):
+            state = centers.AdmissionPlanningTests().center(capacities)
+            for cpus in (0,1):
+                value = state.admission(dict(project='A',cpus=cpus,max_cpus=1024))
+                self.assertGreater(value['in_flight'], 128)
+                self.assertGreater(value['in_flight'], sum(capacities))
+                self.assertGreater(value['queued_tasks'], 0)
+                self.assertEqual(sum(n.reserved for n in state.pool.nodes), 0)
 
     def test_unconsumed_terminal_and_uncertain_ids_keep_queue_credits(self):
         client = Client()

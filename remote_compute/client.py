@@ -386,48 +386,26 @@ class Client:
             raise conflict
         return self._read_reconnecting(reconcile)
 
-    def resize(self, identity, cpus, *, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
-        """Borrow/return resources at a safe boundary; use the actual returned grant."""
-        if min_cpus is not None and (type(min_cpus) is not int or min_cpus<0):
-            raise ValueError('resize min_cpus must be a nonnegative integer')
-        modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
-        if min_cpus is not None or memory_mb is not None or cpus==0 or modeled:
-            if getattr(self, '_capabilities', None) is None:
-                self._read_reconnecting(lambda: self.health(brief=True))
-            if (memory_mb is not None and not ({'resize_memory','memory_resize'} & set(self._capabilities))
-                    or cpus==0 and not ({'resize_auto','cpu_auto_resize'} & set(self._capabilities))
-                    or modeled and not ({'resize_memory_model','memory_resize_model'} & set(self._capabilities))
-                    or min_cpus is not None and 'resize_min_cpus' not in self._capabilities):
-                state=self._read_reconnecting(lambda: self.status(identity,brief=True))
-                return dict(id=identity,node=state.get('assigned_node',state.get('node')),
-                            cpus=state['cpus'],memory_mb=state['memory_mb'],requested_cpus=cpus,supported=False)
+    def cpu_lease(self, identity, **options):
+        """Track ready/active CPU demand at executor boundaries, without a thread."""
+        from .leases import CpuLease
+        return CpuLease(self, identity, **options)
+
+    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+        """Borrow idle slots or return them; active_cpus counts in-flight threads."""
+        if type(cpus) is not int or cpus < 0:
+            raise ValueError('resize cpus must be a nonnegative integer')
+        if active_cpus is not None and (type(active_cpus) is not int or active_cpus < 0):
+            raise ValueError('active_cpus must count nonnegative in-flight threads')
         request = dict(cpus=cpus)
-        if min_cpus is not None:
-            request['min_cpus'] = min_cpus
-        if memory_mb is not None:
-            request['memory_mb'] = memory_mb
-        if modeled:
-            request.update(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
+        for key, value in dict(active_cpus=active_cpus, memory_mb=memory_mb,
+                              base_memory_mb=base_memory_mb, memory_per_cpu_mb=memory_per_cpu_mb,
+                              memory_limit_mb=memory_limit_mb).items():
+            if value is not None:request[key] = value
         action='lease' if (os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
                            and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/')) else 'resize'
         target=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',identity) if action=='lease' else identity
-        try:
-            return self.request('/jobs/'+target+'/'+action, request)
-        except RemoteError as error:
-            # Old centers can fail a RAM return before changing any grant.
-            # During their natural drain, confirm this worker's original grant
-            # instead of replaying a lease or failing already-prepared work.
-            if (action!='lease' or modeled or memory_mb is None or cpus<1
-                    or getattr(error,'status_code',None)!=409
-                    or 'min() iterable argument is empty' not in str(error)):
-                raise
-            state=self._read_reconnecting(lambda: self.request('/jobs/'+target,brief=True))
-            if (state.get('id')!=target or state.get('status')!='running'
-                    or state.get('cpus')!=cpus or state.get('memory_mb',0)<memory_mb):
-                raise error
-            return dict(id=identity,node=state.get('node'),cpus=state['cpus'],memory_mb=state['memory_mb'],
-                        requested_cpus=cpus,supported=False,resize_applied=False,
-                        existing_grant_confirmed=True,resize_error=str(error))
+        return self.request('/jobs/'+target+'/'+action, request)
 
     def nodes(self):
         if not self.operator:
@@ -454,13 +432,6 @@ class Client:
             value = self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission')))
         else:
             value = self._read_reconnecting(lambda:self.request('/admission',request))
-        if ready_tasks is not None and 'ready_tasks' not in value:
-            # Old centers already own execution admission and accept queued work.
-            # Keep the same local project counter until their normal idle reload.
-            running = min(ready_tasks, value['running_tasks'])
-            value.update(ready_tasks=ready_tasks, ready_source='sdk_legacy', queue_scope='project',
-                         running_tasks=running, queued_tasks=ready_tasks-running,
-                         in_flight=ready_tasks, max_in_flight=ready_tasks)
         return value
 
     def window(self, project, **options):

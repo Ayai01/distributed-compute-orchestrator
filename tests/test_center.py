@@ -191,8 +191,9 @@ class AdmissionPlanningTests(unittest.TestCase):
         for capacities,cap,expected in (([2,2,2],8,3),([3,3,3],2,6),([24,30,96],96,3)):
             with self.subTest(capacities=capacities,cap=cap):
                 window=self.center(capacities).admission(dict(project='A',cpus=0,max_cpus=cap,queue_ratio=1))
-                self.assertEqual((window['running_tasks'],window['queued_tasks']),(expected,expected))
-                self.assertEqual(window['max_in_flight'],sum(capacities)+expected)
+                self.assertEqual(window['running_tasks'],expected)
+                self.assertEqual(window['in_flight'],max(129,sum(capacities)+1,2*expected))
+                self.assertEqual(window['queued_tasks'],window['in_flight']-expected)
 
     def test_fixed_cpu_admission_excludes_nodes_below_the_task_width(self):
         window=self.center([2,8]).admission(dict(project='A',cpus=4,queue_ratio=0))
@@ -797,21 +798,20 @@ class CenterTests(unittest.TestCase):
             until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
             self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
-    def test_old_center_memory_return_error_uses_worker_confirmed_grant_once(self):
+    def test_lease_rejection_preserves_actual_failure_and_worker_cost(self):
         code=("import os,sys\nsys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\n"
               "from remote_compute import Client\n"
               "grant=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],lease_timeout=3).resize("
               "os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n"
-              "assert grant['existing_grant_confirmed'] and not grant['resize_applied']\n"
               "print(str(grant['cpus'])+':'+str(grant['memory_mb']))\n")
         with scratch() as root,provider(Path(root)/'worker',memory_mb=1024,memory_reserve_mb=0) as (worker,remote), \
                 Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client):
-            with patch.object(state,'resize',side_effect=ValueError('min() iterable argument is empty')) as resize:
+            with patch.object(state,'resize',side_effect=ValueError('phase rejected')) as resize:
                 identity=client.submit(python(code,memory_mb=512))['id']
                 outcome=client.wait(identity,wait_timeout=5)
                 result=client.fetch(identity)
-            self.assertEqual(outcome['status'],'succeeded',result.get('stderr'))
-            self.assertEqual(result['stdout'].strip(),'1:512')
+            self.assertEqual(outcome['status'],'failed',result.get('stderr'))
+            self.assertIn('phase rejected',result['stderr'])
             self.assertEqual(resize.call_count,1)
             self.assertEqual((result['id'],result['memory_mb'],result['attempts']),(identity,512,[]))
             until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
@@ -870,8 +870,8 @@ class CenterTests(unittest.TestCase):
                 client._capabilities=None
                 with patch.object(client,'request',wraps=client.request) as requests:
                     with self.assertRaises(RemoteError):client.resize('0'*32,0,memory_mb=64)
-                    self.assertEqual(requests.call_args_list[0].args,('/health',))
-                    self.assertEqual(requests.call_args_list[0].kwargs,{'brief':True})
+                    self.assertEqual(requests.call_count,1)
+                    self.assertEqual(requests.call_args.args,('/jobs/'+'0'*32+'/resize',dict(cpus=0,memory_mb=64)))
                 self.assertIn('nodes',client.health())
 
     def test_project_shares_and_prefetch_exclude_unusable_server_capacity(self):
@@ -885,7 +885,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual([resources[p]['target'] for p in ('A','B')],[1,1])
                 self.assertEqual([resources[p]['capacity'] for p in ('A','B')],[2,2])
                 window=client.admission('B',requires=['native_only'],queue_ratio=1)
-                self.assertEqual((window['target_cpus'],window['in_flight']),(1,2))
+                self.assertEqual((window['target_cpus'],window['in_flight']),(1,129))
                 for identity in identities:client.cancel(identity);client.delete(identity)
 
     def test_window_tracks_new_worker_capabilities_and_budget_reductions(self):
@@ -931,14 +931,14 @@ class CenterTests(unittest.TestCase):
                 self.assertNotIn('phase_memory',state.jobs[identity])
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
-    def test_memory_model_legacy_fallback_and_validation(self):
+    def test_memory_model_request_and_validation(self):
         from unittest.mock import Mock
         from remote_compute.allocation import plan_resize
-        client=Client('http://old-center');client._capabilities=['resize','resize_auto','resize_memory']
-        client.request=Mock(return_value=dict(cpus=1,memory_mb=64))
-        self.assertFalse(client.resize('original',0,base_memory_mb=128,memory_per_cpu_mb=64)['supported'])
-        self.assertEqual(client.request.call_count,1)
-        self.assertNotIn('resize',client.request.call_args.args[0])
+        client=Client()
+        client.request=Mock(return_value=dict(cpus=1,memory_mb=192))
+        self.assertEqual(client.resize('original',0,base_memory_mb=128,memory_per_cpu_mb=64)['memory_mb'],192)
+        client.request.assert_called_once_with('/jobs/original/resize',
+            dict(cpus=0,base_memory_mb=128,memory_per_cpu_mb=64))
         with self.assertRaises(ValueError):plan_resize(4,64,128,64,None,1024)
         for base,per in ((None,64),(64,None),(-1,64),(64,True),(0,0)):
             with self.assertRaises(ValueError):plan_resize(4,None,base,per,None,1024)
@@ -982,16 +982,14 @@ class CenterTests(unittest.TestCase):
                 until(lambda:pool.nodes[0].reserved==0)
                 self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
-    def test_auto_resize_keeps_existing_grant_on_older_center(self):
+    def test_resize_uses_current_endpoint_instead_of_cached_capability_labels(self):
         from unittest.mock import Mock
-        client=Client('http://old-center')
+        client=Client()
         client._capabilities=['resize','resize_memory']
         client.request=Mock(return_value=dict(id='original',cpus=1,memory_mb=256,assigned_node='same'))
         grant=client.resize('original',0,memory_mb=512)
-        self.assertFalse(grant['supported'])
         self.assertEqual((grant['cpus'],grant['memory_mb']),(1,256))
-        self.assertEqual(client.request.call_count,1)
-        self.assertNotIn('resize',client.request.call_args.args[0])
+        client.request.assert_called_once_with('/jobs/original/resize',dict(cpus=0,memory_mb=512))
 
     def test_cooperative_boundary_admits_same_project_auto_and_fixed_jobs(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
@@ -1376,7 +1374,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(window.current(),4)
                 queued=client.admission('phased',cpus=0,queue_ratio=1)
                 self.assertEqual((queued['running_tasks'],queued['queued_tasks'],queued['in_flight'],queued['max_in_flight']),
-                                 (4,2,6,10))
+                                 (4,125,129,129))
                 first=list(ids)
                 ids += [client.submit(python(hold,cpus=0,project='phased'))['id'] for _ in range(2)]
                 until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
@@ -1398,7 +1396,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.health()['used_cpus'],4)
                 client.resize(ids[0],1)
                 window=client.admission('capped',cpus=0,max_cpus=2,queue_ratio=1)
-                self.assertEqual((window['running_tasks'],window['queued_tasks'],window['max_in_flight']),(3,2,6))
+                self.assertEqual((window['running_tasks'],window['queued_tasks'],window['max_in_flight']),(3,126,129))
                 ids.append(client.submit(python(hold,cpus=0,max_cpus=2,project='capped'))['id'])
                 until(lambda:client.health()['used_cpus']==4)
                 until(lambda:client.status(ids[-1])['status']=='running')
@@ -1879,9 +1877,9 @@ class CenterTests(unittest.TestCase):
                 client.control(paused=True)
                 for _ in range(7):client.submit(python('pass',project='A',resource_share=2))
                 window=client.admission('B',resource_share=1,queue_ratio=1)
-                self.assertEqual((window['target_cpus'],window['running_tasks'],window['queued_tasks'],window['in_flight']),(2,2,2,4))
+                self.assertEqual((window['target_cpus'],window['running_tasks'],window['queued_tasks'],window['in_flight']),(2,2,127,129))
                 self.assertEqual(client.admission('B',resource_share=1,queue_ratio=0)['in_flight'],2)
-                self.assertEqual(client.admission('B',resource_share=1,queue_ratio=.5)['in_flight'],3)
+                self.assertEqual(client.admission('B',resource_share=1,queue_ratio=.5)['in_flight'],129)
                 for job in client.status():client.cancel(job['id']);client.delete(job['id'])
     def test_late_parallel_project_enters_as_soon_as_one_thread_is_free(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, node):

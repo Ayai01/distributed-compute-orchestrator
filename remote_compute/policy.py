@@ -12,6 +12,7 @@ from functools import lru_cache
 MAX_RESOURCE_SHARE = 16.0
 MAX_QUEUE_RATIO = 4.0
 MAX_READY_TASKS = 4096
+READY_QUEUE_FLOOR = 129
 MAX_STATUS_BATCH = 128
 MAX_SINGLE_THREAD_WEIGHT = 8.0
 MIN_PRIORITY = -1000
@@ -248,7 +249,7 @@ def public_capabilities():
         "resize_auto",
         "resize_memory",
         "resize_memory_model",
-        "resize_min_cpus",
+        "resize_active_cpus",
         "semantic_requires",
         "single_thread_weight",
         "asset_cache",

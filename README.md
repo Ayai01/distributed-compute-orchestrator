@@ -1,26 +1,24 @@
 # Distributed Compute Orchestrator（DCO）
 
-当前源码0.8.52增加滚动子任务池的活动CPU下限，保留较早任务前4个有用核，尾项释放单核后新任务进入也不会摊薄旧暖启动。`Client.resize(id, desired, min_cpus=active)`沿中心／worker保护仍在计算的子任务，完成一个即可让核和补位。历史冷读及索引恢复继续沿原合同。运行版本与维护放行以[STATUS](docs/STATUS.md)指向的实际账本为准。
+DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.9.0**；实际加载版本、维护状态和验证入口见 [STATUS](docs/STATUS.md)。
 
-DCO 提供统一计算调度、远程任务执行和设备运维。调用工程保留科学测量、评分、实验预算和结果缓存；DCO 负责能力匹配、CPU/RAM/加速器授权、任务生命周期与传输。服务、SDK、终端只依赖 Python 标准库，日常使用系统标准 GIL x64 CPython 3.14；源码兼容 3.7–3.15，科学工具另按任务安装。
+服务、SDK 和终端仅依赖 Python 标准库。日常使用系统标准 GIL x64 CPython 3.14，源码支持 3.7–3.15。仓库为 `distributed-compute-orchestrator`，包为 `remote_compute`，协议环境变量为 `REMOTE_COMPUTE_*`。
 
-仓库名为 `distributed-compute-orchestrator`，Python 包仍为 `remote_compute`，环境变量仍为 `REMOTE_COMPUTE_*`。源码来自 [Ayai01/distributed-compute-orchestrator](https://github.com/Ayai01/distributed-compute-orchestrator)。
+## 工程接入要求
 
-## 科研计算的工作段
+- 一般可扩核搜索使用 `cpus=1, max_cpus=1024`；单代、种群或有限并行内核按真实可并行宽度设置上限。串行任务使用 `cpus=1, max_cpus=1`。任务从1核启动，不设置最低核数字段。
+- 调度顺序：已有弹性任务先取得最多4个有用核；就绪新任务以1核进入；没有可进入的新任务时，已有任务继续扩展，直到有用需求或兼容设备预算用满。实际优先级、内存和加速器条件一并参与准入。
+- 控制器保持一个工程级 pending 计数。默认准备窗口超过128，且大于兼容CPU总数；可显式设置 `ready_tasks` 为1–4096。只补充已授权计划中真正就绪的任务，完成即领取、发布、补位。依赖关系和有限批次自然约束实际队列。
+- 执行器使用 `Client.cpu_lease(...).refresh(active_cpus=..., ready_cpus=...)` 随工作边界借还核心，始终使用返回的实际核数。`active_cpus` 是已经在途的授权线程数量，`ready_cpus` 是可立即投入计算的额外线程需求。滚动池在完成事件及最长1秒的等待间隔刷新，长尾只保留仍能使用的核心。
+- 外层进程和 BLAS/Numba/Torch 等内层线程共用一份授权。调整内层线程数须在内核边界进行。CPU 使用率用于选点和诊断，空闲租约通过真实工作需求归还。看板的授权核数与实际CPU时间分别记录。
 
-长科研任务按完整代、训练epoch、原生窗口或批次安排执行段，依据近期耗时合并短项、拆分长项，通常以数分钟至20分钟为目标。30分钟用于复查粒度，不作统一硬截断；科学预算、工作目标与故障超时分别记录。只提交输入和预算已就绪的工作，依赖上一段状态的任务在持久完成后解锁。
+控制器和执行器的完整示例见 [DESIGN](docs/DESIGN.md#python-接口)。所有工程按汇总语义能力提交，设备选择及共享DCO修改由操作员负责。
 
-科研总预算、种子和原科学任务身份跨段连续，新段执行ID显式映射，原接受请求及回执保留。受理未明时继续查询原执行ID。完整恢复状态、已付观测和费用账本在发起端持久化；远端只保留本段必要输入与未领取增量，模型、工具和只读资产沿原引用复用。
+## 科研任务与成果
 
-`write_job_file` 原子投递项目约定的控制文件，`read_job_file_changed` 按版本领取已封存状态。worker在安全边界保存完整状态并正常退出；DCO取消/超时保留进程树终止语义。既有冻结worker按实际支持的恢复边界接续。段终态按 `fetch(delete=False)` → 本地持久发布增量、恢复状态和费用 → `delete` 收齐，释放一次性目录；活跃引用继续保护。细节见[设计合同](docs/DESIGN.md#分段计算和本地持久结果)。
+长任务按完整代、训练epoch、原生窗口或可恢复批次组织，依据实测耗时选择段长。科学任务身份、输入/seed、预算、费用和完整恢复状态跨段连续；受理结果未明时继续查询原执行ID。
 
-看板任务行的 `1/8` 表示1个任务、授予8核；实际并行度由项目执行器配置，并按进程/线程CPU样本核对。
-
-成果领取和删除按原ID互斥；递归清理任务目录在全局调度锁外执行，使其他原ID的状态、租约和文件读取继续流动。源码与现网生效范围见[STATUS](docs/STATUS.md)。
-
-`cpus: 1, max_cpus: N`适用于低核启动、计算阶段再扩核的任务。默认顺序为：现有弹性任务先取得最多4个有用线程（跨工程同样优先于新任务，实际资源就绪的更高优先级除外）；就绪任务随后以1线程进入；没有可进入任务时，再扩展现有任务至有用并行上限和可用核心数。`cpus: 0`也以1线程启动。线程池在完整工作边界按实际授予调整，调度优先分散到空闲兼容设备。固定串行任务使用`cpus: 1, max_cpus: 1`，显式固定宽度任务保留整组准入。具体规则见[设计合同](docs/DESIGN.md)。
-
-当前工程因节点短暂失联而缺少在线配额时，边界调核返回原worker持有的CPU/RAM授予；原任务继续，在线投影恢复后再按实时份额调核。运维按原ID核worker实际终态，收齐最终成果与CPU费用，再由调用工程持久发布和正常领取。现场维护与恢复证据见[STATUS](docs/STATUS.md)。
+原结果按 `fetch(delete=False)` → 工程持久发布结果、费用及恢复状态 → `delete` 收齐。内容资产按引用复用，静态模型与源码分包。原ID的读取、领取和清理互斥，递归文件操作在全局调度锁外进行。持久状态和未领取成果放普通磁盘，可重建临时物使用任务专属RAM目录并随生命周期回收。
 
 ## 启动
 
@@ -80,9 +78,9 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 
 `TASK_ID` 换成实际 ID。单任务成功返回 0，任务失败返回 1，配置/通信错误返回 2。自动化保存返回 ID，用原 ID 查状态、日志和取回结果；短暂断连继续查询原任务。成功取回默认清理服务端副本，`--keep` 用于显式保留。任务 JSON、SDK 与恢复语义见 [DESIGN](docs/DESIGN.md)。
 
-任务总表不要在长时间运行的中心上读取全部历史。CLI `jobs` 使用最近页；SDK 可用 `client.status_page(limit=256, offset=0)` 读取有界页，返回 `items/total/offset/limit/has_more`，按完整 ID继续查单项。旧 `status()` 全量接口保留兼容，但不用于高频巡检或大历史中心。
+任务总表不要在长时间运行的中心上读取全部历史。CLI `jobs` 使用最近页；SDK 可用 `client.status_page(limit=256, offset=0)` 读取有界页，返回 `items/total/offset/limit/has_more`，按完整 ID继续查单项。完整任务查询使用原ID或批状态接口。
 
-工程控制器可用 `client.window(project, ready_tasks=256, ...)` 设置整个工程的待收齐任务窗口，由中心继续分配实际 CPU/RAM/GPU。`window.available(len(pending))` 提供提交背压；pending 包括已排队、运行、尚未发布的终态及受理结果未明的原 ID。`client.statuses(ids)` 每128个已知 ID 合并查询，`wait_any(ids)` 在一个采集循环等终态，完整费用随 `fetch` 领取。旧中心继续兼容，接口、共享计数与结果发布示例见 [DESIGN：提交与查询窗口](docs/DESIGN.md#向中心提交与查询窗口)。
+工程控制器可用 `client.window(project, ready_tasks=256, ...)` 设置整个工程的待收齐任务窗口，由中心继续分配实际 CPU/RAM/GPU。`window.available(len(pending))` 提供提交背压；pending 包括已排队、运行、尚未发布的终态及受理结果未明的原 ID。`client.statuses(ids)` 每128个已知 ID 合并查询，`wait_any(ids)` 在一个采集循环等终态，完整费用随 `fetch` 领取。接口、共享计数与结果发布示例见 [DESIGN：提交与查询窗口](docs/DESIGN.md#向中心提交与查询窗口)。
 
 <a id="终端操作"></a>
 
@@ -149,11 +147,11 @@ Tab 在空输入时显示根命令候选，有输入时补全；PgUp/PgDn 翻任
 
 旧worker状态迁入DCO时，在本机配置中将`root`设为新的`.local/state/...`路径，并临时添加`migrate_root_from`旧根。排空后正常重载；启动会先验证旧worker已退出，再在同一文件系统整体重命名并移除迁移字段。目标目录须尚不存在，原ID、回执、输入及链接原样保留；不合并两套状态、不复制工具目录。
 
-资源协商使用独立的 `lease_timeout`，默认取普通 `timeout` 与130秒中的较大值：远端 worker 的初始 lease 和本机直连中心的 resize 都使用这一期限，worker 可等待中心回复120秒。普通请求及中心的资源答复保持普通期限，`pool_timeout` 只管理本地连接排队。lease 或 resize 超时均不自动重发，资源变更可能已生效；先按原ID核对实际授予和任务状态。任务跟进使用 `status(id)` 或有界的 `status_page()`，全量 `status()` 只为兼容旧调用保留，勿用于高频轮询或费用总账；已显式删除的任务由调用工程保存原回执与费用。
+资源协商使用独立的 `lease_timeout`，默认取普通 `timeout` 与130秒中的较大值：远端 worker 的初始 lease 和本机直连中心的 resize 都使用这一期限，worker 可等待中心回复120秒。普通请求及中心的资源答复保持普通期限，`pool_timeout` 只管理本地连接排队。lease 或 resize 超时均不自动重发，资源变更可能已生效；先按原ID核对实际授予和任务状态。任务跟进使用 `status(id)` 或有界的 `status_page()`，全量 `status()` 用于显式全表读取，高频轮询使用原ID批状态或分页；已显式删除的任务由调用工程保存原回执与费用。
 
-部署改名后核对 tools/shared/env、`.tools/science.json`、`.tools/rtl.json` 和联接目标。`worker.local.json`、`nodes.local.json`、`.local/`、`.tools/`、`.projects/`、`.runtime/`、结果均留本机；令牌、证书私钥保留在设备配置。服务配置使用私密原子写入。
+部署时核对 tools/shared/env、`.tools/science.json`、`.tools/rtl.json` 和联接目标。`worker.local.json`、`nodes.local.json`、`.local/`、`.tools/`、`.projects/`、`.runtime/`、结果均留本机；令牌、证书私钥保留在设备配置。服务配置使用私密原子写入。
 
-临时大输入在准备阶段已确定原任务ID时，使用 `client.sync_files(files, job_id=原ID)`，提交也传同一 `job_id`；若准备取消，调用 `client.release_assets(原ID)`。引用覆盖同步至受理的间隔，任务收妥删除后按LRU回收；多生产者共享同一内容分别受保护。重开或交接1小时未更新后重新同步原冻结内容。固定源码/模型继续分包复用。协议和旧服务兼容规则见[DESIGN](docs/DESIGN.md#接入与传输约定)。
+临时大输入在准备阶段已确定原任务ID时，使用 `client.sync_files(files, job_id=原ID)`，提交也传同一 `job_id`；若准备取消，调用 `client.release_assets(原ID)`。引用覆盖同步至受理的间隔，任务收妥删除后按LRU回收；多生产者共享同一内容分别受保护。重开或交接1小时未更新后重新同步原冻结内容。固定源码/模型继续分包复用。协议见[DESIGN](docs/DESIGN.md#接入与传输约定)。
 
 已有冻结ZIP的恢复入口用 `client.has_asset(资产ID, job_id=原ID)` 检查是否存在，返回布尔值；短暂读超时沿既有有限重连处理。存在时直接复用，缺失时才补传原ZIP，查询不打包、摘要或上传内容。
 
@@ -295,10 +293,10 @@ New-NetFirewallRule -Name RemoteCompute-Control-26133 -DisplayName "DCO 26133" -
 | 线程数设置被拒绝 | 查看当前设备 cpu_limit，按硬上限调整。 |
 | 排队或 CPU 未满 | 查看能力、就绪任务、工程份额、内存和任务实际线程需求。 |
 | 断连后仍有任务 | 记录原 ID，恢复连接后查询并取回；结果持久保留。 |
-| 旧端口或旧目录 | 同步本机配置与调用工程 URL，排空后重载，核对完整状态根。 |
+| 地址或目录不匹配 | 核对本机配置、调用工程 URL 与实际状态根，排空后重载。 |
 
 维护验证入口：`python -B main.py --test` 是核心回归，`--test-native` 增加真实 ngspice/Verilator；按改动选择范围。当前已验证事实见 [STATUS](docs/STATUS.md)。
 
 ## 文档分工
 
-[AGENTS](AGENTS.md) 管协作；[DESIGN](docs/DESIGN.md) 管协议、调度和内部机制；[STATUS](docs/STATUS.md) 管当前事实及验证；[HISTORY](docs/HISTORY.md) 管重要变化；[ROADMAP](docs/ROADMAP.md) 管已确认后续。README 集中实际使用入口，示例和配置另见 [examples](examples/)、[worker.example.json](worker.example.json)、[nodes.example.json](nodes.example.json)。
+[AGENTS](AGENTS.md) 管协作；[DESIGN](docs/DESIGN.md) 管协议、调度和内部机制；[STATUS](docs/STATUS.md) 管当前事实及验证；[ROADMAP](docs/ROADMAP.md) 管已确认后续。README 集中实际使用入口，示例和配置另见 [examples](examples/)、[worker.example.json](worker.example.json)、[nodes.example.json](nodes.example.json)。

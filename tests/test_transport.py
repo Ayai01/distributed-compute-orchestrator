@@ -479,20 +479,17 @@ class OriginalSubmitReceiptTests(unittest.TestCase):
 
 
 class ArtifactReloadTests(unittest.TestCase):
-    def test_legacy_memory_return_only_confirms_an_identical_cpu_grant(self):
+    def test_resource_conflict_is_reported_without_reading_a_different_grant(self):
         identity='e'*32;url='http://127.0.0.1:12345'
-        state=dict(id=identity,status='running',cpus=1,memory_mb=512)
-        with patch.dict(os.environ,REMOTE_COMPUTE_LEASE='1',REMOTE_COMPUTE_JOB_ID=identity,
-                        REMOTE_COMPUTE_WORKER_JOB_ID=identity,REMOTE_COMPUTE_URL=url):
-            for changes,requested in (({'status':'failed'},128),({'status':'cancelled'},128),
-                    ({'id':'f'*32},128),({'cpus':2},128),({'memory_mb':64},128),({},768)):
-                with self.subTest(changes=changes,requested=requested):
-                    client=Client(url);client._capabilities=['resize_memory']
-                    failure=RemoteError('min() iterable argument is empty');failure.status_code=409
-                    with patch.object(client,'request',side_effect=[failure,dict(state,**changes)]) as request:
-                        with self.assertRaises(RemoteError):client.resize(identity,1,memory_mb=requested)
-                    self.assertEqual([c.args[0] for c in request.call_args_list],['/jobs/'+identity+'/lease','/jobs/'+identity])
-                    self.assertEqual(request.call_args_list[-1].kwargs,dict(brief=True))
+        environment=dict(REMOTE_COMPUTE_LEASE='1',REMOTE_COMPUTE_JOB_ID=identity,
+                         REMOTE_COMPUTE_WORKER_JOB_ID=identity,REMOTE_COMPUTE_URL=url)
+        failure=RemoteError('phase memory rejected');failure.status_code=409
+        with patch.dict(os.environ,environment):
+            client=Client(url)
+            with patch.object(client,'request',side_effect=failure) as request:
+                with self.assertRaises(RemoteError):client.resize(identity,1,memory_mb=128)
+            self.assertEqual(request.call_count,1)
+            self.assertEqual(request.call_args.args[0],'/jobs/'+identity+'/lease')
 
     def test_unrelated_or_growing_resize_errors_are_never_hidden_or_replayed(self):
         identity='e'*32;url='http://127.0.0.1:12345'
@@ -652,7 +649,7 @@ class StatusReadReconnectTests(unittest.TestCase):
         else:error.status_code=status
         return error
 
-    def test_resize_bootstrap_recovers_health_before_one_actual_grant_change(self):
+    def test_resize_does_not_depend_on_health_reads_before_one_grant_change(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client):
             identity=client.submit(python('import time; time.sleep(30)'))['id']
             until(lambda:client.status(identity,brief=True)['status']=='running')
@@ -666,46 +663,42 @@ class StatusReadReconnectTests(unittest.TestCase):
                 with patch.object(Handler,'_reply',reply):
                     grant=client.resize(identity,1,memory_mb=256)
                 self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb']),(identity,1,256))
-                self.assertEqual(sum(path.startswith('/health') for _,path in requests),3)
+                self.assertEqual(sum(path.startswith('/health') for _,path in requests),0)
                 self.assertEqual([path for method,path in requests if method=='POST'],['/jobs/'+identity+'/resize'])
             finally:
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
-    def test_resize_bootstrap_rejects_permanent_health_error_before_mutation(self):
+    def test_resize_propagates_permission_error_without_replaying_mutation(self):
         client=Client();error=self.outage(403)
-        with patch.object(client,'health',side_effect=error) as health,patch.object(client,'request') as request,patch('remote_compute.client.time.sleep') as sleep:
+        with patch.object(client,'request',side_effect=error) as request,patch('remote_compute.client.time.sleep') as sleep:
             with self.assertRaises(RemoteError) as caught:client.resize('a'*32,1,memory_mb=256)
         self.assertIs(caught.exception,error)
-        self.assertEqual(health.call_count,1);request.assert_not_called();sleep.assert_not_called()
+        request.assert_called_once_with('/jobs/'+'a'*32+'/resize',dict(cpus=1,memory_mb=256))
+        sleep.assert_not_called()
 
-    def test_resize_bootstrap_outage_is_finite_and_never_changes_grant(self):
-        client=Client();clock=[0.]
-        def sleep(seconds):clock[0]+=seconds
-        with patch.object(client,'health',side_effect=self.outage()) as health,patch.object(client,'request') as request,patch('remote_compute.client.time.monotonic',side_effect=lambda:clock[0]),patch('remote_compute.client.time.sleep',side_effect=sleep):
+    def test_resize_transport_outage_retains_original_identity_without_replay(self):
+        client=Client();error=self.outage()
+        with patch.object(client,'request',side_effect=error) as request,patch('remote_compute.client.time.sleep') as sleep:
             with self.assertRaises(RemoteError):client.resize('a'*32,1,memory_mb=256)
-        self.assertAlmostEqual(clock[0],120.)
-        self.assertLess(health.call_count,40);request.assert_not_called()
+        self.assertEqual(request.call_count,1)
+        self.assertEqual(request.call_args.args[0],'/jobs/'+'a'*32+'/resize')
+        sleep.assert_not_called()
 
-    def test_unsupported_resize_recovers_only_original_grant_read(self):
-        client=Client();client._capabilities=[];identity='b'*32
-        state=dict(id=identity,status='running',cpus=1,memory_mb=512)
-        with patch.object(client,'status',side_effect=[self.outage(),state]) as status,patch.object(client,'request') as request,patch('remote_compute.client.time.sleep'):
-            grant=client.resize(identity,0,memory_mb=256)
-        self.assertEqual((grant['id'],grant['cpus'],grant['memory_mb'],grant['supported']),(identity,1,512,False))
-        self.assertEqual([call.args for call in status.call_args_list],[(identity,)]*2)
-        request.assert_not_called()
+    def test_resize_sends_one_current_request_without_capability_probes(self):
+        client=Client();identity='b'*32
+        state=dict(id=identity,cpus=2,memory_mb=256)
+        with patch.object(client,'request',return_value=state) as request:
+            self.assertEqual(client.resize(identity,0,memory_mb=256),state)
+        request.assert_called_once_with('/jobs/'+identity+'/resize',dict(cpus=0,memory_mb=256))
 
-    def test_legacy_lease_confirms_original_grant_after_read_outage_without_replaying_lease(self):
-        client=Client();client._capabilities=['resize_memory'];identity='c'*32;worker='d'*32
-        failure=self.outage(409);failure.args=('min() iterable argument is empty',)
-        state=dict(id=worker,status='running',cpus=1,memory_mb=512)
+    def test_lease_error_keeps_original_worker_identity_and_is_not_replayed(self):
+        client=Client();identity='c'*32;worker='d'*32
+        failure=self.outage(409)
         environment=dict(REMOTE_COMPUTE_LEASE='1',REMOTE_COMPUTE_URL=client.url,
                          REMOTE_COMPUTE_JOB_ID=identity,REMOTE_COMPUTE_WORKER_JOB_ID=worker)
-        with patch.dict(os.environ,environment),patch.object(client,'request',side_effect=[failure,self.outage(),state]) as request,patch('remote_compute.client.time.sleep'):
-            grant=client.resize(identity,1,memory_mb=256)
-        self.assertEqual([call.args[0] for call in request.call_args_list],['/jobs/'+worker+'/lease','/jobs/'+worker,'/jobs/'+worker])
-        self.assertEqual(grant['id'],identity)
-        self.assertTrue(grant['existing_grant_confirmed']);self.assertFalse(grant['resize_applied'])
+        with patch.dict(os.environ,environment),patch.object(client,'request',side_effect=failure) as request:
+            with self.assertRaises(RemoteError):client.resize(identity,1,memory_mb=256)
+        self.assertEqual([call.args[0] for call in request.call_args_list],['/jobs/'+worker+'/lease'])
 
     def test_wait_recovers_after_both_http_status_attempts_drop(self):
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):

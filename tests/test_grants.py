@@ -37,10 +37,6 @@ class GrantTests(unittest.TestCase):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
                 first=client.submit(python(HOLD,cpus=2,memory_mb=192))['id']
                 until(lambda:client.status(first)['status']=='running')
-                with patch.object(client,'_capabilities',['resize']):
-                    declined=client.resize(first,4,memory_mb=96)
-                self.assertFalse(declined['supported'])
-                self.assertEqual((declined['cpus'],declined['memory_mb']),(2,192))
                 second=client.submit(python(HOLD,memory_mb=128))['id']
                 self.assertEqual(client.status(second)['status'],'queued')
                 with self.assertRaises(RemoteError) as rejected:
@@ -53,7 +49,6 @@ class GrantTests(unittest.TestCase):
                 with patch.object(pool.nodes[0].client,'resize',side_effect=rejected_by_worker):
                     with self.assertRaises(RemoteError):client.resize(first,4,memory_mb=192)
                 self.assertEqual(client.health()['projects']['default']['demand'],before)
-                del client._capabilities  # A client created before the in-process update.
                 grant=client.resize(first,1,memory_mb=96)
                 self.assertEqual((grant['cpus'],grant['memory_mb']),(1,96))
                 pool.refresh()

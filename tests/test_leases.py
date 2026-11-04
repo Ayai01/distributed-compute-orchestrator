@@ -1,0 +1,95 @@
+"""Executor demand, rolling tails and automatic spare-CPU reuse over real HTTP."""
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+
+from remote_compute import Client, Pool
+from test_center import center
+from test_compute import provider, python, scratch, until
+
+
+HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+
+
+class CpuLeaseTests(unittest.TestCase):
+    def test_tail_returns_idle_slots_and_peer_expands_without_a_new_cpu_request(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=8) as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(root)/'center') as (_, client):
+                first = client.submit(python(HOLD, project='A', cpus=1, max_cpus=1024, memory_mb=64))['id']
+                remaining = {first}
+                try:
+                    until(lambda: client.status(first)['status'] == 'running')
+                    lease = client.cpu_lease(first, max_cpus=1024, cpus=1)
+                    self.assertEqual(lease.refresh(ready_cpus=1024), 8)
+                    second = client.submit(python(HOLD, project='B', cpus=1, max_cpus=1024, memory_mb=64))['id']
+                    remaining.add(second)
+                    # The remaining child keeps one CPU; seven unused slots return.
+                    self.assertEqual(lease.refresh(active_cpus=1, ready_cpus=0), 1)
+                    until(lambda: client.status(second)['status'] == 'running')
+                    peer = client.cpu_lease(second, max_cpus=1024, cpus=1)
+                    self.assertEqual(peer.refresh(ready_cpus=1024), 7)
+                    self.assertEqual(client.status(first)['cpus'] + client.status(second)['cpus'], 8)
+                    client.write_job_file(first, 'release', 'done')
+                    client.wait(first); client.fetch(first)
+                    remaining.remove(first)
+                    with patch('remote_compute.leases.time.monotonic', return_value=peer.updated+2):
+                        self.assertEqual(peer.refresh(ready_cpus=1024), 8)
+                finally:
+                    for identity in remaining:
+                        client.write_job_file(identity, 'release', 'done')
+                        client.wait(identity); client.fetch(identity)
+
+    def test_phase_memory_model_limits_useful_parallelism(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=8, memory_mb=1024) as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(root)/'center') as (_, client):
+                identity = client.submit(python(HOLD, cpus=1, max_cpus=1024, memory_mb=64))['id']
+                try:
+                    until(lambda: client.status(identity)['status'] == 'running')
+                    lease = client.cpu_lease(identity, max_cpus=1024, cpus=1,
+                                             base_memory_mb=128, memory_per_cpu_mb=128)
+                    self.assertEqual(lease.refresh(ready_cpus=1024), 7)
+                    self.assertEqual(lease.memory_mb, 1024)
+                    self.assertEqual(lease.refresh(active_cpus=1, ready_cpus=0), 1)
+                    self.assertEqual(lease.memory_mb, 256)
+                finally:
+                    client.write_job_file(identity, 'release', 'done')
+                    client.wait(identity); client.fetch(identity)
+
+    def test_identical_demand_polls_once_per_second_and_changed_demand_returns_now(self):
+        client = Client()
+        with patch.object(client, 'resize', return_value=dict(cpus=4, memory_mb=64)) as resize, \
+                patch('remote_compute.leases.time.monotonic', return_value=10) as clock:
+            lease = client.cpu_lease('a'*32, max_cpus=1024)
+            self.assertEqual(lease.refresh(ready_cpus=32), 4)
+            lease.refresh(ready_cpus=32)
+            self.assertEqual(resize.call_count, 1)
+            clock.return_value = 11
+            lease.refresh(ready_cpus=32)
+            self.assertEqual(resize.call_count, 2)
+            lease.refresh(active_cpus=1, ready_cpus=0)
+            self.assertEqual(resize.call_count, 3)
+            self.assertEqual(resize.call_args.args, ('a'*32, 1))
+            self.assertEqual(resize.call_args.kwargs['active_cpus'], 1)
+
+    def test_invalid_active_report_does_not_send_a_resource_request(self):
+        client = Client()
+        lease = client.cpu_lease('a'*32, cpus=2)
+        with patch.object(client, 'resize') as resize:
+            for value in (-1, 3, True, 1.5):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    lease.refresh(active_cpus=value)
+            with self.assertRaises(ValueError):lease.refresh(ready_cpus=-1)
+            resize.assert_not_called()
+
+    def test_stable_single_thread_tail_needs_no_resource_heartbeat(self):
+        client = Client()
+        with patch.object(client, 'resize', return_value=dict(cpus=1, memory_mb=64)) as resize, \
+                patch('remote_compute.leases.time.monotonic', return_value=10) as clock:
+            lease = client.cpu_lease('a'*32)
+            self.assertEqual(lease.refresh(active_cpus=1, ready_cpus=0), 1)
+            clock.return_value = 100
+            self.assertEqual(lease.refresh(active_cpus=1, ready_cpus=0), 1)
+            self.assertEqual(resize.call_count, 1)
+
+
+if __name__ == '__main__':unittest.main()
