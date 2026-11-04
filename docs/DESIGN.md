@@ -41,7 +41,7 @@ center = Client()
 print(center.capabilities())  # tags/tools/CPU/RAM 的汇总视图
 ```
 
-能力摘要只返回汇总标签、可用工具名称、CPU/RAM 总量与单位、以及去掉设备 ID 的加速器档案，不含设备名、URL、路径、活动任务或工程配额。大输入先用 `sync_files(..., content_id=...)` 内容寻址同步，任务只引用资产 ID；同一客户端并发准备相同内容时共享一次打包、摘要及上传，各原任务仍分别登记自己的交接引用。不同内容可并行准备，缓存缺失后沿原字节补传。能力登记拒绝资格状态标签；执行工具按实际登记的语义能力解析。数值验收沿原执行/测量协议。不要把模型、源码或完整健康快照随每个任务重复上传。
+能力摘要的tags/tools只返回固定运行能力，另返回CPU/RAM 总量与单位、以及去掉设备 ID 的加速器档案，不含设备名、URL、路径、活动任务或工程配额。大输入先用 `sync_files(..., content_id=...)` 内容寻址同步，任务只引用资产 ID；同一客户端并发准备相同内容时共享一次打包、摘要及上传，各原任务仍分别登记自己的交接引用。不同内容可并行准备，缓存缺失后沿原字节补传。能力登记拒绝资格状态标签；执行工具按实际登记的语义能力解析。数值验收沿原执行/测量协议。不要把模型、源码或完整健康快照随每个任务重复上传。
 
 GPU 和其他加速器使用同一套汇总能力协议。`capabilities()['accelerators']` 返回去掉设备 ID 后的能力档案，例如：
 
@@ -54,8 +54,8 @@ GPU 和其他加速器使用同一套汇总能力协议。`capabilities()['accel
 ```python
 from remote_compute import command
 
-task = command(["${tool:python_torch_pyg}", "train.py"], cpus=4, memory_mb=8192,
-               requires=["python_torch_pyg"], project="rgcn",
+task = command(["${tool:python}", "train.py"], cpus=4, memory_mb=8192,
+               requires=["ml"], project="rgcn",
                accelerator={"kind":"cuda", "memory_mb":4096,
                                              "requires":["gpu:training"]})
 ```
@@ -92,11 +92,11 @@ ARH 的 `tensor_backend=auto` 声明一张CUDA卡和30秒阈值。显式 `torch_
 
 能力与执行引擎不生成或保存哈希，科研回执和科学缓存也不记录引擎哈希或其派生分区。`ng47` 是规范语义能力名。工具注册、任务和准入拒绝哈希或 OS 选择标签；worker 不把操作系统发布为科研能力。执行兼容性由明文引擎族/主版本、执行/测量协议和数值容差确认，兼容设备共同参与。源码（含生成RTL）、PDK、模型和输入内容摘要继续承担数据身份、传输完整性与资产复用；不得将其反向变成设备选择条件。
 
-能力按实际执行环境和工具划分。新增算法使用同一解释器时，把所需包纳入该环境的完整性校验，不按算法重复登记能力。PDK 等材料通过内容资产或共享路径提供，不把目录伪装成可执行工具。迁移重复别名时保留已接受请求及原 ID 恢复所需的旧绑定，调用方迁完且原任务收齐后再退役。
+运行能力使用[README的固定词汇](../README.md#运行能力)：ng47、hsp、chisel、ml、cuda、layout、rtl、onnx。Python/C++为基础环境，实际构建工具保留在操作员明细。Chisel及layout必须由单个节点完整提供，汇总不拼接跨设备工具。任务的工具模板继续按实际可用入口匹配；共享材料继续按共享路径或内容资产匹配。
 
-Python 环境及旧名映射见 README。`requires`、命令、参数和环境中的工具模板使用同一别名规则匹配可用绑定；只比较原始工具键会错误排除兼容设备。能力汇总去重，但历史回执保留已接受的实际 Python 绑定名称和路径，避免把不同解释器的来源合并覆盖。SDK 也规范化旧服务的能力汇总，允许忙碌实例在下一次空闲重载前继续执行原任务。
+Python仅有一个模板`${tool:python}`。设备私有python_runtimes登记cpu/ml/cuda等后端的完整argv；无GPU时ml请求选择ml，其余选择cpu，加速器任务选择对应设备后端。调度匹配同时检查后端与真实加速器供给，缺失后端不受理。每个后端在同一解释器中提供任务所需的完整依赖。新增算法补齐环境，不新增Python组合能力或工程专属标签。执行绑定在受理时冻结并保存在原ID回执中。
 
-工具模板与能力使用同一语义别名表，`${tool:ng47}`和旧配置键可互通。命令首项保留完整argv前缀，路径/环境变量仅接受单可执行文件绑定；优先使用同一语义能力的可用绑定。登记允许的加号、点、连字符在模板中保持相同语法。
+完整argv前缀用于命令首项；路径及环境变量模板仅接受单可执行文件绑定。工具名允许的加号、点和连字符在模板中保持相同语法。ONNX及layout通过自己的真实工具入口选择独立环境。研究控制器使用admission的capable_cpus判断组合要求的实际供给，不以运行能力列表做包含Python等基础项的集合判断。
 
 任务进程内部继续调用 Magic/Netgen 等工具时，读取 DCO 注入的自身执行记录，保留其中 `tools[工具名]['argv']` 的完整前缀：
 
@@ -168,7 +168,7 @@ RAM随并发线性增长时，使用 `client.resize(id, 0, base_memory_mb=1024, 
 
 worker 默认将 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS`、`NUMEXPR_NUM_THREADS` 设为此次线程授予；任务 `env` 显式指定的值优先。例如外层并发处理多个候选时，可将这些数值库设为 `1`，避免嵌套并行；编译仍使用 `${cpus}`。外层任务与内核线程共同使用此次授予。
 
-任务还可设置 `priority` 和 `requires`。较大的 `priority` 先启动；`requires` 要求汇总能力标签全部匹配。节点自动报告 Python、ngspice、Verilator 等可用工具，调度器据任务使用的工具筛选供给。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
+任务还可设置 `priority` 和 `requires`。较大的 `priority` 先启动；`requires` 要求单节点满足全部语义需求。节点内部报告实际工具及解释器后端，调度器同时核对模板入口、共享材料和执行环境。`resource_share`、`queue_ratio`、`single_thread_weight` 有界且只影响中心内部公平、预取和近负载先验，不能指定设备或绕过 CPU/RAM 准入。
 
 中心与直连 Pool 按任务 ID 区分本方预留和外部任务；慢健康快照中的旧授予不再占用第二份额度。新 worker 声明 `memory_accounting=rss`：首次进程树采样前及未反映到健康快照的派发按申报量预留，采样后按当前 RSS 记账；设备预算与配置的系统可用余量共同约束新任务准入，默认8GiB。Windows同时读取物理可用RAM及提交额度余量，按两者较小值减去系统余量和未采样预留，得到新任务可用量；`host_memory_available_mb`继续表示物理RAM，另列`host_commit_limit_mb`与`host_commit_available_mb`。既有授予保持，余量恢复后正常准入；Linux及未提供可选字段的旧worker沿原物理RAM规则。旧worker沿用其预留规则，允许逐节点在空闲边界更新。任务取消只向worker发送一次请求，随后按正常间隔等待终态；空队列由新任务与资源事件唤醒。
 
@@ -204,13 +204,13 @@ Windows新建作业目录设置可继承的Low完整性标签，允许现有带L
 | 工程 | 选择中心 | 执行粒度与节点要求 |
 | --- | --- | --- |
 | AOP_v2 | `--compute-center URL` 或 `compute.center`；网页选本地调度器 / 本地工程 | 每角点任务；源码、模型按内容同步，沿用原测量与解析。 |
-| RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | 原生阶段使用`python_numpy/ng47`，训练使用`python_torch_pyg`；共享观测操作另需`shared:rgcn`，POST另需实际布局工具。源码/模型闭包同步，保留原ID及检查点。 |
-| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务使用`python_numpy`及相应RTL/编译工具；`shared:arh`复用预部署工具、模型与持久统计缓存。冻结源码的执行与校验使用同一内容资产。 |
-| Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码内容同步，科学数组环境使用`python_scientific`，同时依赖Torch和科学优化库的算法使用`python_torch_scientific`。 |
+| RGCN-v2 | `config.py` 的 `COMPUTE_URL` 或 `circuit.pre.remote_compute.url` | 原生阶段使用默认Python与`ng47`，训练声明`ml`；共享观测操作另需`shared:rgcn`，POST声明`layout`。源码/模型闭包同步，保留原ID及检查点。 |
+| ARH-DSE-v2 | `--compute-center URL` / `--compute-mode auto` | 整轮任务使用默认Python及`chisel`或`rtl`；`shared:arh`复用预部署工具、模型与持久统计缓存。冻结源码的执行与校验使用同一内容资产。 |
+| Analog-Opt-Bench-v2 | `--remote-url URL` 或 `remote_compute.url` | 算法/种子任务；源码内容同步，科学数组使用默认Python，同时依赖Torch的算法声明`ml`。 |
 
 仿真器、评分、实验预算、设计顺序、研究缓存和报告仍由调用工程管理。线程配置影响资源分配；中心不修改科研评价逻辑。验证任务使用独立临时产物目录，ARH 的 JobManager 可传 `artifact_root` 隔离结果、历史与报告，将验证结果与正式结果分开。日常正式运行仍按各工程规则更新当前成功报告。
 
-ONNX CPU推理使用规范能力`onnx`，对应同一解释器内的OpenCV、ONNX Runtime与CPUExecutionProvider；旧`onnx_cpu`仅作兼容。模型、输入与descriptor作为内容资产同步。GPU执行同时声明`accelerator`及实际可用的工具环境。
+ONNX CPU推理使用规范能力`onnx`，对应同一解释器内的OpenCV、ONNX Runtime与CPUExecutionProvider。模型、输入与descriptor作为内容资产同步。GPU执行同时声明`accelerator`及实际可用的工具环境。
 
 ## Python 接口
 
@@ -239,13 +239,13 @@ from remote_compute import Client, command
 
 center = Client()
 window = center.window('my-project', cpus=1, max_cpus=1024,
-                       requires=['python_scientific'])
+                       requires=[])
 # pending 从工程的持久恢复账本载入，所有生产者共用。
 room = window.available(len(pending))
 # 只准备并提交 room 范围内、已经就绪的既定输入。
-task = command(['${tool:python_scientific}', 'runner.py', '--cpus', '${cpus}'],
+task = command(['${tool:python}', 'runner.py', '--cpus', '${cpus}'],
                cpus=1, max_cpus=1024, memory_mb=1024, project='my-project',
-               requires=['python_scientific'], outputs=['result.json'])
+               requires=[], outputs=['result.json'])
 ```
 
 pending 在提交前登记稳定执行ID，包括受理结果未明、排队、派发、运行和终态尚未持久发布的任务。结果持久发布、费用入账并删除远端副本后才移除。缩小窗口停止补充输入，已受理任务继续。准备深度不对应同数量的线程。
@@ -476,3 +476,5 @@ Windows CPU信息通过注册表和`GetNativeSystemInfo`读取，终端可见性
 托管父进程和服务子进程各自持有防休眠请求，覆盖子进程重载边界。Windows 使用 `PowerCreateRequest` 持有 SystemRequired/ExecutionRequired，操作员可用 `powercfg /requests` 核对具名 DCO 原因；Linux 的 systemd-logind 环境使用 `systemd-inhibit --what=idle --mode=block`，由随上下文退出的标准输入管道管理辅助进程。异常路径归还已取得的请求与句柄，显示器不要求常亮，一次性客户端操作不持有抑制请求。
 
 耗时命令和文件操作后台执行，完成后及时释放 future/句柄；补全只读快照，Enter 才执行。键位与实际操作集中在 README。
+
+任务操作`kill <id>`沿原任务取消接口终止指定任务及子进程。CLI和交互终端接受完整ID或唯一的至少4位活动任务短ID；短ID解析只读取当前队列和运行状态。终态原ID保留输入身份、已有输出及累计费用，领取继续使用fetch/delete生命周期。

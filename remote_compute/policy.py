@@ -40,24 +40,19 @@ def validate_status_ids(identities):
 # Capability names are part of the project-facing contract.  Keep the older
 # tool labels accepted at the boundary while publishing compact canonical
 # fields to health, admission and the operator view.
-PYTHON_RUNTIME_ALIASES = {
-    'aop_python': 'python_numpy',
-    'arh_python': 'python_numpy',
-    'rgcn_python': 'python_numpy',
-    'aop_hspice_python': 'python_numpy',
-    'aop-hs': 'python_numpy',
-    'bench_python': 'python_scientific',
-    'python_fiber_reproducible': 'python_scientific',
-    'rgcn_train': 'python_torch_pyg',
-    'rgcn_fiber': 'python_torch_pyg',
-}
+PYTHON_RUNTIME_ALIASES = dict.fromkeys((
+    'python_numpy', 'python_scientific', 'python_torch_pyg', 'python_torch_scientific',
+    'aop_python', 'arh_python', 'rgcn_python', 'aop_hspice_python', 'aop-hs',
+    'bench_python', 'python_fiber_reproducible', 'rgcn_train', 'rgcn_fiber',
+    'rgcn_python_linux', 'rgcn-linux'), 'python')
+PYTHON_RUNTIME_ALIASES.update(dict.fromkeys(('python_torch_pyg','python_torch_scientific','rgcn_train','rgcn_fiber'),'ml'))
 CAPABILITY_ALIASES = {
     **PYTHON_RUNTIME_ALIASES,
+    'layout_python': 'layout',
+    'hspice': 'hsp',
     'circt-translate': 'circt',
     'ngspice47': 'ng47',
     'onnx_cpu': 'onnx',
-    'rgcn_python_linux': 'python_numpy',
-    'rgcn-linux': 'python_numpy',
 }
 
 _IDENTITY_TAG = re.compile(
@@ -83,6 +78,8 @@ def _canonical_capability(value, registration):
         raise ValueError('Capabilities require semantic tool names, without hashes or platform selectors')
     if _QUALIFICATION_TAG.search(name) or registration and _QUALIFICATION_TAG.search(value):
         raise ValueError('Capabilities describe tools and dependencies, not qualification status')
+    if registration and (value in PYTHON_RUNTIME_ALIASES or value.startswith('python_') or value.endswith('_python')):
+        raise ValueError('Register one python entry; configure CPU/GPU backends in python_runtimes')
     return name
 
 

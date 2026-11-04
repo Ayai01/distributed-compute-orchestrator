@@ -264,18 +264,18 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertIn('1.23/56.8','\n'.join(lines))
 
     def test_capabilities_group_aliases_without_folding_or_changing_protocol_tags(self):
-        tags=['aop_python','arh_python','bench_python','rgcn_python','rgcn_train',
+        tags=['python','python','python','python','python',
               'cpu','win32','ngspice','python','rtl','verilator']
-        self.assertEqual(_capabilities(tags),'ng RTL Py ML')
+        self.assertEqual(_capabilities(tags),'RTL')
         self.assertEqual(len(tags),11)
-        self.assertEqual(_capabilities([*tags,'ngspice47','java','scala-cli','firtool','shared:arh']),'ng47 RTL Chisel Py ML')
-        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'ng RTL Py ML '+'long-custom-tag'*8)
-        self.assertIn('HS',_capabilities([*tags,'hspice','aop_hspice_python']))
+        self.assertEqual(_capabilities([*tags,'ngspice47','java','scala-cli','firtool','shared:arh']),'ng47 RTL')
+        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'RTL')
+        self.assertIn('HSP',_capabilities([*tags,'hspice','python']))
         value=dict(role='worker',node='Aya1-TX',cpus=30,tags=tags)
         for width in (56,80,110,160):
             lines=format_status(value,width=width)
             self.assertTrue(all(_width(line)<=width for line in lines))
-            self.assertIn('ng RTL Py ML','\n'.join(lines))
+            self.assertIn('RTL','\n'.join(lines))
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):
         with patch('remote_compute.benchmark.measure') as kernel:

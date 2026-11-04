@@ -38,11 +38,11 @@ class StandaloneTests(unittest.TestCase):
             root = Path(directory)
             with patch('remote_compute.worker.open', side_effect=OSError(22, 'Invalid argument')):
                 with provider(root/'worker', shared={'old-project': root/'missing'},
-                              tools={'old_python': str(root/'missing/python.exe')}) as (_, client):
+                              tools={'optional-tool': str(root/'missing/python.exe')}) as (_, client):
                     health = client.health()
                     self.assertEqual(health['shared'], [])
                     self.assertIn('old-project', health['unavailable_shared'])
-                    self.assertFalse(health['tools']['old_python']['available'])
+                    self.assertFalse(health['tools']['optional-tool']['available'])
                     self.assertEqual(set(health['tools']['python']), {'argv', 'available'})
                     result = client.run(python("print('independent worker')"))
                     self.assertEqual(result['status'], 'succeeded')

@@ -154,7 +154,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
         temporary = Path(directory)
         python, runtime = _python(temporary)
         ngspice, simulator = _ngspice(tools/'ngspice', temporary, ngspice_source)
-    result = {'tools':{name:python.as_posix() for name in ('python_numpy','python_scientific')},
+    result = {'tools':{'python':python.as_posix()}, 'python_runtimes':{'cpu':[python.as_posix()]},
               'env':{'PYTHONNOUSERSITE':'1'},
               'runtime':runtime, 'ngspice':simulator}
     result['tools']['ngspice'] = ngspice.as_posix()

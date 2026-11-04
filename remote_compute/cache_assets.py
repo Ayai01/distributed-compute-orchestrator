@@ -33,7 +33,7 @@ def _aop(root):
     for package in ('analog', 'compute', 'utils'):
         sources.update((path.relative_to(root).as_posix(), path)
                        for path in (root/package).rglob('*.py') if not path.name.startswith('test_'))
-    result = {'aop_code': _group(sources, 'aop_python')}
+    result = {'aop_code': _group(sources)}
     simulation_jobs = importlib.import_module('analog.simulators').simulation_jobs
     model_bundle = importlib.import_module('compute.models').model_bundle
     token = re.compile(r'__AOP_MODEL_([0-9a-f]{64})__')
@@ -55,14 +55,14 @@ def _aop(root):
                                                 for name, data in models.items())))
             if fingerprint not in seen:
                 seen.add(fingerprint)
-                result['aop_models_'+path.stem+'_'+str(index)] = _group(models, 'aop_python', engine)
+                result['aop_models_'+path.stem+'_'+str(index)] = _group(models, engine)
     return result
 
 
 def _rgcn(root):
     native = importlib.import_module('src.remote_native')
     code = native.native_code(root)
-    result = {'rgcn_native': _group(code, 'rgcn_python', native.NATIVE_TOOL)}
+    result = {'rgcn_native': _group(code, native.NATIVE_TOOL)}
     # RemoteStudy.__init__ extends the native source with current configs and
     # their explicitly referenced validation decks, never experiment history.
     research = dict(code)
@@ -74,12 +74,12 @@ def _rgcn(root):
                 template = (root/pre[field]).resolve()
                 research[template.relative_to(root).as_posix()] = template.read_bytes()
     research['tools/research_worker.py'] = (root/'tools/research_worker.py').read_bytes()
-    result['rgcn_research'] = _group(research, 'rgcn_train')
+    result['rgcn_research'] = _group(research, 'ml')
     pdk = importlib.import_module('src.eda').resolve_tools(root).get('pdk_root')
     if pdk:
         models = native.native_models(pdk)
-        result['rgcn_pdk'] = _group(models, 'rgcn_python', native.NATIVE_TOOL)
-        result['rgcn_research_pdk'] = _group(models, 'rgcn_train', native.NATIVE_TOOL)
+        result['rgcn_pdk'] = _group(models, native.NATIVE_TOOL)
+        result['rgcn_research_pdk'] = _group(models, 'ml', native.NATIVE_TOOL)
     return result
 
 
@@ -93,9 +93,9 @@ def groups(root, project):
     if project == 'bench':
         capture = _Capture()
         assets = importlib.import_module('bench.remote')._source_assets(capture)
-        return {name: _group(capture.files[identity], 'bench_python')
+        return {name: _group(capture.files[identity])
                 for name, identity in assets.items()}
     if project == 'arh':
         files = importlib.import_module('framework.source_snapshot').files(root)
-        return {'arh_source': _group(files, 'arh_python', 'shared:arh')}
+        return {'arh_source': _group(files, 'shared:arh')}
     raise ValueError('Unknown cache project: '+str(project))

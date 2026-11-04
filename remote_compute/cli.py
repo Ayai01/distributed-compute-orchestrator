@@ -210,6 +210,10 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
             if args.calibrate:
                 changes['benchmark'] = True
             display(dispatch.control(node=args.node, worker=changes) if dispatch else next(n.client for n in pool.nodes if n.name == args.node).control(**changes))
+        elif args.action == 'kill':
+            from .commands import kill_job
+            client=dispatch or next(n.client for n in pool.nodes if args.node is None or n.name==args.node)
+            display(kill_job(client,args.identity))
         else:
             client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
             method = getattr(client, args.action)
@@ -350,10 +354,10 @@ def main(argv=None):
     sub.add_parser("sync_cache", parents=[cache_parser()], add_help=False)
     item = sub.add_parser("sync")
     item.add_argument("source")
-    for action in ("cancel", "logs", "fetch", "delete"):
+    for action in ("kill", "cancel", "logs", "fetch", "delete"):
         item = sub.add_parser(action)
         item.add_argument("identity")
-        item.add_argument("--node", default=socket.gethostname())
+        item.add_argument("--node", default=None if action=='kill' else socket.gethostname())
         if action == "fetch":
             item.add_argument("--output", required=True)
     args = parser.parse_args(invocation)
@@ -447,6 +451,7 @@ def main(argv=None):
             if args.rtl_source:
                 result['env'].update(reuse_rtl(args.rtl_source)['env'])
             saved = {**config, 'tools': {**config.get('tools', {}), **result['tools']},
+                     'python_runtimes':{**config.get('python_runtimes',{}),**result['python_runtimes']},
                      'env': {**config.get('env', {}), **result['env']}}
             atomic_json(path, saved, private=True)
             display(result)
@@ -515,7 +520,7 @@ def main(argv=None):
                 saved = read_json(path)
                 saved.pop('migrate_root_from', None)
                 atomic_json(path, saved, private=True)
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "temp_root", "cache_root", "accelerators") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "temp_root", "cache_root", "accelerators", "python_runtimes") if key in config}
             if options.get('cache_root') is None:
                 options['cache_root'] = ROOT / '.local/cache'
             if options.get('temp_root') is None:

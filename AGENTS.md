@@ -16,6 +16,7 @@ DCO操作员独占共享DCO源码、设备配置、能力登记和部署。调�
 - 执行器使用 `Client.cpu_lease(...).refresh(active_cpus=在途已授权线程数,ready_cpus=可立即投入的额外线程需求)`。完成事件与最长1秒的等待间隔刷新；按返回核数调整实际进程池及内层线程。外层/内层合计不超过授权，长尾按剩余有用需求收缩。同步内核在排空边界调整，滚动池只归还空槽。
 - 窗口、任务和执行器使用一致的cpus/max_cpus/requires。pending计入受理未明、排队、运行及终态未持久发布的原ID；按 `fetch(delete=False)`、持久发布结果/费用/恢复状态、`delete` 的顺序释放位置并补位。查询用statuses/wait_any或有界页，不高频读取全部历史。
 - 工程使用capabilities汇总视图及真实语义能力，不读取节点清单、指定设备或用设备/OS/工具构建身份包装能力白名单。工具环境维护和路由由操作员负责。数值差异沿实际数组、输入、依赖和执行路径定位，验收协议与容差保持。
+- 运行能力仅公布ng47、hsp、chisel、ml、cuda、layout、rtl、onnx。Python/C++为基础环境，不列为能力。Python统一使用`${tool:python}`；Torch声明`ml`，GPU另声明accelerator。禁止新增Python包组合、工程名和设备名后缀；依赖补齐及CPU/ML/CUDA绑定统一由操作员在python_runtimes维护。
 
 ## 工程与文档
 

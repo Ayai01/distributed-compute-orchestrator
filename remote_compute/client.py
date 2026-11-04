@@ -30,6 +30,9 @@ from .auth import lan_endpoint
 from .allocation import elastic_cpus
 
 
+from .runtimes import supports_python, execution_tool, python_accelerator
+
+
 class RemoteError(RuntimeError):
     def __init__(self, *args):
         super().__init__(*args)
@@ -808,6 +811,11 @@ class Node:
         """Whether the provider advertises a matching profile, regardless of load."""
         return self._select_accelerator(requirement, include_reserved=False) is not None
 
+    def execution_accelerator(self, task, *, available=False):
+        used=([unit for items in self.accelerator_reservations.values()for unit in items]
+              +self.external_accelerator_reservations)if available else ()
+        return python_accelerator(task,self.health.get('python_backends',['cpu']),self.accelerator_units(),used)
+
     def reserve_accelerator(self, requirement, job_id):
         selected=self._select_accelerator(requirement)
         if selected is not None:
@@ -1138,17 +1146,18 @@ class Pool:
         cpus=task.get('cpus',1) or 1
         texts=[*task.get('env',{}).values(),task.get('cwd',''),
                *(arg for argv in task.get('steps',()) for arg in argv)]
-        required_tools=set(canonical_capabilities(name for text in texts for name in
-            re.findall(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}',text)))
+        required_tools={execution_tool(name) for text in texts for name in
+            re.findall(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}',text)}
         required_shared={name for text in texts for name in re.findall(r'\$\{shared:([\w-]+)\}',text)}
         required=canonical_capabilities(task.get('requires',()))
         return [n for n in self.nodes if (not task.get('node') or n.name==task['node'])
                 and set(required).issubset(canonical_capabilities(n.health.get('tags',())))
-                and required_tools.issubset(canonical_capabilities(
-                    name for name,info in n.health.get('tools',{}).items() if info.get('available')))
+                and required_tools.issubset({execution_tool(name)
+                    for name,info in n.health.get('tools',{}).items() if info.get('available')})
                 and required_shared.issubset(n.health.get('shared',()))
                 and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)
-                and n.supports_accelerator(task.get('accelerator'))]
+                and n.supports_accelerator(n.execution_accelerator(task))
+                and supports_python(dict(task,accelerator=n.execution_accelerator(task)),n.health.get('python_backends',['cpu']))]
 
     def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, node_headroom=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
@@ -1177,7 +1186,7 @@ class Pool:
                          and available(n) >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0
-                         and n.can_match_accelerator(task.get('accelerator'))]
+                         and n.can_match_accelerator(n.execution_accelerator(task,available=True))]
                 if ready:
                     if self.policy == "round_robin":
                         node = next((n for n in self.nodes[self.rotation:] + self.nodes[:self.rotation] if n in ready))
@@ -1215,8 +1224,10 @@ class Pool:
                         cpus = min(cpus, task.get('max_cpus',node.capacity))
                         task['cpus'] = cpus
                     reservation_id=job_id or f'local:{id(task)}'
-                    if node.reserve_accelerator(task.get('accelerator'), reservation_id) is None:
+                    requirement=node.execution_accelerator(task,available=True)
+                    if node.reserve_accelerator(requirement, reservation_id) is None:
                         continue
+                    task['accelerator']=requirement
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
                     if job_id:

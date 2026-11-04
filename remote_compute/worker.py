@@ -25,6 +25,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,
                      tree, unpack, progress, progress_fields)
+from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS,
+                       python_backend, python_accelerator, supports_python, uses_python, execution_tool)
 from . import __version__
 from .process import Process, low_integrity_directory
 from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, service_usage,
@@ -39,7 +41,7 @@ from .allocation import plan_resize
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
-                     normalize_accelerators, aggregate_accelerators, canonical_capabilities, PYTHON_RUNTIME_ALIASES,
+                     normalize_accelerators, aggregate_accelerators, canonical_capabilities,
                      canonical_capability, clean_tool_snapshot)
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
@@ -174,7 +176,7 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, cache_root=None, accelerators=None):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, cache_root=None, accelerators=None, python_runtimes=None):
         self.root = Path(root).expanduser().resolve()
         self.cache_root = Path(cache_root).expanduser().resolve() if cache_root else self.root / 'cache'
         self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
@@ -214,17 +216,28 @@ class Worker:
             (self.shared if path.is_dir() else self.unavailable_shared)[name] = path.as_posix()
         self.restart_available = False
         self.tools = {"python": [sys.executable], "ngspice": ["ngspice"],
+                      "cxx": [shutil.which('c++') or shutil.which('g++') or 'c++'],
                       "verilator": [sys.executable, str(Path(__file__).with_name("rtl.py"))]}
         for name, value in (tools or {}).items():
             self.tools[name] = [value] if isinstance(value, str) else list(value)
         self.tools,self.tool_info=self._probe_tools(self.tools)
-        self.tool_tags = set(canonical_capabilities(self.tools)) | {'rtl'}
+        runtimes=python_runtimes or {}
+        if not isinstance(runtimes,dict) or set(runtimes)-{'cpu','ml','cuda','rocm','xpu'}:
+            raise ValueError('python_runtimes maps cpu/ml/cuda/rocm/xpu to interpreter argv')
+        self.python_runtimes={}
+        for backend,argv in runtimes.items():
+            resolved,info=self._probe_tools({'python':argv})
+            if not info['python']['available']:raise ValueError('Python backend executable not found: '+backend)
+            self.python_runtimes[backend]=resolved['python']
+        if 'cpu' in self.python_runtimes:
+            self.tools['python']=self.python_runtimes['cpu']
+            self.tool_info['python']=dict(argv=self.tools['python'],available=True)
+        else:self.python_runtimes['cpu']=self.tools['python']
+        self.tool_tags = set(canonical_capabilities(self.tools)) | set(EXECUTION_CAPABILITIES)
         self._refresh_tags()
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
-        benchmark_python=next((self.tools[name][0] for name in ('python_scientific','python_numpy','python_torch_pyg',
-                                                             'bench_python','aop_python','arh_python','rgcn_python','python')
-                               if self.tool_info.get(name,{}).get('available')),sys.executable)
+        benchmark_python=self.tools['python'][0]
         benchmark_env=tuple((name,self.env[name]) for name in ('PATH','LD_LIBRARY_PATH','OPENBLAS_CORETYPE','MKL_ENABLE_INSTRUCTIONS')
                             if name in self.env)
         self.benchmark_python = benchmark_python
@@ -288,7 +301,7 @@ class Worker:
             value = {**identity, "platform": sys.platform,
                     "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
                     "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
-                    "tools": self.tool_info, "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
+                    "tools": self.tool_info, "python_backends": sorted(self.python_runtimes), "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "accelerators": self.accelerators,
                     "accelerator_used": len({unit[:2] for items in self.accelerator_reservations.values() for unit in items}),
                     "accelerator_jobs": sum(bool(items) for items in self.accelerator_reservations.values()),
@@ -355,16 +368,19 @@ class Worker:
         tags = {tag for tag in self.configured_tags - self.tool_tags
                 if not tag.startswith('shared:')}
         tags.update('shared:'+name for name in self.shared)
-        tags.update(canonical_capabilities(name for name, item in self.tool_info.items()
-                                           if item['available']))
-        # Registered legacy bindings keep older schedulers working during a
-        # rolling update; the project capability view publishes canonical names.
-        tags.update(name for name,item in self.tool_info.items()
-                    if name in PYTHON_RUNTIME_ALIASES and item['available'])
-        if self.tool_info.get('verilator', {}).get('available'):
+        available=set(canonical_capabilities(name for name,item in self.tool_info.items()if item['available']))
+        tags.update(available)
+        if CHISEL_TOOLS <= available:tags.add('chisel')
+        else:tags.discard('chisel')
+        if not LAYOUT_TOOLS <= available:tags.discard('layout')
+        if self.tool_info.get('verilator', {}).get('available') or self.tool_info.get('iverilog', {}).get('available'):
             tags.add('rtl')
         if self.accelerators:
             tags.update({'gpu', *{tag for item in self.accelerators for tag in item['tags']}})
+            tags.update(item['kind']for item in self.accelerators)
+        if 'ml' in self.python_runtimes:tags.add('ml')
+        else:tags.discard('ml')
+        if not any(item['kind']=='cuda'for item in self.accelerators):tags.discard('cuda')
         self.tags = sorted(tags)
 
     def _probe_tools(self, tools):
@@ -452,6 +468,8 @@ class Worker:
                 self.tools={k:v for k,v in self.tools.items() if k not in removed}
                 self.tool_info={k:v for k,v in self.tool_info.items() if k not in removed}
                 self.tools.update(additions);self.tool_info.update(info)
+                if 'python' in additions:self.python_runtimes['cpu']=additions['python']
+                if 'python' in removed:self.python_runtimes.pop('cpu',None)
                 self.tool_tags.update(canonical_capabilities(tools))
                 self._refresh_tags()
                 self.configuration_revision += 1
@@ -490,9 +508,13 @@ class Worker:
     def _save(self, job):
         atomic_json(job["directory"] / "result.json", job["result"])
 
-    def _tool_argv(self, name):
+    def _tool_argv(self, name, task=None):
         """Resolve one semantic capability for commands and path variables."""
-        canonical = canonical_capability(name)
+        canonical = execution_tool(name)
+        if canonical=='python' and task is not None:
+            backend=python_backend(task)
+            if backend not in self.python_runtimes:raise ValueError('Python backend is not configured: '+backend)
+            return self.python_runtimes[backend]
         names = [key for key in dict.fromkeys((name,canonical)) if key in self.tools]
         names += [alias for alias in self.tools if alias not in names and canonical_capability(alias) == canonical]
         for alias in names:
@@ -518,7 +540,7 @@ class Worker:
                 return self.shared[name]
             if kind == "asset":
                 return (self.root / "assets" / task["assets"][name]).as_posix()
-            prefix = self._tool_argv(name)
+            prefix = self._tool_argv(name, task)
             if len(prefix) != 1:
                 raise ValueError("Multi-argument tools belong at argv[0]")
             return Path(prefix[0]).as_posix()
@@ -611,8 +633,13 @@ class Worker:
                     return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), self.capacity)
+                with self.condition:
+                    task['accelerator']=python_accelerator(task,self.python_runtimes,self._accelerator_units(),
+                        [unit for items in self.accelerator_reservations.values()for unit in items])
                 if task["memory_mb"] > self.memory_capacity:
                     raise ValueError("Task memory_mb exceeds worker memory budget")
+                if not supports_python(task,self.python_runtimes):
+                    raise ValueError('Requested Python backend is not configured')
                 if task.get('accelerator') is not None and not self._match_accelerator(task['accelerator']):
                     raise ValueError('Task accelerator requirement is not provided by this worker')
                 for item in archive.infolist():
@@ -632,7 +659,7 @@ class Worker:
             commands = []
             for argv in task["steps"]:
                 match = _VAR.fullmatch(argv[0])
-                prefix = (self._tool_argv(match[1][5:]) if match and match[1].startswith('tool:')
+                prefix = (self._tool_argv(match[1][5:], task) if match and match[1].startswith('tool:')
                           else [self._expand(argv[0], task, work)])
                 commands.append([*prefix, *[self._expand(x, task, work) for x in argv[1:]]])
             for value in task["env"].values():
@@ -656,7 +683,9 @@ class Worker:
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
                           "total_steps": len(task["steps"]),
-                          "stdout": "", "stderr": "", "tools": self.tool_info,
+                          "stdout": "", "stderr": "", "tools": ({**self.tool_info,
+                              'python':dict(argv=self._tool_argv('python',task),available=True)}
+                              if uses_python(task) else self.tool_info),
                           "assets": task["assets"], "cwd": cwd.as_posix(),
                           "accelerator": task.get('accelerator')}
                 job = Job({"result": result, "cancel": threading.Event(), "task": task,

@@ -94,7 +94,7 @@ class PrivateJsonTests(unittest.TestCase):
         with scratch() as directory:
             target = Path(directory) / 'worker.local.json'
             target.write_text('{"cpus":2,"token":"test-secret"}', encoding='utf8')
-            with patch('remote_compute.setup_tools.install', return_value={'tools': {}, 'env': {}}), \
+            with patch('remote_compute.setup_tools.install', return_value={'tools': {}, 'env': {},'python_runtimes':{}}), \
                  patch('remote_compute.cli.atomic_json', wraps=atomic_json) as write, \
                  patch('remote_compute.cli.display'):
                 self.assertEqual(cli.main(['--config', str(target), 'setup']), 0)

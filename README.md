@@ -1,6 +1,6 @@
 # Distributed Compute Orchestrator（DCO）
 
-DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.9.0**；实际加载版本、维护状态和验证入口见 [STATUS](docs/STATUS.md)。
+DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.10.0**；实际加载版本、维护状态和验证入口见 [STATUS](docs/STATUS.md)。
 
 服务、SDK 和终端仅依赖 Python 标准库。日常使用系统标准 GIL x64 CPython 3.14，源码支持 3.7–3.15。仓库为 `distributed-compute-orchestrator`，包为 `remote_compute`，协议环境变量为 `REMOTE_COMPUTE_*`。
 
@@ -69,6 +69,7 @@ hybrid 本机 worker 由中心进程内调用，不开额外端口；`local://�
 ```text
 python -B main.py --url http://127.0.0.1:26133 nodes
 python -B main.py --url http://127.0.0.1:26133 jobs
+python -B main.py --url http://127.0.0.1:26133 kill ab12
 python -B main.py --url http://127.0.0.1:26133 run examples/spice/task.json --input examples/spice --output results/divider
 python -B main.py --url http://127.0.0.1:26133 spice examples/spice/divider.spice --output results/divider-direct
 python -B main.py --url http://127.0.0.1:26133 rtl examples/rtl --top tb --sources tb.sv --output results/rtl
@@ -77,6 +78,8 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 ```
 
 `TASK_ID` 换成实际 ID。单任务成功返回 0，任务失败返回 1，配置/通信错误返回 2。自动化保存返回 ID，用原 ID 查状态、日志和取回结果；短暂断连继续查询原任务。成功取回默认清理服务端副本，`--keep` 用于显式保留。任务 JSON、SDK 与恢复语义见 [DESIGN](docs/DESIGN.md)。
+
+`kill <id>` 终止一个排队或运行中的任务及其子进程。支持完整ID和唯一的至少4位短ID；有歧义时列出候选，不执行终止。任务进入`cancelled`，原ID、已完成输出与费用继续供`logs/fetch`领取。它沿用任务取消接口；脚本使用`client.cancel(完整ID)`。
 
 任务总表不要在长时间运行的中心上读取全部历史。CLI `jobs` 使用最近页；SDK 可用 `client.status_page(limit=256, offset=0)` 读取有界页，返回 `items/total/offset/limit/has_more`，按完整 ID继续查单项。完整任务查询使用原ID或批状态接口。
 
@@ -95,7 +98,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `cpus 16` / `memory 8G` | 当前本机预算，保存到设备配置 |
 | `cpus Aya1-TX 16` / `memory Aya1-TX 8G` | 指定设备预算 |
 | `calibrate` / `calibrate Aya1-TX` | 人工触发全部/指定设备校准；启动、重连及定期更新均不自动校准 |
-| `logs ab12` / `cancel ab12` | 查看日志 / 取消任务 |
+| `logs ab12` / `kill ab12` | 查看日志 / 终止指定任务及子进程，保留回执 |
 | `fetch ab12 "D:/结果"` | 取回并清理任务副本 |
 | `pause Aya1-TX` / `resume Aya1-TX` | 停止/恢复接收新任务，已有任务继续 |
 | `restart --wait` / `restart Aya1-TX --wait` | 等空闲后在原终端重载中心/worker |
@@ -195,7 +198,7 @@ center.fetch(job["id"], "./results/maintenance")
 
 `Client.wait` 默认从0.15秒轮询开始，同一状态持续较久时逐步放缓，最多5秒；状态或已报告阶段变化后恢复短间隔。`poll`指定最短间隔，`max_poll`指定最长间隔；需要固定节拍时令两者相等。可传入`cancel=stop_event.is_set`，本地等待取消时抛出`RequestCancelled`，远端原任务继续运行；需要结束任务时由调用方明确执行`cancel(原ID)`。`wait_timeout`仍为本次调用的绝对期限，终态返回完整原回执。
 
-`exec` 直接传 argv；需要 shell 语法时显式选择目标 shell。`python` 上传本地脚本，用目标机工具执行，可用 `--tool` 指定登记的 Python。`--stdin` 传文件，`--env NAME=VALUE` 设置变量，`--output` 保存完整日志。API 提供 read_text/write_text/upload/download；上传按文件合并并原子替换文件。日志摘要保留末尾 16 KiB，完整日志随结果取回。`--detach` / `wait=False` 返回任务 ID，调用者随后按原 ID 领取。运维默认 retries=0，避免重复文件副作用。
+`exec` 直接传 argv；需要 shell 语法时显式选择目标 shell。`python` 上传本地脚本，使用统一的`${tool:python}`入口。`--stdin` 传文件，`--env NAME=VALUE` 设置变量，`--output` 保存完整日志。API 提供 read_text/write_text/upload/download；上传按文件合并并原子替换文件。日志摘要保留末尾 16 KiB，完整日志随结果取回。`--detach` / `wait=False` 返回任务 ID，调用者随后按原 ID 领取。运维默认 retries=0，避免重复文件副作用。
 
 ## 任务CPU计量
 
@@ -228,30 +231,51 @@ python -B main.py --check
 
 setup复用系统Python，验证科学依赖后写本机tools/env。已有ngspice和MSYS2原位引用，保留其完整运行依赖；仅缺少的ngspice下载到忽略的`.tools/`，实际版本47才登记ng47。Linux直接配置已有Python/ngspice/编译器。
 
-Python 能力按实际运行环境登记；新增算法先复用已有环境，不按算法或工程重复增加名字。
+### 运行能力
 
-| 规范能力 / 工具 | 同一解释器内的就绪条件 |
+Python和C++是基础环境，不出现在运行能力列表。科学计算的默认Python环境提供NumPy、SciPy、Numba、pymoo、moocore、threadpoolctl、scikit-learn和umap-learn；C++通过`${tool:cxx}`调用。原生工具的完整argv、路径、版本和共享目录只保留在操作员明细与本任务执行回执中。
+
+| 能力 | 就绪条件及独立安装理由 |
 | --- | --- |
-| `python_numpy` | NumPy；用于 AOP、ARH 普通执行及 RGCN 原生测量 |
-| `python_scientific` | NumPy、SciPy、Numba、pymoo、moocore、threadpoolctl、scikit-learn、umap-learn；用于完整科学计算环境 |
-| `python_torch_pyg` | NumPy、Torch、PyG、SciPy、Numba、moocore、threadpoolctl；用于当前完整神经与数值环境 |
-| `python_torch_scientific` | NumPy、SciPy、Numba、scikit-learn、Torch、pymoo、moocore、threadpoolctl；用于同时依赖Torch和科学优化库的算法 |
-| `onnx` | 经调用工程数值验收的 NumPy、ONNX、ONNX Runtime CPU 与 OpenCV 环境；固定 INT8 继续使用已有兼容解释器 |
-| `layout_python` | NumPy、gdstk、GLayout、gdsfactory、rectpack 及实际所需符号；PDK 由任务材料资产提供 |
+| `ng47` | ngspice 47仿真器及其运行依赖；独立电路仿真工具。 |
+| `hsp` | HSPICE执行环境及有效授权；与开源SPICE独立安装。 |
+| `chisel` | 完整Chisel链：Java、Scala CLI、firtool、CIRCT、Verilator、C++与make全部就绪；单台设备完整匹配。 |
+| `ml` | 同一解释器提供Torch、PyG和上述科学计算依赖；最小CPU/EDA节点可省去神经网络框架。 |
+| `cuda` | 已验收的CUDA设备及执行环境；任务另以accelerator申请卡数和显存。 |
+| `layout` | 版图生成环境及Magic、Netgen完整链；Python部分包括NumPy、gdstk、GLayout、gdsfactory、rectpack。PDK作为任务材料提供。 |
+| `rtl` | 独立Verilator或Icarus仿真；只运行已有RTL时可省去Java/Scala/Chisel依赖。 |
+| `onnx` | 独立ONNX推理环境，含NumPy、ONNX、ONNX Runtime CPU与OpenCV；支持轻量部署及固定INT8执行协议，可省去Torch。 |
 
-每个组合能力均由一个实际解释器同时提供所列依赖，登记前逐项导入并验证接口组合。`python_torch_scientific`可复用完整的CPU科学环境或Torch环境；其执行入口与requires使用同一名称。`python` 只承诺 Python 标准库，不隐含上述包。CatBoost 等可选后端按实际调用检查，不作为所有神经任务的统一门槛。Magic、Netgen、ng47、Verilator、CIRCT、Java/Scala 和 C++ 仍是独立的真实工具需求。
+能力表不增加包组合或工程名后缀。新算法需要额外依赖时，在所用环境中补齐并验证接口；独立工具需要新增能力时，先说明独立安装价值、完整就绪条件及消费者。完整工具链能力由单个节点的实际工具推导，不合并不同设备上的零散工具。
 
-旧 `aop_python/arh_python/rgcn_python/aop_hspice_python` 等价于 `python_numpy`，`bench_python`及已退役的`python_fiber_reproducible`请求等价于`python_scientific`，`rgcn_train/rgcn_fiber` 等价于 `python_torch_pyg`；`onnx_cpu/circt-translate/ngspice47` 分别等价于 `onnx/circt/ng47`。旧请求和模板继续兼容，已接受的原 ID、输入及执行绑定保持；新准入和能力汇总使用规范名；设备能力只描述工具和依赖，拒绝可复现/已验证等资格状态标签。新部署先登记已实测的新绑定，忙碌实例保留旧绑定，空闲重载后再退出重复登记。
+### Python与设备选择
 
-GPU 任务同时声明工具能力和 accelerator。支持 CPU/GPU 两条执行路径的调用方可协商 `accelerator_fallback`，具体请求和回执见 [DESIGN](docs/DESIGN.md#工程接口边界)；ARH 的 auto 使用30秒未派发队列阈值，显式 torch_cuda 保持强制GPU。`shared` 只登记真实部署目录，ARH 工具/模型及持久统计可通过 `shared:arh` 复用。
+任务只使用`${tool:python}`。普通科学计算不需要Python能力标签；Torch任务声明`requires=["ml"]`；CUDA任务同时申请`accelerator={"kind":"cuda","count":1,"memory_mb":2048}`。`requires=["cuda"]`只筛选设备能力，不分配GPU。允许CPU回退的任务使用`ml`及带`fallback_after_seconds`的accelerator，回退后自动使用ML的CPU环境。
 
-CUDA环境由操作员按实际消费者配置在忽略的`.tools`中，服务继续只使用标准库。`python_torch_pyg`必须绑定同一套完整数值环境；ARH另通过设备环境的`ARH_INFERENCE_PYTHON`复用已验证的Torch/OpenCV/ONNX解释器，量化推理保留工程固定的ONNX Runtime版本。安装后先做实际GPU及端到端验证，再登记`accelerators`并在空闲时重载；在途任务继续使用原环境。共享环境的有效消费者及部署证据见[STATUS](docs/STATUS.md)。
+```python
+task = command(["${tool:python}", "train.py"], requires=["ml"],
+               cpus=1, max_cpus=1024, memory_mb=4096,
+               accelerator={"kind":"cuda", "count":1, "memory_mb":2048})
+```
 
-已验证工具可用操作员 `center.control(node=名称, worker={"tools": {别名: [可执行路径]}})` 在线登记，None 移除；后续任务用新别名。该操作更新运行进程，部署同时更新设备 `worker.local.json` 以便重载。临时能力验收后再登记正式别名。
+操作员在设备私有配置中维护解释器后端；每个值是完整argv前缀，可复用同一个现成环境：
 
-Windows 节点接入时按上述规范环境和实际工具补齐能力，再比较看板“运行能力”行；路径及编译器实现保留设备的真实配置。已有 Cygwin 工具原位复用，迁移时同时带上动态库、Tcl 脚本和实际执行器。Magic 批处理使用实际安装的 `magicdnull.exe -nowrapper`，配套 Cygwin 运行库及对应安装目录的 `CAD_ROOT`；当前构建在通用 `tclsh` 加载入口中写 GDS 会异常退出。验收须由 Magic 写 GDS，再用独立解析器读取几何，并检查 LVS 报告。`layout_python` 的 PDK 由任务资产及 `PDK_ROOT` 提供，避免随环境反复复制完整模型。
+```json
+{
+  "tools": {"python": ["/opt/science/bin/python"], "cxx": ["/usr/bin/c++"]},
+  "python_runtimes": {
+    "cpu": ["/opt/science/bin/python"],
+    "ml": ["/opt/torch-cpu/bin/python"],
+    "cuda": ["/opt/torch-cuda/bin/python"]
+  }
+}
+```
 
-ngspice 47 统一登记 `ng47`，旧 `ngspice47` 请求等价。能力名称不含哈希、设备或 OS 选择条件；注册和准入会拒绝这类名称。能力与执行引擎不生成或保存哈希，科研回执和科学缓存也不记录引擎哈希。数值兼容性使用明文引擎族/主版本、执行协议、测量协议和容差；源码（含生成RTL）、模型与输入包仍按内容复用和验证完整性。
+无加速器请求时，普通任务选择cpu后端，ml任务选择ml后端；取得CUDA授权时选择cuda后端。每个已登记后端须在同一解释器内通过依赖与最小计算验收，GPU环境另验证实际设备计算。缺少所需后端的设备退出该任务匹配。任务受理时冻结实际命令前缀及执行回执，已接受任务保持原绑定。
+
+`${tool:layout}`使用版图解释器，`${tool:onnx}`使用独立推理解释器，仿真与构建继续调用其真实工具入口。Magic使用`magicdnull.exe -nowrapper`及其配套运行库、Tcl和CAD_ROOT；验收包括写出GDS、独立读取几何及LVS。完整工具链通过后再公布对应能力。
+
+GPU档案、共享显存、CPU回退及原任务恢复见[DESIGN](docs/DESIGN.md#工程接口边界)。共享目录只登记真实部署目录；工具环境、依赖和设备路由由操作员维护。能力名称禁止携带哈希、设备、OS或资格状态；科研输出使用明文引擎族/版本、执行/测量协议与容差。源码、模型和输入的摘要用于内容身份及传输。
 
 看板短表头：`CPU U/B` 为已用/预算逻辑线程，`RAM U/T` 为主机已用/总内存，`Avail` 为可分配内存，`RSS/Res` 为进程实际/已预留内存，`1T/All` 为单线程/总基准，`Share/Pri` 为份额/优先级，`Jobs/CPU` 为任务/线程，`Sec` 为运行秒数。
 

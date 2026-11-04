@@ -21,7 +21,7 @@ from test_center import center
 class CapabilityTests(unittest.TestCase):
     def test_qualification_labels_are_not_runtime_capabilities(self):
         from remote_compute.policy import canonical_capability
-        self.assertEqual(canonical_capabilities(['python_fiber_reproducible']),['python_scientific'])
+        self.assertEqual(canonical_capabilities(['python_fiber_reproducible']),['python'])
         for label in ('python_fiber_reproducible','python_qualified','science_verified','runtime_certified'):
             with self.subTest(label=label), self.assertRaisesRegex(ValueError,'qualification status'):
                 canonical_capability(label,registration=True)
@@ -30,7 +30,7 @@ class CapabilityTests(unittest.TestCase):
 
     def test_legacy_fiber_request_runs_on_standard_scientific_provider(self):
         with scratch() as directory, provider(Path(directory)/'worker',
-                tools={'python_scientific':sys.executable}) as (_,worker):
+                tools={'python':sys.executable}) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(directory)/'center') as (_,client):
                 result=client.run(command(['${tool:python_fiber_reproducible}','-c','print("standard")'],
                     requires=['python_fiber_reproducible'],project='legacy'))
@@ -38,12 +38,12 @@ class CapabilityTests(unittest.TestCase):
                 self.assertEqual(result['stdout'].strip(),'standard')
                 self.assertNotIn('python_fiber_reproducible',client.capabilities()['tags'])
 
-    def test_retired_alias_prefers_canonical_runtime_over_another_legacy_binding(self):
+    def test_request_spellings_resolve_to_the_one_python_entry(self):
         worker=Worker.__new__(Worker)
-        worker.tools={'bench_python':['old'],'python_scientific':['standard']}
-        worker.tool_info={name:{'available':True}for name in worker.tools}
-        self.assertEqual(worker._tool_argv('python_fiber_reproducible'),['standard'])
-        self.assertEqual(worker._tool_argv('bench_python'),['old'])
+        worker.tools={'python':['standard']}
+        worker.tool_info={'python':{'available':True}}
+        for name in ('python_numpy','python_scientific','bench_python','python_torch_pyg'):
+            self.assertEqual(worker._tool_argv(name),['standard'])
 
     def test_cached_capability_sequences_keep_live_inputs_and_fresh_list_results(self):
         from remote_compute.policy import _canonical_capabilities_tuple
@@ -53,45 +53,30 @@ class CapabilityTests(unittest.TestCase):
         first.append('caller-local')
         self.assertEqual(canonical_capabilities(iter(values)),['cpu','ng47'])
         values.append('python_numpy')
-        self.assertEqual(canonical_capabilities(values),['cpu','ng47','python_numpy'])
+        self.assertEqual(canonical_capabilities(values),['cpu','ng47','python'])
         for index in range(300):canonical_capabilities(['cpu','capability'+str(index)])
         self.assertEqual(_canonical_capabilities_tuple.cache_info().maxsize,256)
         self.assertLessEqual(_canonical_capabilities_tuple.cache_info().currsize,256)
 
-    def test_benchmark_uses_available_semantic_numeric_runtime_before_legacy_or_core(self):
-        for semantic in ('python_scientific', 'python_numpy', 'python_torch_pyg'):
-            with self.subTest(semantic=semantic), scratch() as directory:
-                bindings = {semantic: '/science/python', 'bench_python': '/legacy/python'}
-                def probe(tools):
-                    return tools, {name: {'available': True} for name in tools}
-                with patch.object(Worker, '_probe_tools', side_effect=probe), \
-                        provider(directory, tools=bindings) as (worker, _):
-                    self.assertEqual(worker.benchmark_python, '/science/python')
-
-    def test_benchmark_skips_unavailable_semantic_runtime_and_keeps_legacy_fallback(self):
+    def test_benchmark_uses_default_cpu_interpreter(self):
         with scratch() as directory:
-            def probe(tools):
-                return tools, {name: {'available': name != 'python_scientific'} for name in tools}
-            with patch.object(Worker, '_probe_tools', side_effect=probe), \
-                    provider(directory, tools={'python_scientific': '/missing/python',
-                                               'bench_python': '/legacy/python'}) as (worker, _):
-                self.assertEqual(worker.benchmark_python, '/legacy/python')
+            with provider(directory,python_runtimes={'cpu':[sys.executable]})as(worker,_):
+                self.assertEqual(worker.benchmark_python,sys.executable)
 
-    def test_semantic_and_legacy_templates_share_the_registered_binding(self):
-        aliases = (('ngspice47', 'ng47'), ('circt-translate', 'circt'),
-                   ('onnx_cpu', 'onnx'), ('aop_hspice_python', 'python_numpy'),
-                   ('aop_python', 'python_numpy'), ('arh_python', 'python_numpy'),
-                   ('rgcn_python', 'python_numpy'), ('bench_python', 'python_scientific'),
-                   ('rgcn_train', 'python_torch_pyg'), ('rgcn_fiber', 'python_torch_pyg'))
-        for legacy, semantic in aliases:
-            for configured, requested in ((legacy, semantic), (semantic, legacy)):
-                with self.subTest(configured=configured, requested=requested), scratch() as directory:
-                    with provider(Path(directory) / 'worker', tools={configured: sys.executable}) as (_, client):
-                        template = '${tool:' + requested + '}'
-                        result = client.run(command([template, '-c', 'import os;print(os.environ["SELECTED"])'],
-                            env={'SELECTED': template}, requires=[semantic]))
-                        self.assertEqual(result['status'], 'succeeded', result)
-                        self.assertEqual(Path(result['stdout'].strip()).resolve(), Path(sys.executable).resolve())
+    def test_benchmark_does_not_select_the_cuda_interpreter(self):
+        with scratch() as directory:
+            with provider(directory,python_runtimes={'cpu':[sys.executable],'cuda':[sys.executable,'-X','dev']})as(worker,_):
+                self.assertEqual(worker.benchmark_python,worker.python_runtimes['cpu'][0])
+
+    def test_existing_request_templates_use_canonical_registered_binding(self):
+        aliases=(('ngspice47','ng47'),('circt-translate','circt'),('onnx_cpu','onnx'),
+                 ('aop_python','python'),('python_scientific','python'))
+        for requested,configured in aliases:
+            with self.subTest(requested=requested),scratch()as directory:
+                with provider(directory,tools={configured:sys.executable})as(_,client):
+                    template='${tool:'+requested+'}'
+                    r=client.run(command([template,'-c','print("ready")']))
+                    self.assertEqual(r['status'],'succeeded',r)
 
     def test_semantic_template_retains_multi_argument_tool_prefix(self):
         with scratch() as directory, provider(Path(directory) / 'worker',
@@ -133,19 +118,19 @@ class CapabilityTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'semantic tool names'):
                 canonical_capabilities([name])
         self.assertEqual(canonical_capabilities(['ngspice47','ng47','rgcn_python_linux']),
-                         ['ng47','python_numpy'])
+                         ['ng47','python'])
 
     def test_shared_runtime_profiles_use_every_compatible_provider(self):
         with scratch() as directory:
             root = Path(directory)
-            with provider(root/'legacy', cpus=1, tools={'arh_python':sys.executable}) as (_, legacy), \
-                    provider(root/'canonical', cpus=2, tools={'python_numpy':sys.executable}) as (_, canonical):
+            with provider(root/'legacy', cpus=1, tools={'python':sys.executable}) as (_, legacy), \
+                    provider(root/'canonical', cpus=2, tools={'python':sys.executable}) as (_, canonical):
                 with Pool([legacy, canonical]) as pool, center(pool, root/'center') as (_, operator):
                     project = Client(operator.url)
                     self.assertEqual(project.admission('runtime', requires=['rgcn_python'])['capable_cpus'], 3)
                     public = operator.request('/capabilities')
-                    self.assertIn('python_numpy', public['tags'])
-                    self.assertIn('python_numpy', public['tools'])
+                    self.assertNotIn('python', public['tags'])
+                    self.assertNotIn('python', public['tools'])
                     self.assertFalse({'arh_python','rgcn_python'} & set(public['tools']))
                     task = command(['${tool:aop_python}', '-c',
                                     'import os,pathlib,time;assert pathlib.Path(os.environ["PY"]).is_file();'
@@ -173,36 +158,26 @@ class CapabilityTests(unittest.TestCase):
                         tools=['bench_python','python_scientific','onnx_cpu'], capabilities=['admission'])
         with patch.object(Client, 'request', return_value=response):
             result = Client().capabilities()
-        self.assertEqual(result['tags'], ['python_numpy','python_torch_pyg'])
-        self.assertEqual(result['tools'], ['onnx','python_scientific'])
+        self.assertEqual(result['tags'], ['ml','python'])
+        self.assertEqual(result['tools'], ['onnx','python'])
 
-    def test_runtime_binding_migration_preserves_an_accepted_job(self):
-        with scratch() as directory, provider(Path(directory)/'worker',
-                tools={'rgcn_fiber':sys.executable}) as (worker, client):
-            task = command(['${tool:rgcn_fiber}', '-c',
-                            'import time;time.sleep(.3);print("original")'])
-            task['requires'] = ['rgcn_fiber']
-            identity = client.submit(task)['id']
-            until(lambda: client.status(identity)['status']=='running')
-            before = client.status(identity)
-            worker.control({'tools':{'python_torch_pyg':sys.executable,'rgcn_fiber':None}})
-            result = client.wait(identity)
-            self.assertEqual(result['status'], 'succeeded', result)
-            self.assertEqual(result['stdout'].strip(), 'original')
-            for key in ('id','request_sha256','started'):
-                self.assertEqual(result[key], before[key])
-            following = client.run(command(['${tool:rgcn_train}', '-c', 'print("next")'],
-                                           requires=['python_torch_pyg']))
-            self.assertEqual(following['status'], 'succeeded', following)
-            self.assertEqual(following['stdout'].strip(), 'next')
+    def test_runtime_binding_update_preserves_accepted_command(self):
+        with scratch()as directory,provider(directory)as(worker,client):
+            task=command(['${tool:python}','-c','import sys,time;time.sleep(.2);print(int(sys.flags.dev_mode))'])
+            identity=client.submit(task)['id'];until(lambda:client.status(identity)['status']=='running')
+            before=client.status(identity)
+            worker.control({'tools':{'python':[sys.executable,'-X','dev']}})
+            result=client.wait(identity)
+            self.assertEqual(result['stdout'].strip(),'0')
+            self.assertEqual(result['request_sha256'],before['request_sha256'])
+            following=client.run(command(['${tool:python}','-c','import sys;print(int(sys.flags.dev_mode))']))
+            self.assertEqual(following['stdout'].strip(),'1')
 
-    def test_rolling_worker_retains_registered_aliases_until_retired(self):
-        with scratch() as directory, provider(Path(directory)/'worker',
-                tools={'arh_python':sys.executable,'python_numpy':sys.executable}) as (worker, _):
-            self.assertTrue({'arh_python','python_numpy'} <= set(worker.health()['tags']))
-            worker.control({'tools':{'arh_python':None}})
-            self.assertNotIn('arh_python', worker.health()['tags'])
-            self.assertIn('python_numpy', worker.health()['tags'])
+    def test_combinatorial_python_registration_is_rejected(self):
+        with scratch()as directory,provider(directory)as(worker,_):
+            for name in ('python_numpy','python_scientific','python_torch_pyg','python_torch_scientific','python_torch_extra','aop_python'):
+                with self.subTest(name=name),self.assertRaisesRegex(ValueError,'one python entry'):
+                    worker.control({'tools':{name:sys.executable}})
 
     def test_receipt_alias_merge_keeps_the_ready_canonical_binding(self):
         value = dict(tools={'onnx':dict(available=True,argv=['canonical']),
@@ -330,7 +305,8 @@ class RuntimeSetupTests(unittest.TestCase):
                     result = setup_tools.install(root, temporary_root=root/'tmp')
                 self.assertEqual('ng47' in result['tools'], expected)
                 self.assertFalse({'aop_python','arh_python','rgcn_python','bench_python'} & set(result['tools']))
-                self.assertTrue({'python_numpy','python_scientific'} <= set(result['tools']))
+                self.assertEqual({'python'}, {name for name in result['tools'] if name.startswith('python')})
+                self.assertEqual(result['python_runtimes'],{'cpu':[sys.executable.replace('\\','/')]})
                 self.assertNotIn('ARH_INFERENCE_PYTHON', result['env'])
                 self.assertIn('ngspice', result['tools'])
 

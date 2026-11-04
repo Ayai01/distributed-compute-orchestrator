@@ -9,6 +9,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 from . import ABBREVIATION
 from .policy import canonical_capabilities
+from .runtimes import execution_capabilities
 from .task_tags import compact_tag
 
 
@@ -136,34 +137,9 @@ def _gb(value):
 
 
 def _capabilities(tags):
-    tags=set(canonical_capabilities(set(tags or ())-{'win32','linux','darwin'}))
-    groups=[('ng47' if {'ng47','ngspice47'} & tags else 'ng',{'ng','ng47','ngspice','ngspice47','spice'}),
-            ('HSPICE',{'hspice'}),('RTL',{'rtl','verilator','iverilog'}),
-            ('Chisel',{'java','scala-cli','firtool'}),('CIRCT',{'circt','circt-translate'}),
-            ('C++',{'cxx','gcc','g++','clang','clang++'}),
-            ('ONNX',{'onnx','onnx_cpu','onnxruntime'}),
-            ('Python',{'python','python_numpy','python_scientific'}),('ML',{'python_torch_pyg'}),
-            ('Layout',{'layout_python','magic','netgen'}),('GPU',{'gpu','cuda','rocm'})]
-    known={'cpu','win32','linux','darwin'}|{t for t in tags if t.startswith('shared:')}
-    result=[]
-    for name,members in groups:
-        known.update(members)
-        if (members<=tags if name=='Chisel' else tags & members):result.append(name)
-    # The operator view is a compact routing summary.  Keep the protocol tags
-    # stable in the worker/API and shorten only what is painted in the table.
-    labels={'ngspice47':'ng47','ngspice':'ng','HSPICE':'HS','Python':'Py'}
-    result=[labels.get(item,item) for item in result]
-    custom=sorted(tags-known)
-    result.extend(_short_capability(item) for item in custom)
-    return ' '.join(result) or '-'
+    labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','layout':'Layout','rtl':'RTL','onnx':'ONNX'}
+    return ' '.join(labels[name]for name in execution_capabilities(tags or ())) or '-'
 
-
-def _short_capability(value):
-    """Keep a custom capability readable without exposing project internals."""
-    value=str(value)
-    aliases={'python_numpy':'NumPy','python_scientific':'SciPy','python_torch_pyg':'ML',
-             'layout_python':'Layout','onnx':'ONNX','shared:rgcn':'shared:RGCN','shared:aop':'shared:AOP'}
-    return aliases.get(value, value)
 
 
 def _project(name):

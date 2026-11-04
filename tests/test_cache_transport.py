@@ -32,7 +32,7 @@ class CacheTransportTests(unittest.TestCase):
                 (project / 'utils').mkdir(parents=True)
                 shutil.copyfile(installed / 'utils/compat.py', project / 'utils/compat.py')
                 _, node = stack.enter_context(provider(root / (name + '-worker'), cpus=1,
-                    memory_mb=2048, tools={'aop_python': sys.executable}, shared={'aop': str(project)}))
+                    memory_mb=2048, tools={'python': sys.executable}, shared={'aop': str(project)}))
                 endpoints.append(dict(name=name, url=node.url))
 
             def native(project, body):
@@ -81,7 +81,7 @@ class CacheTransportTests(unittest.TestCase):
             endpoints = []
             for name, project in (('A-source', source), ('B-cache', target)):
                 _, node = stack.enter_context(provider(root/(name+'-worker'), cpus=1,
-                    memory_mb=2048, tools={'arh_python': sys.executable}, shared={'arh': str(project)}))
+                    memory_mb=2048, tools={'python': sys.executable}, shared={'arh': str(project)}))
                 endpoints.append(dict(name=name, url=node.url))
             pool = Pool(endpoints)
             stack.callback(pool.close)
@@ -115,7 +115,7 @@ class CacheTransportTests(unittest.TestCase):
                     "            'bench_data':client.sync_files({'data.bin':b'data'*10000})}\n",
                     encoding='utf-8')
                 worker, node = stack.enter_context(provider(root / (name + '-worker'),
-                    cpus=1, memory_mb=2048, tools={'bench_python': sys.executable},
+                    cpus=1, memory_mb=2048, tools={'python': sys.executable},
                     shared={'bench': str(project)}))
                 workers.append((worker, node))
                 projects.append(project)

@@ -33,6 +33,7 @@ import os
 import re
 import secrets
 from urllib.parse import urlsplit
+from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python
 from . import __version__
 
 
@@ -175,7 +176,9 @@ class Coordinator:
                   ]
         fallback_capable = (sum(n.capacity for n in eligible)
                             if accelerator is not None and 'fallback_after_seconds' in accelerator else 0)
-        eligible = [n for n in eligible if n.supports_accelerator(accelerator)]
+        execution=dict(requires=requires,accelerator=accelerator)
+        eligible = [n for n in eligible if n.supports_accelerator(n.execution_accelerator(execution))
+                    and supports_python(dict(execution,accelerator=n.execution_accelerator(execution)),n.health.get('python_backends',['cpu']))]
         capable=sum(n.capacity for n in eligible)
         names={n.name for n in eligible}|{name for row in resources.values() for name in row['eligible_nodes']}
         shares[project], demands[project] = share, capable+sum(held.values())
@@ -282,15 +285,10 @@ class Coordinator:
         with self.condition, self.pool.condition:
             online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled]
             tags = set()
-            tools = set()
             accelerator_profiles = []
             for node in online:
-                tags.update(node.health.get('tags', ()))
+                tags.update(execution_capabilities(node.health.get('tags', ())))
                 accelerator_profiles.extend(node.health.get('accelerators', ()))
-                for name, info in node.health.get('tools', {}).items():
-                    if not info.get('available'):
-                        continue
-                    tools.add(name)
             cpu_capacity = sum(n.capacity for n in online)
             cpu_available = sum(max(0, n.capacity - n.reserved - n.external) for n in online)
             memory_capacity = sum(n.memory_capacity for n in online)
@@ -300,8 +298,8 @@ class Coordinator:
                 'role': 'scheduler',
                 'version': __version__,
                 'capabilities': public_capabilities(),
-                'tags': canonical_capabilities(tags),
-                'tools': canonical_capabilities(tools),
+                'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
+                'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],
                 'accelerators': aggregate_accelerators(accelerator_profiles),
                 'cpu': {'capacity': cpu_capacity, 'available': cpu_available, 'unit': 'logical_threads'},
                 'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
@@ -444,7 +442,7 @@ class Coordinator:
                 for node in self.pool._matching(task):
                     if (node.name not in online or node.health.get('paused')
                             or task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node)))
-                            or task.get('accelerator') and node._select_accelerator(task['accelerator']) is None):continue
+                            or task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True))):continue
                     waiting_priority=priority
                     break
             for job in active_values(self.jobs):
@@ -568,7 +566,7 @@ class Coordinator:
                         if not node.error and node.enabled and not node.health.get('paused')]
             online = bool(matching)
             if requirement['fallback_after_seconds'] == 0 and any(
-                    node.can_match_accelerator(requirement) and node.memory_free >= job['task']['memory_mb']
+                    node.can_match_accelerator(node.execution_accelerator(job['task'],available=True)) and node.memory_free >= job['task']['memory_mb']
                     for node in matching):
                 return
         reason = ('unavailable' if not online else
@@ -722,7 +720,7 @@ class Coordinator:
                          and not node.health.get('paused') and not node.health.get('queued', 0)
                          and node.capacity-node.external >= width
                          and min(node.memory_free, self.pool._host_memory_free(node)) >= task['memory_mb']
-                         and node.can_match_accelerator(task.get('accelerator'))]
+                         and node.can_match_accelerator(node.execution_accelerator(task,available=True))]
                 if ready:
                     node = max(ready, key=lambda node: (node.capacity-node.reserved-node.external, node.name))
                     claims[node.name] = (node, task)
@@ -791,6 +789,9 @@ class Coordinator:
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              dispatched=time.time(), cpus=job['task']['cpus'])
+                        if job['result'].get('accelerator')!=job['task'].get('accelerator'):
+                            job['result'].setdefault('requested_accelerator',job['result'].get('accelerator'))
+                            job['result']['accelerator']=job['task'].get('accelerator')
                         # Admission turns a one-thread waiter into warmup demand.
                         # Recompute the same budget mapping before admitting its
                         # next peer, so the four-thread headroom has a real share.
@@ -1183,7 +1184,7 @@ class Coordinator:
                 if node.name not in capacities or (held is not None and held is not node):continue
                 if held is None:
                     if task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node))):continue
-                    if task.get('accelerator') and node._select_accelerator(task['accelerator']) is None:continue
+                    if task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
                 eligible.append(node.name)
             if not eligible:continue
             if not automatic:

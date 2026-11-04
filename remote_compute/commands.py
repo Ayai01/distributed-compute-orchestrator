@@ -18,7 +18,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from .client import Client, Pool, RemoteError
-from .bundle import atomic_json
+from .bundle import TERMINAL, atomic_json
 from .tasks import ngspice, verilator
 from .records import active_items
 from .auth import node_url
@@ -184,7 +184,7 @@ MACHINE_ACTIONS = {"exec", "python", "ls", "read", "put", "get"}
 COMMAND_TREE = (
     ('查看', ('status', 'nodes', 'jobs')),
     ('资源', ('cpus', 'memory', 'calibrate', 'pause', 'resume', 'policy', 'set')),
-    ('任务', ('run', 'spice', 'rtl', 'batch', 'sync_cache', 'logs', 'cancel', 'fetch', 'wait')),
+    ('任务', ('run', 'spice', 'rtl', 'batch', 'sync_cache', 'logs', 'kill', 'cancel', 'fetch', 'wait')),
     ('设备与文件', ('add', 'scan', 'save', 'exec', 'python', 'ls', 'read', 'put', 'get', 'restart')),
     ('终端', ('help', 'quit')),
 )
@@ -276,6 +276,23 @@ def ram_mib(value):
     return amount
 
 
+def active_job_identity(client, prefix):
+    """Resolve a kill target from live state without scanning cold history."""
+    if len(prefix)==32 and all(c in '0123456789abcdef' for c in prefix):
+        if client.status(prefix)['status'] in TERMINAL:raise ValueError('任务已结束：'+prefix)
+        return prefix
+    health=client.health()
+    rows=list(health.get('active_jobs') or [])+list(health.get('queued_jobs') or [])
+    for node in health.get('nodes') or []:rows.extend(node.get('active_jobs') or [])
+    return job_identity(list({row['id']:row for row in rows}.values()),prefix)
+
+
+def kill_job(client, prefix):
+    identity=active_job_identity(client,prefix)
+    client.cancel(identity)
+    return client.wait(identity,wait_timeout=30)
+
+
 def job_identity(rows, prefix):
     if len(prefix) < 4:
         raise ValueError('请输入至少4位任务ID；输入 jobs 查看ID')
@@ -322,6 +339,8 @@ class Shell(cmd.Cmd):
             choices = ['all', 'aop', 'rgcn', 'arh', 'bench']
         elif command == 'set' and index >= 2:
             choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
+        elif command == 'kill' and index == 1:
+            choices = [j.get('id') for _,j in jobs if j.get('status') not in TERMINAL]
         elif scheduler and index == 1 and command in {'cpus','memory','calibrate','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
             choices = names + ([j.get('id') for _, j in jobs] if command in {'jobs','logs','cancel','fetch'} else [])
         elif command in {'jobs','logs','cancel','delete','fetch'} and index == (2 if scheduler else 1):
@@ -351,7 +370,7 @@ class Shell(cmd.Cmd):
         allowed = {command for _title, commands in self.command_groups for command in commands.split()}
         for title, tree_commands in COMMAND_TREE:
             selected = [command for command in tree_commands if command in allowed and (all_commands or command in {
-                'status','jobs','cpus','memory','calibrate','pause','resume','logs','cancel','fetch','sync_cache','restart','help','quit'})]
+                'status','jobs','cpus','memory','calibrate','pause','resume','logs','kill','cancel','fetch','sync_cache','restart','help','quit'})]
             if not selected:
                 continue
             print('\n'+title)
@@ -445,7 +464,7 @@ class Shell(cmd.Cmd):
 class SchedulerShell(Shell):
     prompt = "调度> "
     command_groups = (('查看','status nodes jobs'),('调资源','cpus memory calibrate pause resume'),
-                      ('任务','logs cancel fetch wait run spice rtl batch sync_cache'),
+                      ('任务','logs kill cancel fetch wait run spice rtl batch sync_cache'),
                       ('维护','restart policy set add save exec python ls read put get'),('帮助','help quit'))
 
     def __init__(self, pool, center=None):
@@ -847,6 +866,14 @@ class SchedulerShell(Shell):
         client, identity, _ = self._job(line)
         display(client.cancel(identity))
 
+    def do_kill(self, line):
+        """kill 任务ID：终止指定任务及子进程，支持唯一短ID，保留结果及费用。"""
+        if self.center:
+            display(kill_job(self.center,line.strip()))
+        else:
+            client,identity,_=self._job(line)
+            display(kill_job(client,identity))
+
     def do_logs(self, line):
         """logs 任务ID：查看日志末尾；可用唯一4位ID，例如 logs ab12。"""
         client, identity, _ = self._job(line)
@@ -909,7 +936,7 @@ class RemoteWorker:
 class WorkerShell(Shell):
     prompt = "算力> "
     command_groups = (('资源','status cpus memory pause resume'),
-                      ('任务','jobs logs cancel delete'),('终端','help quit'))
+                      ('任务','jobs logs kill cancel delete'),('终端','help quit'))
 
     def __init__(self, worker):
         super().__init__()
@@ -961,6 +988,24 @@ class WorkerShell(Shell):
         for identity in identities:
             self.worker.cancel(identity)
         print("已发出取消。")
+
+    def do_kill(self, line):
+        """kill 任务ID：终止一个任务及其子进程，保留回执。"""
+        prefix=line.strip()
+        if isinstance(self.worker,RemoteWorker):
+            display(kill_job(self.worker.client,prefix))
+            return
+        else:
+            with self.worker.condition:
+                identity=job_identity([{'id':key}for key,_ in active_items(self.worker.jobs)],prefix)
+        self.worker.cancel(identity)
+        deadline=time.monotonic()+30
+        with self.worker.condition:
+            while self.worker.get(identity)['status'] not in TERMINAL:
+                remaining=deadline-time.monotonic()
+                if remaining<=0:raise RuntimeError('任务终止仍在处理中；请用原ID查询状态')
+                self.worker.condition.wait(min(.1,remaining))
+        display(self.worker.get(identity))
 
     def do_logs(self, line):
         """logs 任务ID：查看日志；支持唯一4位ID，例如 logs ab12。"""

@@ -37,6 +37,8 @@ def provider(root, cpus=1, *, trusted_networks=None, **options):
     # capacity regressions, not these isolated HTTP/process fixtures.
     with patch('remote_compute.resources.memory',return_value=(48*1024,40*1024)), \
             patch('remote_compute.resources.commit_memory',return_value=None):
+        if options.get('accelerators') and 'python_runtimes' not in options:
+            options['python_runtimes']={profile['kind']:[sys.executable] for profile in options['accelerators']}
         with patch('remote_compute.worker.cpu_benchmark',side_effect=lambda n,*args:
                    dict(name='test-kernel',score=1000.0,unit='kiter/s',threads=n,seconds=2.0)):
             worker = Worker(root, cpus, **options)
@@ -476,7 +478,7 @@ class NativeTests(unittest.TestCase):
     def test_real_ngspice_two_nodes_and_verilator(self):
         config_path = os.environ.get("REMOTE_COMPUTE_TEST_CONFIG")
         config = json.loads(Path(config_path).read_text(encoding="utf-8-sig")) if config_path else {}
-        options = {key: config[key] for key in ("tools", "shared", "env", "tags") if key in config}
+        options = {key: config[key] for key in ("tools", "shared", "env", "tags", "python_runtimes") if key in config}
         with scratch() as directory, \
                 provider(Path(directory) / "one", temp_root=Path(directory)/'scratch', **options) as (_, one), \
                 provider(Path(directory) / "two", temp_root=Path(directory)/'scratch', **options) as (_, two):
