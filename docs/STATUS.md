@@ -1,6 +1,6 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.5**。
+- 当前源码版本：**0.11.6**。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。当前维护入口保存实际运行版本、统一部署、原状态恢复及放行事实；维护门关闭新增工程受理，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
@@ -39,7 +39,7 @@ stop_when只停止新增并排空；cancel_when取消本次调用的在途原ID�
 
 ## 验证与证据
 
-- 完整核心、原生套件及工程fixture共792项检查，787通过、5项跳过；原始日志及跳过原因在`.local/maintenance/commit-pressure-20261105/`。内存回归覆盖固定任务未来提交量、逐任务提交量聚合、已物化private、未报告派发和物理RSS归还。持久执行与跨进程管线47项通过，覆盖短状态事务、共享额度/线程、退出回收、原索引迁移、明确拒绝、取消、失败恢复及中断排空；原始日志在`.local/maintenance/short-project-state-20261105/`。启动、历史索引及清理专项59项完成，其中1项按平台跳过；损坏回执及清理恢复补验22项通过，日志在`.local/maintenance/lease-release-20261105/`。
+- 完整核心、原生套件及停止边界合计797项检查，792通过、5项跳过；795项完整检查与2项追加边界的组成及原始日志在`.local/maintenance/start-pacing-20261105/`。内存回归覆盖固定任务未来提交量、逐任务提交量聚合、已物化private、未报告派发和物理RSS归还。持久执行与跨进程管线47项通过，覆盖短状态事务、共享额度/线程、退出回收、原索引迁移、明确拒绝、取消、失败恢复及中断排空；原始日志在`.local/maintenance/short-project-state-20261105/`。启动、历史索引及清理专项59项完成，其中1项按平台跳过；损坏回执及清理恢复补验22项通过，日志在`.local/maintenance/lease-release-20261105/`。
 - Windows长路径贯穿成果枚举、输入保留、领取和原ID删除，保留链接自身的清理边界；26项文件生命周期检查通过，日志`patch-01101-long-output-lifecycle-final.log`。
 - 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
 - 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。

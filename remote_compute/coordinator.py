@@ -73,6 +73,8 @@ class Coordinator:
         self.asset_handoffs = {}
         self.legacy_assets = set()
         self.stopping = False
+        self.start_lock = threading.Lock()
+        self.next_dispatch = 0.0
         self.paused = bool(paused)
         self.accepting = True
         admission_policy=self.root/'admission-control.json'
@@ -825,7 +827,7 @@ class Coordinator:
                         growth.clear()
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
-                                             dispatched=time.time(), cpus=job['task']['cpus'])
+                                             cpus=job['task']['cpus'])
                         if job['result'].get('accelerator')!=job['task'].get('accelerator'):
                             job['result'].setdefault('requested_accelerator',job['result'].get('accelerator'))
                             job['result']['accelerator']=job['task'].get('accelerator')
@@ -994,6 +996,20 @@ class Coordinator:
                 archive_job(self.jobs, job)
                 self.condition.notify_all()
 
+    def _pace_submission(self, job):
+        # Planning can reserve fair shares in one pass. Pace only the actual
+        # POST after asset preparation, without serializing network transfers.
+        with self.start_lock:
+            if self.stopping or job['cancel'].wait(max(0,self.next_dispatch-time.monotonic())):
+                return False
+            if self.stopping or job['cancel'].is_set():
+                return False
+            with self.condition:
+                job['result']['dispatched'] = time.time()
+                self._save(job)
+            self.next_dispatch = time.monotonic() + .1
+            return True
+
     def _submit(self, job, identity, payload, callback):
         node, force, uncertain = job['node'], False, False
         while True:
@@ -1004,6 +1020,9 @@ class Coordinator:
                     self._ensure_assets(node, job['task']['assets'].values(), force=force,
                                         cancel=None if uncertain else job['cancel'].is_set)
                     if not uncertain and job['cancel'].is_set():return False
+                    if not uncertain:
+                        if not self._pace_submission(job):return False
+                        if self.stopping or job['cancel'].is_set():return False
                     submitting=True
                     node.client.submit_bundle(identity,payload,**({'callback':callback} if callback else {}))
                 return True

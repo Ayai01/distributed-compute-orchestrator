@@ -262,6 +262,8 @@ class Worker:
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
+        self.start_lock = threading.Lock()
+        self.next_start = 0.0
         # Keep one bounded history index per worker root.  Sharing the parent
         # index would mix local-fresh (and any future worker roots) and force
         # startup to reopen unrelated job directories.
@@ -783,6 +785,19 @@ class Worker:
                         continue
                 self.condition.wait(0.5)
 
+    def _start_process(self, job, *args, **kwargs):
+        # Serialize only initial OS process creation, outside the scheduler
+        # condition. Cancellation wakes the pacing wait without starting it.
+        with self.start_lock:
+            if self.stopping or job['cancel'].wait(max(0,self.next_start-time.monotonic())):
+                return None
+            if self.stopping or job['cancel'].is_set():
+                return None
+            try:
+                return Process(*args, **kwargs)
+            finally:
+                self.next_start = time.monotonic() + .1
+
     def _execute(self, job):
         task, result, directory = job["task"], job["result"], job["directory"]
         work = directory / "input"
@@ -867,7 +882,13 @@ class Worker:
                         self._save(job)
                     source = inside(work, task["stdin"]).open("rb") if "stdin" in task else nullcontext(None)
                     with source as stdin:
-                        process = Process(argv, job["cwd"], environment, stdout, stderr, stdin=stdin)
+                        if len(result['steps']) == 1:
+                            process = self._start_process(job, argv, job["cwd"], environment, stdout, stderr, stdin=stdin)
+                        else:
+                            process = Process(argv, job["cwd"], environment, stdout, stderr, stdin=stdin)
+                    if process is None:
+                        state = 'cancelled'
+                        break
                     try:
                         while process.child.poll() is None:
                             usage = process_usage(process)
