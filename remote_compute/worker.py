@@ -525,7 +525,11 @@ class Worker:
         reserved=sum(reservations)
         unallocated=sum(max(0,amount-j.get('rss_mb',0))for j,amount in zip(running,reservations))
         private=sum(j.get('private_mb',j.get('rss_mb',0))for j in running)
-        commit_unallocated=sum(max(0,amount-j.get('private_mb',j.get('rss_mb',0)))for j,amount in zip(running,reservations))
+        # A small working set during import does not finish a fixed task's
+        # future private allocations. Keep its declared commit provision until
+        # those bytes materialize, independently of physical RSS accounting.
+        commit_unallocated=sum(max(0,max(j['task']['memory_mb'],j.get('rss_mb',0))-
+                                   j.get('private_mb',j.get('rss_mb',0)))for j in running)
         limits=[self.memory_capacity-reserved,host['host_memory_available_mb']-self.memory_headroom-unallocated]
         if 'host_commit_available_mb'in host:
             limits.append(host['host_commit_available_mb']-self.memory_headroom-commit_unallocated)

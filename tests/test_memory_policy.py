@@ -1,5 +1,6 @@
 """Default budget, live OS headroom, and reservation lifetime contracts."""
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from remote_compute.worker import Worker
@@ -98,6 +99,18 @@ class MemoryPolicyTests(unittest.TestCase):
         node.live_jobs.add('dispatching');node.reserved_memory_mb+=4*GIB
         self.assertEqual(node.memory_free,10*GIB)
         self.assertEqual(node.memory_accounted,6*GIB)
+
+    def test_host_preserves_per_job_commit_gap_without_cross_job_offsets(self):
+        node=Node('host',SimpleNamespace(url='host'))
+        node.health=dict(machine_id='host',memory_accounting='rss',
+            memory_reserved_mb=4*GIB,rss_mb=4*GIB,private_mb=9*GIB,
+            host_memory_available_mb=40*GIB,host_commit_available_mb=8*GIB,
+            memory_headroom_mb=2*GIB,commit_unallocated_mb=5*GIB)
+        pool=Pool.__new__(Pool);pool.nodes=[node]
+        self.assertEqual(pool._host_memory_free(node),GIB)
+        # A fresh dispatch has no sample yet and retains its full reservation.
+        node.reserved_memory_mb=2*GIB
+        self.assertEqual(pool._host_memory_free(node),-GIB)
 
     def test_real_process_with_high_estimate_does_not_block_another_job(self):
         with scratch() as root,provider(root+'/worker',cpus=2,memory_mb=512,memory_headroom_mb=0) as (_,node):

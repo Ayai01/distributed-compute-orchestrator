@@ -51,7 +51,7 @@ class CommitMemoryTests(unittest.TestCase):
         worker.jobs={'active':dict(result=dict(status='running'),task=dict(memory_mb=10*GIB),
             rss_mb=GIB,rss_sampled=True)}
         state=worker._memory_state()
-        self.assertEqual(state['memory_available_mb'],4*GIB)
+        self.assertEqual(state['memory_available_mb'],0)
         self.assertEqual(state['host_memory_available_mb'],40*GIB)
         self.assertEqual(worker.jobs['active']['task']['memory_mb'],10*GIB)
 
@@ -59,6 +59,20 @@ class CommitMemoryTests(unittest.TestCase):
         worker=self.worker(6*GIB)
         worker.jobs={'starting':dict(result=dict(status='running'),task=dict(memory_mb=3*GIB))}
         self.assertEqual(worker._memory_state()['memory_available_mb'],GIB)
+
+    def test_sampled_fixed_task_keeps_future_commit_until_materialized(self):
+        worker=self.worker(12*GIB)
+        job=dict(result=dict(status='running'),task=dict(memory_mb=6*GIB),
+                 rss_mb=2*GIB,private_mb=GIB,rss_sampled=True)
+        worker.jobs={'loading':job}
+        state=worker._memory_state()
+        self.assertEqual(state['memory_reserved_mb'],2*GIB)
+        self.assertEqual(state['commit_unallocated_mb'],5*GIB)
+        self.assertEqual(state['memory_available_mb'],5*GIB)
+        job['private_mb']=7*GIB
+        state=worker._memory_state()
+        self.assertEqual(state['commit_unallocated_mb'],0)
+        self.assertEqual(state['memory_available_mb'],10*GIB)
 
     def test_exhaustion_recovery_and_missing_optional_field(self):
         worker=self.worker(GIB)
