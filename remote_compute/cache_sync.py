@@ -65,7 +65,7 @@ class _RPC:
                 on_submit=self.on_submit, assets=assets, requires=requires,
                 env={'DCO_CACHE_PRODUCER': '${asset:cache_producer}'}
                     if 'cache_producer' in assets else {},
-                cpus=1, memory_mb=512, priority=-100, timeout=900,
+                max_cpus=1, memory_mb=512, priority=-100, timeout=900,
                 retries=0, project='DCO-cache', label='sync_cache/' + project + '/' + action)
         except RemoteError as error:
             status = getattr(error, 'status_code', None)

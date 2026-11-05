@@ -369,7 +369,7 @@ finally:
             process,client=start()
             try:
                 task=python("import os,time;from pathlib import Path\nPath('pid.txt').write_text(str(os.getpid()))\nwhile not Path('release').exists():time.sleep(.02)\nprint('once')",
-                            cpus=0,max_cpus=2,memory_mb=128,outputs=['pid.txt'],project='recovery')
+                            max_cpus=2,memory_mb=128,outputs=['pid.txt'],project='recovery')
                 accepted=client.submit(task);identity=accepted['id']
                 until(lambda:identity in worker.jobs and worker.get(identity)['status']=='running')
                 until(lambda:(worker.jobs[identity]['directory']/'input/pid.txt').exists())

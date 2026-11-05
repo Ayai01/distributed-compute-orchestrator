@@ -63,7 +63,7 @@ class Machine:
         files[_PREFIX + "/files.py"] = _HELPER
         result = self.execute(["${tool:python}", "${work}/" + _PREFIX + "/files.py", action, str(path),
                                "--work", "${work}/" + _PREFIX, "--patterns", json.dumps(list(patterns))],
-                              files=files, outputs=[_PREFIX + "/result/*"], label="machine/" + action + ' ' + str(path))
+                              files=files, outputs=[_PREFIX + "/result/*"],max_cpus=1,label="machine/" + action + ' ' + str(path))
         if result["status"] != "succeeded":
             error = RemoteError(result.get("stderr") or result.get("error") or "Remote file operation failed")
             error.result = result

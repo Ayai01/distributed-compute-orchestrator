@@ -16,7 +16,8 @@ class RuntimeContractTests(unittest.TestCase):
         with scratch()as root,provider(root,cpus=2,
                 python_runtimes={'cpu':[sys.executable],'ml':[sys.executable]})as(_,client):
             with Pool([client])as pool:
-                node=pool.nodes[0];task=command(['${tool:python}','-c','print(1)'],requires=['ml'],cpus=2)
+                node=pool.nodes[0];task=command(['${tool:python}','-c','print(1)'],requires=['ml'],max_cpus=2)
+                task['cpus']=2  # Allocation matches a materialized grant, not its public upper bound.
                 _execution_bindings.cache_clear()
                 for _ in range(3):self.assertEqual(pool._matching(task),[node])
                 self.assertGreaterEqual(_execution_bindings.cache_info().hits,2)

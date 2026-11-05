@@ -1,267 +1,76 @@
-"""Fixed-width work must receive its share despite a stream of small jobs."""
+"""One-slot admission, useful growth and real memory constraints stay fair."""
 from pathlib import Path
-import time
 import unittest
-
-from remote_compute import Pool
-from remote_compute.records import Job
+from remote_compute import Pool,command,python_map
+from test_compute import provider,python,scratch,until
 from test_center import center
-from test_compute import provider, python, scratch, until
+
+HOLD="from pathlib import Path;import time\nprint('ready',flush=True)\nwhile not Path('release').exists():time.sleep(.02)"
+BUSINESS="""import time
+from pathlib import Path
+def work(value):
+    if isinstance(value,str):
+        while not Path(value).exists():time.sleep(.02)
+    else:time.sleep(value)
+    return value
+"""
 
 
-HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+class AutomaticQueueFairnessTests(unittest.TestCase):
+    def finish(self,client,identities):
+        for identity in identities:
+            client.cancel(identity);client.wait(identity);client.fetch(identity)
 
-
-class FixedQueueFairnessTests(unittest.TestCase):
-    def test_offline_grant_does_not_block_online_fixed_queue_reservation(self):
-        with scratch() as directory, provider(Path(directory)/'offline',cpus=4) as (_,offline), \
-                provider(Path(directory)/'online',cpus=4) as (_,online):
-            with Pool([offline,online],policy='round_robin',refresh=1000) as pool, \
-                    center(pool,Path(directory)/'center') as (state,client):
-                pool.stop_event.set();pool.monitor.join()
-                accepted=client.submit(python(HOLD,project='wide',cpus=2))
-                original=accepted['id']
-                until(lambda:client.status(original)['status']=='running')
-                lost=state.jobs[original]['node']
-                lost.last_connected_at=time.monotonic()-61
-                pool._expire_unreachable()
-                self.assertTrue(lost.detached)
-                healthy=next(node for node in pool.nodes if node is not lost)
-                running=[client.submit(python(HOLD,project='small'))['id'] for _ in range(4)]
-                until(lambda:all(client.status(key)['status']=='running' for key in running))
-                client.control(paused=True)
-                wide=client.submit(python(HOLD,project='wide',cpus=2))['id']
-                refill=client.submit(python(HOLD,project='small'))['id']
-                resources=state.project_resources()
-                self.assertEqual(resources['wide']['used'],0)
-                self.assertEqual(resources['wide']['target'],2)
-                self.assertIn(healthy.name,state._fixed_queue_claims(resources))
-                self.assertEqual(lost.reserved,2)
-                self.assertEqual(client.status(original)['request_sha256'],accepted['request_sha256'])
-                client.control(paused=False)
-                client.write_job_file(running[0],'release','done');client.wait(running[0])
-                time.sleep(.3)
+    def test_one_freed_slot_admits_another_project_without_a_minimum_width(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                busy=[client.submit(python(HOLD,project='serial'))['id']for _ in range(4)]
+                until(lambda:all(client.status(i)['status']=='running'for i in busy))
+                wide=client.submit(python(HOLD,project='parallel',max_cpus=16))['id']
                 self.assertEqual(client.status(wide)['status'],'queued')
-                self.assertEqual(client.status(refill)['status'],'queued')
-                self.assertEqual(healthy.reserved,3)
-                client.write_job_file(running[1],'release','done');client.wait(running[1])
-                until(lambda:client.status(wide)['status']=='running')
-                self.assertEqual(client.status(wide)['cpus'],2)
-                self.assertEqual(client.status(original)['status'],'running')
-                self.assertEqual(lost.reserved,2)
-                for key in (*running,wide,refill,original):
-                    client.cancel(key);client.wait(key)
+                client.write_job_file(busy[0],'release','done');client.wait(busy[0])
+                until(lambda:'ready'in client.logs(wide)['stdout'])
+                self.assertEqual(worker.status(wide)['initial_cpus'],1)
+                self.assertEqual(client.status(wide)['cpus'],1)
+                self.assertEqual(client.health()['used_cpus'],4)
+                self.finish(client,[*busy,wide])
 
-    def test_unattached_recovery_does_not_create_online_project_demand(self):
-        with scratch() as directory,provider(Path(directory)/'worker',cpus=4) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(directory)/'center') as (state,client):
-                client.control(paused=True)
-                for project in ('Bench','ARH'):
-                    client.submit(python(HOLD,project=project,cpus=2))
-                identity='a'*32
-                with state.condition,pool.condition:
-                    state.jobs[identity]=Job(recover=True,result=dict(id=identity,status='running',
-                        worker_url='http://127.0.0.1:1'))
-                    try:
-                        resources=state.project_resources()
-                        self.assertEqual(set(resources),{'Bench','ARH'})
-                        self.assertTrue(all(row['target']==2 for row in resources.values()))
-                    finally:
-                        del state.jobs[identity]
+    def test_map_tail_returns_slots_for_a_new_project(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                first=client.submit(python_map('business:work',[.3,.3,.3,'${work}/release'],
+                    max_cpus=4,project='first'),files={'business.py':BUSINESS})['id']
+                until(lambda:client.status(first)['status']=='running' and worker.status(first).get('peak_cpus')==4)
+                later=client.submit(python(HOLD,max_cpus=4,project='later'))['id']
+                until(lambda:'ready'in client.logs(later)['stdout'],seconds=10)
+                self.assertEqual(client.status(first)['status'],'running')
+                until(lambda:client.status(first)['cpus']==1)
+                self.assertEqual(client.status(first)['cpus'],1)
+                self.assertEqual(worker.status(later)['initial_cpus'],1)
+                self.assertLessEqual(client.health()['used_cpus'],4)
+                self.finish(client,[first,later])
 
-    def test_single_cpu_phase_growth_accumulates_under_continuous_refill(self):
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=6) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                accepted = client.submit(python(HOLD, project='growing', cpus=1, max_cpus=3, memory_mb=64))
-                identity = accepted['id']
-                until(lambda: client.status(identity)['status']=='running')
-                # Explicitly enter a one-thread preparation phase before the
-                # later growth request; default warmup now protects its ceiling.
-                self.assertEqual(client.resize(identity,1)['cpus'],1)
-                peers = [client.submit(python(HOLD, project='small', memory_mb=64))['id'] for _ in range(5)]
-                until(lambda: all(client.status(key)['status']=='running' for key in peers))
-                refill = client.submit(python(HOLD, project='small', memory_mb=64))['id']
-                self.assertEqual(client.resize(identity, 3)['cpus'], 1)
-                for expected, key in zip((2, 3), peers):
-                    client.write_job_file(key, 'release', 'done')
-                    client.wait(key)
-                    time.sleep(.4)
-                    self.assertEqual(client.status(refill)['status'], 'queued')
-                    self.assertEqual(client.resize(identity, 3)['cpus'], expected)
-                self.assertEqual(client.status(identity)['request_sha256'], accepted['request_sha256'])
-                client.resize(identity, 1)
-                until(lambda: client.status(refill)['status']=='running')
-                for key in (*peers, identity, refill):
-                    client.cancel(key)
-                    client.wait(key)
-                    client.fetch(key)
+    def test_higher_priority_new_work_gets_the_available_slot(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                busy=[client.submit(python(HOLD,project='serial'))['id']for _ in range(2)]
+                until(lambda:all(client.status(i)['status']=='running'for i in busy))
+                low=client.submit(python(HOLD,max_cpus=4,priority=0,project='low'))['id']
+                high=client.submit(python(HOLD,max_cpus=4,priority=10,project='high'))['id']
+                client.write_job_file(busy[0],'release','done');client.wait(busy[0])
+                until(lambda:'ready'in client.logs(high)['stdout'])
+                self.assertEqual(client.status(low)['status'],'queued')
+                self.assertEqual(client.status(high)['cpus'],1)
+                self.finish(client,[*busy,low,high])
 
-    def test_single_cpu_job_grows_and_returns_at_completed_boundaries(self):
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=8) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                peers = [client.submit(python(HOLD, project=project, cpus=2, memory_mb=64))['id']
-                         for project in ('AOP', 'ARH', 'RGCN')]
-                until(lambda: all(client.status(key)['status']=='running' for key in peers))
-                accepted = client.submit(python(HOLD, project='Bench', cpus=1, max_cpus=4, memory_mb=80))
-                identity = accepted['id']
-                until(lambda: client.status(identity)['status']=='running')
-                self.assertEqual(client.status(identity)['cpus'], 1)
-                grant = client.resize(identity, 4, base_memory_mb=64, memory_per_cpu_mb=16)
-                self.assertEqual((grant['cpus'], grant['memory_mb']), (2, 96))
-                client.write_job_file(peers[0], 'release', 'done')
-                client.wait(peers[0])
-                client.fetch(peers[0])
-                grant = client.resize(identity, 4, base_memory_mb=64, memory_per_cpu_mb=16)
-                self.assertEqual((grant['cpus'], grant['memory_mb']), (4, 128))
-                grant = client.resize(identity, 1, base_memory_mb=64, memory_per_cpu_mb=16)
-                self.assertEqual((grant['cpus'], grant['memory_mb']), (1, 80))
-                self.assertEqual(client.status(identity)['request_sha256'], accepted['request_sha256'])
-                for key in (*peers[1:], identity):
-                    client.write_job_file(key, 'release', 'done')
-                    client.wait(key)
-                    client.fetch(key)
-
-    def test_four_single_cpu_projects_refill_fairly_over_multiple_rounds(self):
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=8) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                client.control(paused=True)
-                submitted = {client.submit(python(HOLD, project=project, memory_mb=64))['id']:project
-                             for project in ('AOP', 'ARH', 'Bench', 'RGCN') for _ in range(6)}
-                collected = set()
-                client.control(paused=False)
-                def running():
-                    rows = {project:[] for project in ('AOP', 'ARH', 'Bench', 'RGCN')}
-                    for key, project in submitted.items():
-                        if key not in collected and client.status(key, brief=True)['status']=='running':
-                            rows[project].append(key)
-                    return rows
-                def balanced():
-                    resources = client.health()['projects']
-                    return (len(resources)==4 and all(row['used']==row['target']==2 for row in resources.values())
-                            and all(len(keys)==2 for keys in running().values()))
-                until(balanced)
-                for _ in range(3):
-                    # Provider health can lag the grants. Use original task IDs
-                    # confirmed running before exercising the next refill.
-                    selected = {project:keys[0] for project,keys in running().items()}
-                    for key in selected.values(): client.write_job_file(key, 'release', 'done')
-                    for key in selected.values():
-                        client.wait(key)
-                        client.fetch(key)
-                        collected.add(key)
-                    until(balanced)
-                for key in submitted:
-                    if key not in collected:
-                        client.cancel(key)
-                        client.wait(key)
-                        client.fetch(key)
-
-    def test_freed_cpus_accumulate_for_an_under_share_fixed_job(self):
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=4) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                running = [client.submit(python(HOLD, project='small'))['id'] for _ in range(4)]
-                until(lambda: all(client.status(key)['status']=='running' for key in running))
-                client.control(paused=True)
-                wide = client.submit(python(HOLD, project='wide', cpus=2))['id']
-                refill = client.submit(python(HOLD, project='small'))['id']
-                client.control(paused=False)
-
-                client.write_job_file(running[0], 'release', 'done')
-                client.wait(running[0])
-                time.sleep(.3)
-                self.assertEqual(client.status(wide)['status'], 'queued')
-                self.assertEqual(client.status(refill)['status'], 'queued')
-                self.assertEqual(pool.nodes[0].reserved, 3)
-
-                client.write_job_file(running[1], 'release', 'done')
-                until(lambda: client.status(wide)['status']=='running')
-                self.assertEqual(client.status(wide)['cpus'], 2)
-                self.assertEqual(client.status(refill)['status'], 'queued')
-                for key in (*running, wide, refill):
-                    client.cancel(key)
-                    client.wait(key)
-                    client.fetch(key)
-
-    def test_higher_priority_work_can_use_the_freed_cpu(self):
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=4) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                running = [client.submit(python(HOLD, project='small'))['id'] for _ in range(4)]
-                until(lambda: all(client.status(key)['status']=='running' for key in running))
-                client.control(paused=True)
-                wide = client.submit(python(HOLD, project='wide', cpus=2))['id']
-                urgent = client.submit(python(HOLD, project='small', priority=1))['id']
-                client.write_job_file(running[0], 'release', 'done')
-                client.wait(running[0])
-                client.control(paused=False)
-                until(lambda: client.status(urgent)['status']=='running')
-                self.assertEqual(client.status(wide)['status'], 'queued')
-                for key in (*running, wide, urgent):
-                    client.cancel(key)
-                    client.wait(key)
-                    client.fetch(key)
-
-    def test_memory_blocked_fixed_work_does_not_hold_cpu(self):
-        code = 'data=bytearray(64*1024*1024)\n' + HOLD
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=4, memory_mb=128) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                busy = client.submit(python(code, project='busy', memory_mb=96))['id']
-                until(lambda: client.status(busy)['status']=='running')
-                until(lambda: worker.health()['memory_available_mb'] < 80)
-                client.control(paused=True)
-                wide = client.submit(python(HOLD, project='wide', cpus=2, memory_mb=80))['id']
-                small = client.submit(python(HOLD, project='small', memory_mb=32))['id']
-                client.control(paused=False)
-                until(lambda: client.status(small)['status']=='running')
-                self.assertEqual(client.status(wide)['status'], 'queued')
-                for key in (busy, wide, small):
-                    client.cancel(key)
-                    client.wait(key)
-                    client.fetch(key)
-
-    def test_cancelling_the_waiter_releases_the_accumulated_cpu(self):
-        with scratch() as directory, provider(Path(directory)/'worker', cpus=4) as (_, worker):
-            with Pool([worker]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                running = [client.submit(python(HOLD, project='small'))['id'] for _ in range(4)]
-                until(lambda: all(client.status(key)['status']=='running' for key in running))
-                client.control(paused=True)
-                wide = client.submit(python(HOLD, project='wide', cpus=2))['id']
-                refill = client.submit(python(HOLD, project='small'))['id']
-                client.write_job_file(running[0], 'release', 'done')
-                client.wait(running[0])
-                client.control(paused=False)
-                time.sleep(.3)
-                self.assertEqual(client.status(refill)['status'], 'queued')
-                client.cancel(wide)
-                until(lambda: client.status(refill)['status']=='running')
-                for key in (*running, wide, refill):
-                    client.cancel(key)
-                    client.wait(key)
-                    client.fetch(key)
-
-    def test_only_one_worker_accumulates_a_fixed_jobs_cpus(self):
-        with scratch() as directory, provider(Path(directory)/'left', cpus=4) as (_, left), \
-                provider(Path(directory)/'right', cpus=4) as (_, right):
-            with Pool([left, right]) as pool, center(pool, Path(directory)/'center') as (_, client):
-                running = [client.submit(python(HOLD, project='small'))['id'] for _ in range(8)]
-                until(lambda: all(client.status(key)['status']=='running' for key in running))
-                locations = {}
-                for key in running:
-                    locations.setdefault(client.status(key)['assigned_node'], []).append(key)
-                self.assertEqual(sorted(map(len, locations.values())), [4, 4])
-                client.control(paused=True)
-                wide = client.submit(python(HOLD, project='wide', cpus=2))['id']
-                refill = client.submit(python(HOLD, project='small'))['id']
-                for keys in locations.values():
-                    client.write_job_file(keys[0], 'release', 'done')
-                    client.wait(keys[0])
-                client.control(paused=False)
-                until(lambda: client.status(refill)['status']=='running')
-                self.assertEqual(client.status(wide)['status'], 'queued')
-                waiting = next(node for node in pool.nodes if node.reserved==3)
-                client.write_job_file(locations[waiting.name][1], 'release', 'done')
-                until(lambda: client.status(wide)['status']=='running')
-                self.assertEqual(client.status(wide)['assigned_node'], waiting.name)
-                for key in (*running, wide, refill):
-                    client.cancel(key)
-                    client.wait(key)
-                    client.fetch(key)
+    def test_memory_blocked_work_does_not_hold_an_unused_cpu(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=256,memory_headroom_mb=0)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                busy=client.submit(python(HOLD,base_memory_mb=128,memory_per_cpu_mb=64,project='resident'))['id']
+                until(lambda:'ready'in client.logs(busy)['stdout'])
+                blocked=client.submit(python(HOLD,max_cpus=4,memory_mb=128,priority=10,project='large'))['id']
+                small=client.submit(python(HOLD,memory_mb=32,project='small'))['id']
+                until(lambda:'ready'in client.logs(small)['stdout'])
+                self.assertEqual(client.status(blocked)['status'],'queued')
+                self.assertEqual(client.status(small)['cpus'],1)
+                self.finish(client,[busy,blocked,small])

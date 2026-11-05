@@ -1,7 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.10.1**。
-- 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。现网0.10.1正在排空已受理工作，0.11统一自动执行接口在独立工作树实现；维护期间停止新科学准入，原ID工作继续执行和领取。
+- 当前源码版本：**0.11.0**。
+- 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。当前维护入口保存实际运行版本、统一部署、原状态恢复及放行事实；维护门关闭新增工程受理，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
 ## 能力与环境
@@ -29,15 +29,16 @@ Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，T
 
 弹性任务先取得最多4个有用核，新任务随后以1核进入，剩余兼容核心用于已有任务扩核。一般搜索上限1024；有限种群按真实并行宽度限定。默认准备窗口超过128并覆盖兼容CPU数；工程以真实就绪工作持续补位。
 
-现网0.10已受理执行器使用Client.cpu_lease，长尾归还空槽；0.11将排队、执行、内存/CPU分配和扩核统一到DCO，项目按发布后的SDK迁移。当前迁移不改已受理请求的科学身份。所有工程使用标准语义能力，设备选择和共享服务修改归DCO操作员。
+公开任务省略cpus，只声明max_cpus及能力/内存；DCO通过python_map/python_call和client.execute管理准备、排队、实际并发、扩缩核和持久收齐。映射完成项退出进程并释放内存，线程后端保留共享缓存。after等待持久发布，Deferred/Skipped管理业务门。原ID接续及已付结果保持。所有工程使用标准语义能力，设备选择和共享服务修改归DCO操作员。
 
 `kill <id>`终止指定任务及其子进程，支持完整ID或唯一的至少4位活动任务短ID。原ID、输入身份、声明输出、日志及累计费用继续保留，领取后按任务生命周期清理。
 
 ## 验证与证据
 
-- 完整核心及原生回归入口：`python -B main.py --test-native`。结果见`native-core-final-tests.log`。
-- 环境及路由证明：`.local/maintenance/layout-ku26s-20261104/`中的`layout-qualify-final.json`、`admission-after.json`及现场验收；CPU/ML/CUDA环境原记录见`.local/maintenance/capability-contract-20261104/`。
-- 一次集中DSH Flash/max只读审查已完成并由Owner逐项裁定：`review-adjudication.json`。
-- 统一源码清单、版本/PID/状态根核对、原ID领取及任务终止证明保存在同一维护目录。
+- 完整核心及原生回归：728项，4项按平台条件跳过。日志：`.local/maintenance/automatic-contract-20261104/native-release.log`。
+- 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
+- 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。
+- 能力与环境原生资格：`.local/maintenance/layout-ku26s-20261104/`中的`layout-qualify-final.json`、`admission-after.json`及逐设备现场验收；CPU/ML/CUDA环境记录见`.local/maintenance/capability-contract-20261104/`。
+- 集中本机DSH Flash/max审查的原回执和Owner裁定保存在当前维护目录。规划性能重放见`.local/maintenance/lease-scale-20261104/`：352个真实任务、27次规划，授权与资源逐项相同，耗时降低5.60倍。
 
 科学计划、输入、评价及恢复账本由所属工程维护。源码变化由Git记录，正式文档说明当前事实、要求及设计。

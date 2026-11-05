@@ -54,7 +54,7 @@ print(os.environ['REMOTE_COMPUTE_WORKER'],os.environ['REMOTE_COMPUTE_JOB_ID'],fl
 while not Path('control.json').exists(): time.sleep(.02)
 print(Path('control.json').read_text(),flush=True)
 """
-                identity = client.submit(python(source, cpus=1))['id']
+                identity = client.submit(python(source, max_cpus=1))['id']
                 until(lambda: client.status(identity)['status'] == 'running')
                 def ready():
                     try: return client.read_job_file(identity, 'progress.json') == b'working'
@@ -94,7 +94,7 @@ print(Path('control.json').read_text(),flush=True)
         with scratch() as directory, provider(Path(directory) / 'worker', cpus=2) as (worker, client):
             settings = Path(directory) / 'worker.json'
             worker.save_settings = lambda changes: settings.write_text(json.dumps(changes))
-            identity = client.submit(python('import time;time.sleep(.3)', cpus=2))['id']
+            identity = client.submit(python('import time;time.sleep(.3)', max_cpus=2))['id']
             until(lambda: client.status(identity)['status'] == 'running')
             client.control(cpus=1)
             self.assertEqual(json.loads(settings.read_text()), {'cpus': 1})

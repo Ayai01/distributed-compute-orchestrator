@@ -21,7 +21,7 @@ from test_compute import provider, scratch
 
 class CacheTransportTests(unittest.TestCase):
     def test_aop_semantic_units_roundtrip_and_repeat_export_nothing(self):
-        installed = Path(__file__).resolve().parents[2] / 'AOP_v2'
+        installed = Path(os.environ.get('REMOTE_COMPUTE_TEST_PROJECTS_ROOT',Path(__file__).resolve().parents[2])) / 'AOP_v2'
         if not (installed / 'analog/cache.py').is_file() or not importlib.util.find_spec('numpy'):
             self.skipTest('Installed AOP producer and NumPy runtime')
         with scratch() as directory, ExitStack() as stack:
@@ -62,7 +62,7 @@ class CacheTransportTests(unittest.TestCase):
             self.assertEqual(client.status(), [])
 
     def test_arh_cache_only_worker_imports_producer_from_normal_source_asset(self):
-        installed = Path(__file__).resolve().parents[2] / 'ARH-DSE-v2'
+        installed = Path(os.environ.get('REMOTE_COMPUTE_TEST_PROJECTS_ROOT',Path(__file__).resolve().parents[2])) / 'ARH-DSE-v2'
         if not (installed / 'framework/storage.py').is_file():
             self.skipTest('Installed ARH producer fixture')
         with scratch() as directory, ExitStack() as stack:

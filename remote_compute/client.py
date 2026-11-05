@@ -362,6 +362,8 @@ class Client:
                 time.sleep(.25)
 
     def submit(self, task, *, inputs=None, files=None, job_id=None):
+        if 'cpus' in task:
+            raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')
         identity = job_id or uuid.uuid4().hex
         # A stable id can be queried or resubmitted to THIS node after a lost reply.
         return self.submit_bundle(identity, task_bundle(task, inputs, files))
@@ -416,11 +418,11 @@ class Client:
             raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, cpus=1, requires=(), node=None, max_cpus=None, job_id=None, accelerator=None, ready_tasks=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         if node is not None and not self.operator:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
-        request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,cpus=cpus,requires=list(requires))
+        request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,requires=list(requires))
         if ready_tasks is not None:
             request['ready_tasks'] = validate_ready_tasks(ready_tasks)
         if accelerator is not None:
@@ -641,6 +643,11 @@ class Client:
             self.cancel(identity)
             raise
         return self.fetch(identity, output_dir, delete=not keep)
+
+    def execute(self, requests, *, project, output_dir, prepare=None, publish=None, ready_tasks=None,stop_when=None):
+        """Submit a keyed plan and durably publish/collect it through one pipeline."""
+        from .pipeline import execute
+        return execute(self,requests,project=project,output_dir=output_dir,prepare=prepare,publish=publish,ready_tasks=ready_tasks,stop_when=stop_when)
 
     def sync(self, root, patterns=("**/*",)):
         return self.sync_files(tree(root, patterns))
@@ -941,7 +948,7 @@ class Pool:
                 running=[job for job in jobs if job['status']=='running']
                 node.external=sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
                 node.refresh_external_accelerators(running)
-                owned_memory=sum(((job.get('rss_mb') or job['memory_mb']) if value.get('memory_accounting')=='rss' else
+                owned_memory=sum(((job.get('rss_mb') or job['memory_mb']) if value.get('memory_accounting')=='rss' and not job.get('memory_modeled') else
                                   max(job['memory_mb'],job.get('rss_mb',0))) for job in running if job['id'] in node.known_jobs)
                 node.external_memory_mb=max(0,value.get('memory_reserved_mb',0)-owned_memory)
                 node.known_jobs.intersection_update({job['id'] for job in jobs}|node.live_jobs)

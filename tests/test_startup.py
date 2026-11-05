@@ -134,7 +134,7 @@ raise SystemExit(main())
                                 return False
                         until(ready, seconds=15)
                         identity = client.submit(python('import time;time.sleep(30)',
-                                                        cpus=1, memory_mb=128))['id']
+                                                        max_cpus=1, memory_mb=128))['id']
                         def running():
                             try:
                                 return remote.status(identity, brief=True)['status'] == 'running'
@@ -195,7 +195,7 @@ raise SystemExit(main())
                             return False
                     until(ready, seconds=15)
                     identity = client.submit(python('import time;time.sleep(30)',
-                                                    cpus=1, memory_mb=128))['id']
+                                                    max_cpus=1, memory_mb=128))['id']
                     def running():
                         try:
                             return remote.status(identity, brief=True)['status'] == 'running'

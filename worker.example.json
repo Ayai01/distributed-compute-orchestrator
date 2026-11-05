@@ -7,7 +7,7 @@
   "memory_headroom_mb": 8192,
   "temp_root": null,
   "cache_root": null,
-  "tags": ["cpu"],
+  "tags": [],
   "accelerators": [],
   "tools": {},
   "python_runtimes": {},

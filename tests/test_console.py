@@ -174,7 +174,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(suggest('exec --node Aya')['matches'], ['Aya1-PC','Aya1-TX'])
         self.assertEqual(suggest('exec --node ')['matches'], ['Aya1-PC','Aya1-TX'])
         self.assertEqual(suggest('exec --no')['matches'], ['--node'])
-        self.assertEqual(suggest('run --cpus ')['matches'], [])
+        self.assertEqual(suggest('run --max-cpus ')['matches'], [])
         self.assertIn('--max-cpus', suggest('run --')['matches'])
         self.assertEqual(suggest('policy b')['matches'], ['balanced'])
         self.assertIn('[节点] N', suggest('cpus Aya1-PC 12')['usage'])

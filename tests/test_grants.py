@@ -9,7 +9,7 @@ from test_compute import provider, python, scratch, until
 from test_center import center
 
 
-HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+HOLD = "from pathlib import Path;import time\nprint('ready',flush=True)\nwhile not Path('release').exists():time.sleep(.02)"
 
 
 class GrantTests(unittest.TestCase):
@@ -21,10 +21,10 @@ class GrantTests(unittest.TestCase):
     def test_auto_and_resize_honor_the_task_demand_ceiling(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                task=python(HOLD,cpus=0,max_cpus=2)
+                task=python(HOLD,max_cpus=2)
                 accepted=client.submit(task); identity=accepted['id']
-                until(lambda:client.status(identity)['status']=='running')
-                self.assertEqual(client.status(identity)['cpus'],1)
+                until(lambda:'ready'in client.logs(identity)['stdout'])
+                self.assertEqual(client.status(identity)['cpus'],2)
                 self.assertEqual(client.resize(identity,99)['cpus'],2)
                 self.assertEqual(worker.resize(identity,99)['cpus'],2)
                 self.assertEqual(client.submit(task,job_id=identity)['request_sha256'],accepted['request_sha256'])
@@ -35,8 +35,8 @@ class GrantTests(unittest.TestCase):
     def test_joint_resize_unblocks_memory_and_failure_preserves_both_grants(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4,memory_mb=256) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                first=client.submit(python(HOLD,cpus=2,memory_mb=192))['id']
-                until(lambda:client.status(first)['status']=='running')
+                first=client.submit(python(HOLD,max_cpus=2,base_memory_mb=128,memory_per_cpu_mb=32))['id']
+                until(lambda:'ready'in client.logs(first)['stdout'])
                 second=client.submit(python(HOLD,memory_mb=128))['id']
                 self.assertEqual(client.status(second)['status'],'queued')
                 with self.assertRaises(RemoteError) as rejected:
@@ -47,7 +47,7 @@ class GrantTests(unittest.TestCase):
                 rejected_by_worker.status_code=409
                 before=client.health()['projects']['default']['demand']
                 with patch.object(pool.nodes[0].client,'resize',side_effect=rejected_by_worker):
-                    with self.assertRaises(RemoteError):client.resize(first,4,memory_mb=192)
+                    with self.assertRaises(RemoteError):client.resize(first,4,memory_mb=160)
                 self.assertEqual(client.health()['projects']['default']['demand'],before)
                 grant=client.resize(first,1,memory_mb=96)
                 self.assertEqual((grant['cpus'],grant['memory_mb']),(1,96))
@@ -62,8 +62,8 @@ class GrantTests(unittest.TestCase):
     def test_joint_resize_recovers_a_lost_reply_without_another_request(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4,memory_mb=256) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                identity=client.submit(python(HOLD,memory_mb=128))['id']
-                until(lambda:client.status(identity)['status']=='running')
+                identity=client.submit(python(HOLD,max_cpus=4,memory_mb=128))['id']
+                until(lambda:'ready'in client.logs(identity)['stdout'])
                 original=pool.nodes[0].client.resize
                 def lost(*args,**kwargs):
                     original(*args,**kwargs)
@@ -82,7 +82,7 @@ class GrantTests(unittest.TestCase):
                 busy=client.submit(python(HOLD,project='A',memory_mb=80))['id']
                 until(lambda:client.status(busy)['status']=='running')
                 client.control(paused=True)
-                automatic=client.submit(python(HOLD,project='B',cpus=0,memory_mb=80))['id']
+                automatic=client.submit(python(HOLD,project='B',max_cpus=1024,memory_mb=80))['id']
                 small=client.submit(python(HOLD,project='C',memory_mb=32))['id']
                 client.control(paused=False)
                 until(lambda:client.status(small)['status']=='running')
@@ -93,9 +93,9 @@ class GrantTests(unittest.TestCase):
     def test_auto_eventually_starts_in_a_partly_occupied_node(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                busy=client.submit(python(HOLD,project='A',cpus=3))['id']
+                busy=client.submit(python(HOLD,project='A',max_cpus=3))['id']
                 until(lambda:client.status(busy)['status']=='running')
-                automatic=client.submit(python(HOLD,project='B',cpus=0))['id']
+                automatic=client.submit(python(HOLD,project='B',max_cpus=1024))['id']
                 until(lambda:client.status(automatic)['status']=='running')
                 self.assertEqual(client.status(automatic)['cpus'],1)
                 self.assertEqual(client.status(busy)['status'],'running')
@@ -104,8 +104,8 @@ class GrantTests(unittest.TestCase):
     def test_bounded_auto_admission_counts_useful_work_units(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                window=client.admission('bounded',cpus=0,max_cpus=2,queue_ratio=0)
-                self.assertEqual((window['running_tasks'],window['in_flight']),(2,2))
+                window=client.admission('bounded',max_cpus=2,queue_ratio=0)
+                self.assertEqual((window['running_tasks'],window['in_flight']),(4,4))
         for limit in (True,0,-1):
             with self.assertRaises(ValueError):validate_task(python('pass',max_cpus=limit),4)
-        with self.assertRaises(ValueError):validate_task(python('pass',cpus=3,max_cpus=2),4)
+        self.assertEqual(validate_task(python('pass',max_cpus=2),1)['cpus'],1)

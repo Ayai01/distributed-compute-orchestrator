@@ -55,6 +55,7 @@ def provider(root, cpus=1, *, trusted_networks=None, **options):
 
 
 def python(code, **options):
+    options.setdefault('max_cpus',1)
     return command(["${tool:python}", "-u", "-c", code], **options)
 
 
@@ -197,7 +198,7 @@ class ExecutionTests(unittest.TestCase):
         keys=('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS')
         with scratch() as directory, provider(Path(directory)/'worker',cpus=3,env={key:'99' for key in keys}) as (_,client):
             task=python("import json,os;print(json.dumps({k:os.environ[k] for k in " + repr(keys) + "}))",
-                        cpus=3,env={'OMP_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1','NUMEXPR_NUM_THREADS':'${cpus}'})
+                        max_cpus=3,env={'OMP_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1','NUMEXPR_NUM_THREADS':'${cpus}'})
             result=client.run(task)
             self.assertEqual(result['status'],'succeeded',result.get('stderr'))
             self.assertEqual(json.loads(result['stdout']),dict(zip(keys,('1','1','3','3'))))
@@ -283,7 +284,7 @@ class ExecutionTests(unittest.TestCase):
 
     def test_cpu_budget_serializes_weighted_jobs_and_live_limit(self):
         self.client.control(cpus=2)
-        first = self.client.submit(python("import time; time.sleep(.3)", cpus=2))["id"]
+        first = self.client.submit(python("import time; time.sleep(.3)", max_cpus=2))["id"]
         until(lambda: self.client.status(first)["status"] == "running")
         self.client.control(cpus=1)
         second = self.client.submit(python("print('next')"))["id"]
@@ -316,7 +317,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self.client.request("/jobs/" + identity, payload)["id"], identity)
         with self.assertRaises(ValueError):
             task_bundle(python("print(1)"), files={"../../outside": b"bad"})
-        for task in [python("print(1)", cpus=3), {"steps": "echo invalid"}, {"steps": [["x"]], "typo": 1}]:
+        for task in [python("print(1)", max_cpus=0), {"steps": "echo invalid"}, {"steps": [["x"]], "typo": 1}]:
             with self.assertRaises(RemoteError):
                 self.client.submit(task)
 

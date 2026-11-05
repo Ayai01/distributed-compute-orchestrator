@@ -172,7 +172,7 @@ class BulkIOControlTests(unittest.TestCase):
 
     def test_worker_asset_unpack_and_submission_keep_status_and_grants_responsive(self):
         with scratch() as directory, provider(Path(directory)/'worker', cpus=2) as (_, client):
-            identity = client.submit(python('import time;time.sleep(30)', cpus=2))['id']
+            identity = client.submit(python('import time;time.sleep(30)', max_cpus=2))['id']
             until(lambda: client.status(identity)['status'] == 'running')
             def probe():
                 self.assertEqual(client.status(identity)['status'], 'running')
@@ -740,7 +740,7 @@ class StatusReadReconnectTests(unittest.TestCase):
     def test_admission_recovers_only_the_same_readonly_advice(self):
         client=Client();grant=dict(current=3,maximum=8)
         with patch.object(client,'request',side_effect=[self.outage(502),grant]) as request,patch('remote_compute.client.time.sleep'):
-            self.assertEqual(client.admission('RGCN',cpus=1,requires=['ng47']),grant)
+            self.assertEqual(client.admission('RGCN',max_cpus=1,requires=['ng47']),grant)
         self.assertEqual(request.call_count,2)
         self.assertEqual(request.call_args_list[0],request.call_args_list[1])
         self.assertEqual(request.call_args.args[0],'/admission')

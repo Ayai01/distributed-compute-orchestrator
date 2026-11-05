@@ -343,6 +343,7 @@ class StatusRows(list):
         self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))
+            if not value.get('accepting',True):self.summary+=' | 停止新增，收齐在途'
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
         self.devices,self.jobs=[],[]
         for number,node in enumerate(nodes,1):

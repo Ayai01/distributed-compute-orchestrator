@@ -78,7 +78,7 @@ class ReadyQueueTests(unittest.TestCase):
         original = dict(running_tasks=2, queued_tasks=254, in_flight=256, max_in_flight=256,
                         target_cpus=8, ready_source='center')
         with patch.object(client, 'request', return_value=original.copy()) as request:
-            window = client.window('A', cpus=4, ready_tasks=256)
+            window = client.window('A', max_cpus=4, ready_tasks=256)
             self.assertEqual((window.maximum, window.current()), (256, 256))
             self.assertEqual(window.value['target_cpus'], 8)
             self.assertEqual(window.value['ready_source'], 'center')
@@ -98,7 +98,7 @@ class ReadyQueueTests(unittest.TestCase):
         client = Client()
         value = dict(running_tasks=2, queued_tasks=2, in_flight=4, max_in_flight=8)
         with patch.object(client, 'request', return_value=value):
-            window = client.window('A', cpus=4, ready_tasks=4)
+            window = client.window('A', max_cpus=4, ready_tasks=4)
         pending = {'running': 'a'*32, 'terminal_unpublished': 'b'*32,
                    'submission_unknown': 'c'*32, 'queued': 'd'*32}
         self.assertEqual(window.available(len(pending)), 0)

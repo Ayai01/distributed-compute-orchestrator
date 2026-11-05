@@ -80,7 +80,7 @@ class DirectTests(unittest.TestCase):
                           "c=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN']);"
                           "a=c.admission('default',job_id=os.environ['REMOTE_COMPUTE_JOB_ID']);assert a['recommended_cpus']==2;"
                           "print(json.dumps(c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=64)))")
-                    result=client.run(python(code,cpus=2,memory_mb=128))
+                    result=client.run(python(code,max_cpus=2,memory_mb=128))
                     self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                     grant=json.loads(result['stdout'])
                     self.assertEqual((grant['cpus'],grant['memory_mb']),(1,64))

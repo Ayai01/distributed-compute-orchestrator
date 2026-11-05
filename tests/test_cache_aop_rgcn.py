@@ -18,7 +18,7 @@ import zlib
 from remote_compute import cache_aop, cache_rgcn
 
 
-PROJECTS = Path(__file__).resolve().parents[2]
+PROJECTS = Path(os.environ.get('REMOTE_COMPUTE_TEST_PROJECTS_ROOT',Path(__file__).resolve().parents[2]))
 AOP = PROJECTS / 'AOP_v2'
 RGCN = PROJECTS / 'RGCN-v2'
 

@@ -371,10 +371,10 @@ class CenterTests(unittest.TestCase):
     def test_cross_project_four_thread_lease_precedes_new_dispatch(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
-                first=client.submit(python('import time;time.sleep(30)',cpus=1,max_cpus=8,project='A'))['id']
+                first=client.submit(python('import time;time.sleep(30)',max_cpus=8,project='A'))['id']
                 try:
                     until(lambda:client.status(first)['status']=='running')
-                    second=client.submit(python('print("new-project")',cpus=1,max_cpus=1,project='B'))['id']
+                    second=client.submit(python('print("new-project")',max_cpus=1,project='B'))['id']
                     self.assertEqual(client.status(second)['status'],'queued')
                     self.assertEqual(client.resize(first,4)['cpus'],4)
                     self.assertEqual(worker.status(first)['cpus'],4)
@@ -393,7 +393,7 @@ class CenterTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=16)as (_,worker):
             with Pool([dict(name='only',url=worker.url)],refresh=60)as pool:
                 with center(pool,Path(root)/'center',paused=True)as (state,client):
-                    ids=[client.submit(python('import time;time.sleep(30)',cpus=1,max_cpus=16,
+                    ids=[client.submit(python('import time;time.sleep(30)',max_cpus=16,
                         project='warmup',retries=0))['id']for _ in range(6)]
                     try:
                         client.control(paused=False)
@@ -566,44 +566,46 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.fetch(waiting)['assigned_node'],name)
 
     def test_global_pause_blocks_dispatch_but_allows_existing_phase_growth(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
-            with center(pool,Path(root)/'center') as (_,client):
-                hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
-                active=client.submit(python(hold,cpus=0,memory_mb=64,project='A'))['id']
-                until(lambda:client.status(active)['status']=='running')
-                before=client.status(active)
-                self.assertEqual(client.resize(active,1)['cpus'],1)
-                was_paused=client.health()['paused']
-                try:
-                    client.control(paused=True)
-                    waiting=client.submit(python(hold,cpus=1,memory_mb=64,project='B'))['id']
-                    reply=client.resize(active,2,base_memory_mb=64,memory_per_cpu_mb=32)
-                    self.assertEqual((reply['cpus'],reply['memory_mb']),(2,128))
-                    time.sleep(.15)
-                    self.assertEqual(client.status(waiting)['status'],'queued')
-                    after=client.status(active)
-                    self.assertEqual(after['status'],'running')
-                    self.assertEqual(after['started'],before['started'])
-                    self.assertEqual(after['request_sha256'],before['request_sha256'])
-                    self.assertEqual(pool.nodes[0].capacity,4)
-                    self.assertFalse(pool.nodes[0].health.get('paused',False))
-                finally:
-                    client.control(paused=was_paused)
-                until(lambda:client.status(waiting)['status']=='running')
-                for identity in (active,waiting):
-                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
+                with center(pool,Path(root)/'center') as (_,client):
+                    hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+                    active=client.submit(python(hold,max_cpus=1024,memory_mb=64,project='A'))['id']
+                    until(lambda:client.status(active)['status']=='running' and bool(worker.status(active).get('steps')))
+                    before=client.status(active)
+                    self.assertEqual(client.resize(active,1)['cpus'],1)
+                    was_paused=client.health()['paused']
+                    try:
+                        client.control(paused=True)
+                        waiting=client.submit(python(hold,max_cpus=1,memory_mb=64,project='B'))['id']
+                        reply=client.resize(active,2,base_memory_mb=64,memory_per_cpu_mb=32)
+                        self.assertEqual((reply['cpus'],reply['memory_mb']),(2,128))
+                        time.sleep(.15)
+                        self.assertEqual(client.status(waiting)['status'],'queued')
+                        after=client.status(active)
+                        self.assertEqual(after['status'],'running')
+                        self.assertEqual(after['started'],before['started'])
+                        self.assertEqual(after['request_sha256'],before['request_sha256'])
+                        self.assertEqual(pool.nodes[0].capacity,4)
+                        self.assertFalse(pool.nodes[0].health.get('paused',False))
+                    finally:
+                        client.control(paused=was_paused)
+                    until(lambda:client.status(waiting)['status']=='running')
+                    for identity in (active,waiting):
+                        client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
 
     def test_freed_cpu_waits_for_running_phase_growth_before_lending_again(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
             with center(pool,Path(root)/'center') as (state,client):
                 sleep="import time;time.sleep(30)"
-                borrowers=[client.submit(python(sleep,cpus=1,memory_mb=64,project='Bench'))['id'] for _ in range(3)]
+                borrowers=[client.submit(python(sleep,max_cpus=1,memory_mb=64,project='Bench'))['id'] for _ in range(3)]
                 until(lambda:all(client.status(i)['status']=='running' for i in borrowers))
-                active=client.submit(python(sleep,cpus=0,memory_mb=64,project='ARH'))['id']
+                active=client.submit(python(sleep,max_cpus=1024,memory_mb=64,project='ARH'))['id']
                 until(lambda:client.status(active)['status']=='running')
                 original=client.status(active)['request_sha256']
                 self.assertEqual(client.resize(active,2)['cpus'],1)
-                waiting=client.submit(python(sleep,cpus=1,memory_mb=64,project='Bench'))['id']
+                waiting=client.submit(python(sleep,max_cpus=1,memory_mb=64,project='Bench'))['id']
                 client.cancel(borrowers[0]);client.wait(borrowers[0]);client.fetch(borrowers[0])
                 time.sleep(.3)
                 self.assertEqual(client.status(waiting)['status'],'queued')
@@ -761,7 +763,7 @@ class CenterTests(unittest.TestCase):
               "print(str(grant['cpus'])+':'+str(grant['memory_mb']))\n")
         with scratch() as root,provider(Path(root)/'worker',cpus=2,memory_mb=1024,memory_reserve_mb=0) as (worker,remote), \
                 Pool([remote]) as pool,center(pool,Path(root)/'center') as (_,client):
-            identity=client.submit(python(code,cpus=2,memory_mb=512))['id']
+            identity=client.submit(python(code,max_cpus=2,memory_mb=512))['id']
             until(lambda:client.status(identity)['status']=='running')
             with patch.object(pool,'_probe',return_value=None):
                 pool.refresh()
@@ -824,24 +826,24 @@ class CenterTests(unittest.TestCase):
             with Pool([pc,tx,server]) as pool,center(pool,Path(root)/'center') as (_,client):
                 client.control(paused=True)
                 tasks=[python('pass',project='ARH',node='node1'),
-                       python('pass',project='ARH',cpus=0,node='node2'),
-                       python('pass',project='Bench',cpus=0,max_cpus=2,node='node3')]
+                       python('pass',project='ARH',max_cpus=1024,node='node2'),
+                       python('pass',project='Bench',max_cpus=2,node='node3')]
                 tasks += [python('pass',project='Bench',requires=['physical_profile_a']) for _ in range(10)]
                 identities=[client.submit(task)['id'] for task in tasks]
                 resources=client.health()['projects']
                 self.assertEqual({p:r['target'] for p,r in resources.items()},{'ARH':5,'Bench':5})
-                self.assertEqual(client.admission('ARH',node='node2',cpus=0)['target_cpus'],5)
+                self.assertEqual(client.admission('ARH',node='node2',max_cpus=1024)['target_cpus'],5)
                 for identity in identities:client.cancel(identity);client.delete(identity)
 
     def test_auto_reloan_returns_excess_only_when_the_running_task_requests_it(self):
         hold="from pathlib import Path; import time\nwhile not Path('release').exists():time.sleep(.02)"
         with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
-                first=client.submit(python(hold,project='A',cpus=0,memory_mb=64))['id']
+                first=client.submit(python(hold,project='A',max_cpus=1024,memory_mb=64))['id']
                 until(lambda:client.status(first)['status']=='running')
                 self.assertEqual(client.status(first)['cpus'],1)
                 self.assertEqual(client.resize(first,0)['cpus'],4)
-                second=client.submit(python(hold,project='B',cpus=0,memory_mb=64))['id']
+                second=client.submit(python(hold,project='B',max_cpus=1024,memory_mb=64))['id']
                 self.assertEqual(client.status(first)['cpus'],4)
                 # The first four useful threads precede a queued entrant.
                 self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],4)
@@ -903,22 +905,24 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual((window.current(),window.maximum),(2,2))
 
     def test_modeled_resize_fits_cpu_and_ram_and_rechecks_later_budget(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=768,memory_reserve_mb=0) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
-                identity=client.submit(python('import time;time.sleep(30)',memory_mb=64))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256)
-                self.assertEqual((grant['cpus'],grant['memory_mb']),(2,640))
-                self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(2,640))
-                grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256,memory_limit_mb=384)
-                self.assertEqual((grant['cpus'],grant['memory_mb']),(1,384))
-                client.control(node='node1',worker={'memory_mb':1536})
-                grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256,memory_limit_mb=1152)
-                self.assertEqual((grant['cpus'],grant['memory_mb']),(4,1152))
-                self.assertEqual(worker.status(identity)['cpus'],4)
-                client.cancel(identity);client.wait(identity);client.fetch(identity)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=768,memory_reserve_mb=0) as (_,worker):
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                    identity=client.submit(python('import time;time.sleep(30)',memory_mb=64,max_cpus=4))['id']
+                    until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
+                    grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256)
+                    self.assertEqual((grant['cpus'],grant['memory_mb']),(2,640))
+                    self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(2,640))
+                    grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256,memory_limit_mb=384)
+                    self.assertEqual((grant['cpus'],grant['memory_mb']),(1,384))
+                    client.control(node='node1',worker={'memory_mb':1536})
+                    grant=client.resize(identity,0,base_memory_mb=128,memory_per_cpu_mb=256,memory_limit_mb=1152)
+                    self.assertEqual((grant['cpus'],grant['memory_mb']),(4,1152))
+                    self.assertEqual(worker.status(identity)['cpus'],4)
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_modeled_resize_rejection_preserves_existing_grant_and_demand(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=512,memory_reserve_mb=0) as (_,worker):
@@ -964,9 +968,9 @@ class CenterTests(unittest.TestCase):
     def test_auto_resize_rechecks_budget_after_a_partial_initial_grant(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
-                blocker=client.submit(python('import time;time.sleep(30)',cpus=3,project='other'))['id']
+                blocker=client.submit(python('import time;time.sleep(30)',max_cpus=3,project='other'))['id']
                 until(lambda:client.status(blocker)['status']=='running')
-                identity=client.submit(python('import time;time.sleep(30)',cpus=0,max_cpus=3,project='A'))['id']
+                identity=client.submit(python('import time;time.sleep(30)',max_cpus=3,project='A'))['id']
                 until(lambda:client.status(identity)['status']=='running')
                 self.assertEqual(client.status(identity)['cpus'],1)
                 client.cancel(blocker);client.wait(blocker);client.fetch(blocker)
@@ -992,49 +996,52 @@ class CenterTests(unittest.TestCase):
         client.request.assert_called_once_with('/jobs/original/resize',dict(cpus=0,memory_mb=512))
 
     def test_cooperative_boundary_admits_same_project_auto_and_fixed_jobs(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
-                first=client.submit(python('import time;time.sleep(30)',cpus=0,project='RGCN'))['id']
-                until(lambda:client.status(first)['status']=='running')
-                before=client.status(first)['request_sha256']
-                second=client.submit(python('import time;time.sleep(30)',cpus=0,project='RGCN'))['id']
-                fixed=client.submit(python('import time;time.sleep(30)',cpus=1,project='RGCN'))['id']
-                grant=client.resize(first,1,base_memory_mb=64,memory_per_cpu_mb=32)
-                self.assertEqual(grant['cpus'],1)
-                until(lambda:client.status(second)['status']=='running' and client.status(fixed)['status']=='running')
-                self.assertEqual(client.resize(second,0)['cpus'],2)
-                self.assertEqual(client.status(first)['request_sha256'],before)
-                self.assertEqual(pool.nodes[0].reserved,4)
-                for identity in (fixed,second):
-                    client.cancel(identity);client.wait(identity);client.fetch(identity)
-                self.assertEqual(client.resize(first,0)['cpus'],4)
-                client.cancel(first);client.wait(first);client.fetch(first)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                    first=client.submit(python('import time;time.sleep(30)',max_cpus=1024,project='RGCN'))['id']
+                    until(lambda:client.status(first)['status']=='running' and bool(worker.status(first).get('steps')))
+                    before=client.status(first)['request_sha256']
+                    second=client.submit(python('import time;time.sleep(30)',max_cpus=2,project='RGCN'))['id']
+                    fixed=client.submit(python('import time;time.sleep(30)',max_cpus=1,project='RGCN'))['id']
+                    grant=client.resize(first,1,base_memory_mb=64,memory_per_cpu_mb=32)
+                    self.assertEqual(grant['cpus'],1)
+                    until(lambda:client.status(second)['status']=='running' and client.status(fixed)['status']=='running')
+                    self.assertEqual(client.resize(second,0)['cpus'],2)
+                    self.assertEqual(client.status(first)['request_sha256'],before)
+                    self.assertEqual(pool.nodes[0].reserved,4)
+                    for identity in (fixed,second):
+                        client.cancel(identity);client.wait(identity);client.fetch(identity)
+                    self.assertEqual(client.resize(first,0)['cpus'],4)
+                    client.cancel(first);client.wait(first);client.fetch(first)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_finite_phase_demand_from_auto_job_yields_to_ready_fixed_work(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
-                active=client.submit(python('import time;time.sleep(30)',cpus=0,project='RGCN'))['id']
-                until(lambda:client.status(active)['status']=='running')
-                client.resize(active,4)
-                self.assertEqual(client.status(active)['cpus'],4)
-                before=client.status(active)['request_sha256']
-                waiting=client.submit(python('import time;time.sleep(30)',cpus=3,project='RGCN'))['id']
-                # RGCN reports the useful width at a drained native boundary,
-                # including when it equals the previous phase's grant.
-                grant=client.resize(active,4,base_memory_mb=64,memory_per_cpu_mb=32)
-                self.assertEqual((grant['cpus'],grant['requested_cpus']),(1,4))
-                until(lambda:client.status(waiting)['status']=='running')
-                self.assertEqual(pool.nodes[0].reserved,4)
-                client.cancel(waiting);client.wait(waiting);client.fetch(waiting)
-                # A finite useful width remains an upper bound after the peer
-                # finishes; it does not request the whole node like cpus=0.
-                self.assertEqual(client.resize(active,2)['cpus'],2)
-                self.assertEqual(client.status(active)['request_sha256'],before)
-                client.cancel(active);client.wait(active);client.fetch(active)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
+                    active=client.submit(python('import time;time.sleep(30)',max_cpus=1024,project='RGCN'))['id']
+                    until(lambda:client.status(active)['status']=='running' and bool(worker.status(active).get('steps')))
+                    client.resize(active,4)
+                    self.assertEqual(client.status(active)['cpus'],4)
+                    before=client.status(active)['request_sha256']
+                    waiting=client.submit(python('import time;time.sleep(30)',max_cpus=3,project='RGCN'))['id']
+                    # The executor yields idle slots at a drained one-item tail.
+                    grant=client.resize(active,1,base_memory_mb=64,memory_per_cpu_mb=32)
+                    self.assertEqual((grant['cpus'],grant['requested_cpus']),(1,1))
+                    until(lambda:client.status(waiting)['status']=='running')
+                    self.assertEqual(client.resize(waiting,3)['cpus'],3)
+                    self.assertEqual(pool.nodes[0].reserved,4)
+                    client.cancel(waiting);client.wait(waiting);client.fetch(waiting)
+                    # The next kernel can grow within the original useful ceiling.
+                    self.assertEqual(client.resize(active,2)['cpus'],2)
+                    self.assertEqual(client.status(active)['request_sha256'],before)
+                    client.cancel(active);client.wait(active);client.fetch(active)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_node_public_ip_override_survives_load_configure_snapshot_and_save(self):
         from types import SimpleNamespace
@@ -1069,57 +1076,62 @@ class CenterTests(unittest.TestCase):
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_slow_resize_reserves_growth_without_blocking_admission(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
-                identity=client.submit(python('import time;time.sleep(30)',project='A'))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                backend=pool.nodes[0].client;original=backend.resize
-                entered,release=threading.Event(),threading.Event();results=[]
-                def delayed(*args,**kwargs):
-                    entered.set();release.wait(5)
-                    return original(*args,**kwargs)
-                with patch.object(backend,'resize',side_effect=delayed):
-                    thread=threading.Thread(target=lambda:results.append(state.resize(identity,4,memory_mb=512)))
-                    thread.start()
-                    try:
-                        self.assertTrue(entered.wait(2))
-                        quick=Client(client.url,timeout=.5)
-                        self.assertEqual(quick.health()['used_cpus'],4)
-                        self.assertEqual(quick.admission('B')['target_cpus'],2)
-                        self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
-                        self.assertEqual(worker.health()['used_cpus'],1)
-                        other=quick.submit(python('pass',project='B'))['id']
-                        self.assertEqual(quick.status(other)['status'],'queued')
-                    finally:
-                        release.set();thread.join(5)
-                self.assertEqual(results[0]['cpus'],4)
-                client.cancel(identity);client.wait(identity);client.fetch(identity)
-                client.wait(other);client.fetch(other)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                    identity=client.submit(python('import time;time.sleep(30)',project='A',max_cpus=4))['id']
+                    until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
+                    client.resize(identity,1)
+                    backend=pool.nodes[0].client;original=backend.resize
+                    entered,release=threading.Event(),threading.Event();results=[]
+                    def delayed(*args,**kwargs):
+                        entered.set();release.wait(5)
+                        return original(*args,**kwargs)
+                    with patch.object(backend,'resize',side_effect=delayed):
+                        thread=threading.Thread(target=lambda:results.append(state.resize(identity,4,memory_mb=512)))
+                        thread.start()
+                        try:
+                            self.assertTrue(entered.wait(2))
+                            quick=Client(client.url,timeout=.5)
+                            self.assertEqual(quick.health()['used_cpus'],4)
+                            self.assertEqual(quick.admission('B')['target_cpus'],2)
+                            self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
+                            self.assertEqual(worker.health()['used_cpus'],1)
+                            other=quick.submit(python('pass',project='B',max_cpus=4))['id']
+                            self.assertEqual(quick.status(other)['status'],'queued')
+                        finally:
+                            release.set();thread.join(5)
+                    self.assertEqual(results[0]['cpus'],4)
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
+                    client.wait(other);client.fetch(other)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_late_resize_ack_after_completion_does_not_release_twice(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
-                identity=client.submit(python('import time;time.sleep(30)'))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                backend=pool.nodes[0].client;original=backend.resize
-                entered,release=threading.Event(),threading.Event();results=[]
-                def delayed(*args,**kwargs):
-                    value=original(*args,**kwargs);entered.set();release.wait(5)
-                    return value
-                with patch.object(backend,'resize',side_effect=delayed):
-                    thread=threading.Thread(target=lambda:results.append(state.resize(identity,4)))
-                    thread.start()
-                    try:
-                        self.assertTrue(entered.wait(2))
-                        client.cancel(identity);client.wait(identity);client.fetch(identity)
-                        until(lambda:pool.nodes[0].reserved==0)
-                    finally:
-                        release.set();thread.join(5)
-                self.assertEqual(results[0]['cpus'],4)
-                self.assertEqual(pool.nodes[0].reserved,0)
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                    identity=client.submit(python('import time;time.sleep(30)',max_cpus=4))['id']
+                    until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
+                    backend=pool.nodes[0].client;original=backend.resize
+                    entered,release=threading.Event(),threading.Event();results=[]
+                    def delayed(*args,**kwargs):
+                        value=original(*args,**kwargs);entered.set();release.wait(5)
+                        return value
+                    with patch.object(backend,'resize',side_effect=delayed):
+                        thread=threading.Thread(target=lambda:results.append(state.resize(identity,4)))
+                        thread.start()
+                        try:
+                            self.assertTrue(entered.wait(2))
+                            client.cancel(identity);client.wait(identity);client.fetch(identity)
+                            until(lambda:pool.nodes[0].reserved==0)
+                        finally:
+                            release.set();thread.join(5)
+                    self.assertEqual(results[0]['cpus'],4)
+                    self.assertEqual(pool.nodes[0].reserved,0)
+                    self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_rejected_resize_restores_cpu_and_ram_reservations(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
@@ -1135,25 +1147,27 @@ class CenterTests(unittest.TestCase):
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_uncertain_resize_keeps_budget_and_reconfirms_same_grant(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
-            with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
-                identity=client.submit(python('import time;time.sleep(30)'))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                backend=pool.nodes[0].client;original=backend.resize
-                def lost_reply(*args,**kwargs):
-                    original(*args,**kwargs)
-                    raise RemoteError('lost resize acknowledgement')
-                with patch.object(backend,'resize',side_effect=lost_reply),patch.object(backend,'status',side_effect=RemoteError('status unavailable')):
-                    with self.assertRaises(RemoteError):state.resize(identity,4,memory_mb=512)
-                    self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(4,512))
-                    self.assertTrue(state.jobs[identity]['resize_uncertain'])
-                with patch.object(backend,'resize',wraps=original) as resize:
-                    self.assertEqual(client.resize(identity,4,memory_mb=512)['cpus'],4)
-                    self.assertEqual(resize.call_count,1)
-                self.assertNotIn('resize_uncertain',state.jobs[identity])
-                client.cancel(identity);client.wait(identity);client.fetch(identity)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+                with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
+                    identity=client.submit(python('import time;time.sleep(30)',max_cpus=4))['id']
+                    until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
+                    backend=pool.nodes[0].client;original=backend.resize
+                    def lost_reply(*args,**kwargs):
+                        original(*args,**kwargs)
+                        raise RemoteError('lost resize acknowledgement')
+                    with patch.object(backend,'resize',side_effect=lost_reply),patch.object(backend,'status',side_effect=RemoteError('status unavailable')):
+                        with self.assertRaises(RemoteError):state.resize(identity,4,memory_mb=512)
+                        self.assertEqual((pool.nodes[0].reserved,pool.nodes[0].reserved_memory_mb),(4,512))
+                        self.assertTrue(state.jobs[identity]['resize_uncertain'])
+                    with patch.object(backend,'resize',wraps=original) as resize:
+                        self.assertEqual(client.resize(identity,4,memory_mb=512)['cpus'],4)
+                        self.assertEqual(resize.call_count,1)
+                    self.assertNotIn('resize_uncertain',state.jobs[identity])
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_serial_hint_is_center_metadata_and_not_forwarded_to_older_worker(self):
         import zipfile
@@ -1256,7 +1270,7 @@ class CenterTests(unittest.TestCase):
                                 until(lambda:client.health()['used_cpus']==16)
                                 until(lambda:all(client.status(i)['status']=='running' for i in ids))
                                 assigned=[client.status(i)['assigned_node'] for i in ids]
-                                self.assertEqual(assigned[:6],['idle']*6)
+                                self.assertEqual(assigned[0],'idle')
                                 self.assertEqual((assigned.count('busy'),assigned.count('idle')),(8,8))
                                 for identity in ids:
                                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
@@ -1271,32 +1285,32 @@ class CenterTests(unittest.TestCase):
             with host_load(warm,50,'warm-host'), host_load(busy,75,'busy-host'):
                 with Pool([dict(name='warm',url=one.url),dict(name='busy',url=two.url)],refresh=60) as pool:
                     with center(pool,Path(root)/'center') as (_,client):
-                        initial=client.submit(python(code,cpus=4,node='warm',project='CPU-placement'))['id']
-                        until(lambda:client.status(initial)['status']=='running')
+                        initial=client.submit(python(code,max_cpus=4,node='warm',project='CPU-placement'))['id']
+                        until(lambda:client.status(initial)['status']=='running' and bool(one.status(initial).get('steps')))
                         pool.refresh()
                         client.control(paused=True)
                         ids=[client.submit(python(code,project='CPU-placement'))['id'] for _ in range(3)]
                         client.control(paused=False)
                         until(lambda:client.health()['used_cpus']==7)
                         until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
-                        self.assertEqual([client.status(i)['assigned_node'] for i in ids],['warm','warm','busy'])
+                        self.assertEqual(sorted(client.status(i)['assigned_node'] for i in ids),['busy','warm','warm'])
                         for identity in [initial,*ids]:
                             client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
 
     def test_auto_window_runs_both_nodes_without_extra_prefetch(self):
         with scratch() as root, provider(Path(root)/'one',cpus=2) as (_,one), provider(Path(root)/'two',cpus=2) as (_,two):
             with Pool([one,two]) as pool, center(pool,Path(root)/'center') as (_,client):
-                window=client.window('automatic',cpus=0,queue_ratio=0)
-                self.assertEqual(window.current(),2)
+                window=client.window('automatic',queue_ratio=0)
+                self.assertEqual(window.current(),4)
                 ids=[client.submit(python("from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)",
-                    cpus=0,project='automatic'))['id'] for _ in range(window.current())]
-                until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
-                self.assertEqual(client.health()['used_cpus'],2)
-                for identity in ids:client.resize(identity,0)
+                    max_cpus=1024,project='automatic'))['id'] for _ in range(window.current())]
+                until(lambda:client.health()['used_cpus']==4)
+                until(lambda:sum(client.status(i)['status']=='running'for i in ids)==2)
+                for identity in ids[:2]:client.resize(identity,0)
                 self.assertEqual(client.health()['used_cpus'],4)
-                self.assertEqual(len({client.status(i)['assigned_node'] for i in ids}),2)
+                self.assertEqual(len({client.status(i)['assigned_node'] for i in ids if client.status(i)['status']=='running'}),2)
                 for identity in ids:
-                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_overlapping_auto_projects_start_the_restricted_job_before_flexible_work(self):
         hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
@@ -1304,8 +1318,8 @@ class CenterTests(unittest.TestCase):
                 provider(Path(root)/'two',cpus=2) as (_,two):
             with Pool([one,two]) as pool,center(pool,Path(root)/'center') as (_,client):
                 client.control(paused=True)
-                flexible=client.submit(python(hold,project='A',cpus=0))['id']
-                restricted=client.submit(python(hold,project='B',cpus=0,requires=['special']))['id']
+                flexible=client.submit(python(hold,project='A',max_cpus=1024))['id']
+                restricted=client.submit(python(hold,project='B',max_cpus=1024,requires=['special']))['id']
                 client.control(paused=False)
                 until(lambda:all(client.status(identity)['status']=='running' for identity in (flexible,restricted)))
                 self.assertEqual(client.status(restricted)['assigned_node'],'node1')
@@ -1320,15 +1334,15 @@ class CenterTests(unittest.TestCase):
         with scratch() as root,provider(Path(root)/'one',cpus=12) as (_,one), \
                 provider(Path(root)/'two',cpus=12) as (_,two):
             with Pool([one,two]) as pool,center(pool,Path(root)/'center') as (_,client):
-                existing=client.submit(python(hold,project='A',cpus=0,node='node1'))['id']
+                existing=client.submit(python(hold,project='A',max_cpus=1024,node='node1'))['id']
                 until(lambda:client.status(existing)['status']=='running')
                 client.resize(existing,0)
                 client.control(node='node1',worker=dict(paused=True))
                 client.control(paused=True)
-                queued=client.submit(python(hold,project='A',cpus=0))['id']
-                other=client.submit(python(hold,project='B',cpus=0))['id']
-                self.assertEqual(client.admission('A',cpus=0,queue_ratio=0)['target_cpus'],12)
-                self.assertEqual(client.admission('B',cpus=0,queue_ratio=0)['target_cpus'],12)
+                queued=client.submit(python(hold,project='A',max_cpus=1024))['id']
+                other=client.submit(python(hold,project='B',max_cpus=1024))['id']
+                self.assertEqual(client.admission('A',max_cpus=1024,queue_ratio=0)['target_cpus'],12)
+                self.assertEqual(client.admission('B',max_cpus=1024,queue_ratio=0)['target_cpus'],12)
                 client.control(paused=False)
                 until(lambda:all(client.status(i)['status']=='running'for i in (other,queued)))
                 client.resize(other,0)
@@ -1349,40 +1363,40 @@ class CenterTests(unittest.TestCase):
         with scratch() as root,provider(Path(root)/'one',cpus=2) as (_,one), \
                 provider(Path(root)/'two',cpus=2) as (_,two),provider(Path(root)/'three',cpus=2) as (_,three):
             with Pool([one,two,three]) as pool,center(pool,Path(root)/'center') as (_,client):
-                window=client.window('automatic',cpus=0,max_cpus=8,queue_ratio=0)
-                identities=[client.submit(python(hold,cpus=0,max_cpus=8,project='automatic'))['id']
+                window=client.window('automatic',max_cpus=8,queue_ratio=0)
+                identities=[client.submit(python(hold,max_cpus=8,project='automatic'))['id']
                             for _ in range(window.current())]
-                until(lambda:all(client.status(identity)['status']=='running' for identity in identities))
-                for identity in identities:client.resize(identity,0)
+                until(lambda:client.health()['used_cpus']==6)
+                until(lambda:sum(client.status(i)['status']=='running'for i in identities)==3)
                 self.assertEqual(client.health()['used_cpus'],6)
-                self.assertEqual(len({client.status(identity)['assigned_node'] for identity in identities}),3)
+                self.assertEqual(len({client.status(i)['assigned_node']for i in identities if client.status(i)['status']=='running'}),3)
                 for identity in identities:
-                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_auto_window_refills_after_running_tasks_return_cpu_credits(self):
         hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
         with scratch() as root, provider(Path(root)/'one',cpus=4,cpu_limit=4) as (_,one), provider(Path(root)/'two',cpus=4,cpu_limit=4) as (_,two):
             with Pool([one,two]) as pool, center(pool,Path(root)/'center') as (_,client):
-                window=client.window('phased',cpus=0,queue_ratio=0)
-                self.assertEqual((window.maximum,window.current()),(8,2))
-                ids=[client.submit(python(hold,cpus=0,project='phased'))['id'] for _ in range(2)]
+                window=client.window('phased',queue_ratio=0)
+                self.assertEqual((window.maximum,window.current()),(8,8))
+                ids=[client.submit(python(hold,max_cpus=1024,project='phased'))['id'] for _ in range(2)]
                 until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
                 for identity in ids:client.resize(identity,0)
                 self.assertEqual(client.health()['used_cpus'],8)
                 for identity in ids:client.resize(identity,1)
                 window.updated=0
-                self.assertEqual(window.current(),4)
-                queued=client.admission('phased',cpus=0,queue_ratio=1)
+                self.assertEqual(window.current(),8)
+                queued=client.admission('phased',max_cpus=1024,queue_ratio=1)
                 self.assertEqual((queued['running_tasks'],queued['queued_tasks'],queued['in_flight'],queued['max_in_flight']),
-                                 (4,125,129,129))
+                                 (8,121,129,129))
                 first=list(ids)
-                ids += [client.submit(python(hold,cpus=0,project='phased'))['id'] for _ in range(2)]
+                ids += [client.submit(python(hold,max_cpus=1024,project='phased'))['id'] for _ in range(2)]
                 until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
                 for identity in ids[2:]:client.resize(identity,0)
                 self.assertEqual(client.health()['used_cpus'],8)
                 self.assertTrue(all(client.status(identity)['cpus']==1 for identity in first))
                 window.updated=0
-                self.assertEqual(window.current(),4)
+                self.assertEqual(window.current(),8)
                 for identity in ids:
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
 
@@ -1390,14 +1404,14 @@ class CenterTests(unittest.TestCase):
         hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
         with scratch() as root, provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                ids=[client.submit(python(hold,cpus=0,max_cpus=2,project='capped'))['id'] for _ in range(2)]
+                ids=[client.submit(python(hold,max_cpus=2,project='capped'))['id'] for _ in range(2)]
                 until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
                 for identity in ids:client.resize(identity,0)
                 self.assertEqual(client.health()['used_cpus'],4)
                 client.resize(ids[0],1)
-                window=client.admission('capped',cpus=0,max_cpus=2,queue_ratio=1)
-                self.assertEqual((window['running_tasks'],window['queued_tasks'],window['max_in_flight']),(3,126,129))
-                ids.append(client.submit(python(hold,cpus=0,max_cpus=2,project='capped'))['id'])
+                window=client.admission('capped',max_cpus=2,queue_ratio=1)
+                self.assertEqual((window['running_tasks'],window['queued_tasks'],window['max_in_flight']),(4,125,129))
+                ids.append(client.submit(python(hold,max_cpus=2,project='capped'))['id'])
                 until(lambda:client.health()['used_cpus']==4)
                 until(lambda:client.status(ids[-1])['status']=='running')
                 self.assertEqual(client.status(ids[-1])['cpus'],1)
@@ -1407,10 +1421,10 @@ class CenterTests(unittest.TestCase):
     def test_auto_window_counts_only_its_own_projects_running_tasks(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                identity=client.submit(python('import time;time.sleep(30)',cpus=0,project='other'))['id']
+                identity=client.submit(python('import time;time.sleep(30)',max_cpus=1024,project='other'))['id']
                 until(lambda:client.status(identity)['status']=='running')
-                window=client.admission('newcomer',cpus=0,queue_ratio=0)
-                self.assertEqual((window['running_tasks'],window['in_flight']),(1,1))
+                window=client.admission('newcomer',max_cpus=1024,queue_ratio=0)
+                self.assertEqual((window['running_tasks'],window['in_flight']),(2,2))
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_cancellation_is_sent_once_and_terminal_polling_stays_bounded(self):
@@ -1430,40 +1444,42 @@ class CenterTests(unittest.TestCase):
                 client.fetch(identity)
 
     def test_stale_probe_does_not_count_our_released_job_as_external(self):
-        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
-            with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):
-                code='import time;time.sleep(30)'
-                identity=client.submit(python(code,memory_mb=1))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                until(lambda:any(j['id']==identity and j['rss_mb']>1 for j in worker.health()['active_jobs']))
-                external=worker.submit(python(code))['id']
-                until(lambda:worker.status(external)['status']=='running')
-                self.assertEqual(client.resize(identity,3)['cpus'],3)
-                entered,release=threading.Event(),threading.Event();original=pool.nodes[0].client.health
-                sampled={}
-                def delayed_health(**options):
-                    result=original(**options)
-                    sampled.update(next(j for j in result['active_jobs'] if j['id']==external))
-                    entered.set();release.wait(5);return result
-                with patch.object(pool.nodes[0].client,'health',side_effect=delayed_health):
-                    probe=threading.Thread(target=pool.refresh);probe.start()
-                    try:
-                        self.assertTrue(entered.wait(3))
-                        self.assertEqual(client.resize(identity,1)['cpus'],1)
-                        client.cancel(identity);client.wait(identity);client.fetch(identity)
-                        until(lambda:pool.nodes[0].reserved==0)
-                    finally:release.set();probe.join(5)
-                self.assertEqual(pool.nodes[0].external,1)
-                self.assertAlmostEqual(pool.nodes[0].external_memory_mb,
-                                       sampled['rss_mb'] or sampled['memory_mb'],delta=.03)
-                self.assertIn(identity,pool.nodes[0].known_jobs)
-                self.assertFalse(pool.nodes[0].live_jobs)
-                pool.refresh()
-                self.assertFalse(pool.nodes[0].known_jobs)
-                worker.cancel(external);worker.wait(external);worker.fetch(external)
-                pool.refresh()
-                self.assertEqual(pool.nodes[0].external,0)
-                self.assertEqual(pool.nodes[0].external_memory_mb,0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
+                with Pool([worker],refresh=60) as pool, center(pool,Path(root)/'center') as (_,client):
+                    code='import time;time.sleep(30)'
+                    identity=client.submit(python(code,memory_mb=1,max_cpus=4))['id']
+                    until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
+                    until(lambda:any(j['id']==identity and j['rss_mb']>1 for j in worker.health()['active_jobs']))
+                    external=worker.submit(python(code,max_cpus=4))['id']
+                    until(lambda:worker.status(external)['status']=='running')
+                    self.assertEqual(client.resize(identity,3)['cpus'],3)
+                    entered,release=threading.Event(),threading.Event();original=pool.nodes[0].client.health
+                    sampled={}
+                    def delayed_health(**options):
+                        result=original(**options)
+                        sampled.update(next(j for j in result['active_jobs'] if j['id']==external))
+                        entered.set();release.wait(5);return result
+                    with patch.object(pool.nodes[0].client,'health',side_effect=delayed_health):
+                        probe=threading.Thread(target=pool.refresh);probe.start()
+                        try:
+                            self.assertTrue(entered.wait(3))
+                            self.assertEqual(client.resize(identity,1)['cpus'],1)
+                            client.cancel(identity);client.wait(identity);client.fetch(identity)
+                            until(lambda:pool.nodes[0].reserved==0)
+                        finally:release.set();probe.join(5)
+                    self.assertEqual(pool.nodes[0].external,1)
+                    self.assertAlmostEqual(pool.nodes[0].external_memory_mb,
+                                           sampled['rss_mb'] or sampled['memory_mb'],delta=.03)
+                    self.assertIn(identity,pool.nodes[0].known_jobs)
+                    self.assertFalse(pool.nodes[0].live_jobs)
+                    pool.refresh()
+                    self.assertFalse(pool.nodes[0].known_jobs)
+                    worker.cancel(external);worker.wait(external);worker.fetch(external)
+                    pool.refresh()
+                    self.assertEqual(pool.nodes[0].external,0)
+                    self.assertEqual(pool.nodes[0].external_memory_mb,0)
 
     def test_disconnected_running_job_keeps_grant_and_recovers_original_id(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,worker):
@@ -1515,22 +1531,24 @@ class CenterTests(unittest.TestCase):
             self.assertEqual(client.health()['cpus'],1)
 
     def test_resize_lost_reply_recovers_the_original_grant(self):
-        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
-            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                identity=client.submit(python('import time; time.sleep(30)'))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                original=pool.nodes[0].client.resize
-                def lost_reply(*args):
-                    original(*args)
-                    raise RemoteError('connection closed after accepting resize')
-                with patch.object(pool.nodes[0].client,'resize',side_effect=lost_reply) as resize:
-                    self.assertEqual(client.resize(identity,4)['cpus'],4)
-                    self.assertEqual(resize.call_count,1)
-                self.assertEqual(pool.nodes[0].reserved,4)
-                self.assertEqual(worker.health()['used_cpus'],4)
-                client.cancel(identity);client.wait(identity);client.fetch(identity)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(worker.health()['used_cpus'],0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
+                with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                    identity=client.submit(python('import time; time.sleep(30)',max_cpus=4))['id']
+                    until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
+                    original=pool.nodes[0].client.resize
+                    def lost_reply(*args):
+                        original(*args)
+                        raise RemoteError('connection closed after accepting resize')
+                    with patch.object(pool.nodes[0].client,'resize',side_effect=lost_reply) as resize:
+                        self.assertEqual(client.resize(identity,4)['cpus'],4)
+                        self.assertEqual(resize.call_count,1)
+                    self.assertEqual(pool.nodes[0].reserved,4)
+                    self.assertEqual(worker.health()['used_cpus'],4)
+                    client.cancel(identity);client.wait(identity);client.fetch(identity)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(worker.health()['used_cpus'],0)
 
     def test_submission_window_refreshes_shares_and_honors_node(self):
         with scratch() as root, provider(Path(root)/'big',cpus=4,cpu_limit=4) as (_,big), provider(Path(root)/'small',cpus=2,cpu_limit=2) as (_,small):
@@ -1560,7 +1578,7 @@ class CenterTests(unittest.TestCase):
                       "Path('grant.json').write_text(json.dumps(r))\n"
                       "while not Path('release').exists(): time.sleep(.02)\n"
                       "c.resize(os.environ['REMOTE_COMPUTE_JOB_ID'],1)\n")
-                task=python(code,project='callback',outputs=['grant.json'])
+                task=python(code,project='callback',outputs=['grant.json'],max_cpus=4)
                 identity=client.submit(task)['id']
                 until(lambda:client.status(identity)['cpus']==4)
                 self.assertEqual(client.health()['used_cpus'],4)
@@ -1582,39 +1600,43 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(worker.health()['used_cpus'],0)
 
     def test_running_grants_obey_project_shares_and_cancel_releases_latest_grant(self):
-        with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
-            with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
-                client.control(paused=True)
-                task="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
-                first=client.submit(python(task,project='A'))['id']
-                second=client.submit(python(task,project='B'))['id']
-                with self.assertRaises(RemoteError):client.resize(first,2)
-                client.control(paused=False)
-                until(lambda:all(client.status(i)['status']=='running' for i in (first,second)))
-                self.assertEqual(client.resize(first,4)['cpus'],3)
-                self.assertEqual(client.resize(second,4)['cpus'],1)
-                self.assertEqual(client.health()['used_cpus'],4)
-                self.assertEqual(client.resize(first,1)['cpus'],1)
-                self.assertEqual(client.resize(second,4)['cpus'],3)
-                client.cancel(first);client.wait(first);client.fetch(first)
-                until(lambda:pool.nodes[0].reserved==3)
-                self.assertEqual(client.resize(second,4)['cpus'],4)
-                client.write_job_file(second,'release','done')
-                result=client.wait(second);client.fetch(second)
-                self.assertEqual(result['cpus'],4)
-                until(lambda:pool.nodes[0].reserved==0)
-                self.assertEqual(worker.health()['used_cpus'],0)
+        # Test resource acknowledgement separately from initial kernel preparation.
+        with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
+            with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,worker):
+                with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
+                    client.control(paused=True)
+                    task="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+                    first=client.submit(python(task,project='A',max_cpus=4))['id']
+                    second=client.submit(python(task,project='B',max_cpus=4))['id']
+                    with self.assertRaises(RemoteError):client.resize(first,2)
+                    client.control(paused=False)
+                    until(lambda:client.status(first)['status']=='running')
+                    client.resize(first,1)
+                    until(lambda:all(client.status(i)['status']=='running' for i in (first,second)))
+                    self.assertEqual(client.resize(first,4)['cpus'],2)
+                    self.assertEqual(client.resize(second,4)['cpus'],2)
+                    self.assertEqual(client.health()['used_cpus'],4)
+                    self.assertEqual(client.resize(first,1)['cpus'],1)
+                    self.assertEqual(client.resize(second,4)['cpus'],3)
+                    client.cancel(first);client.wait(first);client.fetch(first)
+                    until(lambda:pool.nodes[0].reserved==3)
+                    self.assertEqual(client.resize(second,4)['cpus'],4)
+                    client.write_job_file(second,'release','done')
+                    result=client.wait(second);client.fetch(second)
+                    self.assertEqual(result['cpus'],4)
+                    until(lambda:pool.nodes[0].reserved==0)
+                    self.assertEqual(worker.health()['used_cpus'],0)
 
     def test_auto_uses_idle_smaller_node_while_larger_node_is_busy(self):
         with scratch() as root, provider(Path(root)/'big',cpus=3) as (_,big), provider(Path(root)/'small',cpus=2) as (_,small):
             with Pool([dict(name='big',url=big.url),dict(name='small',url=small.url)]) as pool, center(pool,Path(root)/'center') as (_,client):
                 busy=client.submit(python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",
-                                          cpus=3,node='big',project='busy'))['id']
+                                          max_cpus=3,node='big',project='busy'))['id']
                 until(lambda: client.status(busy)['status']=='running')
-                automatic=client.submit(python("print('parallel')",cpus=0,project='auto'))['id']
+                automatic=client.submit(python("print('parallel')",max_cpus=1024,project='auto'))['id']
                 until(lambda: client.status(automatic)['status'] in ('running','succeeded'))
                 result=client.wait(automatic)
-                self.assertEqual((result['assigned_node'],result['cpus']),('small',1))
+                self.assertEqual((result['assigned_node'],result['cpus']),('small',2))
                 self.assertEqual(client.status(busy)['status'],'running')
                 client.fetch(automatic)
                 client.write_job_file(busy,'release','done')
@@ -1788,7 +1810,7 @@ class CenterTests(unittest.TestCase):
                 def request(path,data=None,**kwargs):
                     if path=='/assets/'+asset:counts.append('POST' if data is not None else 'GET')
                     return original(path,data,**kwargs)
-                with patch.object(pool.nodes[0].client,'request',side_effect=request), patch('remote_compute.coordinator.pack',side_effect=AssertionError('repacked fixed task')):
+                with patch.object(pool.nodes[0].client,'request',side_effect=request):
                     client.control(paused=False)
                     for identity in identities:client.wait(identity)
                 for identity in identities:client.fetch(identity)
@@ -1837,7 +1859,7 @@ class CenterTests(unittest.TestCase):
     def test_auto_cpu_result_preserves_original_submission_identity(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=2) as (_,node):
             with Pool([node]) as pool, center(pool,Path(root)/'center') as (_,client):
-                task=python('pass',cpus=0)
+                task=python('pass',max_cpus=1024)
                 accepted=client.submit(task);client.wait(accepted['id'])
                 repeated=client.submit(task,job_id=accepted['id'])
                 self.assertEqual(repeated['request_sha256'],accepted['request_sha256'])
@@ -1890,7 +1912,7 @@ class CenterTests(unittest.TestCase):
                 task=python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",project='A')
                 jobs=[client.submit(task)['id'] for _ in range(4)]
                 until(lambda: all(client.status(job)['status']=='running' for job in jobs))
-                parallel=client.submit(python('import time; time.sleep(.4)',cpus=0,project='B'))['id']
+                parallel=client.submit(python('import time; time.sleep(.4)',max_cpus=1024,project='B'))['id']
                 client.write_job_file(jobs[0],'release','go')
                 client.wait(jobs[0]);client.fetch(jobs[0])
                 until(lambda:client.status(parallel)['status']in('running','succeeded'))
@@ -1914,7 +1936,7 @@ class CenterTests(unittest.TestCase):
             with Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
                 client.control(paused=True)
                 identities=[]
-                identities.append(client.submit(python('import time; time.sleep(1)',cpus=0,project='A'))['id'])
+                identities.append(client.submit(python('import time; time.sleep(1)',max_cpus=1024,project='A'))['id'])
                 for project in ('B','C'):
                     for _ in range(2):
                         identities.append(client.submit(python('import time; time.sleep(1)',project=project))['id'])
@@ -1930,12 +1952,13 @@ class CenterTests(unittest.TestCase):
     def test_automatic_cpu_grant_starts_with_one_thread(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, node):
             with Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
-                busy = client.submit(python('import time; time.sleep(1)', cpus=1))['id']
+                busy = client.submit(python('import time; time.sleep(1)', max_cpus=1))['id']
                 until(lambda: client.status(busy)['status'] == 'running')
-                result = client.run(python("import os; print(os.environ['GRANT'])", cpus=0, env={'GRANT':'${cpus}'}))
+                result = client.run(python("import os; print(os.environ['GRANT'])", max_cpus=1024, env={'GRANT':'${cpus}'}))
                 self.assertEqual(result['status'], 'succeeded')
-                self.assertEqual(result['cpus'], 1)
-                self.assertEqual(result['stdout'].strip(), '1')
+                self.assertEqual(result['initial_cpus'],1)
+                self.assertEqual(result['cpus'],3)
+                self.assertEqual(result['stdout'].strip(), '3')
                 client.wait(busy)
                 client.fetch(busy)
 

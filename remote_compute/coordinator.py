@@ -33,8 +33,21 @@ import os
 import re
 import secrets
 from urllib.parse import urlsplit
-from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python
+from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python, execution_bindings, capability_set
 from . import __version__
+
+
+def _matching_pass(pool):
+    """Reuse provider matches within one unchanged allocation pass."""
+    cache={}
+    def matching(task):
+        accelerator=task.get('accelerator')
+        key=(task.get('node'),task.get('cpus',1)or 1,task.get('memory_mb',256),
+             execution_bindings(task),capability_set(task.get('requires',())),
+             json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
+        if key not in cache:cache[key]=tuple(pool._matching(task))
+        return cache[key]
+    return matching
 
 
 def _elastic_job(job):
@@ -60,6 +73,12 @@ class Coordinator:
         self.legacy_assets = set()
         self.stopping = False
         self.paused = bool(paused)
+        self.accepting = True
+        admission_policy=self.root/'admission-control.json'
+        if admission_policy.is_file():
+            saved=json.loads(admission_policy.read_bytes())['accepting']
+            if type(saved)is not bool:raise ValueError('Saved accepting policy requires a boolean')
+            self.accepting=saved
         self.restart_available = False
         self.callback_address = None
         indexed = self.jobs.load_index()
@@ -240,7 +259,7 @@ class Coordinator:
                     extra=slots(credits) or int(room>0)
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
-        value = dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,
+        value = dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,accepting=getattr(self,'accepting',True),
                     accelerator=accelerator,fallback_capable_cpus=fallback_capable,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
@@ -354,6 +373,7 @@ class Coordinator:
                 'used_cpus': sum(n.reserved + n.external for n in self.pool.nodes if not n.error and n.enabled),
                 'queued': len(self.queue),
                 'paused': self.paused,
+                'accepting':getattr(self,'accepting',True),
             })
         return value
 
@@ -416,7 +436,7 @@ class Coordinator:
                                                           sum(n.memory_free for n in group))) for group in machines.values()),
                     "memory_reserved_mb": sum(n.memory_accounted for n in online),
                     "memory_requested_mb": sum(n.reserved_memory_mb+n.external_memory_mb for n in online),
-                    "paused": self.paused, "queued": len(self.queue), "tags": sorted(tags),
+                    "paused": self.paused,"accepting":getattr(self,'accepting',True), "queued": len(self.queue), "tags": sorted(tags),
                     "policy": snapshot["policy"], "nodes": snapshot["nodes"],
                     'queued_jobs':[{**{key:self.jobs[identity]['result'].get(key) for key in
                         ('id','label','status','cpus','memory_mb','started')},
@@ -433,13 +453,14 @@ class Coordinator:
         capacities={name:node.reserved if node.health.get('paused') else node.capacity for name,node in online.items()}
         largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
         with self.condition,self.pool.condition:
+            matching=_matching_pass(self.pool)
             waiting_priority=MIN_PRIORITY
             for job in active_values(self.jobs):
                 task=job.get('task',{});priority=task.get('priority',0)
                 if (priority<=waiting_priority or job.get('node') is not None or job.get('recover')
                         or job['result']['status']!='queued'
                         or job.get('cancel') and job['cancel'].is_set()):continue
-                for node in self.pool._matching(task):
+                for node in matching(task):
                     if (node.name not in online or node.health.get('paused')
                             or task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node)))
                             or task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True))):continue
@@ -477,7 +498,7 @@ class Coordinator:
                     # their project's share until their tasks release them.
                     available[held.name]=available.get(held.name,0)+demand
                 else:
-                    for node in self.pool._matching(wanted):
+                    for node in matching(wanted):
                         if node.name in online and not node.health.get('paused') and (not held or node is held):
                             available[node.name]=available.get(node.name,0)+min(demand,node.capacity)
                 used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
@@ -523,10 +544,14 @@ class Coordinator:
         if isinstance(changes, dict) and set(changes) == {"add"}:
             self.pool.add(**changes["add"])
             return self.health()
-        if not isinstance(changes, dict) or set(changes) - {"paused"} or not isinstance(changes.get("paused"), bool):
-            raise ValueError("Scheduler control accepts paused=true|false; node budgets are set per node")
+        if (not isinstance(changes,dict)or not changes or set(changes)-{'paused','accepting'}
+                or any(type(value)is not bool for value in changes.values())):
+            raise ValueError('Scheduler control accepts paused/accepting booleans; node budgets are set per node')
         with self.condition:
-            self.paused = changes["paused"]
+            if 'paused'in changes:self.paused=changes['paused']
+            if 'accepting'in changes:
+                atomic_json(self.root/'admission-control.json',dict(accepting=changes['accepting']),private=True)
+                self.accepting=changes['accepting']
             self.condition.notify_all()
         return self.health()
 
@@ -594,6 +619,8 @@ class Coordinator:
                     return dict(saved)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 raw_task = json.loads(archive.read("task.json"))
+                if 'cpus'in raw_task:raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')
+                if not self.accepting and not operator:raise Conflict('DCO maintenance: new task admissions are paused')
                 if not operator and raw_task.get('node') is not None:
                     raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
                 task = validate_task(raw_task,
@@ -632,15 +659,16 @@ class Coordinator:
                 self._save(job)
                 with self.condition:
                     stopping = self.stopping
-                    if not stopping:
+                    held_admission=not self.accepting and not operator
+                    if not stopping and not held_admission:
                         self.jobs[identity] = job
                         self.asset_handoffs.pop(identity, None)
                         self.queue.append(identity)
                         self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
                         self.condition.notify_all()
-                if stopping:
+                if stopping or held_admission:
                     shutil.rmtree(directory)
-                    raise Conflict("Scheduler is stopping")
+                    raise Conflict('Scheduler is stopping'if stopping else'DCO maintenance: new task admissions are paused')
                 return dict(job["result"])
             finally:
                 # The published job now owns its assets. Releasing the
@@ -651,8 +679,9 @@ class Coordinator:
     def _queued_candidates(self,budgets):
         """Within a priority, serve the least CPU per resource-share first."""
         from collections import deque
+        matching=_matching_pass(self.pool)
         counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
-                        for node in self.pool._matching(self.jobs[key]['task'])) for key in self.queue}
+                        for node in matching(self.jobs[key]['task'])) for key in self.queue}
         for borrowing in (False,True):
             for priority in sorted({self.jobs[key]['task']['priority'] for key in self.queue},reverse=True):
                 groups={}
@@ -1170,7 +1199,8 @@ class Coordinator:
             held=sum(job['task']['cpus'] for job in members.values() if job.get('node') is node)
             capacities[name]=max(0,min(resource['node_targets'].get(name,0),
                 node.capacity-node.external-node.reserved+held))
-        fixed=[];demands={};rooms={};waiting={}
+        matching=_matching_pass(self.pool)
+        fixed=[];demands={};rooms={};waiting={};memory_available={}
         for key,job in members.items():
             task=job['task'];held=job.get('node')
             automatic=key==identity or _elastic_job(job)
@@ -1180,10 +1210,12 @@ class Coordinator:
             if task.get('priority',0)<priority:continue
             wanted={**task,'cpus':0} if automatic else task
             eligible=[]
-            for node in self.pool._matching(wanted):
+            for node in matching(wanted):
                 if node.name not in capacities or (held is not None and held is not node):continue
                 if held is None:
-                    if task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node))):continue
+                    if node.name not in memory_available:
+                        memory_available[node.name]=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
+                    if task['memory_mb']>memory_available[node.name]:continue
                     if task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
                 eligible.append(node.name)
             if not eligible:continue

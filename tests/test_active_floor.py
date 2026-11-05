@@ -20,7 +20,7 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
 """
         with scratch()as root,provider(Path(root)/'worker',cpus=4)as (_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as (_,client):
-                result=client.run(python(code,cpus=1,max_cpus=4,memory_mb=64))
+                result=client.run(python(code,max_cpus=4,memory_mb=64))
                 self.assertEqual(result['status'],'succeeded',result)
                 self.assertIn('"cpus": 4',result['stdout'])
                 self.assertIn('"lease": "1"',result['stdout'])
@@ -71,12 +71,12 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
         with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=1024)as (_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as (_,client):
                 hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
-                first=client.submit(python(hold,cpus=1,max_cpus=8,project='A',memory_mb=64))['id']
+                first=client.submit(python(hold,max_cpus=8,project='A',memory_mb=64))['id']
                 second=None
                 try:
                     until(lambda:client.status(first)['status']=='running')
                     self.assertEqual(client.resize(first,4,active_cpus=1)['cpus'],4)
-                    second=client.submit(python(hold,cpus=1,max_cpus=8,project='B',priority=1,memory_mb=64))['id']
+                    second=client.submit(python(hold,max_cpus=8,project='B',priority=1,memory_mb=64))['id']
                     self.assertEqual(client.resize(first,4,active_cpus=4)['cpus'],4)
                     self.assertEqual(worker.status(first)['cpus'],4)
                     self.assertEqual(client.status(second)['status'],'queued')

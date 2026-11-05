@@ -84,7 +84,7 @@ class MachineTests(unittest.TestCase):
                 "subprocess.Popen([sys.executable,'-c',\"import time; from pathlib import Path; "
                 "time.sleep(1); Path('leaked').write_text('bad')\"])\n"
                 "print('ready', flush=True)\ntime.sleep(30)\n")
-        accepted = self.machine.python(code, wait=False, memory_mb=64)
+        accepted = self.machine.python(code, wait=False, max_cpus=1, memory_mb=64)
         identity = accepted["id"]
         reconnected = Client(self.client.url)
         until(lambda: "ready" in reconnected.logs(identity)["stdout"])

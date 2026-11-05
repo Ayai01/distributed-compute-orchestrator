@@ -47,7 +47,7 @@ from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_stat
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
-_VAR = re.compile(r"\$\{(work|cpus|exe|tool:[A-Za-z_][A-Za-z0-9_+.-]*|asset:[\w-]+|shared:[\w-]+)\}")
+_VAR = re.compile(r"\$\{(work|cpus|exe|dco|tool:[A-Za-z_][A-Za-z0-9_+.-]*|asset:[\w-]+|shared:[\w-]+)\}")
 
 
 class Conflict(ValueError):
@@ -106,13 +106,24 @@ def cpu_budget(value=0):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
-    task = {"cpus": 1, "timeout": 300, "outputs": [], "env": {}, "assets": {},
+    maximum=task.get('max_cpus',task.get('cpus') or 1024)
+    task = {"cpus": 0 if allow_auto else 1, "max_cpus": maximum, "timeout": 300, "outputs": [], "env": {}, "assets": {},
             "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256,
             "accelerator": None, **task}
     cpus, timeout = task["cpus"], task["timeout"]
+    if 'execution' in task:
+        from .execution import validate_execution
+        validate_execution(task['execution'])
+    if 'memory_model'in task:
+        model=task['memory_model']
+        if not isinstance(model,dict)or set(model)-{'base_memory_mb','memory_per_cpu_mb','memory_limit_mb'}:
+            raise ValueError('memory_model requires base/per-CPU memory and optional limit')
+        base,per=model.get('base_memory_mb',0),model.get('memory_per_cpu_mb',0)
+        width,required=plan_resize(1,None,base,per,model.get('memory_limit_mb'),task['memory_mb'])
+        if width!=1 or required>task['memory_mb']:raise ValueError('Initial memory must fit one execution slot')
     if type(task.get('retries',2)) is not int or not 0<=task.get('retries',2)<=10:
         raise ValueError('retries must be an integer in 0..10')
     if not isinstance(task.get('project', ''), str):
@@ -316,7 +327,7 @@ class Worker:
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started', 'accelerator')},
-                                     'rss_mb':round(j.get('rss_mb',0),2), **progress_fields(j['result']),
+                                     'rss_mb':round(j.get('rss_mb',0),2),'memory_modeled':bool(j['task'].get('memory_model')), **progress_fields(j['result']),
                                      **({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in active_values(self.jobs) if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
@@ -492,8 +503,10 @@ class Worker:
     def _memory_state(self):
         host = self.host.sample()
         running = [j for j in active_values(self.jobs) if j["result"]["status"] == "running"]
-        reserved = sum(j['rss_mb'] if j.get('rss_sampled') else j['task']['memory_mb'] for j in running)
-        unallocated = sum(j['task']['memory_mb'] for j in running if not j.get('rss_sampled'))
+        reservations=[max(j.get('rss_mb',0),j['task']['memory_mb'])if j['task'].get('memory_model')or not j.get('rss_sampled')
+                      else j['rss_mb']for j in running]
+        reserved=sum(reservations)
+        unallocated=sum(max(0,amount-j.get('rss_mb',0))for j,amount in zip(running,reservations))
         host_available = min(host["host_memory_available_mb"],
                              host.get("host_commit_available_mb", host["host_memory_available_mb"]))
         available = max(0, min(self.memory_capacity - reserved,
@@ -524,15 +537,17 @@ class Worker:
             return self.tools[names[0]]
         raise KeyError(name)
 
-    def _expand(self, text, task, work):
+    def _expand(self, text, task, work, *, dynamic_cpus=False):
         def substitute(match):
             key = match[1]
             if key == "work":
                 return work.as_posix()
             if key == "cpus":
-                return str(task["cpus"])
+                return '${cpus}' if dynamic_cpus else str(task["cpus"])
             if key == "exe":
                 return ".exe" if os.name == "nt" else ""
+            if key == 'dco':
+                return Path(__file__).resolve().parent.parent.as_posix()
             kind, name = key.split(":", 1)
             if kind == "shared":
                 if name in self.unavailable_shared:
@@ -660,8 +675,8 @@ class Worker:
             for argv in task["steps"]:
                 match = _VAR.fullmatch(argv[0])
                 prefix = (self._tool_argv(match[1][5:], task) if match and match[1].startswith('tool:')
-                          else [self._expand(argv[0], task, work)])
-                commands.append([*prefix, *[self._expand(x, task, work) for x in argv[1:]]])
+                          else [self._expand(argv[0], task, work,dynamic_cpus=True)])
+                commands.append([*prefix, *[self._expand(x, task, work,dynamic_cpus=True) for x in argv[1:]]])
             for value in task["env"].values():
                 self._expand(value, task, work)
             directory = work.parent
@@ -675,8 +690,15 @@ class Worker:
                 work.mkdir(exist_ok=True)
                 if "stdin" in task and not inside(work, task["stdin"]).is_file():
                     raise ValueError("Missing stdin input file: " + task["stdin"])
-                for name, path in tree(work, task["render"]).items():
-                    path.write_text(self._expand(path.read_text(encoding="utf-8"), task, work), encoding="utf-8")
+                templates={name:self._expand(path.read_text(encoding='utf8'),task,work,dynamic_cpus=True)
+                           for name,path in tree(work,task['render']).items()}
+                resolved_env={key:self._expand(value,task,work,dynamic_cpus=True)for key,value in task['env'].items()}
+                def freeze(value):
+                    if isinstance(value,str):return self._expand(value,task,work,dynamic_cpus=True)
+                    if isinstance(value,list):return [freeze(item)for item in value]
+                    if isinstance(value,dict):return {key:freeze(item)for key,item in value.items()}
+                    return value
+                execution=freeze(task['execution'])if 'execution'in task else None
                 result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"],
                           "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
                           'initial_cpus':task['cpus'],'peak_cpus':task['cpus'],'resize_count':0,
@@ -690,7 +712,9 @@ class Worker:
                           "accelerator": task.get('accelerator')}
                 job = Job({"result": result, "cancel": threading.Event(), "task": task,
                        "commands": commands, "directory": directory, "cwd": cwd,
-                       'callback':dict(self.callback if callback is None else callback)})
+                       'callback':dict(self.callback if callback is None else callback),
+                       'templates':templates,'resolved_env':resolved_env,'execution':execution,
+                       'python_argv':self._tool_argv('python',task)if uses_python(task)else []})
                 # This small immutable admission record survives damage to a
                 # later progress receipt. Never snapshot inputs or full tools.
                 admission = {key: result[key] for key in (
@@ -758,11 +782,11 @@ class Worker:
                 inherited = environment.get('PATH', '')
                 environment['PATH'] = os.pathsep.join(
                     [str(path) for path in msys_paths if path.is_dir()] + ([inherited] if inherited else []))
-            environment.update({key: self._expand(value, task, work) for key, value in task["env"].items()})
+            environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
             environment = cache_environment(environment, self.cache_root)
             # Default libraries to the grant; callers with outer parallelism
             # can explicitly keep each numerical kernel single-threaded.
-            for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS"):
                 if key not in task['env']:
                     environment[key] = str(task["cpus"])
             temporary = self._temporary(job)
@@ -782,13 +806,33 @@ class Worker:
                                REMOTE_COMPUTE_RESIZE='1' if callback.get('url') else '0',
                                REMOTE_COMPUTE_LEASE='1' if polling else '0',
                                REMOTE_COMPUTE_CA=callback.get('ca_file') or '',
+                               REMOTE_COMPUTE_PYTHON_ARGV=json.dumps(job.get('python_argv',[])),
                                REMOTE_COMPUTE_HOME=str(Path(__file__).resolve().parent.parent))
             self._accelerator_environment(result['id'], environment)
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
-                for argv in job["commands"]:
+                templates=job.get('templates',{})
+                for frozen in job['commands']:
                     if job["cancel"].is_set():
                         state = "cancelled"
                         break
+                    self._automatic_grant(job)
+                    environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
+                    self._accelerator_environment(result['id'],environment)
+                    for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','NUMBA_NUM_THREADS'):
+                        if key not in task['env']:environment[key]=str(task['cpus'])
+                    environment.update(REMOTE_COMPUTE_CPUS=str(task['cpus']),
+                        REMOTE_COMPUTE_MAX_CPUS=str(min(task['max_cpus'],self.cpu_limit)),
+                        REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(task.get('memory_model',{})))
+                    for name,text in templates.items():
+                        inside(work,name).write_text(text.replace('${cpus}',str(task['cpus'])),encoding='utf8')
+                    if 'execution'in task:
+                        def expand(value):
+                            if isinstance(value,str):return value.replace('${cpus}',str(task['cpus']))
+                            if isinstance(value,list):return [expand(v)for v in value]
+                            if isinstance(value,dict):return {k:expand(v)for k,v in value.items()}
+                            return value
+                        atomic_json(work/'.dco-execution.json',expand(job['execution']))
+                    argv=[value.replace('${cpus}',str(task['cpus']))for value in frozen]
                     step = {"argv": argv, "started": time.time(), "returncode": None}
                     with self.condition:
                         job['rss_sampled'] = False
@@ -865,6 +909,22 @@ class Worker:
                 self.threads.discard(threading.current_thread())
                 archive_job(self.jobs, job)
                 self.condition.notify_all()
+
+    def _automatic_grant(self,job):
+        """Prepare a real kernel grant before expanding its argv and thread env."""
+        task=job['task'];maximum=min(task['max_cpus'],self.capacity)
+        if task.get('execution',{}).get('mode')=='map':
+            maximum=min(maximum,max(1,len(task['execution']['items'])))
+        if maximum==task['cpus']==1:return
+        callback=job.get('callback',{})
+        request=dict(cpus=maximum,active_cpus=0,**task.get('memory_model',{}))
+        if callback.get('mode')=='poll':
+            self.lease(job['result']['id'],request)
+        elif callback.get('url'):
+            from .client import Client
+            client=Client(callback['url'],callback.get('token',''),ca_file=callback.get('ca_file'))
+            client.resize(callback.get('job_id',job['result']['id']),**request)
+        else:self.resize(job['result']['id'],**request)
 
     def _clean_work(self, job, *, discard=False):
         """Keep declared results; consumed input decks/builds are no longer artifacts."""

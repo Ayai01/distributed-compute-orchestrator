@@ -24,6 +24,7 @@ class AcceptanceTests(unittest.TestCase):
         center.condition = threading.Condition(threading.RLock())
         center.submission_lock = SubmissionLocks()
         center.stopping = False
+        center.accepting = True
         center.accepting_assets = SubmissionAssets()
         center.asset_handoffs = {}
         center.jobs, center.queue = {}, []
@@ -34,7 +35,7 @@ class AcceptanceTests(unittest.TestCase):
         raw = pack({'input.txt': content})
         identity = hashlib.sha256(raw).hexdigest()
         (center.root/'assets'/(identity+'.zip')).write_bytes(raw)
-        task = command(['python', '-c', 'pass'], cpus=1, memory_mb=128,
+        task = command(['python', '-c', 'pass'], max_cpus=1, memory_mb=128,
                        assets=dict(source=identity), project='test', outputs=['output.txt'])
         return task_bundle(task), identity
 

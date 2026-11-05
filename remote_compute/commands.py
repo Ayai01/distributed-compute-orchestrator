@@ -127,8 +127,7 @@ def submission_parser(kind):
     parser.add_argument("source", help="任务 JSON、SPICE 文件或 RTL 目录")
     parser.add_argument("--input", help="要传输的任务输入目录")
     parser.add_argument("--output", help="结果保存目录")
-    parser.add_argument("--cpus", type=int, dest="task_cpus")
-    parser.add_argument("--max-cpus", type=int, help="任务线程需求硬上界，包含后续借核")
+    parser.add_argument("--max-cpus", type=int, help="任务可用并行上限，由DCO自动分配")
     parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
     parser.add_argument("--priority", type=int)
     parser.add_argument("--single-thread-weight", type=float, help="单线程偏好，默认1；较高偏单线程、较低偏总吞吐")
@@ -153,8 +152,8 @@ def prepare(kind, args):
     else:
         task = verilator(args.sources, args.top, flags=words(args.flags))
         inputs = inputs or source
-    for key in ("cpus", "max_cpus", "priority", "single_thread_weight"):
-        value = getattr(args, "task_cpus" if key == "cpus" else key)
+    for key in ("max_cpus", "priority", "single_thread_weight"):
+        value = getattr(args,key)
         if value is not None:
             task[key] = value
     if args.requires:
@@ -195,7 +194,7 @@ def machine_parser(action):
     parser.add_argument("--node", required=True, help="操作的目标节点")
     parser.add_argument("--cwd", default="~", help="目标机工程目录，默认目标用户目录")
     if action in {"exec", "python"}:
-        parser.add_argument("--cpus", type=int, default=1, dest="task_cpus")
+        parser.add_argument("--max-cpus", type=int, default=1024)
         parser.add_argument("--memory-mb", type=int, default=256)
         parser.add_argument("--timeout", type=float, default=3600)
         parser.add_argument("--priority", type=int, default=0)
@@ -221,7 +220,7 @@ def machine_parser(action):
 def machine_action(client, args, *, on_submit=None):
     machine = client.machine(args.node, cwd=args.cwd)
     if args.action in {"exec", "python"}:
-        options = {"cpus": args.task_cpus, "memory_mb": args.memory_mb, "timeout": args.timeout,
+        options = {"max_cpus": args.max_cpus, "memory_mb": args.memory_mb, "timeout": args.timeout,
                    "priority": args.priority, "env": dict(item.split("=", 1) for item in args.env),
                    "stdin": Path(args.stdin) if args.stdin else None, "wait": not args.detach,
                    "output_dir": args.output, "keep": args.keep, "on_submit": on_submit}

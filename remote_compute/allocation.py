@@ -56,11 +56,12 @@ def weighted_node_threads(capacities, shares, demands, rooms):
     placed={name:{node:0 for node in rooms.get(name,{})} for name in shares}
     used={node:0 for node in capacities}
     total={name:0 for name in shares}
+    degree={node:sum(node in edges for edges in rooms.values()) for node in capacities}
     def place(name,seen):
         nodes=[node for node in placed[name] if node in capacities and node not in seen
                and placed[name][node]<rooms[name][node]]
         nodes.sort(key=lambda node:(used[node]>=capacities[node],
-                                   sum(node in edges for edges in rooms.values()),node))
+                                   degree[node],node))
         for node in nodes:
             seen.add(node)
             if used[node]<capacities[node]:
