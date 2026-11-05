@@ -48,7 +48,7 @@ DCO负责能力、调度、CPU/RAM/加速器、任务和传输。电路测量、
 
 CLI生命周期在cli/startup/terminal，命令语义在commands，交互在console，格式在view。调度在coordinator/allocation/admission，通用执行器租约在leases，执行所有权在worker/process/resources。注释解释所有权、授权、原ID恢复及非直观边界。
 
-看板保留真实视口、固定输入行、ASCII边框与变化行重画。Tab显示/补全候选，PgUp/PgDn翻任务页，Ctrl+PgUp/Ctrl+PgDn翻命令输出；补全只读快照，Enter执行。任务ID保持青色，Tag最长24终端单元格，按实际列宽缩写，不用省略号；完整标签保留在API及明细。进度只消费已有显式比例或命令步数，不按运行时长猜测。
+看板保留真实视口、固定输入行、ASCII边框与变化行重画。Tab显示/补全候选，PgUp/PgDn翻任务页，Ctrl+PgUp/Ctrl+PgDn翻命令输出；补全只读快照，Enter执行。任务ID保持青色，Tag最长24终端单元格，使用对象/阶段、必要设置、种子末2或4位和工作量/预计CPU秒；禁整段hash或纯hash，按实际列宽语义缩写，不用省略号；当前任务列显示实际CPU/max_cpus，CPU不重复放Tag；完整标签保留在API及明细。进度只消费已有显式比例或命令步数，不按运行时长猜测。
 
 按变化选择现有隔离检查；核心入口 `python -B main.py --test`，原生执行链变化使用 `--test-native`。测试状态、校准缓存及临时文件隔离，不修改在用设备。关键修改集中本地存档并统一部署，保留其他会话改动。
 

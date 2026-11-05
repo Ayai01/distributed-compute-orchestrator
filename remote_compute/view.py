@@ -390,7 +390,7 @@ class StatusRows(list):
         for name,job in self.jobs:
             state=job.get('status','running')
             started=job.get('started')
-            self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"1/{job.get('cpus',0)}",
+            self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
                                  _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),compact_tag(job,preferred=_label(job),measure=_width),
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
@@ -411,11 +411,11 @@ class StatusRows(list):
     def _resources(self, width):
         records=[r for _,r in self.devices]
         if width>=100:
-            table=_table(['Node','CPU U/B','CPU%','1T/All','RAM U/T','Avail','GPU','RSS/Res'],
+            table=_table(['Node','CPU U/B','CPU%','1T/All','RAM U/T','Admit','GPU','RSS/Res'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
                          [max([11]+[_width(f'#{r[10]} ')+self.node_width for r in records]),10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
-            table=_table(['Node','CPU U/B','CPU%','RAM U/T','Avail'],[r[:5] for r in records],
+            table=_table(['Node','CPU U/B','CPU%','RAM U/T','Admit'],[r[:5] for r in records],
                          [self.node_width,10,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
@@ -424,7 +424,7 @@ class StatusRows(list):
                 table.append(_line(r[0]+': '+node['error'],width))
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
-        sections=[('设备资源 | CPU U/B | RAM U/T GiB',table,0)]
+        sections=[('设备资源 | RAM物理 U/T | Admit可派 GiB',table,0)]
         if width>=100:
             details=_table(['Node','1T/All','RSS/Res','IP','Net'],
                            [[r[0],r[7],r[5],r[9],
@@ -498,22 +498,22 @@ class StatusRows(list):
         # the same ratio remains available in the status/API payload.
         show_progress = width >= 140
         if width>=110 and not show_progress:
-            table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
+            table=_table(['ID','Node','Proj','CPU/max','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
                          [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
         elif width>=110:
-            table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Prog','Tag'],
+            table=_table(['ID','Node','Proj','CPU/max','RAM','Sec','St','Prog','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
                          [4,self.node_width,6,9,4,6,4,6,None],width,right=(3,4,5,6))
         elif width>=80:
-            table=_table(['ID','Node','Proj','Jobs/CPU','RAM','Sec','St','Tag'],
+            table=_table(['ID','Node','Proj','CPU/max','RAM','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
                          [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
         elif width>=54:
-            table=_table(['ID','Node','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
+            table=_table(['ID','Node','CPU/max','Sec','Tag'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
                          [4,self.node_width,9,6,None],width,right=(2,3))
         elif width>=38:
-            table=_table(['ID','Jobs/CPU','Sec','Tag'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
+            table=_table(['ID','CPU/max','Sec','Tag'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
                          [4,9,6,None],width,right=(1,2))
         else:
             table=[_line('ID CPU Tag',width)]

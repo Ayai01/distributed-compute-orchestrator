@@ -307,7 +307,7 @@ def process_usage(process):
     kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
     kernel.OpenProcess.restype = w.HANDLE
     psapi.GetProcessMemoryInfo.argtypes = [w.HANDLE, c.c_void_p, w.DWORD]
-    rss = 0
+    rss = private = 0
     for pid in pids.ids[:pids.count]:
         handle = kernel.OpenProcess(0x1010, False, pid)
         if handle:
@@ -316,6 +316,7 @@ def process_usage(process):
                 info.size = c.sizeof(info)
                 if psapi.GetProcessMemoryInfo(handle, c.byref(info), c.sizeof(info)):
                     rss += info.rss
+                    private += info.private
             finally:
                 kernel.CloseHandle(handle)
-    return {"rss_mb": rss / MIB, "cpu_seconds": (accounting.user + accounting.kernel) / 1e7}
+    return {"rss_mb": rss / MIB, 'private_mb':private/MIB, "cpu_seconds": (accounting.user + accounting.kernel) / 1e7}

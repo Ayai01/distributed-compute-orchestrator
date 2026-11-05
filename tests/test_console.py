@@ -762,7 +762,7 @@ class ConsoleTests(unittest.TestCase):
                 for row in rows:
                     seen.extend(job['id'][:4] for job in jobs if any(prefix+job['id'][:4]+' |' in row for prefix in ('| ','+ ')))
             self.assertCountEqual(seen,[job['id'][:4] for job in jobs])
-            self.assertIn('1/2','\n'.join(first))
+            self.assertIn('2/?','\n'.join(first))
             self.assertNotIn('温度','\n'.join(first))
             self.assertNotIn('在线','\n'.join(first))
             if width>=120:

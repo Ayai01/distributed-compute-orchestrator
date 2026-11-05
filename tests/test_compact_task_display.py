@@ -23,13 +23,14 @@ class CompactTaskDisplayTests(unittest.TestCase):
 
     def test_task_table_spends_the_removed_share_priority_width_on_tag(self):
         job = {'id': '1234'+'a'*28, 'project': 'RGCN', 'label': 'FSA -KCL s19b2 ep:96 ~600s',
-            'cpus': 4, 'status': 'running', 'memory_mb': 4096, 'total_steps': 1}
+            'cpus': 4, 'max_cpus':128, 'status': 'running', 'memory_mb': 4096, 'total_steps': 1}
         value = {'role': 'scheduler', 'nodes': [{'name': 'GPU-A', 'capacity': 16, 'active_jobs': [job]}]}
         for width in (80, 110, 139, 140, 160, 200):
             with self.subTest(width=width):
                 text = '\n'.join(format_status(value, width=width).fit(36))
                 self.assertNotIn('Share/Pri', text)
-                self.assertIn('Jobs/CPU', text)
+                self.assertIn('CPU/max',text)
+                self.assertIn('4/128',text)
                 if width >= 140:
                     self.assertIn('ep:96', text)
 

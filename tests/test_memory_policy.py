@@ -11,6 +11,34 @@ GIB=1024
 
 
 class MemoryPolicyTests(unittest.TestCase):
+    def test_private_usage_is_cleared_before_starting_the_next_command(self):
+        from remote_compute import command
+        from remote_compute.process import Process
+        with scratch()as root,provider(root,cpus=1)as(worker,client):
+            snapshots=[]
+            def start(*args,**kwargs):
+                current=next(iter(worker.jobs.values()))
+                snapshots.append(current.get('private_mb'))
+                return Process(*args,**kwargs)
+            task=command(['${tool:python}','-c','import time;time.sleep(.3)'],max_cpus=1)
+            task['steps']*=2
+            with patch('remote_compute.worker.Process',side_effect=start),patch('remote_compute.worker.process_usage',return_value=dict(rss_mb=8,private_mb=100,cpu_seconds=0)):
+                result=client.run(task)
+            self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+            self.assertEqual(snapshots,[None,None])
+            self.assertEqual(result['peak_private_mb'],100)
+
+    def test_materialized_private_commit_is_not_reserved_again_from_rss(self):
+        worker=Worker.__new__(Worker);worker.host=Mock()
+        worker.host.sample.return_value=dict(memory_total_mb=4000,host_memory_available_mb=1200,host_commit_available_mb=600)
+        worker.memory_capacity=2000;worker.memory_reserve=0;worker.memory_headroom=100;worker.memory_budget=2000
+        worker.jobs={'job':dict(result=dict(status='running'),task=dict(memory_mb=1000,memory_model=True),
+                               rss_mb=400,private_mb=900,rss_sampled=True)}
+        value=worker._memory_state()
+        self.assertEqual(value['memory_unallocated_mb'],600)
+        self.assertEqual(value['commit_unallocated_mb'],100)
+        self.assertEqual(value['memory_available_mb'],400)
+
     def test_default_budget_and_live_headroom_are_separate(self):
         sample=dict(memory_total_mb=48*GIB,host_memory_available_mb=40*GIB)
         with scratch() as root,patch('remote_compute.worker.Host.sample',return_value=sample),provider(root) as (worker,_):

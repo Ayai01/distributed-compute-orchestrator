@@ -17,6 +17,16 @@ TERMINAL = frozenset({"succeeded", "failed", "cancelled", "timed_out", "interrup
 MAX_BODY = 512 * 1024 * 1024
 
 
+def native_path(value,*,force=False):
+    """Use the Windows extended namespace for owned filesystem I/O."""
+    path=Path(value).resolve()
+    text=str(path)
+    if os.name=='nt'and (force or len(text)>=248)and not text.startswith('\\\\?\\'):
+        text=('\\\\?\\UNC\\'+text[2:])if text.startswith('\\\\')else'\\\\?\\'+text
+        return Path(text)
+    return path
+
+
 def progress_fields(value):
     """Return cheap progress fields already present in a task snapshot."""
     fields = {}
@@ -102,7 +112,7 @@ def tree(root, patterns=("**/*",)):
 
 
 def unpack(data, root):
-    root = Path(root).resolve()
+    root = native_path(root,force=True)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         entries = archive.infolist()
         if sum(item.file_size for item in entries) > 2 * 1024**3:
@@ -139,7 +149,7 @@ def atomic_json(path, value, *, private=False):
     filename. Flush before replacement so a crash cannot publish an empty
     receipt in place of the last complete JSON document.
     """
-    path = Path(path)
+    path = native_path(path)
     data = json_bytes(value)
     descriptor, name = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
     pending = Path(name)

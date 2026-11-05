@@ -1,13 +1,13 @@
 # Distributed Compute Orchestrator（DCO）
 
-DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.11.0**；实际加载版本、维护状态、工程需求及设备覆盖见 [STATUS](docs/STATUS.md)。
+DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.11.1**；实际加载版本、维护状态、工程需求及设备覆盖见 [STATUS](docs/STATUS.md)。
 
 服务、SDK 和终端仅依赖 Python 标准库。日常使用系统标准 GIL x64 CPython 3.14，源码支持 3.7–3.15。仓库为 `distributed-compute-orchestrator`，包为 `remote_compute`，协议环境变量为 `REMOTE_COMPUTE_*`。
 
 ## 工程接入要求
 
 - 任务声明输入、能力、内存和`max_cpus`；默认上限1024，种群按真实有用宽度限定，串行任务上限1。DCO默认自动分配，任务没有`cpus`、最低核数或auto开关。
-- 使用`client.execute(...)`管理准备、排队、持久领取与补位；使用`python_map`运行独立输入，使用`python_call`运行数值内核。工程不维护执行池或借核循环。
+- 使用`client.execute(...)`管理准备、排队、持久领取与补位；使用`python_map`运行独立输入，`python_call`运行数值内核，`python_task`运行含分阶段映射的业务入口。工程不维护执行池或借核循环。
 - 调度先让已有任务取得最多4个有用核，再让新任务以1核进入，最后用剩余兼容线程扩展已有工作。映射完成即退出单项进程，长尾及时归还CPU和内存。
 - 默认窗口超过128并覆盖兼容线程。只提供已授权且真实就绪的工作；`after`等待前序持久发布，`Deferred/Skipped`表达业务门，准备和领取互不阻塞。
 - 外层进程与内层数值库共用一份实际授权。内存可声明固定值或基础值加每实际核需求，DCO按CPU/RAM共同限制真实并行宽度。
@@ -109,7 +109,7 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `sync_cache all` / `sync_cache arh --kind research` | 手动增量同步，详见下节 |
 | `wait` / `quit` | 等待本终端后台操作 / 退出 |
 
-任务Tag保留对象、方法/阶段和必要预算，例如 `TSA s06 FIBER 12k`、`AB warm 4alg`、`Rocket prep`。seed可只显示后两位；工程、CPU和ID使用各自列。缩写只影响展示，完整seed、原标签、输入与科学身份继续由 `jobs ab12`、API和回执保存。
+当前任务CPU列显示`当前授权/max_cpus`，工程汇总仍显示有意义的任务数/已用CPU。任务Tag在最多24终端格内保留对象、方法/阶段、必要设置、种子末2或4位及评价量或预计CPU时间；不放CPU数、整段hash或纯hash。例如 `TSA s06 FIBER 12k`、`AB warm 4alg`、`Rocket prep`。seed可只显示后两位；工程、CPU和ID使用各自列。缩写只影响展示，完整seed、原标签、输入与科学身份继续由 `jobs ab12`、API和回执保存。
 
 设备名换成 `nodes` 的实际名称，也可用 `#编号`。任务支持唯一的至少四位 ID 前缀，API 使用完整 ID。`memory` 无单位为 MiB，`8G/8GB/8GiB` 均为 8 GiB，0 自动预算。`set limit` 限制本中心派发量，`cpus` 修改提供者总预算。
 

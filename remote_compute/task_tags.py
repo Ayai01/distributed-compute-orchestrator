@@ -1,5 +1,4 @@
 """Semantic display tags; full requests and labels remain unchanged."""
-import hashlib
 import re
 
 MAX_TAG=24
@@ -9,15 +8,17 @@ _METHODS={'fiber-mo':'F','fiber_mo':'F','agemoea2':'AGE','age-moea2':'AGE','age2
 
 
 def _word(value,limit):
-    value=re.sub(r'[^A-Za-z0-9:+-]','',str(value))or'JOB'
+    value=re.sub(r'[^\w:+-]','',str(value))or'RUN'
     if len(value)<=limit:return value
-    tail=hashlib.blake2s(value.encode(),digest_size=2).hexdigest()[:2]
-    return value[:max(0,limit-2)]+tail[:limit]
+    return value[:limit]
 
 
 def compact_tag(job,width=MAX_TAG,preferred=None,measure=len):
     limit=max(1,min(MAX_TAG,int(width)))
     raw=' '.join(str(job.get('label','')).split());text=' '.join(str(preferred if preferred is not None else raw).split())
+    text=re.sub(r'(?<!\w)[0-9a-f]{12,64}(?!\w)',lambda match:':'+match[0][-4:],text,flags=re.I)
+    if re.fullmatch(r':[0-9a-f]{4}',text,re.I):text='RUN '+text
+    if not text:text='RUN'
     clean=text.replace('...','').replace('\u2026','')
     if clean==text and measure(text)<=limit:return text
     progress=re.match(r'^(\d+/\d+|\d+%)\s+',clean)
@@ -59,12 +60,18 @@ def compact_tag(job,width=MAX_TAG,preferred=None,measure=len):
     eta=re.search(r'~\d+(?:\.\d+)?s\b',source);pieces=[subject,method,identity,amount]
     def joined():return' '.join(p for p in pieces if p)
     result=joined()
-    if len(result)>limit:pieces[2]=identity.lstrip('s:');result=joined()
-    if len(result)>limit:pieces[1]={'AGE':'A','-KCL':'-K','-GEO':'-G','-ADJ':'-A','-INV':'-I'}.get(method,method);result=joined()
-    if len(result)>limit:pieces[0]=re.sub(r'^AB[PD](\d)',r'AB\1',subject);result=joined()
-    if len(result)>limit:pieces[3]=re.sub(r'^(ng|ev|ep):',lambda m:{'ng':'n','ev':'v','ep':'e'}[m[1]],amount);result=joined()
-    if len(result)>limit:pieces[0]=_word(pieces[0],2);pieces[1]=_word(pieces[1],2);result=joined()
-    if len(result)>limit:result=(pieces[2]or pieces[0])[-limit:]
-    if progress and len(progress[1]+' '+result)<=limit:result=progress[1]+' '+result
-    if eta and len(result+' '+eta[0])<=limit:result+=' '+eta[0]
+    if measure(result)>limit:pieces[2]=identity.lstrip('s:');result=joined()
+    if measure(result)>limit:pieces[1]={'AGE':'A','-KCL':'-K','-GEO':'-G','-ADJ':'-A','-INV':'-I'}.get(method,method);result=joined()
+    if measure(result)>limit:pieces[0]=re.sub(r'^AB[PD](\d)',r'AB\1',subject);result=joined()
+    if measure(result)>limit:pieces[3]=re.sub(r'^(ng|ev|ep):',lambda m:{'ng':'n','ev':'v','ep':'e'}[m[1]],amount);result=joined()
+    if measure(result)>limit:pieces[0]=_word(pieces[0],2);pieces[1]=_word(pieces[1],2);result=joined()
+    if measure(result)>limit:
+        result=next((word for word in (subject,method,'RUN')if measure(word)<=limit),'')
+        if not result:
+            for letter in subject:
+                if measure(result+letter)>limit:break
+                result+=letter
+        result=result or'-'
+    if progress and measure(progress[1]+' '+result)<=limit:result=progress[1]+' '+result
+    if eta and measure(result+' '+eta[0])<=limit:result+=' '+eta[0]
     return result

@@ -4,19 +4,54 @@ from contextlib import redirect_stdout
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import stat
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from remote_compute.bundle import atomic_json
+from remote_compute.bundle import atomic_json,native_path,pack,unpack
 from remote_compute import cli
 from remote_compute.commands import SchedulerShell
 from test_compute import scratch
 
 
 class PrivateJsonTests(unittest.TestCase):
+    @unittest.skipUnless(os.name=='nt','Windows extended path namespace')
+    def test_long_artifact_and_atomic_state_paths_roundtrip(self):
+        with scratch()as directory:
+            root=Path(directory)/('a'*80)/('b'*80)/('c'*40)
+            try:
+                data=pack({'files/scientific-results/'+('d'*64)+'.json.gz':b'paid-original'})
+                unpack(data,root)
+                target=native_path(root,force=True)/'files/scientific-results'/('d'*64+'.json.gz')
+                self.assertGreater(len(str(target)),260)
+                self.assertEqual(target.read_bytes(),b'paid-original')
+                atomic_json(root/'state.json',{'id':'original'})
+                self.assertEqual(json.loads(native_path(root/'state.json').read_bytes())['id'],'original')
+            finally:
+                if native_path(root,force=True).exists():shutil.rmtree(native_path(root,force=True))
+
+    @unittest.skipUnless(os.name=='nt','Windows extended path namespace')
+    def test_fetch_long_artifact_keeps_original_id_and_returns_a_readable_path(self):
+        from test_compute import provider
+        from remote_compute import command
+        with scratch()as directory,provider(Path(directory)/'worker')as(_,client):
+            root=Path(directory)/('a'*80)/('b'*80)/('c'*40)
+            name='scientific-results/'+('d'*64)+'.json.gz'
+            source="from pathlib import Path;p=Path("+repr(name)+");p.parent.mkdir();p.write_bytes(b'paid-original')"
+            identity=client.submit(command(['${tool:python}','-c',source],max_cpus=1,outputs=[name]))['id']
+            try:
+                client.wait(identity)
+                with patch.object(client,'submit',side_effect=AssertionError('Paid result must not rerun')):
+                    receipt=client.fetch(identity,root,delete=False)
+                self.assertEqual(receipt['id'],identity)
+                self.assertEqual((Path(receipt['output_dir'])/'files'/name).read_bytes(),b'paid-original')
+                client.delete(identity)
+            finally:
+                if native_path(root,force=True).exists():shutil.rmtree(native_path(root,force=True))
+
     def test_private_config_uses_exclusive_owner_only_temp_before_replace(self):
         with scratch() as directory:
             root = Path(directory)

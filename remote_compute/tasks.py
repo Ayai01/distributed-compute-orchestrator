@@ -7,7 +7,7 @@ def python_map(function, items, *, kwargs=None, backend='process', **options):
     task=command(['${tool:python}','-B','${dco}/remote_compute/execution.py','${work}/.dco-execution.json'],
                  **dict(options,retries=options.get('retries',0)))
     task['execution']=dict(function=function,items=list(items),kwargs=dict(kwargs or {}),mode='map',backend=backend)
-    task['outputs']=list(dict.fromkeys([*task['outputs'],'.dco-results.json']))
+    task['outputs']=list(dict.fromkeys([*task['outputs'],'.dco-results.json','.dco-streams/**/*']))
     return task
 
 
@@ -15,6 +15,13 @@ def python_call(function, *, kwargs=None, **options):
     """Run one native or numerical kernel with its platform-assigned threads."""
     task=python_map(function,[],kwargs=kwargs,**options)
     task['execution']['mode']='call'
+    return task
+
+
+def python_task(function, *, kwargs=None, **options):
+    """Run a serial business entry whose parallel stages use DCO map_items."""
+    task=python_map(function,[],kwargs=kwargs,**options)
+    task['execution']['mode']='entry'
     return task
 
 

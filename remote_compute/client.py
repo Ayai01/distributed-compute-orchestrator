@@ -23,7 +23,7 @@ import uuid
 import weakref
 import zipfile
 
-from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack
+from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack, native_path
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids)
 from .auth import lan_endpoint
@@ -625,8 +625,12 @@ class Client:
             result["files"] = ({name[6:]: archive.read(name) for name in names} if output_dir is None
                                else sorted({name[6:] for name in names}))
         if output_dir is not None:
-            unpack(raw, Path(output_dir))
-            result["output_dir"] = str(Path(output_dir).resolve())
+            directory=Path(output_dir).resolve()
+            with zipfile.ZipFile(io.BytesIO(raw))as archive:
+                long=any(len(str(directory/name))>=248 for name in archive.namelist())
+            directory=native_path(directory,force=long)
+            unpack(raw,directory)
+            result["output_dir"] = str(directory)
         result["url"] = self.url
         if delete:
             self.delete(identity)
@@ -1142,6 +1146,8 @@ class Pool:
                  "reserved_memory_mb": n.reserved_memory_mb, "memory_limit_mb": n.memory_limit_mb,
                  "memory_total_mb": n.health.get("memory_total_mb"),
                  "host_memory_available_mb": n.health.get("host_memory_available_mb"),
+                 **{key:n.health.get(key)for key in ('host_commit_available_mb','memory_headroom_mb','memory_reserve_mb',
+                     'private_mb','memory_unallocated_mb','commit_unallocated_mb','memory_budget_mb')},
                  "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
@@ -1306,7 +1312,13 @@ class Pool:
         unallocated = sum((n.memory_unreported+max(0,n.health.get('memory_reserved_mb',0)-n.health.get('rss_mb',0))
                            if n.health.get('memory_accounting')=='rss' else
                            max(0,n.reserved_memory_mb+n.external_memory_mb-n.health.get('rss_mb',0))) for n in siblings)
-        return physical - unallocated
+        available=physical-unallocated
+        committed=[n for n in sampled if n.health.get('host_commit_available_mb')is not None]
+        if committed:
+            commit=min(n.health['host_commit_available_mb']-n.health.get('memory_headroom_mb',n.health.get('memory_reserve_mb',0))for n in committed)
+            unallocated_commit=sum(n.memory_unreported+max(0,n.health.get('memory_reserved_mb',0)-n.health.get('private_mb',n.health.get('rss_mb',0)))for n in siblings)
+            available=min(available,commit-unallocated_commit)
+        return available
 
     def _release(self, node, task, result=None, *, job_id=None):
         label = task.get("label", "")

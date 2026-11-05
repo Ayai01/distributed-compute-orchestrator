@@ -5,6 +5,19 @@ from remote_compute.view import format_status,_width
 
 
 class TagColumnTests(unittest.TestCase):
+    def test_hash_only_and_embedded_hashes_get_readable_short_tags(self):
+        self.assertEqual(compact_tag({'label':'a'*20}),'RUN :aaaa')
+        value=compact_tag({'label':'PSL seed '+('b'*32)+' ev:10k'})
+        self.assertIn('PSL',value);self.assertIn('bbbb',value)
+        self.assertNotIn('b'*8,value);self.assertLessEqual(_width(value),24)
+
+    def test_current_task_shows_actual_cpu_and_configured_maximum(self):
+        job=dict(id='abcd'+'f'*28,label='BGR PSL s26 ev:10k',cpus=4,max_cpus=128,status='running')
+        rows=format_status(dict(role='worker',node='test',cpus=8,active_jobs=[job]),width=110)
+        text='\n'.join(rows)
+        self.assertIn('CPU/max',text);self.assertIn('4/128',text)
+        self.assertNotIn('1/4',text)
+
     def test_long_native_label_has_real_short_seed_and_work(self):
         job=dict(project='Analog-Opt-Bench',id='a'*32,label='Class bounded staged p75_precision9_relaxed50 agemoea2 73137011 4 real designs')
         before=deepcopy(job);self.assertEqual(compact_tag(job),'ABP9R AGE sfb73 ng:4');self.assertEqual(job,before)

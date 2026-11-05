@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor,wait,FIRST_COMPLETED
 from hashlib import sha256
 from pathlib import Path
 import json,time,uuid,re,pickle
-from .bundle import atomic_json,task_bundle,TERMINAL
+from .bundle import atomic_json,task_bundle,TERMINAL,native_path
 from .client import RemoteError
 from .worker import lock_root
 
@@ -62,7 +62,7 @@ def execute(client,requests,*,project,output_dir,prepare=None,publish=None,ready
     publish(receipt) is concurrent, idempotent scientific publication by original ID.
     A maintenance gate drains accepted work and raises ExecutionPaused.
     """
-    root=Path(output_dir).resolve();root.mkdir(parents=True,exist_ok=True)
+    root=native_path(output_dir,force=True);root.mkdir(parents=True,exist_ok=True)
     identity=sha256((client.url+'\0'+project).encode()).hexdigest()
     lock=lock_root(Path.cwd()/'.local/dco-client'/identity,'pipeline')
     try:return _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
@@ -286,8 +286,9 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                     except KeyboardInterrupt:
                         paused=True
                         receipt_path=Path(row['directory'])/'receipt.json'
-                        if receipt_path.is_file():results.append(json.loads(receipt_path.read_bytes()))
-                        if row['state']=='collected':finish(row['key'])
+                        if row['state']in ('published','collected')and receipt_path.is_file():
+                            results.append(json.loads(receipt_path.read_bytes()))
+                            if row['state']=='collected':finish(row['key'])
                     except BaseException as error:failure(row,'collection/publication',error)
                 if (stopped or paused)and not(preparing or submitting or pending or collecting):break
                 futures=[*preparing,*submitting,*collecting]
@@ -300,7 +301,8 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
     # A signal can arrive between Executor.submit and registry assignment.
     # Joined submitters have durable rows; drain those original IDs as well.
     for row in rows.values():
-        if row['key']in completed or row['state']not in ('accepted','submitting'):continue
+        if (row['key']in completed or row['state']not in ('accepted','submitting')
+                or any(f['id']==row['id']and f['stage']=='collection/publication'for f in failures)):continue
         try:
             try:client._read_reconnecting(lambda:client.status(row['id']))
             except RemoteError as error:

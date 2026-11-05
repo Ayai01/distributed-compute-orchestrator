@@ -326,8 +326,8 @@ class Worker:
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
-                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'memory_mb', 'started', 'accelerator')},
-                                     'rss_mb':round(j.get('rss_mb',0),2),'memory_modeled':bool(j['task'].get('memory_model')), **progress_fields(j['result']),
+                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'max_cpus', 'memory_mb', 'started', 'accelerator')},
+                                     'rss_mb':round(j.get('rss_mb',0),2),'private_mb':j.get('private_mb'), 'memory_modeled':bool(j['task'].get('memory_model')), **progress_fields(j['result']),
                                      **({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in active_values(self.jobs) if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
@@ -507,14 +507,18 @@ class Worker:
                       else j['rss_mb']for j in running]
         reserved=sum(reservations)
         unallocated=sum(max(0,amount-j.get('rss_mb',0))for j,amount in zip(running,reservations))
-        host_available = min(host["host_memory_available_mb"],
-                             host.get("host_commit_available_mb", host["host_memory_available_mb"]))
-        available = max(0, min(self.memory_capacity - reserved,
-                               host_available - self.memory_headroom - unallocated))
+        private=sum(j.get('private_mb',j.get('rss_mb',0))for j in running)
+        commit_unallocated=sum(max(0,amount-j.get('private_mb',j.get('rss_mb',0)))for j,amount in zip(running,reservations))
+        limits=[self.memory_capacity-reserved,host['host_memory_available_mb']-self.memory_headroom-unallocated]
+        if 'host_commit_available_mb'in host:
+            limits.append(host['host_commit_available_mb']-self.memory_headroom-commit_unallocated)
+        available=max(0,min(limits))
         return {**host, "memory_capacity_mb": self.memory_capacity, "memory_reserved_mb": round(reserved, 2),
                 "memory_available_mb": int(available), "memory_reserve_mb": self.memory_reserve,
                 "memory_headroom_mb": self.memory_headroom, "memory_budget_mb":self.memory_budget,
                 "memory_effective_mb":int(min(self.memory_capacity,reserved+available)),
+                'private_mb':round(private,2),'memory_unallocated_mb':round(unallocated,2),
+                'commit_unallocated_mb':round(commit_unallocated,2),
                 "memory_accounting":"rss", "memory_requested_mb":sum(j['task']['memory_mb'] for j in running),
                 "rss_mb": round(sum(j.get("rss_mb", 0) for j in running), 2)}
 
@@ -699,7 +703,7 @@ class Worker:
                     if isinstance(value,dict):return {key:freeze(item)for key,item in value.items()}
                     return value
                 execution=freeze(task['execution'])if 'execution'in task else None
-                result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"],
+                result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"], 'max_cpus':task['max_cpus'],
                           "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
                           'initial_cpus':task['cpus'],'peak_cpus':task['cpus'],'resize_count':0,
                           "submitted": time.time(), "started": None, "finished": None,
@@ -837,6 +841,7 @@ class Worker:
                     with self.condition:
                         job['rss_sampled'] = False
                         job['rss_mb'] = 0
+                        job.pop('private_mb',None)
                         result["steps"].append(step)
                         self._save(job)
                     source = inside(work, task["stdin"]).open("rb") if "stdin" in task else nullcontext(None)
@@ -852,6 +857,9 @@ class Worker:
                                 if usage['rss_mb'] > 0:
                                     job['rss_mb'] = usage['rss_mb']
                                     job['rss_sampled'] = True
+                                    if 'private_mb'in usage:
+                                        job['private_mb']=usage['private_mb']
+                                        result['peak_private_mb']=max(result.get('peak_private_mb',0),usage['private_mb'])
                                 result["peak_rss_mb"] = max(result["peak_rss_mb"], usage["rss_mb"])
                                 result["cpu_seconds"] = total_cpu
                                 if measured:
@@ -913,18 +921,24 @@ class Worker:
     def _automatic_grant(self,job):
         """Prepare a real kernel grant before expanding its argv and thread env."""
         task=job['task'];maximum=min(task['max_cpus'],self.capacity)
+        if task.get('execution',{}).get('mode')=='entry':maximum=1
         if task.get('execution',{}).get('mode')=='map':
             maximum=min(maximum,max(1,len(task['execution']['items'])))
         if maximum==task['cpus']==1:return
         callback=job.get('callback',{})
         request=dict(cpus=maximum,active_cpus=0,**task.get('memory_model',{}))
-        if callback.get('mode')=='poll':
-            self.lease(job['result']['id'],request)
-        elif callback.get('url'):
-            from .client import Client
-            client=Client(callback['url'],callback.get('token',''),ca_file=callback.get('ca_file'))
-            client.resize(callback.get('job_id',job['result']['id']),**request)
-        else:self.resize(job['result']['id'],**request)
+        try:
+            if callback.get('mode')=='poll':
+                self.lease(job['result']['id'],request)
+            elif callback.get('url'):
+                from .client import Client
+                client=Client(callback['url'],callback.get('token',''),ca_file=callback.get('ca_file'))
+                client.resize(callback.get('job_id',job['result']['id']),**request)
+            else:self.resize(job['result']['id'],**request)
+        except Exception as error:
+            retained='Insufficient memory for resource resize; existing grant retained'
+            if (retained not in str(error)or not(isinstance(error,Conflict)or getattr(error,'status_code',None)==409)):
+                raise
 
     def _clean_work(self, job, *, discard=False):
         """Keep declared results; consumed input decks/builds are no longer artifacts."""

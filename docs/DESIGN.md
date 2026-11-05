@@ -48,10 +48,18 @@ results = client.execute(plan, project='my-project',
 ```python
 from remote_compute import map_items, run_call
 values = map_items('business:evaluate', ready_inputs, kwargs={'mode': 'native'})
-result = run_call('business:train', config=config)
+result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 ```
 
 `map_items`可提供`on_result(index, value, error)`，逐项持久化业务检查点；`python_map`在`.dco-results.json`写入已完成项及最终状态。直接任务声明的返回值须可JSON序列化，大数组、模型及科学记录写声明输出，返回其必要索引。映射项内部的嵌套调用共用该项的1核，不额外借核。
+
+`python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items(..., backend="thread")`，DCO按输入数动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，单项固定1核，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
+
+`iter_items(function, items, backend=..., stop_when=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。
+
+提前离开上下文时，SDK收齐已开始的工作，将未消费记录的原索引、输入、结果和错误保存到声明输出`.dco-streams/`，并抛出`StreamResultsPending`；其`results/recovery_dir`供业务继续发布。正常消费完毕不生成该目录。恢复记录为本任务可信pickle文件，工程持久发布后随运输副本回收。
+
+串行业务编排使用`python_task`；在原有排空边界进入训练时，`run_call`先等该原ID的SDK stream完成资源归还并检查错误，再取得数值阶段授权。仍有未启动输入的活跃流应先收齐或停止并排空，避免等待消费者自身而死锁。`run_call(..., limits={"max_cpus":8, ...})`声明阶段有用上限和可选内存需求，不改变父任务上限。
 
 ## 持久准备与收齐
 
@@ -87,9 +95,9 @@ python_map('business:evaluate', items,
            memory_limit_mb=8192)
 ```
 
-固定`memory_mb`默认为256MiB。模型使用`base_memory_mb + 实际授权核数 × memory_per_cpu_mb`，可选`memory_limit_mb`限制单任务。首个1核槽必须能容纳；内存限制会缩小实际并行宽度。模型预留与实际RSS取较大值参加准入，避免启动或尾项小RSS覆盖有用预留。进程映射完成项退出后，其内存归还；线程共享缓存仍由实际RSS计账。
+固定`memory_mb`默认为256MiB。模型使用`base_memory_mb + 实际授权核数 × memory_per_cpu_mb`，可选`memory_limit_mb`限制单任务。首个1核槽必须能容纳；内存限制会缩小实际并行宽度。模型预留与实际RSS取较大值参加准入，避免启动或尾项小RSS覆盖有用预留。进程映射完成项退出后，其内存归还；线程共享缓存仍由实际RSS计账。Windows在现有进程采样中读取PrivateUsage，物理RAM与提交容量分别扣除各自尚未落实的预留；已私有提交但暂未驻留的页不再按RSS差额重复预留。设备RAM预算为自动或显式上限，系统保留与实时headroom单独保留。看板RAM U/T为物理用量，Admit为可派发额度。
 
-CPU/RAM增长先预留，远端确认后提交；减少确认后归还。同一原ID串行资源变更，网络RPC不持全局调度锁。利用率用于放置与诊断，不把低利用率当作可强抢在途核心的依据。真实有用需求和执行器边界负责释放闲槽。
+CPU/RAM增长先预留，远端确认后提交；减少确认后归还。同一原ID串行资源变更，网络RPC不持全局调度锁。资源协商明确返回内存不足且保留原授权时，执行器继续已获授权的工作并稍后重试，不中断整个映射；其他资源错误保留原结局。利用率用于放置与诊断，不把低利用率当作可强抢在途核心的依据。真实有用需求和执行器边界负责释放闲槽。
 
 `resource_share`为`(0,16]`，`single_thread_weight`为`(0,8]`，`priority`为`-1000..1000`。窗口查询的`queue_ratio`为`[0,4]`；默认供给深度让就绪工作持续排队。
 
@@ -131,7 +139,7 @@ GPU任务声明`requires=['ml']`及`accelerator={'kind':'cuda', ...}`。默认�
 
 `sync_files(..., content_id=..., job_id=...)`按不可变内容同步。并发准备相同内容共享一次打包和传输，各原ID分别登记引用。SDK管线将原ID传给`prepare`供资产同步使用；未受理准备放弃时释放其引用。已受理和未领取内容持续保留。状态、引用资产和结果在普通磁盘，可重建工作与TMP使用任务专属RAM目录，正常、失败、取消均回收自有临时物。
 
-接受后相同ID和同输入只执行一次。状态查询使用原ID的`statuses/wait_any`或有界分页；普通工程结果去掉设备名、URL、工具路径，保留本任务科学身份、资源、状态、时间、输出和费用。任务日志与声明输出按原ID领取。
+接受后相同ID和同输入只执行一次。状态查询使用原ID的`statuses/wait_any`或有界分页；普通工程结果去掉设备名、URL、工具路径，保留本任务科学身份、资源、状态、时间、输出和费用。任务日志与声明输出按原ID领取。Windows领取与持久状态使用扩展路径命名空间，覆盖超过260字符的嵌套输出；领取失败保留原ID，修复路径后领取，不重算。
 
 `kill <id>`请求终止任务及整个子进程树，支持完整ID或唯一的至少4位活动任务前缀。原ID、输入身份、声明输出、日志及累计CPU费用保留。运维端重启使用`restart --wait`或`Client.restart(wait=True)`，在排空边界重载同版源码并保留原终端及状态根。
 
@@ -152,3 +160,7 @@ AOP按原始角点及明文执行/测量协议交换；RGCN按完整逻辑观测
 AOP按阶段选`ng47/hsp`；RGCN按阶段选`ml/ng47/layout`；ARH-DSE按阶段选`rtl/chisel/onnx/ml`；FIBER普通数值使用基础环境，Torch加`ml`，真实SPICE加`ng47`。设备覆盖和实际工具验收见[STATUS](STATUS.md)。各工程使用SDK管理准备与执行，科学输入、seed、评价次数、成本、已付结果和恢复身份跨段连续。
 
 服务启动、设备配置、可见终端、TLS和运维命令见[README](../README.md)。运行预算以设备私有配置为准，实际版本以health和新PID核对。算力校准仅由人工命令触发，启动、重连和采样不运行基准。
+
+## 任务显示规范
+
+当前任务显示`CPU/max`，分别为实际授权和任务声明的max_cpus；排队未授权为0。工程汇总的任务数/CPU用于比较工程负载。Tag最多24终端格，按对象、方法/阶段、必要设置、种子末2或4位、仿真/评价量或预计CPU秒组合最短业务摘要，例如`BGR PSL s26 ev:10k`、`Rocket RTL s01 ~90s`。CPU配置单列，Tag不重复项目列、不放整段或纯hash。显示按实际列宽作语义缩写并保留任务词，完整标签、输入和原ID仍在明细及回执。

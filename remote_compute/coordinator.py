@@ -397,7 +397,7 @@ class Coordinator:
                 result = job['result']
                 known_ids.add(job.get('worker_id', result.get('worker_id', result['id'])))
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
-                    item = {k: result.get(k) for k in ('id','label','status','cpus','memory_mb','started')}
+                    item = {k: result.get(k) for k in ('id','label','status','cpus','max_cpus','memory_mb','started')}
                     item.update(progress_fields(result))
                     item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
                     item['project'] = job.get('task',{}).get('project','')
@@ -439,7 +439,7 @@ class Coordinator:
                     "paused": self.paused,"accepting":getattr(self,'accepting',True), "queued": len(self.queue), "tags": sorted(tags),
                     "policy": snapshot["policy"], "nodes": snapshot["nodes"],
                     'queued_jobs':[{**{key:self.jobs[identity]['result'].get(key) for key in
-                        ('id','label','status','cpus','memory_mb','started')},
+                        ('id','label','status','cpus','max_cpus','memory_mb','started')},
                         **{key:self.jobs[identity]['task'].get(key,default) for key,default in
                            (('project','default'),('priority',0),('resource_share',1.0))}}
                         for identity in self.queue],
@@ -558,6 +558,7 @@ class Coordinator:
     @staticmethod
     def _publish(job):
         # Replace one complete view; readers never observe an in-place update.
+        if job.get('task'):job['result']['max_cpus']=job['task'].get('max_cpus',1024)
         job['read_result'] = deepcopy(job['result'])
 
     def _save(self, job):
@@ -641,7 +642,7 @@ class Coordinator:
                 (directory / "request.zip").write_bytes(payload)
                 job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0,
                            "elastic_cpus": elastic_cpus(task), "cancel": threading.Event(), "node": None,
-                       "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"],
+                       "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"], 'max_cpus':task['max_cpus'],
                                   "single_thread_weight": task.get('single_thread_weight',1.0),
                                   "accelerator": task.get('accelerator'),
                                   "max_retries": task.get('retries',2), "attempts": [],
@@ -1369,6 +1370,7 @@ class Coordinator:
                         if previous_memory is None:job.pop('phase_memory',None)
                         else:job['phase_memory']=previous_memory
                     commit(old,old_memory)
+                    if error.status_code==409:raise Conflict(str(error))from None
                     raise
                 try:
                     observed=node.client.status(job.get('worker_id',identity))

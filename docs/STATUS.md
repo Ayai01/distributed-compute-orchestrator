@@ -1,6 +1,6 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.0**。
+- 当前源码版本：**0.11.1**。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。当前维护入口保存实际运行版本、统一部署、原状态恢复及放行事实；维护门关闭新增工程受理，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
@@ -10,7 +10,7 @@
 
 Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，Torch任务声明ml，取得CUDA授权后使用cuda后端。设备私有python_runtimes维护完整解释器前缀，项目不选择解释器或设备。新算法补齐所用环境的依赖，禁止扩充Python组合后缀。
 
-2026-11-04环境验收：五个提供者合计174个逻辑线程预算；五台CPU/ML环境、两台CUDA环境已完成逐项依赖、数值接口及最小计算验收，现有依赖版本保持。环境、路由和源码部署的原ID回执保存在`.local/maintenance/layout-ku26s-20261104/`，当前维护状态使用页首入口。
+2026-11-05现场配置：五个提供者合计182个逻辑线程预算；五台CPU/ML环境、两台CUDA环境已完成逐项依赖、数值接口及最小计算验收。实际预算以运行配置为准。环境、路由和源码部署的原ID回执保存在`.local/maintenance/layout-ku26s-20261104/`，当前维护状态使用页首入口。
 
 ## 工程需求与设备覆盖
 
@@ -21,9 +21,9 @@ Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，T
 | ARH-DSE | RTL仿真使用`rtl`，Chisel生成加`chisel`，ONNX推理加`onnx`，Torch执行加`ml` | 5/5 |
 | FIBER | 普通数值使用基础环境，Torch算法加`ml`，真实SPICE任务加`ng47` | 5/5 |
 
-表中能力按实际阶段选择，不把所有需求合并为每个任务的硬条件。CUDA计算覆盖Aya1-PC、Aya1-TX两台，兼容CPU预算46；显式CPU回退仍可使用全部五台。HSPICE只在ku26s配置，其他设备使用ng47。Python/C++、ng47、chisel、ml、rtl和onnx均覆盖五台。
+表中能力按实际阶段选择，不把所有需求合并为每个任务的硬条件。CUDA计算覆盖Aya1-PC、Aya1-TX两台，当前兼容CPU预算54；显式CPU回退仍可使用全部五台。HSPICE只在ku26s配置，其他设备使用ng47。Python/C++、ng47、chisel、ml、rtl和onnx均覆盖五台。
 
-`layout`覆盖五台，合计174线程预算。ku26s使用独立GLayout/GDSFactory环境、Magic 8.3.684及Netgen 1.5.323；已验证真实SKY130材料的GDS生成与读回、NMOS/PMOS提取、寄生电容提取及LVS正反例。PDK由任务内容资产提供，环境不保存实验副本。
+`layout`覆盖五台，当前合计182线程预算。ku26s使用独立GLayout/GDSFactory环境、Magic 8.3.684及Netgen 1.5.323；已验证真实SKY130材料的GDS生成与读回、NMOS/PMOS提取、寄生电容提取及LVS正反例。PDK由任务内容资产提供，环境不保存实验副本。
 
 ## 调度与任务
 
@@ -35,7 +35,7 @@ Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，T
 
 ## 验证与证据
 
-- 完整核心及原生回归：728项，4项按平台条件跳过。日志：`.local/maintenance/automatic-contract-20261104/native-release.log`。
+- 完整核心及原生回归744项；补验27项工程fixture后剩余4项平台条件跳过。流、内存及回收专项42项通过。日志位于当前维护目录的`patch-01101-deploy-native.log`、`patch-01101-project-fixtures.log`、`patch-01101-final-flow.log`及`patch-01101-published-delete-interrupt.log`。
 - 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
 - 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。
 - 能力与环境原生资格：`.local/maintenance/layout-ku26s-20261104/`中的`layout-qualify-final.json`、`admission-after.json`及逐设备现场验收；CPU/ML/CUDA环境记录见`.local/maintenance/capability-contract-20261104/`。

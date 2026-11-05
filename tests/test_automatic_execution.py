@@ -1,7 +1,7 @@
 """Public defaults drive actual kernel/process parallelism without caller leases."""
 import inspect,json,time,unittest,sys
 from pathlib import Path
-from remote_compute import Client,Pool,command,python_map,python_call
+from remote_compute import Client,Pool,command,python_map,python_call,python_task
 from remote_compute.worker import validate_task
 from test_compute import provider,scratch
 from test_center import center
@@ -21,6 +21,70 @@ def hold_kernel():
     Path('started').write_text('yes')
     while not Path('release').exists():time.sleep(.02)
     return 1
+def phased():
+    from pathlib import Path
+    from remote_compute import map_items
+    first=map_items('business:evaluate',[1,2,3],backend='thread')
+    print('serial-boundary',flush=True)
+    while not Path('release').exists():time.sleep(.02)
+    second=map_items('business:evaluate',[4,5,6],backend='thread')
+    return [first,second]
+def streaming():
+    from pathlib import Path
+    from remote_compute import iter_items
+    with iter_items('business:variable',[.6,.1,.3],backend='thread')as completed:
+        first=next(completed)
+        print('consumer-paused',flush=True)
+        while not Path('release').exists():time.sleep(.02)
+        return [first.index]+[item.index for item in completed]
+def bounded_stream():
+    from pathlib import Path
+    from remote_compute import iter_items
+    with iter_items('business:evaluate',range(40),backend='thread')as completed:
+        first=next(completed)
+        print('bounded-consumer-paused',flush=True)
+        while not Path('release').exists():time.sleep(.02)
+        retained=dict(started=completed.started,queued=completed.queue.qsize(),window=completed.window)
+        values=[first]+list(completed)
+        return dict(retained=retained,indices=[item.index for item in values])
+def abandoned_stream():
+    from remote_compute import iter_items
+    with iter_items('business:evaluate',range(20),backend='thread')as completed:
+        while completed.started<2:time.sleep(.01)
+        first=next(completed)
+        completed.stop()
+        return first.index
+def failing_stream_kernel():
+    from remote_compute import iter_items,run_call,execution
+    with iter_items('business:evaluate',[1],backend='thread')as completed:
+        result=next(completed)
+        completed.thread.join()
+        completed.error=RuntimeError('terminal stream failure')
+        return run_call('business:kernel')
+def stopped_stream():
+    from remote_compute import iter_items
+    with iter_items('business:evaluate',list(range(20)),backend='thread')as completed:
+        first=next(completed);completed.stop()
+        values=[first]+list(completed)
+        return dict(indices=[item.index for item in values],started=completed.started)
+def checked_kernel():
+    from remote_compute import Client
+    client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''))
+    time.sleep(.3)
+    return dict(threads=int(os.environ['OMP_NUM_THREADS']),actual=client.status(os.environ['REMOTE_COMPUTE_JOB_ID'])['cpus'])
+def final_stream_kernel():
+    from remote_compute import iter_items,run_call,execution
+    original=execution._Grants.close
+    def delayed_close(grants):time.sleep(.2);original(grants)
+    execution._Grants.close=delayed_close
+    try:
+        count=0
+        with iter_items('business:evaluate',[1,2,3],backend='thread')as completed:
+            for result in completed:
+                count+=1
+                if count==3:
+                    return run_call('business:checked_kernel',limits={'max_cpus':2,'base_memory_mb':64,'memory_per_cpu_mb':128})
+    finally:execution._Grants.close=original
 def variable(value):
     start=time.time();time.sleep(value)
     return dict(started=start,finished=time.time())
@@ -35,6 +99,126 @@ def shared(value):
 '''
 
 class AutomaticExecutionTests(unittest.TestCase):
+    def test_hybrid_memory_refusal_preserves_conflict_status_and_funded_work(self):
+        from unittest.mock import patch
+        from remote_compute.local import LocalClient
+        from remote_compute.worker import Conflict
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,_):
+            original=worker.resize;refused=[]
+            def resize(*args,**options):
+                if options.get('active_cpus',0):
+                    refused.append(True)
+                    raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                return original(*args,**options)
+            with Pool([LocalClient(worker)])as pool,center(pool,Path(root)/'center')as(_,client),patch.object(worker,'resize',side_effect=resize):
+                r=client.run(python_map('business:evaluate',range(6),max_cpus=2),files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            self.assertTrue(refused)
+            self.assertEqual(json.loads(r['files']['.dco-results.json'])['completed'],6)
+
+    def test_slow_consumer_bounds_started_and_buffered_results_and_returns_idle_grant(self):
+        from test_compute import until
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,client):
+            identity=client.submit(python_task('business:bounded_stream',max_cpus=3),files={'business.py':FUNCTIONS})['id']
+            until(lambda:'bounded-consumer-paused'in client.logs(identity)['stdout'],seconds=10)
+            until(lambda:client.status(identity)['cpus']==1,seconds=10)
+            client.write_job_file(identity,'release','yes')
+            client.wait(identity);r=client.fetch(identity)
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            value=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+            self.assertEqual(value['retained'],dict(started=3,queued=2,window=3))
+            self.assertEqual(sorted(value['indices']),list(range(40)))
+
+    def test_early_exit_preserves_all_started_results_as_declared_recovery_outputs(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,client):
+            r=client.run(python_task('business:abandoned_stream',max_cpus=2),files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'failed')
+            self.assertIn('StreamResultsPending',r['stderr'])
+            manifests=[json.loads(value)for name,value in r['files'].items()if name.startswith('.dco-streams/')and name.endswith('manifest.json')]
+            self.assertEqual(len(manifests),1,r['files'].keys())
+            self.assertEqual(manifests[0]['started'],2)
+            self.assertEqual(sorted(manifests[0]['indices']),[0,1])
+            # fetch(output_dir) keeps binary recovery records intact.
+            binary=[name for name in r['files']if name.endswith('.pkl')]
+            self.assertEqual(len(binary),2)
+
+    def test_terminal_stream_failure_blocks_a_kernel_before_the_terminal_marker_is_consumed(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,client):
+            r=client.run(python_task('business:failing_stream_kernel',max_cpus=2),files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'failed')
+            self.assertIn('terminal stream failure',r['stderr'])
+
+    def test_kernel_phase_limit_is_respected_without_a_resource_callback(self):
+        from unittest.mock import patch
+        from remote_compute.execution import run_call
+        with patch.dict('os.environ',{'REMOTE_COMPUTE_WORKER':'1','REMOTE_COMPUTE_CPUS':'8','REMOTE_COMPUTE_MAX_CPUS':'8','REMOTE_COMPUTE_RESIZE':'0','DCO_ITEM_PROCESS':'0'}):
+            value=run_call(lambda:int(__import__('os').environ['REMOTE_COMPUTE_CPUS']),limits={'max_cpus':2})
+            self.assertEqual(value,2)
+            with self.assertRaisesRegex(ValueError,'fixed memory_mb'):
+                run_call(lambda:None,limits=dict(memory_mb=256,base_memory_mb=64,memory_per_cpu_mb=128))
+
+    def test_last_completion_waits_for_resource_return_before_a_limited_kernel(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=8)as(_,client):
+            r=client.run(python_task('business:final_stream_kernel',max_cpus=8),files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            value=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+            self.assertEqual(value,dict(threads=2,actual=2))
+            self.assertEqual(r['cpus'],1)
+
+    def test_completion_stream_keeps_order_and_releases_cores_while_consumer_is_busy(self):
+        from test_compute import until
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,client):
+            identity=client.submit(python_task('business:streaming',max_cpus=3),files={'business.py':FUNCTIONS})['id']
+            until(lambda:'consumer-paused'in client.logs(identity)['stdout'],seconds=10)
+            until(lambda:client.status(identity)['cpus']==1,seconds=10)
+            client.write_job_file(identity,'release','yes')
+            r=client.wait(identity);r=client.fetch(identity)
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            order=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+            self.assertEqual(order,[1,2,0])
+
+    def test_stopping_completion_stream_drains_started_items_without_launching_the_rest(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,client):
+            r=client.run(python_task('business:stopped_stream',max_cpus=2),files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            value=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+            self.assertLess(value['started'],20)
+            self.assertEqual(sorted(value['indices']),list(range(value['started'])))
+
+    def test_business_entry_grows_in_parallel_stages_and_returns_to_one_between_them(self):
+        from test_compute import until
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,client):
+            identity=client.submit(python_task('business:phased',max_cpus=3),files={'business.py':FUNCTIONS})['id']
+            until(lambda:'serial-boundary'in client.logs(identity)['stdout'],seconds=10)
+            self.assertEqual(client.status(identity)['cpus'],1)
+            client.write_job_file(identity,'release','yes')
+            r=client.wait(identity);r=client.fetch(identity)
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            self.assertEqual(r['peak_cpus'],3);self.assertEqual(r['cpus'],1)
+            stages=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+            for values in stages:
+                concurrency=max(sum(v['started']<=point<v['finished']for v in values)for point in [v['started']for v in values])
+                self.assertGreaterEqual(concurrency,2)
+
+    def test_memory_resize_rejection_keeps_the_map_running_on_its_existing_grant(self):
+        from unittest.mock import patch
+        from remote_compute.worker import Conflict
+        for phase in ('initial','runtime'):
+            with self.subTest(phase=phase),scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,client):
+                original=worker.resize;refused=[]
+                def resize(*args,**options):
+                    if options.get('active_cpus',0)or phase=='initial'and args[1]>1:
+                        refused.append(options['active_cpus'])
+                        raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                    return original(*args,**options)
+                with patch.object(worker,'resize',side_effect=resize):
+                    r=client.run(python_map('business:evaluate',range(8),max_cpus=2),files={'business.py':FUNCTIONS})
+                self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+                self.assertTrue(refused)
+                values=[row['value']['value']for row in json.loads(r['files']['.dco-results.json'])['items']]
+                self.assertEqual(values,[i*2 for i in range(8)])
+                self.assertEqual(worker.health()['used_cpus'],0)
+
     def test_multiple_waves_without_a_resource_callback_keep_running(self):
         for backend in ('process','thread'):
             with self.subTest(backend=backend),scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,client):
@@ -137,10 +321,12 @@ class AutomaticExecutionTests(unittest.TestCase):
             identity=client.submit(task,files={'business.py':FUNCTIONS})['id']
             deadline=time.monotonic()+10;observed=False
             while time.monotonic()<deadline:
+                snapshot=worker.health()
+                active=next((row for row in snapshot['active_jobs']if row['id']==identity),{})
                 state=client.status(identity)
-                if state['status']=='running'and state.get('cpus')==3:
-                    observed=True;self.assertEqual(state['memory_mb'],448)
-                    self.assertGreaterEqual(worker.health()['memory_reserved_mb'],448)
+                if active.get('cpus')==3:
+                    observed=True;self.assertEqual(active['memory_mb'],448)
+                    self.assertGreaterEqual(snapshot['memory_reserved_mb'],448)
                 if state['status']in ('succeeded','failed'):break
                 time.sleep(.05)
             result=client.fetch(identity)

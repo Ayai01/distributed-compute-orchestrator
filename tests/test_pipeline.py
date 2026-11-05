@@ -11,6 +11,25 @@ def task(number):
     return dict(task=command(['${tool:python}','-c','print('+str(number)+')'],max_cpus=1))
 
 class PipelineTests(unittest.TestCase):
+    def test_interrupt_after_publication_leaves_original_transport_pending_until_delete(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                original=client.delete;published=[];interrupted=[]
+                def remove(identity):
+                    if not interrupted:interrupted.append(identity);raise KeyboardInterrupt
+                    return original(identity)
+                out=Path(root)/'delivery';plan={'one':task(1)}
+                with patch.object(client,'delete',side_effect=remove):
+                    with self.assertRaises(ExecutionPaused)as paused:
+                        client.execute(plan,project='pipeline-test',output_dir=out,publish=lambda r:published.append(r['id']))
+                self.assertEqual(paused.exception.remaining,['one'])
+                self.assertEqual([r['id']for r in paused.exception.results],published)
+                self.assertEqual(client.status(published[0])['status'],'succeeded')
+                with patch.object(client,'submit_bundle',side_effect=AssertionError('Original must not resubmit')):
+                    results=client.execute(plan,project='pipeline-test',output_dir=out,publish=lambda r:self.fail('Already published'))
+                self.assertEqual([r['id']for r in results],published)
+                self.assertEqual(client.statuses(published)[published[0]]['status'],'unknown')
+
     def test_changed_business_inputs_or_original_id_reject_the_same_output_directory(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
@@ -48,9 +67,12 @@ class PipelineTests(unittest.TestCase):
                         if where=='publish':raise KeyboardInterrupt
                     out=Path(root)/'delivery'
                     with patch.object(client,'submit_bundle',side_effect=submit):
-                        with self.assertRaises(ExecutionPaused):
+                        with self.assertRaises(ExecutionPaused)as paused:
                             client.execute({'one':task(1),'next':dict(spec=task(2),after=['one'])},
                                 project='pipeline-test',output_dir=out,prepare=prepare,publish=publish)
+                        if where=='publish':
+                            self.assertEqual(paused.exception.results,[])
+                            self.assertIn('one',paused.exception.remaining)
                     if accepted:
                         state=json.loads(next(out.rglob('state.json')).read_bytes())
                         with patch.object(client,'submit_bundle',side_effect=AssertionError('Original must not resubmit')):
