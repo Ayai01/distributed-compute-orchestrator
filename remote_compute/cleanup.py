@@ -6,10 +6,12 @@ import re
 import stat
 import threading
 import time
+from .bundle import native_path
 
 
 def remove_owned(path):
     """Remove an owned entry without traversing symlinks or Windows junctions."""
+    path=native_path(path,force=True)
     try:
         info = path.lstat()
     except FileNotFoundError:

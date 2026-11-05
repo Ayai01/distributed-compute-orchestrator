@@ -36,6 +36,7 @@ Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，T
 ## 验证与证据
 
 - 完整核心及原生回归744项；补验27项工程fixture后剩余4项平台条件跳过。流、内存及回收专项42项通过。日志位于当前维护目录的`patch-01101-deploy-native.log`、`patch-01101-project-fixtures.log`、`patch-01101-final-flow.log`及`patch-01101-published-delete-interrupt.log`。
+- Windows长路径贯穿成果枚举、输入保留、领取和原ID删除，保留链接自身的清理边界；26项文件生命周期检查通过，日志`patch-01101-long-output-lifecycle-final.log`。
 - 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
 - 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。
 - 能力与环境原生资格：`.local/maintenance/layout-ku26s-20261104/`中的`layout-qualify-final.json`、`admission-after.json`及逐设备现场验收；CPU/ML/CUDA环境记录见`.local/maintenance/capability-contract-20261104/`。

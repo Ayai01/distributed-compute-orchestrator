@@ -23,7 +23,7 @@ import weakref
 import zipfile
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,
+from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,native_path,
                      tree, unpack, progress, progress_fields)
 from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS,
                        python_backend, python_accelerator, supports_python, uses_python, execution_tool)
@@ -946,6 +946,7 @@ class Worker:
         try:
             if work.resolve() != work:
                 raise ValueError('Job input directory became a link')
+            work=native_path(work,force=True)
             task = job.get('task') or json.loads((job['directory']/'task.json').read_text(encoding='utf-8'))
             if not task['outputs'] and not discard:
                 return  # Generic job-file callers collect arbitrary files by name.

@@ -19,6 +19,28 @@ from test_compute import scratch
 
 class PrivateJsonTests(unittest.TestCase):
     @unittest.skipUnless(os.name=='nt','Windows extended path namespace')
+    def test_long_worker_output_is_retained_fetched_and_deleted_by_original_id(self):
+        from test_compute import provider
+        from remote_compute import command
+        with scratch()as directory,provider(Path(directory)/'worker')as(worker,client):
+            name='deep/'+'/'.join(['segment-abcdefghijkl']*12)+'/result.bin'
+            source="from pathlib import Path;from remote_compute.bundle import native_path;p=native_path("+repr(name)+",force=True);p.parent.mkdir(parents=True);p.write_bytes(b'paid-original');Path('consumed-input').write_text('temporary')"
+            identity=client.submit(command(['${tool:python}','-c',source],max_cpus=1,outputs=['deep/**/*'],env={'PYTHONPATH':'${dco}'}))['id']
+            client.wait(identity)
+            job_root=worker.jobs[identity]['directory']
+            try:
+                receipt=client.fetch(identity,delete=False)
+                self.assertEqual(receipt['status'],'succeeded',receipt.get('stderr'))
+                self.assertEqual(receipt['files'][name],b'paid-original')
+                self.assertNotIn('input_cleanup_error',receipt)
+                self.assertFalse((job_root/'input/consumed-input').exists())
+                client.delete(identity)
+                self.assertFalse(native_path(job_root,force=True).exists())
+                self.assertEqual(client.statuses([identity])[identity]['status'],'unknown')
+            finally:
+                if native_path(job_root,force=True).exists():shutil.rmtree(native_path(job_root,force=True))
+
+    @unittest.skipUnless(os.name=='nt','Windows extended path namespace')
     def test_long_artifact_and_atomic_state_paths_roundtrip(self):
         with scratch()as directory:
             root=Path(directory)/('a'*80)/('b'*80)/('c'*40)

@@ -19,7 +19,8 @@ MAX_BODY = 512 * 1024 * 1024
 
 def native_path(value,*,force=False):
     """Use the Windows extended namespace for owned filesystem I/O."""
-    path=Path(value).resolve()
+    # Keep a link's own identity; containment checks resolve links in inside().
+    path=Path(os.path.abspath(value))
     text=str(path)
     if os.name=='nt'and (force or len(text)>=248)and not text.startswith('\\\\?\\'):
         text=('\\\\?\\UNC\\'+text[2:])if text.startswith('\\\\')else'\\\\?\\'+text
@@ -99,7 +100,7 @@ def pack(files):
 
 
 def tree(root, patterns=("**/*",)):
-    root = Path(root).resolve()
+    root = native_path(Path(root).resolve(),force=True)
     files = {}
     for pattern in patterns:
         inside(root, pattern)
