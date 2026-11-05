@@ -2,6 +2,7 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor,wait,FIRST_COMPLETED
 from hashlib import sha256
+from heapq import heappush,heappop
 from pathlib import Path
 import json,time,uuid,re,pickle
 from .bundle import atomic_json,task_bundle,TERMINAL,native_path
@@ -17,6 +18,30 @@ class Deferred:
 class Skipped:
     """The business gate has completed and this planned item needs no execution."""
     def __init__(self,reason='Business gate skipped this item'):self.reason=reason
+
+
+class _ReadyQueue:
+    """Merge readiness by catalog position, with a turn for fresh inputs."""
+    def __init__(self,catalog):
+        self.order={key:index for index,key in enumerate(catalog)}
+        self.fresh=[];self.retries=[];self.queued=set();self.retry_streak=0
+
+    def add(self,key,*,retry=False):
+        if key in self.queued:return
+        heappush(self.retries if retry else self.fresh,(self.order[key],key))
+        self.queued.add(key)
+
+    def pop(self):
+        # Preparation has four slots. Earlier retries retain their priority,
+        # while every fourth choice can advance a fresh ready input.
+        retry=bool(self.retries)and(not self.fresh or
+            self.retries[0][0]<self.fresh[0][0]and self.retry_streak<3)
+        _,key=heappop(self.retries if retry else self.fresh)
+        self.queued.remove(key)
+        self.retry_streak=self.retry_streak+1 if retry else 0
+        return key
+
+    def __bool__(self):return bool(self.fresh or self.retries)
 
 
 class ExecutionResults(list):
@@ -97,10 +122,10 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
     else:atomic_json(manifest_path,manifest)
     options={}if ready_tasks is None else dict(ready_tasks=ready_tasks)
     window=client.window(project,**options)
-    pending={};preparing={};submitting={};collecting={};deferred={};rows={}
+    pending={};preparing={};submitting={};collecting={};deferred=[];rows={}
     results=ExecutionResults();failures=[];completed=set()
-    ready=deque(key for key,after in dependencies.items()if not after)
-    stopped=paused=False;next_poll=next_retry=next_gate=0.
+    ready=_ReadyQueue(catalog)
+    stopped=paused=False;next_poll=next_gate=0.
 
     def save(row,**changes):
         row.update(changes);atomic_json(Path(row['directory'])/'state.json',row)
@@ -198,10 +223,9 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
         return receipt
 
     def finish(key):
-        nonlocal next_retry
-        completed.add(key);next_retry=0.
+        completed.add(key)
         for following in followers.get(key,[]):
-            if dependencies[following].issubset(completed):ready.append(following)
+            if dependencies[following].issubset(completed):ready.add(following)
 
     def failure(row,stage_name,error):
         nonlocal stopped
@@ -222,7 +246,8 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
             elif row['state']=='accepted':pending[row['id']]=row;recovering.add(key)
             elif row['state']=='submitting'or row.get('recovery')and row['state']=='new':
                 preparing[prep_pool.submit(stage,key,row)]=row;recovering.add(key)
-        ready=deque(key for key in ready if key not in recovering)
+        for key,after in dependencies.items():
+            if not after and key not in recovering:ready.add(key)
         while len(completed)<len(catalog)or preparing or submitting or pending or collecting:
             try:
                 if time.monotonic()>=next_gate:
@@ -230,11 +255,12 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                     paused=paused or bool(stop_when and stop_when())or not window.value.get('accepting',True)
                     next_gate=time.monotonic()+1.
                 if not stopped and not paused:
-                    if deferred and time.monotonic()>=next_retry:
-                        ready.extend(deferred);deferred.clear();next_retry=time.monotonic()+1.
+                    now=time.monotonic()
+                    while deferred and deferred[0][0]<=now:
+                        _,_,key=heappop(deferred);ready.add(key,retry=True)
                     available=window.available(len(preparing)+len(submitting)+len(pending)+len(collecting))
                     while ready and available and len(preparing)<4:
-                        key=ready.popleft();row=row_for(key)
+                        key=ready.pop();row=row_for(key)
                         if key in recovering or key in completed:continue
                         if row['state']=='skipped':
                             results.skipped.append(key);finish(key);continue
@@ -248,7 +274,8 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                     try:
                         data=future.result()
                         if isinstance(data,Deferred):
-                            save(row,state='deferred',reason=data.reason);deferred[row['key']]=True
+                            save(row,state='deferred',reason=data.reason)
+                            heappush(deferred,(time.monotonic()+1.,ready.order[row['key']],row['key']))
                         elif isinstance(data,Skipped):
                             save(row,state='skipped',reason=data.reason);results.skipped.append(row['key'])
                             client.release_assets(row['id']);finish(row['key'])

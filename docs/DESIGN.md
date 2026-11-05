@@ -68,7 +68,8 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 - `requests`为业务键到请求的映射，或`(key, spec)`序列；业务键非空且唯一。
 - 业务请求为`{'task': task, 'inputs': directory, 'files': mapping}`，也可由`prepare(spec, original_id)`返回。依赖包装为`{'spec': business_input, 'after': [keys]}`。依赖图在受理前校验。
 - `after`等待前序结果完成持久发布，之后才准备后续输入。独立任务继续准备和执行。
-- `Deferred(reason)`表示输入暂未就绪，立即归还准备线程；发布事件或有界间隔触发重试。`Skipped(reason)`表示业务门已决定跳过，在结果的`skipped`中登记，不生成科学回执。
+- `Deferred(reason)`表示输入暂未就绪，立即归还准备线程；同一次`execute`中，该项检查完成后至少间隔1秒沿原ID重试，其他项完成不缩短此间隔。重新启动管线时沿原ID重新检查业务门。`Skipped(reason)`表示业务门已决定跳过，在结果的`skipped`中登记，不生成科学回执。
+- 新满足依赖的项和到期重试按原catalog位置合入就绪队列。有首次就绪项等待时，最多连续准备3个重试项，再给首次就绪项一次机会；准备完成和远端执行仍可并行。
 - 准备、提交、领取/发布使用独立线程组，发布慢不会堵住独立输入的准备。`publish(receipt)`可能并发调用，须按原ID幂等、线程安全，成功返回前持久发布科学输出、费用和恢复状态。
 - 默认窗口覆盖兼容线程并超过128；`ready_tasks`可设1–4096。工程只提供已授权且真实就绪的工作，不为填队列增加评价或越过依赖。
 

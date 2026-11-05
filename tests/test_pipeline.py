@@ -10,7 +10,92 @@ from test_center import center
 def task(number):
     return dict(task=command(['${tool:python}','-c','print('+str(number)+')'],max_cpus=1))
 
+
+class ReadyQueueTests(unittest.TestCase):
+    def test_retries_keep_catalog_order_and_allow_fresh_inputs_to_advance(self):
+        from remote_compute.pipeline import _ReadyQueue
+        retries=['retry'+str(i)for i in range(8)];fresh=['normal0','normal1']
+        ready=_ReadyQueue(retries+fresh)
+        for key in reversed(retries):ready.add(key,retry=True)
+        for key in reversed(fresh):ready.add(key)
+        ready.add(retries[0],retry=True)
+        order=[]
+        while ready:order.append(ready.pop())
+        self.assertEqual(len(order),10);self.assertEqual(len(set(order)),10)
+        self.assertEqual([key for key in order if key in retries],retries)
+        self.assertEqual([key for key in order if key in fresh],fresh)
+        self.assertLessEqual(order.index('normal0'),3)
+        self.assertLessEqual(order.index('normal1'),7)
+
+
 class PipelineTests(unittest.TestCase):
+    def test_resuming_deferred_dependency_work_rechecks_the_same_original_id(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                identities=[];resumed=False
+                def prepare(spec,identity):
+                    if spec=='recovery':
+                        identities.append(identity)
+                        if not resumed:return Deferred('Operator handoff pending')
+                    return Skipped('Existing scientific result')
+                plan={'recovery':dict(spec='recovery',after=['skip1','skip2']),
+                      'skip1':'skip1','skip2':'skip2','bulk':'bulk'}
+                output=Path(root)/'delivery'
+                with self.assertRaises(ExecutionPaused)as paused:
+                    client.execute(plan,project='order-test',output_dir=output,prepare=prepare,
+                        ready_tasks=1,stop_when=lambda:bool(identities))
+                self.assertIn('recovery',paused.exception.remaining)
+                resumed=True
+                with patch.object(client,'submit_bundle',side_effect=AssertionError('Paid results are reused')):
+                    result=client.execute(plan,project='order-test',output_dir=output,prepare=prepare,ready_tasks=1)
+                self.assertEqual(len(identities),2);self.assertEqual(identities[0],identities[1])
+                self.assertIn('recovery',result.skipped)
+
+    def test_newly_satisfied_dependency_keeps_its_catalog_priority(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                prepared=[]
+                def prepare(spec,identity):
+                    prepared.append(spec);return Skipped('Existing scientific result')
+                plan={'recovery':dict(spec='recovery',after=['prefix']),'prefix':'prefix',
+                      **{'bulk'+str(i):'bulk'+str(i)for i in range(8)}}
+                result=client.execute(plan,project='order-test',output_dir=Path(root)/'delivery',prepare=prepare,ready_tasks=1)
+                self.assertEqual(prepared,['prefix','recovery']+['bulk'+str(i)for i in range(8)])
+                self.assertEqual(result.skipped,prepared)
+
+    def test_due_deferred_item_rejoins_at_its_catalog_position_with_original_id(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                ready=threading.Event();prepared=[];identities=[]
+                def prepare(spec,identity):
+                    prepared.append(spec)
+                    if spec=='waiting':
+                        identities.append(identity)
+                        if not ready.is_set():return Deferred('Operator handoff pending')
+                    if spec=='prefix':
+                        time.sleep(1.08);ready.set()
+                    return Skipped('Existing scientific result')
+                plan={'waiting':'waiting','prefix':'prefix',**{'bulk'+str(i):'bulk'+str(i)for i in range(8)}}
+                client.execute(plan,project='order-test',output_dir=Path(root)/'delivery',prepare=prepare,ready_tasks=1)
+                self.assertEqual(prepared,['waiting','prefix','waiting']+['bulk'+str(i)for i in range(8)])
+                self.assertEqual(len(identities),2);self.assertEqual(identities[0],identities[1])
+
+    def test_unrelated_completion_does_not_bypass_deferred_retry_interval(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                retries=[];ordinary=[]
+                def prepare(spec,identity):
+                    if spec=='waiting':
+                        retries.append(time.monotonic());return Deferred('External input pending')
+                    time.sleep(.02);ordinary.append(spec);return Skipped('Existing result')
+                plan={'waiting':'waiting',**{'bulk'+str(i):'bulk'+str(i)for i in range(10)}}
+                with self.assertRaises(ExecutionPaused):
+                    client.execute(plan,project='order-test',output_dir=Path(root)/'delivery',prepare=prepare,
+                        ready_tasks=1,stop_when=lambda:len(retries)>=2)
+                self.assertEqual(len(ordinary),10)
+                self.assertGreaterEqual(len(retries),2)
+                self.assertTrue(all(b-a>=.95 for a,b in zip(retries,retries[1:])),retries)
+
     def test_interrupt_after_publication_leaves_original_transport_pending_until_delete(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
