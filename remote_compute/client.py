@@ -648,10 +648,11 @@ class Client:
             raise
         return self.fetch(identity, output_dir, delete=not keep)
 
-    def execute(self, requests, *, project, output_dir, prepare=None, publish=None, ready_tasks=None,stop_when=None):
+    def execute(self, requests, *, project, output_dir, prepare=None, publish=None, ready_tasks=None,stop_when=None,cancel_when=None):
         """Submit a keyed plan and durably publish/collect it through one pipeline."""
         from .pipeline import execute
-        return execute(self,requests,project=project,output_dir=output_dir,prepare=prepare,publish=publish,ready_tasks=ready_tasks,stop_when=stop_when)
+        return execute(self,requests,project=project,output_dir=output_dir,prepare=prepare,publish=publish,
+                       ready_tasks=ready_tasks,stop_when=stop_when,cancel_when=cancel_when)
 
     def sync(self, root, patterns=("**/*",)):
         return self.sync_files(tree(root, patterns))

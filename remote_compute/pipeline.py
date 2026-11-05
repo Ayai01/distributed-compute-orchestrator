@@ -1,13 +1,14 @@
 """One durable SDK pipeline owns preparation, admission and publication."""
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor,wait,FIRST_COMPLETED
+from concurrent.futures import wait,FIRST_COMPLETED
 from hashlib import sha256
 from heapq import heappush,heappop
 from pathlib import Path
-import json,time,uuid,re,pickle
+import json,time,uuid,re,pickle,threading
 from .bundle import atomic_json,task_bundle,TERMINAL,native_path
 from .client import RemoteError
 from .worker import lock_root
+from .pipeline_control import project_call
 
 
 class Deferred:
@@ -79,22 +80,24 @@ def _input_identity(value):
     return sha256(json.dumps(canonical(value),ensure_ascii=False,separators=(',',':')).encode('utf8')).hexdigest()
 
 
-def execute(client,requests,*,project,output_dir,prepare=None,publish=None,ready_tasks=None,stop_when=None):
+def execute(client,requests,*,project,output_dir,prepare=None,publish=None,ready_tasks=None,stop_when=None,cancel_when=None):
     """Execute a keyed immutable business plan.
 
     Each value is a request or {'spec': business_input, 'after': [business_keys]}.
     prepare(spec, job_id) returns task/files/inputs, Deferred, or Skipped.
     publish(receipt) is concurrent, idempotent scientific publication by original ID.
     A maintenance gate drains accepted work and raises ExecutionPaused.
+    cancel_when cancels this call's accepted originals and still publishes results.
     """
     root=native_path(output_dir,force=True);root.mkdir(parents=True,exist_ok=True)
-    identity=sha256((client.url+'\0'+project).encode()).hexdigest()
-    lock=lock_root(Path.cwd()/'.local/dco-client'/identity,'pipeline')
-    try:return _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
+    lock=lock_root(root,'pipeline')
+    try:
+        with project_call(client,project,root,ready_tasks)as call:
+            return _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,call)
     finally:lock.close()
 
 
-def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when):
+def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,call):
     entries=list(requests.items()if hasattr(requests,'items')else requests)
     catalog={};dependencies={};followers={}
     for key,raw in entries:
@@ -120,15 +123,36 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
     if manifest_path.exists():
         if json.loads(manifest_path.read_bytes())!=manifest:raise ValueError('Output directory binds another immutable business plan')
     else:atomic_json(manifest_path,manifest)
-    options={}if ready_tasks is None else dict(ready_tasks=ready_tasks)
-    window=client.window(project,**options)
+    window=call.window
     pending={};preparing={};submitting={};collecting={};deferred=[];rows={}
     results=ExecutionResults();failures=[];completed=set()
     ready=_ReadyQueue(catalog)
     stopped=paused=False;next_poll=next_gate=0.
+    cancellation=threading.Event();cancel_attempted=set();state_lock=threading.RLock()
 
     def save(row,**changes):
-        row.update(changes);atomic_json(Path(row['directory'])/'state.json',row)
+        with state_lock:
+            row.update(changes);atomic_json(Path(row['directory'])/'state.json',row)
+
+    def cancelling():
+        if not cancellation.is_set()and cancel_when and cancel_when():
+            with state_lock:
+                if not cancellation.is_set():
+                    for row in rows.values():
+                        if row['state']in ('submitting','accepted'):save(row,cancel_requested=True)
+                    cancellation.set()
+        return cancellation.is_set()
+
+    def cancel_original(row,state):
+        if not(row.get('cancel_requested')or cancelling()):return
+        if not row.get('cancel_requested'):save(row,cancel_requested=True)
+        if state['status']not in TERMINAL and row['id']not in cancel_attempted:
+            # Intent precedes the RPC. Recovery retries only this original ID.
+            cancel_attempted.add(row['id'])
+            client._read_reconnecting(lambda:client.cancel(row['id']))
+
+    def execution_failed(row,receipt):
+        return receipt['status']!='succeeded'and not(receipt['status']=='cancelled'and row.get('cancel_requested'))
 
     def row_for(key):
         if key in rows:return rows[key]
@@ -144,7 +168,8 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
             if original is not None and not re.fullmatch('[0-9a-f]{32}',original):raise ValueError('job_id requires an original DCO ID')
             row=dict(id=original or uuid.uuid4().hex,key=key,project=project,directory=str(directory),state='new',recovery=bool(original),input_identity=identities[key])
             save(row)
-        rows[key]=row;return row
+        with state_lock:rows[key]=row
+        return row
 
     def stage(key,row):
         raw=catalog[key];directory=Path(row['directory']);payload=directory/'request.zip'
@@ -161,10 +186,12 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                 return 'fetched'
             save(row,state='accepted',request_sha256=original['request_sha256'])
             return 'accepted'
-        if row['state']=='submitting':
+        if row['state']=='submitting'or row.get('cancel_requested'):
             try:original=client._read_reconnecting(lambda:client.status(row['id']))
             except RemoteError as error:
                 if error.status_code!=404:raise
+                if row.get('cancel_requested'):
+                    save(row,state='prepared');return 'paused'
             else:
                 if original['request_sha256']!=row['request_sha256']:
                     raise RuntimeError('Original request identity differs')
@@ -186,15 +213,20 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
         return data
 
     def submit(row,data):
-        if stop_when and stop_when():save(row,state='prepared');return 'paused'
+        if cancelling()or stop_when and stop_when():save(row,state='prepared');return 'paused'
         save(row,state='submitting')
+        if cancelling()or row.get('cancel_requested'):
+            save(row,state='prepared');return 'paused'
         try:accepted=client.submit_bundle(row['id'],data)
         except RemoteError as error:
             if error.status_code==409 and 'new task admissions'in str(error):
                 save(row,state='prepared');return 'paused'
             # A lost reply never creates a new identity. Query the same request.
             try:accepted=client.status(row['id'])
-            except RemoteError:raise error
+            except RemoteError as lookup:
+                if 400<=(getattr(error,'status_code',None)or 0)<500 and lookup.status_code==404:
+                    save(row,state='prepared')
+                raise error
         if accepted['id']!=row['id']or accepted['request_sha256']!=row['request_sha256']:
             raise RuntimeError('Original request identity differs')
         save(row,state='accepted');return 'accepted'
@@ -231,9 +263,7 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
         nonlocal stopped
         failures.append(dict(id=row['id'],key=row['key'],stage=stage_name,error=str(error)));stopped=True
 
-    with ThreadPoolExecutor(4,thread_name_prefix='dco-prepare')as prep_pool, \
-         ThreadPoolExecutor(2,thread_name_prefix='dco-submit')as submit_pool, \
-         ThreadPoolExecutor(2,thread_name_prefix='dco-collect')as collect_pool:
+    with call.pools()as(prep_pool,submit_pool,collect_pool):
         recovering=set()
         # Recovery and collection continue while new admissions are closed.
         # Existing accepted IDs may be deeper in the dependency graph.
@@ -242,14 +272,19 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
             if not path.exists()and not(isinstance(raw,dict)and raw.get('job_id')):continue
             row=row_for(key)
             if row['state']in ('collected','published','fetched','publication_failed'):
+                if row['state']!='collected':call.hold(row,recovered=True)
                 collecting[collect_pool.submit(collect,row)]=row;recovering.add(key)
-            elif row['state']=='accepted':pending[row['id']]=row;recovering.add(key)
-            elif row['state']=='submitting'or row.get('recovery')and row['state']=='new':
+            elif row['state']=='accepted':
+                call.hold(row,recovered=True);pending[row['id']]=row;recovering.add(key)
+            elif row['state']=='submitting'or row.get('recovery')and row['state']=='new'or row.get('cancel_requested'):
+                call.hold(row,recovered=True)
                 preparing[prep_pool.submit(stage,key,row)]=row;recovering.add(key)
         for key,after in dependencies.items():
             if not after and key not in recovering:ready.add(key)
+        call.recovered()
         while len(completed)<len(catalog)or preparing or submitting or pending or collecting:
             try:
+                if cancelling():paused=True
                 if time.monotonic()>=next_gate:
                     client._read_reconnecting(window.current)
                     paused=paused or bool(stop_when and stop_when())or not window.value.get('accepting',True)
@@ -258,17 +293,16 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                     now=time.monotonic()
                     while deferred and deferred[0][0]<=now:
                         _,_,key=heappop(deferred);ready.add(key,retry=True)
-                    available=window.available(len(preparing)+len(submitting)+len(pending)+len(collecting))
-                    while ready and available and len(preparing)<4:
+                    while ready and len(preparing)<4:
                         key=ready.pop();row=row_for(key)
                         if key in recovering or key in completed:continue
                         if row['state']=='skipped':
                             results.skipped.append(key);finish(key);continue
+                        if not call.hold(row):ready.add(key);break
                         if row['state']in ('collected','published','fetched','publication_failed'):
                             collecting[collect_pool.submit(collect,row)]=row
                         elif row['state']=='accepted':pending[row['id']]=row
                         else:preparing[prep_pool.submit(stage,key,row)]=row
-                        available-=1
                 for future in [f for f in preparing if f.done()]:
                     row=preparing.pop(future)
                     try:
@@ -276,12 +310,16 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                         if isinstance(data,Deferred):
                             save(row,state='deferred',reason=data.reason)
                             heappush(deferred,(time.monotonic()+1.,ready.order[row['key']],row['key']))
+                            call.release(row)
                         elif isinstance(data,Skipped):
                             save(row,state='skipped',reason=data.reason);results.skipped.append(row['key'])
                             client.release_assets(row['id']);finish(row['key'])
+                            call.release(row)
                         elif data=='accepted':pending[row['id']]=row
                         elif data=='fetched':collecting[collect_pool.submit(collect,row)]=row
+                        elif data=='paused':paused=True;call.release(row)
                         elif not stopped and not paused:submitting[submit_pool.submit(submit,row,data)]=row
+                        else:call.release(row)
                     except KeyboardInterrupt:paused=True
                     except BaseException as error:
                         failure(row,'prepare',error)
@@ -290,15 +328,20 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                 for future in [f for f in submitting if f.done()]:
                     row=submitting.pop(future)
                     try:
-                        if future.result()=='paused':paused=True
+                        if future.result()=='paused':
+                            paused=True;call.release(row)
                         else:pending[row['id']]=row
                     except KeyboardInterrupt:
                         paused=True;preparing[prep_pool.submit(stage,row['key'],row)]=row
-                    except BaseException as error:failure(row,'submit',error)
+                    except BaseException as error:
+                        failure(row,'submit',error);call.release(row)
                 if pending and time.monotonic()>=next_poll:
                     states=client._read_reconnecting(lambda:client.statuses(pending))
                     for job_id,state in states.items():
                         row=pending[job_id]
+                        if state['status']!='unknown':
+                            try:cancel_original(row,state)
+                            except Exception as error:failure(row,'cancel',error)
                         if state['status']in TERMINAL:
                             pending.pop(job_id);collecting[collect_pool.submit(collect,row)]=row
                         elif state['status']=='unknown':
@@ -308,7 +351,7 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                     row=collecting.pop(future)
                     try:
                         receipt=future.result();results.append(receipt)
-                        if receipt['status']!='succeeded':failure(row,'execution',receipt['status'])
+                        if execution_failed(row,receipt):failure(row,'execution',receipt['status'])
                         finish(row['key'])
                     except KeyboardInterrupt:
                         paused=True
@@ -317,11 +360,12 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
                             results.append(json.loads(receipt_path.read_bytes()))
                             if row['state']=='collected':finish(row['key'])
                     except BaseException as error:failure(row,'collection/publication',error)
+                    call.release(row)
                 if (stopped or paused)and not(preparing or submitting or pending or collecting):break
                 futures=[*preparing,*submitting,*collecting]
                 if futures:wait(futures,timeout=.05,return_when=FIRST_COMPLETED)
                 elif pending or deferred:time.sleep(.05)
-                elif ready:continue
+                elif ready:call.wait()
                 elif len(completed)<len(catalog):raise RuntimeError('Business dependency has no remaining runnable predecessor')
             except KeyboardInterrupt:
                 paused=True
@@ -331,17 +375,20 @@ def _execute(client,requests,project,root,prepare,publish,ready_tasks,stop_when)
         if (row['key']in completed or row['state']not in ('accepted','submitting')
                 or any(f['id']==row['id']and f['stage']=='collection/publication'for f in failures)):continue
         try:
-            try:client._read_reconnecting(lambda:client.status(row['id']))
+            try:state=client._read_reconnecting(lambda:client.status(row['id']))
             except RemoteError as error:
                 if error.status_code!=404:raise
                 save(row,state='prepared');continue
+            try:cancel_original(row,state)
+            except Exception as error:failure(row,'cancel',error)
             client.wait(row['id'])
             receipt=collect(row);results.append(receipt);finish(row['key'])
-            if receipt['status']!='succeeded':failure(row,'execution',receipt['status'])
+            if execution_failed(row,receipt):failure(row,'execution',receipt['status'])
         except KeyboardInterrupt:paused=True
         except Exception as error:failure(row,'drain',error)
     remaining=[key for key in catalog if key not in completed]
-    atomic_json(root/'batch.json',dict(status='failed'if failures else'paused'if remaining else'succeeded',
+    cancelled=cancellation.is_set()or any(row['status']=='cancelled'for row in results)
+    atomic_json(root/'batch.json',dict(status='failed'if failures else'cancelled'if cancelled else'paused'if remaining else'succeeded',
         completed=len(completed),accepted_results=len(results),skipped=results.skipped,remaining=remaining))
     if failures:raise ExecutionFailure(failures,results)
     if remaining:raise ExecutionPaused(results,remaining)

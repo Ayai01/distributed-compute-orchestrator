@@ -63,23 +63,27 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 ## 持久准备与收齐
 
-`Client.execute(requests, project=..., output_dir=..., prepare=None, publish=None, ready_tasks=None, stop_when=None)`同步执行有限业务计划，直到已受理原ID收齐。一个工程只使用一个管线和pending计数。工程级锁位于调用目录`.local/dco-client/`。
+`Client.execute(requests, project=..., output_dir=..., prepare=None, publish=None, ready_tasks=None, stop_when=None, cancel_when=None)`同步执行有限业务计划，直到已受理原ID收齐。同一进程、调用目录、中心URL和project共用一个控制器；独立业务批次可用不同output_dir并发调用。工程级进程锁及待恢复目录索引位于调用目录`.local/dco-client/`，每个output_dir另有单写入者锁。不同批次保留同一project及公平份额。
 
 - `requests`为业务键到请求的映射，或`(key, spec)`序列；业务键非空且唯一。
 - 业务请求为`{'task': task, 'inputs': directory, 'files': mapping}`，也可由`prepare(spec, original_id)`返回。依赖包装为`{'spec': business_input, 'after': [keys]}`。依赖图在受理前校验。
 - `after`等待前序结果完成持久发布，之后才准备后续输入。独立任务继续准备和执行。
 - `Deferred(reason)`表示输入暂未就绪，立即归还准备线程；同一次`execute`中，该项检查完成后至少间隔1秒沿原ID重试，其他项完成不缩短此间隔。重新启动管线时沿原ID重新检查业务门。`Skipped(reason)`表示业务门已决定跳过，在结果的`skipped`中登记，不生成科学回执。
 - 新满足依赖的项和到期重试按原catalog位置合入就绪队列。有首次就绪项等待时，最多连续准备3个重试项，再给首次就绪项一次机会；准备完成和远端执行仍可并行。
-- 准备、提交、领取/发布使用独立线程组，发布慢不会堵住独立输入的准备。`publish(receipt)`可能并发调用，须按原ID幂等、线程安全，成功返回前持久发布科学输出、费用和恢复状态。
-- 默认窗口覆盖兼容线程并超过128；`ready_tasks`可设1–4096。工程只提供已授权且真实就绪的工作，不为填队列增加评价或越过依赖。
+- 同工程共用4个准备、2个提交、2个领取/发布线程；每次调用只等待自己拥有的工作收尾，发布慢不会阻止其他批次完成。`publish(receipt)`可能并发调用，须按原ID幂等、线程安全，成功返回前持久发布科学输出、费用和恢复状态。准备/发布回调不递归执行同工程计划；业务依赖使用after表达。
+- 默认窗口覆盖兼容线程并超过128；`ready_tasks`可设1–4096，并发调用须取相同值，通常全部省略。准备中、受理未明及已受理未完成发布/删除的原ID共用额度；发布失败的原ID跨控制器恢复继续计入。接续待恢复目录领取原结果后再补位。工程只提供已授权且真实就绪的工作，不为填队列增加评价或越过依赖。
 
 `output_dir`保存计划、按业务键划分的状态、原请求ID、冻结请求、回执和已领取输出。原ID先持久化，再准备/提交。相同输出目录只能接续同一业务键、声明输入、原ID及依赖计划，变更会在提交前拒绝；准备完成的输入以冻结请求为准。路径表示输入位置，内容身份由业务spec或资产ID声明；接续不重新调用准备函数改写已冻结字节。
 
 收齐顺序为`fetch(delete=False)`、持久回执及输出、业务`publish`、远端`delete`、回收已消费请求包。发布失败保留已领取原结果；接续只重试发布，不重算。提交回应丢失查询同一ID及输入摘要，恢复保持原请求字节。已受理任务消失时保留失败和恢复事实，不创建新科学身份。
 
+远端明确以4xx拒绝，且原ID查询确认为404时，立即归还准备额度，冻结请求保留供同目录接续。受理未明及已有ID身份冲突继续保留原状态；缺失的历史原ID须提供其持久回执后再完成领取和释放额度。
+
 已有ID可声明`{'job_id': original_id}`。若原ID已领取并删除，同时提供`receipt`字典或路径；业务负责该回执引用的持久成果。SDK不重新准备或提交这些原ID。
 
 `stop_when()`返回真、中心关闭新增受理，或Ctrl+C时，管线停止新增，继续收齐已受理任务，再抛`ExecutionPaused(results, remaining)`。恢复使用相同计划和输出目录。执行或发布失败抛`ExecutionFailure(failures, results)`；已有完成项保留。`ExecutionResults`为回执列表，含`skipped`业务键。维护门关闭期间也能领取恢复的原ID。准备、提交和发布阶段的中断同样保留原ID；已领取但发布中断的项留在remaining，接续完成发布后再删除远端回执。
+
+`cancel_when()`返回真后，本次调用停止新增，并沿自己已受理及提交竞态中受理的原ID请求取消；同工程其他调用继续。锁存取消时，提交中与已受理原ID的取消意图先写入状态，POST前再次核对；恢复时仍会完成取消。带取消标志且原ID查询404的项保留remaining，释放未受理额度，保持原ID和请求供业务核对，不重新POST。所有终态回执继续fetch、publish和delete，声明的部分输出与费用保留。主动取消的cancelled回执计入已收齐结果，其他执行失败和发布错误仍抛ExecutionFailure；若有未受理项，抛ExecutionPaused并列出remaining，全部收齐则返回回执。stop_when、维护及Ctrl+C本身不请求取消。业务条件和发布回调须支持并发调用。
 
 ## CPU与内存
 

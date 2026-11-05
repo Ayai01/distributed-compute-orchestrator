@@ -1,5 +1,6 @@
 """Durable original-ID collection is independent from preparation/publication."""
-import json,threading,time,unittest
+import json,subprocess,sys,threading,time,unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 from remote_compute import Client,Pool,command,Deferred,Skipped,ExecutionPaused
@@ -29,6 +30,435 @@ class ReadyQueueTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_cancellation_fence_after_submitting_save_survives_recovery_without_reposting(self):
+        from remote_compute.bundle import atomic_json
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();output=Path(root)/'delivery';plan={'one':task(1)}
+                def save(path,value,*args,**options):
+                    result=atomic_json(path,value,*args,**options)
+                    if value.get('state')=='submitting':cancel.set()
+                    return result
+                with patch('remote_compute.pipeline.atomic_json',side_effect=save),patch.object(client,'submit_bundle')as post:
+                    with self.assertRaises(ExecutionPaused):
+                        client.execute(plan,project='parallel-test',output_dir=output,cancel_when=cancel.is_set,ready_tasks=1)
+                    post.assert_not_called()
+                row=json.loads(next((output/'jobs').glob('*/state.json')).read_bytes())
+                self.assertTrue(row['cancel_requested']);self.assertEqual(row['state'],'prepared')
+                with patch.object(client,'submit_bundle')as post:
+                    with self.assertRaises(ExecutionPaused):
+                        client.execute(plan,project='parallel-test',output_dir=output,ready_tasks=1)
+                    post.assert_not_called()
+                resumed=json.loads(next((output/'jobs').glob('*/state.json')).read_bytes())
+                self.assertEqual(resumed['id'],row['id'])
+                result=client.execute({'peer':task(2)},project='parallel-test',output_dir=Path(root)/'peer',ready_tasks=1)
+                self.assertEqual(result[0]['stdout'].strip(),'2')
+
+    def test_cancellation_intent_is_durable_while_submit_reply_is_outstanding(self):
+        from remote_compute.client import RemoteError
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();entered=threading.Event();release=threading.Event()
+                output=Path(root)/'delivery';plan={'one':task(1)}
+                def lost_reply(identity,data):
+                    entered.set()
+                    if not release.wait(5):raise RuntimeError('Submit reply not released')
+                    error=RemoteError('Submit response lost');error.status_code=502;raise error
+                with patch.object(client,'submit_bundle',side_effect=lost_reply),ThreadPoolExecutor(1)as callers:
+                    future=callers.submit(client.execute,plan,project='parallel-test',output_dir=output,
+                        cancel_when=cancel.is_set,ready_tasks=1)
+                    try:
+                        self.assertTrue(entered.wait(3));cancel.set();deadline=time.monotonic()+3
+                        path=next((output/'jobs').glob('*/state.json'))
+                        while not json.loads(path.read_bytes()).get('cancel_requested'):
+                            if time.monotonic()>deadline:self.fail('Cancellation intent was not durable during POST')
+                            time.sleep(.025)
+                    finally:release.set()
+                    with self.assertRaises(ExecutionFailure):future.result(timeout=6)
+                row=json.loads(path.read_bytes());self.assertEqual(row['state'],'prepared')
+                self.assertTrue(row['cancel_requested'])
+                with patch.object(client,'submit_bundle')as post:
+                    with self.assertRaises(ExecutionPaused):
+                        client.execute(plan,project='parallel-test',output_dir=output,ready_tasks=1)
+                    post.assert_not_called()
+
+    def _wait_for_partial(self,client,identities):
+        from remote_compute.client import RemoteError
+        deadline=time.monotonic()+4
+        while time.monotonic()<deadline:
+            if identities:
+                try:
+                    if client.read_job_file(identities[0],'partial.txt')==b'kept':return
+                except RemoteError:pass
+            time.sleep(.025)
+        self.fail('Original job did not publish its partial file')
+
+    def test_cancel_when_cancels_only_this_call_and_publishes_partial_output(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();identities=[];published=[]
+                code="from pathlib import Path; import time; Path('partial.txt').write_text('kept'); time.sleep(15)"
+                def prepare(spec,identity):identities.append(identity);return spec
+                def publish(receipt):
+                    published.append(receipt['id'])
+                    self.assertEqual((Path(receipt['output_dir'])/'files/partial.txt').read_text(),'kept')
+                plan={'running':dict(task=command(['${tool:python}','-c',code],max_cpus=1,outputs=['partial.txt'])),
+                      'later':dict(spec=task(2),after=['running'])}
+                with ThreadPoolExecutor(2)as callers:
+                    first=callers.submit(client.execute,plan,project='parallel-test',output_dir=Path(root)/'cancel',
+                        prepare=prepare,publish=publish,cancel_when=cancel.is_set,ready_tasks=2)
+                    peer=callers.submit(client.execute,{'peer':task(7)},project='parallel-test',
+                        output_dir=Path(root)/'peer',ready_tasks=2)
+                    try:self._wait_for_partial(client,identities)
+                    finally:cancel.set()
+                    with self.assertRaises(ExecutionPaused)as paused:first.result(timeout=6)
+                    self.assertEqual(paused.exception.remaining,['later'])
+                    self.assertEqual(paused.exception.results[0]['status'],'cancelled')
+                    self.assertEqual(published,identities)
+                    self.assertEqual(peer.result(timeout=6)[0]['status'],'succeeded')
+                self.assertEqual(client.statuses(identities)[identities[0]]['status'],'unknown')
+
+    def test_cancel_after_lost_submit_reply_uses_the_original_id(self):
+        from remote_compute.client import RemoteError
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();accepted=[];published=[];submit=client.submit_bundle
+                def lost_reply(identity,data):
+                    submit(identity,data);accepted.append(identity);cancel.set()
+                    error=RemoteError('Lost accepted reply');error.status_code=502;raise error
+                with patch.object(client,'submit_bundle',side_effect=lost_reply),patch.object(client,'cancel',wraps=client.cancel)as stop:
+                    results=client.execute({'one':dict(task=command(['${tool:python}','-c','import time; time.sleep(15)'],max_cpus=1))},
+                        project='parallel-test',output_dir=Path(root)/'delivery',cancel_when=cancel.is_set,
+                        publish=lambda row:published.append(row['id']))
+                self.assertEqual([row['id']for row in results],accepted)
+                self.assertEqual(published,accepted);stop.assert_called_once_with(accepted[0])
+                self.assertEqual(results[0]['status'],'cancelled')
+
+    def test_cancelled_publication_failure_resumes_without_resubmission(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();identities=[];output=Path(root)/'delivery'
+                code="from pathlib import Path; import time; Path('partial.txt').write_text('kept'); time.sleep(15)"
+                plan={'one':dict(task=command(['${tool:python}','-c',code],max_cpus=1,outputs=['partial.txt']))}
+                def prepare(spec,identity):identities.append(identity);return spec
+                def publish(receipt):raise RuntimeError('Publication needs recovery')
+                with ThreadPoolExecutor(1)as callers:
+                    future=callers.submit(client.execute,plan,project='parallel-test',output_dir=output,
+                        prepare=prepare,publish=publish,cancel_when=cancel.is_set,ready_tasks=1)
+                    try:self._wait_for_partial(client,identities)
+                    finally:cancel.set()
+                    with self.assertRaises(ExecutionFailure):future.result(timeout=6)
+                with patch.object(client,'submit_bundle',side_effect=AssertionError('Original must not be resubmitted')):
+                    results=client.execute(plan,project='parallel-test',output_dir=output,ready_tasks=1)
+                self.assertEqual([(r['id'],r['status'])for r in results],[(identities[0],'cancelled')])
+                self.assertEqual((Path(results[0]['output_dir'])/'files/partial.txt').read_text(),'kept')
+                self.assertEqual(client.statuses(identities)[identities[0]]['status'],'unknown')
+
+    def test_cancel_after_unregistered_submit_future_drains_the_original_id(self):
+        from remote_compute.pipeline_control import _CallPool
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();identities=[];original=_CallPool.submit
+                def submit(executor,function,*args,**options):
+                    future=original(executor,function,*args,**options)
+                    if function.__name__=='submit'and not identities:
+                        future.result(timeout=4);identities.append(args[0]['id']);cancel.set();raise KeyboardInterrupt
+                    return future
+                with patch.object(_CallPool,'submit',submit):
+                    result=client.execute({'one':dict(task=command(['${tool:python}','-c','import time; time.sleep(15)'],max_cpus=1))},
+                        project='parallel-test',output_dir=Path(root)/'delivery',cancel_when=cancel.is_set)
+                self.assertEqual([(r['id'],r['status'])for r in result],[(identities[0],'cancelled')])
+                self.assertEqual(client.statuses(identities)[identities[0]]['status'],'unknown')
+
+    def test_cancel_rpc_failure_still_publishes_the_unregistered_accepted_receipt(self):
+        from remote_compute.client import RemoteError
+        from remote_compute.pipeline_control import _CallPool
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                cancel=threading.Event();identities=[];published=[];original=_CallPool.submit
+                def submit(executor,function,*args,**options):
+                    future=original(executor,function,*args,**options)
+                    if function.__name__=='submit'and not identities:
+                        future.result(timeout=4);identities.append(args[0]['id']);cancel.set();raise KeyboardInterrupt
+                    return future
+                error=RemoteError('Cancel request rejected');error.status_code=403
+                with patch.object(_CallPool,'submit',submit),patch.object(client,'cancel',side_effect=error):
+                    with self.assertRaises(ExecutionFailure)as failed:
+                        client.execute({'one':dict(task=command(['${tool:python}','-c','import time; time.sleep(.5); print(8)'],max_cpus=1))},project='parallel-test',output_dir=Path(root)/'delivery',
+                            cancel_when=cancel.is_set,publish=lambda row:published.append(row['id']))
+                self.assertEqual(published,identities)
+                self.assertEqual([row['id']for row in failed.exception.results],identities)
+                self.assertEqual(failed.exception.failures[0]['stage'],'cancel')
+                self.assertEqual(client.statuses(identities)[identities[0]]['status'],'unknown')
+
+    def test_rejected_unaccepted_original_releases_credit_before_another_directory_runs(self):
+        from remote_compute.client import RemoteError
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                rejected=RemoteError('Invalid submitted request');rejected.status_code=400
+                first=Path(root)/'rejected'
+                with patch.object(client,'submit_bundle',side_effect=rejected):
+                    with self.assertRaises(ExecutionFailure):
+                        client.execute({'bad':task(1)},project='parallel-test',output_dir=first,ready_tasks=1)
+                row=json.loads(next((first/'jobs').glob('*/state.json')).read_bytes())
+                self.assertEqual(row['state'],'prepared')
+                self.assertEqual(client.statuses([row['id']])[row['id']]['status'],'unknown')
+                result=client.execute({'good':task(2)},project='parallel-test',
+                    output_dir=Path(root)/'next',ready_tasks=1)
+                self.assertEqual(result[0]['stdout'].strip(),'2')
+
+    def test_definite_rejection_releases_credit_while_its_peer_publication_is_blocked(self):
+        from remote_compute.client import RemoteError
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                bad=[];entered=threading.Event();release=threading.Event();submit=client.submit_bundle
+                def prepare(number,identity):
+                    if number==2:bad.append(identity)
+                    return task(number)
+                def rejecting(identity,data):
+                    if identity in bad:
+                        error=RemoteError('Invalid submitted request');error.status_code=400;raise error
+                    return submit(identity,data)
+                def publish(receipt):
+                    entered.set()
+                    if not release.wait(6):raise RuntimeError('Publication was not released')
+                with patch.object(client,'submit_bundle',side_effect=rejecting),ThreadPoolExecutor(2)as callers:
+                    first=callers.submit(client.execute,{'good':1,'bad':2},project='parallel-test',
+                        output_dir=Path(root)/'first',prepare=prepare,publish=publish,ready_tasks=2)
+                    try:
+                        self.assertTrue(entered.wait(4))
+                        peer=callers.submit(client.execute,{'peer':task(3)},project='parallel-test',
+                            output_dir=Path(root)/'peer',ready_tasks=2)
+                        self.assertEqual(peer.result(timeout=3)[0]['stdout'].strip(),'3')
+                    finally:release.set()
+                    with self.assertRaises(ExecutionFailure):first.result(timeout=6)
+
+    def test_project_process_lock_preserves_the_conflict_type(self):
+        from hashlib import sha256
+        from remote_compute.worker import Conflict
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                identity=sha256((client.url+'\0parallel-test').encode()).hexdigest()
+                lock=Path.cwd()/'.local/dco-client'/identity
+                code="import sys; from pathlib import Path; from remote_compute.worker import lock_root; hold=lock_root(Path(sys.argv[1]),'pipeline'); print('locked',flush=True); sys.stdin.readline(); hold.close()"
+                with subprocess.Popen([sys.executable,'-B','-c',code,str(lock)],
+                        stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)as child:
+                    try:
+                        self.assertEqual(child.stdout.readline().strip(),'locked')
+                        with self.assertRaisesRegex(Conflict,'Another pipeline'):
+                            client.execute({},project='parallel-test',output_dir=Path(root)/'delivery')
+                    finally:child.communicate('\n',timeout=5)
+                self.assertEqual(child.returncode,0)
+
+    def test_missing_recovery_receipt_keeps_original_credit_and_identity(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                original='abcde012345678901234567890123456';first=Path(root)/'recovery'
+                with self.assertRaises(ExecutionFailure):
+                    client.execute({'old':dict(job_id=original)},project='parallel-test',
+                        output_dir=first,ready_tasks=1)
+                row=json.loads(next((first/'jobs').glob('*/state.json')).read_bytes())
+                self.assertEqual((row['id'],row['state'],row['recovery']),(original,'new',True))
+                stopped=threading.Event();prepared=[]
+                def prepare(spec,identity):prepared.append(identity);return spec
+                with ThreadPoolExecutor(1)as callers:
+                    future=callers.submit(client.execute,{'new':task(2)},project='parallel-test',
+                        output_dir=Path(root)/'peer',prepare=prepare,ready_tasks=1,stop_when=stopped.is_set)
+                    try:
+                        time.sleep(.15);self.assertEqual(prepared,[]);self.assertFalse(future.done())
+                    finally:stopped.set()
+                    with self.assertRaises(ExecutionPaused):future.result(timeout=3)
+                self.assertEqual(client.statuses([original])[original]['status'],'unknown')
+
+    def test_finishing_one_call_does_not_wait_for_its_peers_blocked_publication(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=threading.Event();release=threading.Event()
+                def publish(receipt):
+                    entered.set()
+                    if not release.wait(5):raise RuntimeError('Peer publication was not released')
+                with ThreadPoolExecutor(2)as callers:
+                    first=callers.submit(client.execute,{'one':task(1)},project='parallel-test',
+                        output_dir=Path(root)/'first',publish=publish,ready_tasks=2)
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        second=callers.submit(client.execute,{'two':task(2)},project='parallel-test',
+                            output_dir=Path(root)/'second',ready_tasks=2)
+                        self.assertEqual(second.result(timeout=3)[0]['stdout'].strip(),'2')
+                    finally:release.set()
+                    self.assertEqual(first.result(timeout=6)[0]['stdout'].strip(),'1')
+
+    def test_callback_reentry_is_explicit_and_preserves_the_parent_receipt(self):
+        from remote_compute.worker import Conflict
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                published=[]
+                def publish(receipt):
+                    with self.assertRaisesRegex(Conflict,'callbacks cannot reenter'):
+                        client.execute({},project='parallel-test',output_dir=Path(root)/'nested')
+                    published.append(receipt['id'])
+                result=client.execute({'one':task(1)},project='parallel-test',
+                    output_dir=Path(root)/'delivery',publish=publish,ready_tasks=1)
+                self.assertEqual([row['id']for row in result],published)
+                self.assertEqual(client.statuses(published)[published[0]]['status'],'unknown')
+
+    def test_concurrent_calls_use_one_explicit_project_window(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=threading.Event();release=threading.Event()
+                def prepare(spec,identity):
+                    entered.set()
+                    if not release.wait(4):raise RuntimeError('Preparation was not released')
+                    return task(spec)
+                with ThreadPoolExecutor(1)as callers:
+                    first=callers.submit(client.execute,{'one':1},project='parallel-test',
+                        output_dir=Path(root)/'first',prepare=prepare,ready_tasks=2)
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        with self.assertRaisesRegex(ValueError,'same ready_tasks'):
+                            client.execute({},project='parallel-test',output_dir=Path(root)/'second',ready_tasks=3)
+                    finally:release.set()
+                    self.assertEqual(first.result(timeout=6)[0]['stdout'].strip(),'1')
+
+    def test_interrupt_after_shared_submit_enqueue_drains_the_same_original_id(self):
+        from remote_compute.pipeline_control import _CallPool
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                original=_CallPool.submit;interrupted=[]
+                def submit(executor,function,*args,**options):
+                    future=original(executor,function,*args,**options)
+                    if function.__name__=='submit'and not interrupted:
+                        interrupted.append(args[0]['id']);raise KeyboardInterrupt
+                    return future
+                with patch.object(_CallPool,'submit',submit):
+                    with self.assertRaises(ExecutionPaused)as paused:
+                        client.execute({'one':task(1),'next':dict(spec=2,after=['one'])},
+                            project='parallel-test',output_dir=Path(root)/'delivery')
+                self.assertEqual([r['id']for r in paused.exception.results],interrupted)
+                self.assertEqual(paused.exception.remaining,['next'])
+                self.assertEqual(client.statuses(interrupted)[interrupted[0]]['status'],'unknown')
+
+    def test_failed_publication_holds_project_credit_across_controller_recovery(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                plan={'one':task(1)};first_dir=Path(root)/'first';paid=[]
+                def failed(receipt):paid.append(receipt['id']);raise RuntimeError('Scientific publication failed')
+                with self.assertRaises(ExecutionFailure):
+                    client.execute(plan,project='parallel-test',output_dir=first_dir,publish=failed,ready_tasks=1)
+                prepared=threading.Event();join=threading.Event();original_window=client.window
+                def window(*args,**options):
+                    value=original_window(*args,**options);join.set();return value
+                def prepare(number,identity):prepared.set();return task(number)
+                with patch.object(client,'window',side_effect=window),ThreadPoolExecutor(2)as callers:
+                    second=callers.submit(client.execute,{'two':2},project='parallel-test',
+                        output_dir=Path(root)/'second',prepare=prepare,ready_tasks=1)
+                    self.assertTrue(join.wait(3));self.assertFalse(prepared.wait(.2))
+                    resumed=callers.submit(client.execute,plan,project='parallel-test',output_dir=first_dir,ready_tasks=1)
+                    self.assertEqual(resumed.result(timeout=8)[0]['id'],paid[0])
+                    self.assertEqual(second.result(timeout=8)[0]['stdout'].strip(),'2')
+                self.assertEqual(client.statuses(paid)[paid[0]]['status'],'unknown')
+
+    def test_parallel_plans_share_the_four_preparation_workers(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                guard=threading.Lock();entered=threading.Event();release=threading.Event();active=peak=0
+                def prepare(number,identity):
+                    nonlocal active,peak
+                    with guard:
+                        active+=1;peak=max(peak,active)
+                        if active==4:entered.set()
+                    try:
+                        if not release.wait(5):raise RuntimeError('Preparation workers did not share capacity')
+                        return task(number)
+                    finally:
+                        with guard:active-=1
+                with ThreadPoolExecutor(6)as callers:
+                    futures=[callers.submit(client.execute,{str(j):j for j in (i*2,i*2+1)},
+                        project='parallel-test',output_dir=Path(root)/str(i),prepare=prepare,ready_tasks=32)for i in range(6)]
+                    try:self.assertTrue(entered.wait(4))
+                    finally:release.set()
+                    results=[f.result(timeout=12)for f in futures]
+                self.assertEqual(peak,4);self.assertEqual(sum(map(len,results)),12)
+
+    def test_slow_project_window_does_not_block_another_project(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=threading.Event();release=threading.Event();original=client.window
+                def window(project,**options):
+                    if project=='slow-project':
+                        entered.set()
+                        if not release.wait(5):raise RuntimeError('Other project was blocked by the slow window')
+                    return original(project,**options)
+                with patch.object(client,'window',side_effect=window),ThreadPoolExecutor(2)as callers:
+                    first=callers.submit(client.execute,{'one':task(1)},project='slow-project',output_dir=Path(root)/'slow')
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        second=callers.submit(client.execute,{'two':task(2)},project='fast-project',output_dir=Path(root)/'fast')
+                        self.assertEqual(second.result(timeout=3)[0]['stdout'].strip(),'2')
+                    finally:release.set()
+                    self.assertEqual(first.result(timeout=6)[0]['stdout'].strip(),'1')
+
+    def test_same_project_parallel_directories_keep_independent_plans_and_ids(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=set();guard=threading.Lock();both=threading.Event()
+                def prepare(number,identity):
+                    with guard:
+                        entered.add(number)
+                        if len(entered)==2:both.set()
+                    if not both.wait(3):raise RuntimeError('Independent execution did not enter preparation')
+                    return task(number)
+                with ThreadPoolExecutor(2)as callers:
+                    futures=[callers.submit(client.execute,{'one':i},project='parallel-test',
+                        output_dir=Path(root)/('delivery'+str(i)),prepare=prepare,ready_tasks=2)for i in (1,2)]
+                    results=[f.result(timeout=10)for f in futures]
+                self.assertEqual(entered,{1,2})
+                self.assertEqual([r[0]['stdout'].strip()for r in results],['1','2'])
+                self.assertNotEqual(results[0][0]['id'],results[1][0]['id'])
+                for i,result in zip((1,2),results):
+                    row=json.loads(next((Path(root)/('delivery'+str(i))/'jobs').glob('*/state.json')).read_text())
+                    self.assertEqual((row['state'],row['id']),('collected',result[0]['id']))
+
+    def test_same_project_credit_stays_held_until_publication_and_delete_finish(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=threading.Event();release=threading.Event();prepared=threading.Event();original=[]
+                def publish(receipt):
+                    original.append(receipt['id']);entered.set()
+                    if not release.wait(5):raise RuntimeError('Publication was not released')
+                def prepare(number,identity):prepared.set();return task(number)
+                with ThreadPoolExecutor(2)as callers:
+                    first=callers.submit(client.execute,{'one':task(1)},project='parallel-test',
+                        output_dir=Path(root)/'first',publish=publish,ready_tasks=1)
+                    try:
+                        self.assertTrue(entered.wait(4))
+                        second=callers.submit(client.execute,{'two':2},project='parallel-test',
+                            output_dir=Path(root)/'second',prepare=prepare,ready_tasks=1)
+                        self.assertFalse(prepared.wait(.2))
+                        self.assertEqual(client.status(original[0])['status'],'succeeded')
+                    finally:release.set()
+                    self.assertEqual(first.result(timeout=8)[0]['id'],original[0])
+                    self.assertEqual(second.result(timeout=8)[0]['stdout'].strip(),'2')
+
+    def test_one_output_directory_has_one_writer_even_across_projects(self):
+        from remote_compute.worker import Conflict
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=threading.Event();release=threading.Event()
+                def prepare(number,identity):
+                    entered.set()
+                    if not release.wait(4):raise RuntimeError('Preparation was not released')
+                    return task(number)
+                with ThreadPoolExecutor(1)as callers:
+                    first=callers.submit(client.execute,{'one':1},project='first-project',
+                        output_dir=Path(root)/'shared',prepare=prepare)
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        with self.assertRaises(Conflict):
+                            client.execute({'one':task(2)},project='second-project',output_dir=Path(root)/'shared')
+                    finally:release.set()
+                    self.assertEqual(first.result(timeout=6)[0]['stdout'].strip(),'1')
+
     def test_resuming_deferred_dependency_work_rechecks_the_same_original_id(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):

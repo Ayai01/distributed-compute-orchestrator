@@ -1917,6 +1917,8 @@ class CenterTests(unittest.TestCase):
                 client.wait(jobs[0]);client.fetch(jobs[0])
                 until(lambda:client.status(parallel)['status']in('running','succeeded'))
                 self.assertEqual(client.status(parallel)['cpus'],1)
+                # The command chooses its startup grant before creating steps.
+                until(lambda:bool(client.status(parallel).get('steps')))
                 client.write_job_file(jobs[1],'release','go')
                 client.wait(jobs[1]);client.fetch(jobs[1])
                 until(lambda: client.status(parallel)['status'] in ('running','succeeded'))
