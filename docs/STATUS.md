@@ -1,7 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.10.0**。
-- 实际加载版本、当前操作员、维护及放行状态：`.local/maintenance/capability-contract-20261104/current.json`；与实际health交叉核对。
+- 当前源码版本：**0.10.1**。
+- 实际加载版本、当前操作员、维护及放行状态：`.local/maintenance/layout-ku26s-20261104/current.json`；与实际health交叉核对。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
 ## 能力与环境
@@ -11,6 +11,19 @@
 Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，Torch任务声明ml，取得CUDA授权后使用cuda后端。设备私有python_runtimes维护完整解释器前缀，项目不选择解释器或设备。新算法补齐所用环境的依赖，禁止扩充Python组合后缀。
 
 2026-11-04现场记录：五个提供者合计174个逻辑线程预算；五台CPU/ML环境、两台CUDA环境已完成逐项依赖、数值接口及最小计算验收，现有依赖版本保持。环境、路由和源码部署的原ID回执保存在上述维护目录。
+
+## 工程需求与设备覆盖
+
+| 工程 | 按阶段声明的能力 | CPU执行覆盖 |
+| --- | --- | --- |
+| AOP | ngspice仿真使用`ng47`；HSPICE仿真使用`hsp` | ng47为5/5；hsp为ku26s |
+| RGCN | 数据/代理/训练使用`ml`，原生测量加`ng47`，版图与后仿阶段加`layout` | 5/5 |
+| ARH-DSE | RTL仿真使用`rtl`，Chisel生成加`chisel`，ONNX推理加`onnx`，Torch执行加`ml` | 5/5 |
+| FIBER | 普通数值使用基础环境，Torch算法加`ml`，真实SPICE任务加`ng47` | 5/5 |
+
+表中能力按实际阶段选择，不把所有需求合并为每个任务的硬条件。CUDA计算覆盖Aya1-PC、Aya1-TX两台，兼容CPU预算46；显式CPU回退仍可使用全部五台。HSPICE只在ku26s配置，其他设备使用ng47。Python/C++、ng47、chisel、ml、rtl和onnx均覆盖五台。
+
+`layout`覆盖五台，合计174线程预算。ku26s使用独立GLayout/GDSFactory环境、Magic 8.3.684及Netgen 1.5.323；已验证真实SKY130材料的GDS生成与读回、NMOS/PMOS提取、寄生电容提取及LVS正反例。PDK由任务内容资产提供，环境不保存实验副本。
 
 ## 调度与任务
 
@@ -23,7 +36,7 @@ Client.cpu_lease按在途已授权线程及就绪需求借还核心，长尾归�
 ## 验证与证据
 
 - 完整核心及原生回归入口：`python -B main.py --test-native`。结果见`native-core-final-tests.log`。
-- 环境及路由证明：`*-environments.json`、`routing-final-tests.log`及`live-acceptance.json`。
+- 环境及路由证明：本目录`layout-qualify-final.json`、`admission-after.json`及现场验收；CPU/ML/CUDA环境原记录见`.local/maintenance/capability-contract-20261104/`。
 - 一次集中DSH Flash/max只读审查已完成并由Owner逐项裁定：`review-adjudication.json`。
 - 统一源码清单、版本/PID/状态根核对、原ID领取及任务终止证明保存在同一维护目录。
 

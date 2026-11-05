@@ -1,6 +1,6 @@
 # Distributed Compute Orchestrator（DCO）
 
-DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.10.0**；实际加载版本、维护状态和验证入口见 [STATUS](docs/STATUS.md)。
+DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行和成果传输。调用工程管理科学测量、评分、输入/seed、有限实验预算与结果缓存。当前源码版本 **0.10.1**；实际加载版本、维护状态、工程需求及设备覆盖见 [STATUS](docs/STATUS.md)。
 
 服务、SDK 和终端仅依赖 Python 标准库。日常使用系统标准 GIL x64 CPython 3.14，源码支持 3.7–3.15。仓库为 `distributed-compute-orchestrator`，包为 `remote_compute`，协议环境变量为 `REMOTE_COMPUTE_*`。
 

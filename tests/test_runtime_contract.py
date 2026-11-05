@@ -11,6 +11,25 @@ from test_compute import provider, scratch
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_cached_syntax_keeps_tool_availability_backends_and_budgets_live(self):
+        from remote_compute.runtimes import _execution_bindings
+        with scratch()as root,provider(root,cpus=2,
+                python_runtimes={'cpu':[sys.executable],'ml':[sys.executable]})as(_,client):
+            with Pool([client])as pool:
+                node=pool.nodes[0];task=command(['${tool:python}','-c','print(1)'],requires=['ml'],cpus=2)
+                _execution_bindings.cache_clear()
+                for _ in range(3):self.assertEqual(pool._matching(task),[node])
+                self.assertGreaterEqual(_execution_bindings.cache_info().hits,2)
+                node.health['python_backends']=['cpu'];self.assertEqual(pool._matching(task),[])
+                node.health['python_backends'].append('ml');self.assertEqual(pool._matching(task),[node])
+                node.limit=1;self.assertEqual(pool._matching(task),[])
+                node.limit=0;task['env']['COMPILER']='${tool:optional-compiler}'
+                self.assertEqual(pool._matching(task),[])
+                node.health['tools']['optional-compiler']=dict(available=True,argv=[sys.executable])
+                self.assertEqual(pool._matching(task),[node])
+                node.health['tools']['optional-compiler']['available']=False
+                self.assertEqual(pool._matching(task),[])
+
     def test_base_and_build_details_do_not_expand_the_capability_line(self):
         tags=['python','cxx','g++','java','scala-cli','firtool','circt','make','verilator',
               'ng47','hspice','chisel','ml','cuda','layout','magic','netgen','rtl','onnx',
@@ -54,7 +73,8 @@ class RuntimeContractTests(unittest.TestCase):
                 code='import sys;print(str(int(sys.flags.dev_mode))+":"+str(sys.flags.isolated))'
                 cases=[({},'0:0'),({'requires':['ml']},'1:0'),
                        ({'requires':['ml','cuda'],'accelerator':dict(kind='cuda',count=1,memory_mb=128)},'0:1'),
-                       ({'requires':['ml'],'accelerator':dict(count=1,memory_mb=128)},'0:1')]
+                       ({'requires':['ml'],'accelerator':dict(count=1,memory_mb=128)},'0:1'),
+                       ({'requires':['ml'],'accelerator':{}},'0:1')]
                 for options,expected in cases:
                     with self.subTest(options=options):
                         r=client.run(command(['${tool:python}','-c',code],**options))
@@ -107,6 +127,34 @@ class RuntimeContractTests(unittest.TestCase):
             task=command(['${tool:python}','-c','print(1)'],accelerator=dict(count=1,memory_mb=128))
             with self.assertRaisesRegex(RemoteError,'Python backend'):worker.submit(task)
             with Pool([worker])as pool:self.assertEqual(pool._matching(task),[])
+
+    def test_busy_python_backend_does_not_reserve_a_different_free_accelerator(self):
+        from test_compute import python
+        with scratch()as root,provider(root,cpus=2,
+                python_runtimes={'cpu':[sys.executable],'cuda':[sys.executable]},
+                accelerators=[dict(kind='cuda',count=1,memory_mb=1024),
+                              dict(kind='xpu',count=1,memory_mb=1024)])as(_,worker):
+            with Pool([worker])as pool:
+                busy=python('print(1)',accelerator=dict(kind='cuda',count=1,memory_mb=128))
+                any_task=python('print(2)',accelerator=dict(kind='any',count=1,memory_mb=128))
+                node=pool._acquire(busy,block=False,job_id='a'*32)
+                self.assertIsNotNone(node)
+                self.assertIsNone(pool._acquire(any_task,block=False,job_id='b'*32))
+                self.assertNotIn('b'*32,node.accelerator_reservations)
+                pool._release(node,busy,None,job_id='a'*32)
+                self.assertIs(pool._acquire(any_task,block=False,job_id='b'*32),node)
+                self.assertEqual(any_task['accelerator']['kind'],'cuda')
+                pool._release(node,any_task,None,job_id='b'*32)
+
+    def test_cpu_acquisition_skips_accelerator_units_and_reservations(self):
+        from unittest.mock import patch
+        with scratch()as root,provider(root)as(_,worker):
+            with Pool([worker])as pool:
+                node=pool.nodes[0];task=command(['${tool:python}','-c','print(1)'])
+                with patch.object(node,'accelerator_units',side_effect=AssertionError('CPU asks for a GPU')):
+                    self.assertIs(pool._acquire(task,block=False,job_id='c'*32),node)
+                self.assertEqual(node.accelerator_reservations,{})
+                pool._release(node,task,None,job_id='c'*32)
 
 
 if __name__=='__main__':unittest.main()

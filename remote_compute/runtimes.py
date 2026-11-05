@@ -1,5 +1,6 @@
 """Stable execution categories and per-task Python backend selection."""
 import re
+from functools import lru_cache
 
 from .policy import canonical_capability, canonical_capabilities, select_accelerator_units
 
@@ -7,6 +8,8 @@ from .policy import canonical_capability, canonical_capabilities, select_acceler
 EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','layout','rtl','onnx')
 CHISEL_TOOLS = {'java', 'scala-cli', 'firtool', 'circt', 'verilator', 'cxx', 'make'}
 LAYOUT_TOOLS = {'layout', 'magic', 'netgen'}
+_TOOLS = re.compile(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}')
+_SHARED = re.compile(r'\$\{shared:([\w-]+)\}')
 
 
 def execution_capabilities(tags):
@@ -22,33 +25,58 @@ def execution_tool(name):
     return 'python' if canonical in {'python','ml'} else canonical
 
 
+def execution_bindings(task):
+    """Cache immutable request syntax; provider availability stays live."""
+    texts=(*task.get('env',{}).values(),task.get('cwd',''),
+           *(arg for argv in task.get('steps',())for arg in argv))
+    return _execution_bindings(tuple(task.get('requires',())),texts)
+
+
+@lru_cache(maxsize=256)
+def _execution_bindings(requirements,texts):
+    required=set(canonical_capabilities(requirements))
+    names={canonical_capability(name)for text in texts for name in _TOOLS.findall(text)}
+    tools=frozenset('python'if name in {'python','ml'}else name for name in names)
+    shared=frozenset(name for text in texts for name in _SHARED.findall(text))
+    python='python'in tools or bool({'python','ml'}&required)
+    return tools,shared,python,'ml'if 'ml'in required or 'ml'in names else'cpu'
+
+
+@lru_cache(maxsize=256)
+def execution_tool_set(names):
+    return frozenset(execution_tool(name)for name in names)
+
+
+def capability_set(names):
+    return _capability_set(tuple(names))
+
+
+@lru_cache(maxsize=256)
+def _capability_set(names):
+    return frozenset(canonical_capabilities(names))
+
+
 def uses_python(task):
-    if {'python','ml'}&set(canonical_capabilities(task.get('requires', ()))):return True
-    texts = [*task.get('env', {}).values(), task.get('cwd', ''),
-             *(arg for argv in task.get('steps', ()) for arg in argv)]
-    return any(execution_tool(name) == 'python' for text in texts
-               for name in re.findall(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}', text))
+    return execution_bindings(task)[2]
 
 
 def python_backend(task):
-    accelerator=task.get('accelerator') or {}
-    if accelerator:
+    accelerator=task.get('accelerator')
+    if accelerator is not None:
         return accelerator.get('kind','any')
-    if 'ml' in canonical_capabilities(task.get('requires', ())):return 'ml'
-    texts=[*task.get('env',{}).values(),task.get('cwd',''),*(arg for argv in task.get('steps',())for arg in argv)]
-    if any(canonical_capability(name)=='ml' for text in texts
-           for name in re.findall(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}',text)):return 'ml'
-    return 'cpu'
+    return execution_bindings(task)[3]
 
 
 def supports_python(task, backends):
-    return not uses_python(task) or python_backend(task) in backends
+    _tools,_shared,python,backend=execution_bindings(task)
+    accelerator=task.get('accelerator')
+    return not python or ((accelerator.get('kind','any')if accelerator is not None else backend)in backends)
 
 
 def python_accelerator(task, backends, units, reserved=()):
     """Bind an any-device Python request to one matching execution backend."""
     requirement=task.get('accelerator')
-    if not requirement or requirement.get('kind','any')!='any' or not uses_python(task):return requirement
+    if requirement is None or requirement.get('kind','any')!='any' or not uses_python(task):return requirement
     for kind in dict.fromkeys(unit[2] for unit in units if unit[2] in backends):
         bound=dict(requirement,kind=kind)
         if select_accelerator_units(units,bound,reserved) is not None:return bound

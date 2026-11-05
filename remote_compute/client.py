@@ -30,7 +30,8 @@ from .auth import lan_endpoint
 from .allocation import elastic_cpus
 
 
-from .runtimes import supports_python, execution_tool, python_accelerator
+from .runtimes import (supports_python, execution_bindings, execution_tool_set, capability_set,
+                       python_accelerator)
 
 
 class RemoteError(RuntimeError):
@@ -812,9 +813,17 @@ class Node:
         return self._select_accelerator(requirement, include_reserved=False) is not None
 
     def execution_accelerator(self, task, *, available=False):
+        requirement=task.get('accelerator')
+        if requirement is None or requirement.get('kind','any')!='any':return requirement
         used=([unit for items in self.accelerator_reservations.values()for unit in items]
               +self.external_accelerator_reservations)if available else ()
-        return python_accelerator(task,self.health.get('python_backends',['cpu']),self.accelerator_units(),used)
+        units=self.accelerator_units();backends=self.health.get('python_backends',['cpu'])
+        bound=python_accelerator(task,backends,units,used)
+        # A busy compatible backend must keep waiting for its own device kind.
+        # Returning raw any here could reserve a free but unsupported kind.
+        if available and bound.get('kind','any')=='any':
+            bound=python_accelerator(task,backends,units)
+        return bound
 
     def reserve_accelerator(self, requirement, job_id):
         selected=self._select_accelerator(requirement)
@@ -1144,20 +1153,26 @@ class Pool:
 
     def _matching(self, task):
         cpus=task.get('cpus',1) or 1
-        texts=[*task.get('env',{}).values(),task.get('cwd',''),
-               *(arg for argv in task.get('steps',()) for arg in argv)]
-        required_tools={execution_tool(name) for text in texts for name in
-            re.findall(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}',text)}
-        required_shared={name for text in texts for name in re.findall(r'\$\{shared:([\w-]+)\}',text)}
-        required=canonical_capabilities(task.get('requires',()))
-        return [n for n in self.nodes if (not task.get('node') or n.name==task['node'])
-                and set(required).issubset(canonical_capabilities(n.health.get('tags',())))
-                and required_tools.issubset({execution_tool(name)
-                    for name,info in n.health.get('tools',{}).items() if info.get('available')})
-                and required_shared.issubset(n.health.get('shared',()))
-                and n.capacity>=cpus and n.memory_capacity>=task.get('memory_mb',256)
-                and n.supports_accelerator(n.execution_accelerator(task))
-                and supports_python(dict(task,accelerator=n.execution_accelerator(task)),n.health.get('python_backends',['cpu']))]
+        required_tools,required_shared,python,backend=execution_bindings(task)
+        required=capability_set(task.get('requires',()))
+        result=[]
+        for node in self.nodes:
+            health=node.health
+            if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
+                    or node.memory_capacity<task.get('memory_mb',256)
+                    or not required.issubset(capability_set(health.get('tags',())))
+                    or not required_shared.issubset(health.get('shared',()))
+                    or not required_tools.issubset(execution_tool_set(tuple(name
+                        for name,info in health.get('tools',{}).items()if info.get('available'))))):
+                continue
+            requirement=task.get('accelerator')
+            if requirement is not None:
+                requirement=node.execution_accelerator(task)
+                if not node.supports_accelerator(requirement):continue
+            selected=requirement.get('kind','any')if requirement is not None else backend
+            if python and selected not in health.get('python_backends',['cpu']):continue
+            result.append(node)
+        return result
 
     def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, node_headroom=None):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
@@ -1186,7 +1201,8 @@ class Pool:
                          and available(n) >= needed(n)
                          and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
                          and n.health.get("queued", 0) == 0
-                         and n.can_match_accelerator(n.execution_accelerator(task,available=True))]
+                         and (task.get('accelerator')is None or
+                              n.can_match_accelerator(n.execution_accelerator(task,available=True)))]
                 if ready:
                     if self.policy == "round_robin":
                         node = next((n for n in self.nodes[self.rotation:] + self.nodes[:self.rotation] if n in ready))
@@ -1224,10 +1240,10 @@ class Pool:
                         cpus = min(cpus, task.get('max_cpus',node.capacity))
                         task['cpus'] = cpus
                     reservation_id=job_id or f'local:{id(task)}'
-                    requirement=node.execution_accelerator(task,available=True)
-                    if node.reserve_accelerator(requirement, reservation_id) is None:
-                        continue
-                    task['accelerator']=requirement
+                    if task.get('accelerator')is not None:
+                        requirement=node.execution_accelerator(task,available=True)
+                        if node.reserve_accelerator(requirement,reservation_id)is None:continue
+                        task['accelerator']=requirement
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
                     if job_id:
