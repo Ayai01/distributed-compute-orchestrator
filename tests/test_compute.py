@@ -309,7 +309,7 @@ class ExecutionTests(unittest.TestCase):
         result = self.client.run(task, files={"config.txt": "${asset:models}/model.txt"})
         self.assertEqual(result["status"], "succeeded")
         self.assertIn("asset-data", result["stdout"])
-        self.assertEqual(len(list((self.worker.root / "assets").iterdir())), 1)
+        self.assertEqual(self.worker.asset_cache.snapshot()['count'], 1)
 
     def test_path_and_task_validation_precede_admission(self):
         identity = uuid.uuid4().hex

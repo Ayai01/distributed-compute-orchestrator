@@ -33,7 +33,7 @@ from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, servi
                         DEFAULT_MEMORY_RESERVE_MB, DEFAULT_MEMORY_HEADROOM_MB)
 from .telemetry import Activity
 from .client import RemoteError
-from .cleanup import AssetCache, remove_owned
+from .cleanup import AssetCache, Reclaimer, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .receipts import read_receipt
 from .paths import cache_environment
@@ -188,6 +188,8 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 class Worker:
     def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, cache_root=None, accelerators=None, python_runtimes=None):
+        started=time.monotonic()
+        self.startup={}
         self.root = Path(root).expanduser().resolve()
         self.cache_root = Path(cache_root).expanduser().resolve() if cache_root else self.root / 'cache'
         self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
@@ -248,6 +250,7 @@ class Worker:
         self._refresh_tags()
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
+        self.temp_reclaimer=Reclaimer(self.temp_root/'.trash')if self.temp_root else None
         benchmark_python=self.tools['python'][0]
         benchmark_env=tuple((name,self.env[name]) for name in ('PATH','LD_LIBRARY_PATH','OPENBLAS_CORETYPE','MKL_ENABLE_INSTRUCTIONS')
                             if name in self.env)
@@ -270,7 +273,10 @@ class Worker:
         self.cleanup_pending = set()
         self.asset_handoffs = {}
         self.asset_writes = weakref.WeakValueDictionary()
-        indexed = self.jobs.load_index()
+        self.startup['environment_seconds']=round(time.monotonic()-started,4)
+        phase=time.monotonic();indexed = self.jobs.load_index()
+        self.startup['index_seconds']=round(time.monotonic()-phase,4)
+        phase=time.monotonic()
         candidates = tuple(self.jobs.pending) if indexed else None
         paths = ((self.root / 'jobs' / identity / 'result.json') for identity in candidates) if candidates is not None else (self.root / "jobs").glob("*/result.json")
         self.startup_recoveries = []
@@ -297,8 +303,18 @@ class Worker:
         if not indexed:
             self.jobs.write_index()
         self.jobs.compact_index()
+        if self.temp_reclaimer:
+            for path in self.temp_root.iterdir():
+                if _ID.fullmatch(path.name)and path.name not in self.startup_recoveries:
+                    self.temp_reclaimer.defer(path)
+        self.startup['recovery_seconds']=round(time.monotonic()-phase,4)
+        phase=time.monotonic()
         self.asset_cache = AssetCache(self.root / 'assets')
+        self.asset_cache.reclaim_uploads()
         self._prune_assets()
+        self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
+                            seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
+        atomic_json(self.root/'startup-current.json',self.startup)
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
         self.scheduler.start()
 
@@ -320,6 +336,7 @@ class Worker:
                     "configuration_revision": self.configuration_revision,
                     "startup_recoveries": self.startup_recoveries,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
+                    "startup":self.startup,"temp_reclaim":self.temp_reclaimer.snapshot()if self.temp_reclaimer else None,
                     "service": service_usage(),
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
@@ -1194,6 +1211,8 @@ class Worker:
             self._clean_work(job)
         self.asset_handoffs.clear()
         self._prune_assets(recent=False)
+        self.asset_cache.reclaimer.close()
+        if self.temp_reclaimer:self.temp_reclaimer.close()
         if self.temp_root:
             try:
                 self.temp_root.rmdir()

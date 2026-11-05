@@ -56,6 +56,7 @@ def _elastic_job(job):
 
 class Coordinator:
     def __init__(self, pool, root, *, token="", operator_token=None, paused=False):
+        started=time.monotonic();self.startup={}
         self.pool, self.token = pool, token
         self.activity = Activity()
         self.root = Path(root).resolve()
@@ -81,7 +82,8 @@ class Coordinator:
             self.accepting=saved
         self.restart_available = False
         self.callback_address = None
-        indexed = self.jobs.load_index()
+        phase=time.monotonic();indexed = self.jobs.load_index()
+        self.startup['index_seconds']=round(time.monotonic()-phase,4);phase=time.monotonic()
 
         def restore_live(path, value):
             if clean_tool_snapshot(value):
@@ -134,8 +136,13 @@ class Coordinator:
                     archive_job(self.jobs, job, startup=True)
             self.jobs.write_index()
         self.jobs.compact_index()
+        self.startup['recovery_seconds']=round(time.monotonic()-phase,4);phase=time.monotonic()
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
+        self.asset_cache.reclaim_uploads()
         self._prune_assets()
+        self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
+                            seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
+        atomic_json(self.root/'startup-current.json',self.startup)
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
 

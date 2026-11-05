@@ -45,7 +45,7 @@ class LaunchHandoffTests(unittest.TestCase):
         public.health.return_value = {'pid': 10, 'role': 'scheduler'}
         operator.health.side_effect = [{'pid': 10, 'role': 'scheduler'},
                                        {'pid': 11, 'role': 'scheduler', 'version': '0.8.46'}]
-        with patch.object(startup, 'available', return_value=True), patch.object(startup, 'owners', return_value=[]), \
+        with patch.object(startup, 'available', return_value=True), patch.object(startup, 'owners', return_value=[{'pid':10}]), \
              patch.object(startup, 'Client', side_effect=[public, operator]), redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(startup.Cancelled, '原窗口完成重载'):
                 startup.resolve('127.0.0.1', 26133, policy='restart', reuse_role='scheduler')

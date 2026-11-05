@@ -18,6 +18,17 @@ from remote_compute import Pool
 
 
 class StartupTests(unittest.TestCase):
+    def test_free_port_skips_http_timeouts_but_checks_native_listener_conflicts(self):
+        with patch.object(startup,'available',return_value=True), \
+                patch.object(startup,'owners',return_value=[]),patch.object(startup,'Client')as client:
+            self.assertIsNone(startup.resolve('127.0.0.1',26133,reuse_role='worker'))
+            client.assert_not_called()
+        with patch.object(startup,'available',return_value=True), \
+                patch.object(startup,'owners',return_value=[{'pid':123}]),patch.object(startup,'Client')as client:
+            client.return_value.health.return_value=dict(role='worker')
+            self.assertEqual(startup.resolve('127.0.0.1',26133,reuse_role='worker',policy='reuse'),'http://127.0.0.1:26133')
+            client.return_value.health.assert_called_once()
+
     @unittest.skipUnless(os.name == 'nt', 'Windows ConPTY host visibility')
     def test_conpty_uses_own_visibility_or_its_visible_terminal_host(self):
         kernel, user = MagicMock(), MagicMock()

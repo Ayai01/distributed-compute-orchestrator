@@ -60,7 +60,7 @@ class JobRecords(MutableMapping):
         """Load the durable identity index, returning whether it was usable."""
         if not self.index_path.is_file():
             return False
-        entries = {}
+        entries = {};asset_names={}
         self.deleted = set()
         try:
             with self.index_path.open('rb') as stream:
@@ -81,7 +81,11 @@ class JobRecords(MutableMapping):
                         self.deleted.add(identity)
                         continue
                     self.deleted.discard(identity)
-                    entries[identity] = row
+                    # Keep compact identity metadata rather than every parsed
+                    # JSON dictionary/list while rebuilding a large history.
+                    assets=tuple(asset_names.setdefault(x,x)for x in row.get('assets',())if isinstance(x,str))
+                    worker=row.get('worker')or identity
+                    entries[identity]=(row.get('terminal',True),assets,identity if worker==identity else worker)
         except OSError:
             return False
         self.history.clear()
@@ -89,16 +93,14 @@ class JobRecords(MutableMapping):
         self.workers.clear()
         self.pending = []
         self.pending_assets = {}
-        for identity, row in entries.items():
-            if row.get('terminal', True):
-                assets = tuple(x for x in row.get('assets', ()) if isinstance(x, str))
-                worker = row.get('worker') or identity
+        for identity, (terminal,assets,worker) in entries.items():
+            if terminal:
                 self.history[identity] = (assets, worker)
                 self.assets.update(assets)
                 self.workers.update((worker,))
             else:
                 self.pending.append(identity)
-                self.pending_assets[identity] = tuple(x for x in row.get('assets', ()) if isinstance(x, str))
+                self.pending_assets[identity] = assets
         self.index_loaded = True
         return True
 

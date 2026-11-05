@@ -3,6 +3,8 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import os
+import hashlib
+import json
 import threading
 import time
 import unittest
@@ -12,9 +14,83 @@ from remote_compute import Pool
 from remote_compute.local import LocalClient
 from test_center import center
 from test_compute import provider, python, scratch, until
+from remote_compute.cleanup import AssetCache
 
 
 class CleanupTests(unittest.TestCase):
+    def test_failed_retirement_is_reclaimed_on_the_next_start(self):
+        with scratch()as directory:
+            root=Path(directory)/'assets';root.mkdir();asset=root/('f'*64);asset.mkdir()
+            (asset/'raw').write_bytes(b'discard');cache=AssetCache(root,limit=0)
+            with patch('remote_compute.cleanup.remove_owned',side_effect=PermissionError('busy file')):
+                cache.prune(set());until(lambda:cache.reclaimer.snapshot()['pending']==0)
+            self.assertFalse(asset.exists());self.assertTrue(list((root/'.trash').iterdir()))
+            self.assertEqual(len(cache.reclaimer.snapshot()['errors']),1)
+            again=AssetCache(root);until(lambda:again.reclaimer.snapshot()['pending']==0)
+            self.assertEqual(list((root/'.trash').iterdir()),[])
+
+    def test_corrupt_receipt_keeps_its_diagnostic_scratch(self):
+        with scratch()as directory:
+            root=Path(directory)/'worker';identity='7'*32
+            job=root/'jobs'/identity;job.mkdir(parents=True);(job/'result.json').write_bytes(b'{broken')
+            temporary=Path(directory)/'temp';scope=temporary/hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:12]
+            diagnostic=scope/identity;diagnostic.mkdir(parents=True);(diagnostic/'raw').write_bytes(b'recovery')
+            with provider(root,temp_root=temporary)as(worker,_):
+                self.assertIn(identity,worker.startup_recoveries)
+                self.assertEqual((diagnostic/'raw').read_bytes(),b'recovery')
+
+    def test_cached_immutable_asset_sizes_skip_tree_walks_on_restart(self):
+        with scratch()as directory:
+            root=Path(directory)/'assets';root.mkdir();identity='a'*64
+            asset=root/identity;asset.mkdir();(asset/'model').write_bytes(b'x'*123)
+            first=AssetCache(root)
+            self.assertEqual(first.snapshot()['bytes'],123)
+            with patch('remote_compute.cleanup.os.walk',side_effect=AssertionError('startup rescanned immutable files')):
+                again=AssetCache(root)
+            self.assertEqual(again.snapshot()['bytes'],123)
+            with again.size_index.open('ab')as stream:stream.write(b'{"id":')
+            other=root/('b'*64);other.mkdir();(other/'input').write_bytes(b'new')
+            again=AssetCache(root)
+            with patch('remote_compute.cleanup.os.walk',side_effect=AssertionError('torn metadata lost a complete size')):
+                self.assertEqual(AssetCache(root).snapshot()['bytes'],126)
+
+    def test_slow_asset_reclaim_retires_the_old_name_and_leaves_cache_control_free(self):
+        from remote_compute.cleanup import remove_owned
+        with scratch()as directory:
+            root=Path(directory)/'assets';root.mkdir();identity='c'*64
+            asset=root/identity;asset.mkdir();(asset/'data').write_bytes(b'paid')
+            cache=AssetCache(root,limit=0);entered=threading.Event();release=threading.Event()
+            def slow(path):
+                entered.set()
+                if not release.wait(5):raise AssertionError('reclaim was not released')
+                return remove_owned(path)
+            with patch('remote_compute.cleanup.remove_owned',side_effect=slow):
+                try:
+                    self.assertEqual(cache.prune(set()),[])
+                    self.assertTrue(entered.wait(2));self.assertFalse(asset.exists())
+                    self.assertEqual(cache.snapshot()['bytes'],0)
+                    # The same content can be resynchronized while retired
+                    # bytes are still being reclaimed under a private name.
+                    asset.mkdir();(asset/'data').write_bytes(b'paid');cache.touch(identity)
+                    self.assertEqual(cache.snapshot()['bytes'],4)
+                finally:release.set()
+                until(lambda:cache.reclaimer.snapshot()['pending']==0)
+            self.assertEqual((asset/'data').read_bytes(),b'paid')
+
+    def test_startup_reclaims_only_its_orphan_scratch_and_unfinished_asset_uploads(self):
+        with scratch()as directory:
+            root=Path(directory)/'worker';assets=root/'assets';assets.mkdir(parents=True)
+            upload=assets/('d'*64+'.upload');upload.mkdir();(upload/'partial').write_bytes(b'discard')
+            (assets/'operator-note').write_bytes(b'keep')
+            temporary=Path(directory)/'temp';scope=temporary/hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:12]
+            orphan=scope/('e'*32);orphan.mkdir(parents=True);(orphan/'raw').write_bytes(b'discard')
+            other=temporary/'other-owner';other.mkdir();(other/'data').write_bytes(b'keep')
+            with provider(root,temp_root=temporary)as(worker,_):
+                self.assertFalse(upload.exists());self.assertFalse(orphan.exists())
+                until(lambda:worker.asset_cache.reclaimer.snapshot()['pending']==worker.temp_reclaimer.snapshot()['pending']==0)
+                self.assertEqual((other/'data').read_bytes(),b'keep')
+                self.assertEqual((assets/'operator-note').read_bytes(),b'keep')
+
     def test_late_terminal_response_cannot_recreate_a_collected_directory(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (_,node):
             with Pool([node]) as pool, center(pool,Path(directory)/'center') as (state,client):

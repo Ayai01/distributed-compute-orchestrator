@@ -99,6 +99,25 @@ def shared(value):
 '''
 
 class AutomaticExecutionTests(unittest.TestCase):
+    def test_memory_resize_rejection_keeps_the_kernel_running_on_its_funded_grant(self):
+        from unittest.mock import patch
+        from remote_compute.worker import Conflict
+        for phase in ('initial','active'):
+            with self.subTest(phase=phase),scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,client):
+                original=worker.resize;refused=[]
+                def resize(*args,**options):
+                    if phase=='initial'and args[1]>1 or phase=='active'and options.get('active_cpus',0):
+                        refused.append(True)
+                        raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                    return original(*args,**options)
+                with patch.object(worker,'resize',side_effect=resize):
+                    result=client.run(python_call('business:kernel',max_cpus=2),files={'business.py':FUNCTIONS})
+                self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                self.assertTrue(refused)
+                value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
+                self.assertEqual(value,dict(grant=1 if phase=='initial'else 2,threads=1 if phase=='initial'else 2))
+                self.assertEqual(worker.health()['used_cpus'],0)
+
     def test_hybrid_memory_refusal_preserves_conflict_status_and_funded_work(self):
         from unittest.mock import patch
         from remote_compute.local import LocalClient

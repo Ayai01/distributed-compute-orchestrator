@@ -111,13 +111,9 @@ class _Grants:
             try:
                 actual=self.lease.refresh(active_cpus=active,ready_cpus=ready)
             except Exception as error:
-                if (getattr(error,'status_code',None)==409 and
-                        'Insufficient memory for resource resize; existing grant retained'in str(error)):
-                    actual=self.lease.cpus
-                else:
-                    with self.condition:
-                        self.error=error;self.pending=False;self.condition.notify_all()
-                    return
+                with self.condition:
+                    self.error=error;self.pending=False;self.condition.notify_all()
+                return
             with self.condition:
                 self.cpus=actual;self.pending=False
                 self.fenced=self.active<active

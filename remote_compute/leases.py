@@ -1,5 +1,6 @@
 """Cooperative CPU demand at executor boundaries, without a polling thread."""
 import time
+from .allocation import plan_resize
 
 
 class CpuLease:
@@ -37,7 +38,23 @@ class CpuLease:
             return self.cpus
         if (desired != self.demand or active_cpus != self.active_cpus
                 or time.monotonic() - self.updated >= 1):
-            grant = self.client.resize(self.identity, desired, active_cpus=active_cpus, **self.memory)
+            try:
+                grant = self.client.resize(self.identity, desired, active_cpus=active_cpus, **self.memory)
+            except Exception as error:
+                if (getattr(error,'status_code',None)!=409 or
+                        'Insufficient memory for resource resize; existing grant retained'not in str(error)):
+                    raise
+                # A refused increase leaves paid CPU/RAM usable. Re-read that
+                # grant: a new phase may need more memory than it can fund.
+                grant=self.client.status(self.identity)
+                available=grant.get('memory_mb',0)
+                funded,required=plan_resize(min(desired,grant.get('cpus',0)),
+                    self.memory.get('memory_mb'),self.memory.get('base_memory_mb'),
+                    self.memory.get('memory_per_cpu_mb'),self.memory.get('memory_limit_mb'),available)
+                if (grant.get('status')!='running' or funded<max(1,active_cpus) or
+                        required is not None and required>available):
+                    raise error
+                grant={**grant,'cpus':funded}
             self.cpus = grant['cpus']
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
             self.demand, self.active_cpus = desired, active_cpus

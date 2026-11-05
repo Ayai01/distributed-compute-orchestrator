@@ -114,6 +114,7 @@ def owners(port):
             fields = line.split()
             if int(fields[1].split(':')[1], 16) == port and fields[3] == '0A':
                 inodes.add('socket:[' + fields[9] + ']')
+    if not inodes:return []
     result = []
     for process in Path('/proc').iterdir():
         if not process.name.isdigit():
@@ -190,6 +191,12 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
     bind_free = available(host, port)
     if bind_free and not reuse_role:
         return None
+    # A free local listener has no HTTP service to negotiate with. Windows
+    # wildcard/specific binds still need the native listener table check.
+    processes=None
+    if bind_free:
+        processes=owners(port)
+        if not processes:return None
     local_host = '127.0.0.1' if host in {'0.0.0.0', ''} else '::1' if host == '::' else host
     url = f"{'https' if tls else 'http'}://{'[' + local_host + ']' if ':' in local_host else local_host}:{port}"
     reusable = False
@@ -205,7 +212,7 @@ def resolve(host, port, *, policy='ask', token='', reuse_role=None, ca_file=None
     if bind_free and not observed:
         return None
     print(f'端口冲突：{host}:{port}')
-    processes = owners(port)
+    processes = owners(port)if processes is None else processes
     for process in processes:
         print(f"  PID {process['pid']}  {process.get('CommandLine') or process.get('Name', '')}")
     choice = policy

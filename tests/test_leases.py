@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from remote_compute import Client, Pool
+from remote_compute import Client, Pool, RemoteError
 from test_center import center
 from test_compute import provider, python, scratch, until
 
@@ -12,6 +12,43 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class CpuLeaseTests(unittest.TestCase):
+    def test_memory_busy_reuses_only_the_observed_funded_width_and_throttles_retries(self):
+        client=Client();error=RemoteError('Insufficient memory for resource resize; existing grant retained')
+        error.status_code=409
+        with patch.object(client,'resize',side_effect=[error,error,dict(cpus=8,memory_mb=1152)])as resize, \
+                patch.object(client,'status',return_value=dict(status='running',cpus=4,memory_mb=512)), \
+                patch('remote_compute.leases.time.monotonic',return_value=10)as clock:
+            lease=client.cpu_lease('a'*32,max_cpus=8,base_memory_mb=128,memory_per_cpu_mb=128)
+            self.assertEqual(lease.refresh(ready_cpus=8),3)
+            self.assertEqual(lease.memory_mb,512)
+            self.assertEqual(lease.refresh(ready_cpus=8),3)
+            self.assertEqual(resize.call_count,1)
+            clock.return_value=11
+            self.assertEqual(lease.refresh(ready_cpus=8),3)
+            self.assertEqual(resize.call_count,2)
+            clock.return_value=12
+            self.assertEqual(lease.refresh(ready_cpus=8),8)
+
+    def test_retained_grant_does_not_fund_a_larger_memory_phase_or_missing_active_threads(self):
+        client=Client();error=RemoteError('Insufficient memory for resource resize; existing grant retained')
+        error.status_code=409
+        for options,observed,active in (
+                (dict(memory_mb=513),dict(status='running',cpus=2,memory_mb=512),0),
+                (dict(base_memory_mb=513,memory_per_cpu_mb=1),dict(status='running',cpus=2,memory_mb=512),0),
+                ({},dict(status='running',cpus=1,memory_mb=512),2),
+                ({},dict(status='cancelled',cpus=2,memory_mb=512),0)):
+            with self.subTest(options=options,observed=observed), \
+                    patch.object(client,'resize',side_effect=error),patch.object(client,'status',return_value=observed):
+                lease=client.cpu_lease('a'*32,max_cpus=8,cpus=2,**options)
+                with self.assertRaises(RemoteError)as raised:lease.refresh(active_cpus=active,ready_cpus=6)
+                self.assertIs(raised.exception,error)
+
+    def test_other_conflicts_are_not_treated_as_retained_memory_grants(self):
+        client=Client();error=RemoteError('Only a running task can change its CPU grant');error.status_code=409
+        with patch.object(client,'resize',side_effect=error),patch.object(client,'status')as status:
+            with self.assertRaises(RemoteError):client.cpu_lease('a'*32).refresh(ready_cpus=8)
+            status.assert_not_called()
+
     def test_tail_returns_idle_slots_and_peer_expands_without_a_new_cpu_request(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=8) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(root)/'center') as (_, client):

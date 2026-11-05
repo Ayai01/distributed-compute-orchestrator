@@ -172,8 +172,8 @@ class BulkIOControlTests(unittest.TestCase):
 
     def test_worker_asset_unpack_and_submission_keep_status_and_grants_responsive(self):
         with scratch() as directory, provider(Path(directory)/'worker', cpus=2) as (_, client):
-            identity = client.submit(python('import time;time.sleep(30)', max_cpus=2))['id']
-            until(lambda: client.status(identity)['status'] == 'running')
+            identity = client.submit(python('import time;print("started",flush=True);time.sleep(30)', max_cpus=2))['id']
+            until(lambda: 'started' in client.logs(identity)['stdout'])
             def probe():
                 self.assertEqual(client.status(identity)['status'], 'running')
                 self.assertEqual(client.resize(identity, 1)['cpus'], 1)
