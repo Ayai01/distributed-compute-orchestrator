@@ -63,15 +63,17 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 ## 持久准备与收齐
 
-`Client.execute(requests, project=..., output_dir=..., prepare=None, publish=None, ready_tasks=None, stop_when=None, cancel_when=None)`同步执行有限业务计划，直到已受理原ID收齐。同一进程、调用目录、中心URL和project共用一个控制器；独立业务批次可用不同output_dir并发调用。工程级进程锁及待恢复目录索引位于调用目录`.local/dco-client/`，每个output_dir另有单写入者锁。不同批次保留同一project及公平份额。
+`Client.execute(requests, project=..., output_dir=..., prepare=None, publish=None, ready_tasks=None, stop_when=None, cancel_when=None)`同步执行有限业务计划，直到已受理原ID收齐。独立output_dir在同进程或不同进程中并发调用；相同调用目录、中心URL和project共用待收窗口。共享状态索引位于调用目录`.local/dco-client/`，工程文件锁只覆盖该索引的短读改写。准备、计算、网络查询、领取与业务发布回调均在工程锁外执行；每个output_dir保留原ID恢复所需的单写入者锁。不同批次保留同一project及公平份额。
 
 - `requests`为业务键到请求的映射，或`(key, spec)`序列；业务键非空且唯一。
 - 业务请求为`{'task': task, 'inputs': directory, 'files': mapping}`，也可由`prepare(spec, original_id)`返回。依赖包装为`{'spec': business_input, 'after': [keys]}`。依赖图在受理前校验。
 - `after`等待前序结果完成持久发布，之后才准备后续输入。独立任务继续准备和执行。
 - `Deferred(reason)`表示输入暂未就绪，立即归还准备线程；同一次`execute`中，该项检查完成后至少间隔1秒沿原ID重试，其他项完成不缩短此间隔。重新启动管线时沿原ID重新检查业务门。`Skipped(reason)`表示业务门已决定跳过，在结果的`skipped`中登记，不生成科学回执。
 - 新满足依赖的项和到期重试按原catalog位置合入就绪队列。有首次就绪项等待时，最多连续准备3个重试项，再给首次就绪项一次机会；准备完成和远端执行仍可并行。
-- 同工程共用4个准备、2个提交、2个领取/发布线程；每次调用只等待自己拥有的工作收尾，发布慢不会阻止其他批次完成。`publish(receipt)`可能并发调用，须按原ID幂等、线程安全，成功返回前持久发布科学输出、费用和恢复状态。准备/发布回调不递归执行同工程计划；业务依赖使用after表达。
+- 同进程同工程共用4个准备、2个提交、2个领取/发布线程；跨进程共享待收额度。每次调用只等待自己拥有的工作收尾，发布慢不会阻止其他批次完成。`publish(receipt)`可能并发调用，须按原ID幂等、线程安全，成功返回前持久发布科学输出、费用和恢复状态。准备/发布回调不递归执行同工程计划；业务依赖使用after表达。
 - 默认窗口覆盖兼容线程并超过128；`ready_tasks`可设1–4096，并发调用须取相同值，通常全部省略。准备中、受理未明及已受理未完成发布/删除的原ID共用额度；发布失败的原ID跨控制器恢复继续计入。接续待恢复目录领取原结果后再补位。工程只提供已授权且真实就绪的工作，不为填队列增加评价或越过依赖。
+
+共享索引保存各输出目录的在途原ID及其状态位置。新控制器在原输出目录无人持有时核对持久状态，归还已退出准备者的未用额度，继续保留受理未明和未发布结果；冷状态读取在工程锁外进行。进程退出由系统释放文件句柄，锁文件本身保留复用。
 
 `output_dir`保存计划、按业务键划分的状态、原请求ID、冻结请求、回执和已领取输出。原ID先持久化，再准备/提交。相同输出目录只能接续同一业务键、声明输入、原ID及依赖计划，变更会在提交前拒绝；准备完成的输入以冻结请求为准。路径表示输入位置，内容身份由业务spec或资产ID声明；接续不重新调用准备函数改写已冻结字节。
 

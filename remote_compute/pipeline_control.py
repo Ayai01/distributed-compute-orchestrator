@@ -1,11 +1,11 @@
-"""One local project controller for concurrent durable execution directories."""
+"""Concurrent durable calls share credits through short state transactions."""
 from contextlib import contextmanager
 from concurrent.futures import Future,ThreadPoolExecutor,wait
 from hashlib import sha256
 from pathlib import Path
-import json,os,threading
+import json,os,threading,time
 
-from .bundle import atomic_json
+from .bundle import atomic_json,native_path
 from .worker import Conflict,lock_root
 
 
@@ -15,7 +15,7 @@ _callback=threading.local()
 _unpublished={'submitting','accepted','fetched','publication_failed','published'}
 
 
-def _owner(root):return os.path.normcase(str(Path(root).resolve()))
+def _owner(root):return os.path.normcase(str(native_path(Path(root).resolve(),force=True)))
 
 
 def _unfinished(row):
@@ -59,77 +59,150 @@ class _CallPool:
 class _Controller:
     def __init__(self,path,project):
         self.path=path;self.identity=_owner(path);self.project=project;self.users=0
-        self.configuration=threading.Lock();self.condition=threading.Condition()
-        self.window=None;self.file_lock=None;self.pools=();self.roots=set();self.held={};self.recovering=set()
+        self.configuration=threading.Lock();self.window=None;self.pools=();self.next_reap=0.
+        self.registry=self.path/'executions.json'
 
-    def initialize(self,client,ready_tasks):
-        # A slow center or a cold recovery blocks only this project.
+    def read(self):
+        value=json.loads(self.registry.read_bytes())if self.registry.exists()else dict(
+            project=self.project,ready_tasks=None,directories={})
+        if value['project']!=self.project:raise ValueError('Execution registry belongs to another project')
+        return value
+
+    @contextmanager
+    def transaction(self):
+        # The native lock protects only the read/modify/write of this index.
+        # RPC, preparation, publication and cold row reads stay outside it.
+        deadline=time.monotonic()+30
+        while True:
+            try:lock=lock_root(self.path,'pipeline');break
+            except Conflict:
+                if time.monotonic()>=deadline:raise
+                time.sleep(.01)
+        try:yield self.read()
+        finally:lock.close()
+
+    def save(self,value):atomic_json(self.registry,value)
+
+    def pending(self,owner,entries):
+        result={}
+        for identity,key in entries.items():
+            path=Path(owner)/'jobs'/key/'state.json'
+            if not path.exists()or _unfinished(json.loads(path.read_bytes())):result[identity]=key
+        return result
+
+    def restore_index(self,owner):
+        previous=self.read()
+        if not isinstance(previous['directories'],list):return
+        # Import existing receipt references once, while their output owners
+        # are inactive or this call already owns the same output directory.
+        holds=[];directories={}
+        try:
+            for root in previous['directories']:
+                root=_owner(root)
+                if root!=owner and Path(root).is_dir():holds.append(lock_root(Path(root),'pipeline'))
+                pending={}
+                for path in (Path(root)/'jobs').glob('*/state.json'):
+                    row=json.loads(path.read_bytes())
+                    if _unfinished(row):pending[row['id']]=path.parent.name
+                if pending:directories[root]=dict(pending=pending,recovering=False)
+            with self.transaction()as value:
+                if isinstance(value['directories'],list):
+                    value.update(ready_tasks=self.ready_tasks,directories=directories);self.save(value)
+        finally:
+            for hold in holds:hold.close()
+
+    def reap(self,owner):
+        for root,entry in self.read()['directories'].items():
+            if root==owner:continue
+            if not Path(root).is_dir():
+                with self.transaction()as value:
+                    current=value['directories'].get(root)
+                    if current is not None:
+                        if not current['pending']:value['directories'].pop(root)
+                        else:current['recovering']=False
+                        if current!=entry or not current['pending']:self.save(value)
+                continue
+            try:hold=lock_root(Path(root),'pipeline')
+            except Conflict:continue
+            try:
+                pending=self.pending(root,entry['pending'])
+                with self.transaction()as value:
+                    current=value['directories'].get(root)
+                    if current is None:continue
+                    if not pending:value['directories'].pop(root)
+                    else:
+                        current['pending']=pending;current['recovering']=False
+                    if current!=entry or not pending:self.save(value)
+            finally:hold.close()
+
+    def initialize(self,client,ready_tasks,owner):
         with self.configuration:
             if self.window is not None:
                 if ready_tasks!=self.ready_tasks:
                     raise ValueError('Concurrent executions of one project require the same ready_tasks')
                 return
-            self.file_lock=lock_root(self.path,'pipeline')
-            try:
-                self.held={}
-                self.registry=self.path/'executions.json'
-                if self.registry.exists():
-                    saved=json.loads(self.registry.read_bytes())
-                    if saved['project']!=self.project:raise ValueError('Execution registry belongs to another project')
-                    for root in saved['directories']:
-                        for path in (Path(root)/'jobs').glob('*/state.json'):
-                            row=json.loads(path.read_bytes())
-                            if _unfinished(row):self._adopt(row,root)
-                self.roots={owner for owner,_ in self.held.values()}
-                self.ready_tasks=ready_tasks
-                self.window=client.window(self.project,**({}if ready_tasks is None else dict(ready_tasks=ready_tasks)))
-                self.pools=tuple(ThreadPoolExecutor(width,thread_name_prefix='dco-'+name)
-                                 for width,name in ((4,'prepare'),(2,'submit'),(2,'collect')))
-            except BaseException:
-                self.window=None;self.file_lock.close();self.file_lock=None;raise
-
-    def _adopt(self,row,owner):
-        previous=self.held.get(row['id'])
-        if previous is not None and previous[0]!=owner:
-            raise ValueError('Original job already belongs to another execution directory: '+row['id'])
-        self.held[row['id']]=(owner,str(Path(row['directory'])/'state.json'))
-
-    def _save_roots(self):
-        atomic_json(self.registry,dict(project=self.project,directories=sorted(self.roots)))
+            self.ready_tasks=ready_tasks
+            self.restore_index(owner)
+            window=client.window(self.project,**({}if ready_tasks is None else dict(ready_tasks=ready_tasks)))
+            self.pools=tuple(ThreadPoolExecutor(width,thread_name_prefix='dco-'+name)
+                             for width,name in ((4,'prepare'),(2,'submit'),(2,'collect')))
+            self.window=window
 
     def register(self,owner):
-        with self.condition:
-            self.roots.add(owner);self.recovering.add(owner);self._save_roots()
+        self.reap(owner)
+        with self.transaction()as value:
+            if value['directories']and value['ready_tasks']!=self.ready_tasks:
+                raise ValueError('Concurrent executions of one project require the same ready_tasks')
+            value['ready_tasks']=self.ready_tasks
+            entry=value['directories'].setdefault(owner,dict(pending={},recovering=False))
+            entry['recovering']=True;self.save(value)
 
     def recovered(self,owner):
-        with self.condition:
-            self.recovering.discard(owner);self.condition.notify_all()
+        with self.transaction()as value:
+            entry=value['directories'].get(owner)
+            if entry and entry['recovering']:
+                entry['recovering']=False;self.save(value)
 
     def hold(self,row,owner,*,recovered=False):
         maximum=None if recovered else self.window.current()
-        with self.condition:
-            if row['id']in self.held:
-                self._adopt(row,owner);return True
-            if not recovered and self.recovering:return False
-            if maximum is not None and len(self.held)>=maximum:return False
-            self._adopt(row,owner);return True
+        with self.transaction()as value:
+            directories=value['directories']
+            for root,entry in directories.items():
+                if row['id']in entry['pending']:
+                    if root!=owner:raise ValueError('Original job already belongs to another execution directory: '+row['id'])
+                    return True
+            blocked=(not recovered and any(entry['recovering']for entry in directories.values())or
+                     maximum is not None and sum(len(entry['pending'])for entry in directories.values())>=maximum)
+            if not blocked:
+                directories[owner]['pending'][row['id']]=Path(row['directory']).name
+                self.save(value);return True
+        # A peer may exit after this call registered. Reconcile only on
+        # backpressure, outside the project transaction, at most once a second.
+        now=time.monotonic()
+        if now>=self.next_reap:
+            self.next_reap=now+1.;self.reap(owner)
+        return False
 
     def release(self,row,owner):
-        with self.condition:
-            if not _unfinished(row)and self.held.get(row['id'],(None,))[0]==owner:
-                self.held.pop(row['id']);self.condition.notify_all()
+        if _unfinished(row):return
+        with self.transaction()as value:
+            pending=value['directories'][owner]['pending']
+            if row['id']in pending:
+                pending.pop(row['id']);self.save(value)
 
     def reconcile(self,owner):
-        with self.condition:
-            for identity,(current,path)in list(self.held.items()):
-                if current==owner and not _unfinished(json.loads(Path(path).read_bytes())):
-                    self.held.pop(identity)
-            if not any(current==owner for current,_ in self.held.values()):self.roots.discard(owner)
-            self._save_roots();self.condition.notify_all()
+        entry=self.read()['directories'].get(owner)
+        if entry is None:return
+        pending=self.pending(owner,entry['pending'])
+        with self.transaction()as value:
+            current=value['directories'].get(owner)
+            if current is None:return
+            if pending:current.update(pending=pending,recovering=False)
+            else:value['directories'].pop(owner)
+            self.save(value)
 
     def close(self):
         for pool in self.pools:pool.shutdown(wait=True)
-        if self.file_lock:self.file_lock.close()
 
 
 class _Call:
@@ -145,7 +218,7 @@ class _Call:
     def recovered(self):self.controller.recovered(self.owner)
 
     def wait(self):
-        with self.controller.condition:self.controller.condition.wait(.05)
+        time.sleep(.05)
 
     @contextmanager
     def pools(self):
@@ -168,7 +241,7 @@ def project_call(client,project,root,ready_tasks):
         controller.users+=1
     call=None
     try:
-        controller.initialize(client,ready_tasks)
+        controller.initialize(client,ready_tasks,_owner(root))
         call=_Call(controller,root);controller.register(call.owner)
         yield call
     finally:

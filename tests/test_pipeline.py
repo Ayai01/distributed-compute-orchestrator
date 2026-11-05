@@ -233,21 +233,21 @@ class PipelineTests(unittest.TestCase):
                     finally:release.set()
                     with self.assertRaises(ExecutionFailure):first.result(timeout=6)
 
-    def test_project_process_lock_preserves_the_conflict_type(self):
+    def test_project_state_writer_releases_the_lock_before_execution_continues(self):
         from hashlib import sha256
-        from remote_compute.worker import Conflict
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 identity=sha256((client.url+'\0parallel-test').encode()).hexdigest()
                 lock=Path.cwd()/'.local/dco-client'/identity
                 code="import sys; from pathlib import Path; from remote_compute.worker import lock_root; hold=lock_root(Path(sys.argv[1]),'pipeline'); print('locked',flush=True); sys.stdin.readline(); hold.close()"
                 with subprocess.Popen([sys.executable,'-B','-c',code,str(lock)],
-                        stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)as child:
+                        stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)as child,ThreadPoolExecutor(1)as callers:
                     try:
                         self.assertEqual(child.stdout.readline().strip(),'locked')
-                        with self.assertRaisesRegex(Conflict,'Another pipeline'):
-                            client.execute({},project='parallel-test',output_dir=Path(root)/'delivery')
+                        future=callers.submit(client.execute,{},project='parallel-test',output_dir=Path(root)/'delivery')
+                        time.sleep(.1);self.assertFalse(future.done())
                     finally:child.communicate('\n',timeout=5)
+                    self.assertEqual(future.result(timeout=5),[])
                 self.assertEqual(child.returncode,0)
 
     def test_missing_recovery_receipt_keeps_original_credit_and_identity(self):
