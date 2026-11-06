@@ -60,6 +60,8 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 `.dco-results.json.items`保存已返回结果；独立的`item_states`按原输入索引记录`pending/running/succeeded/failed`及起止时间。SDK在启动前持久标记该输入的执行尝试；进程树退出后，worker将仍在运行的项标为`interrupted`、未有启动尝试的项标为`not_started`，保留完成结果，顶层状态与运输终态一致。评价次数沿业务账本读取。框架记录执行身份和输出，科学数组与付费前缀由业务及时发布；硬终止后的未知付费量保留为未知。
 
+中心操作员使用`client.control(job=原ID, priority=整数)`调整已受理排队任务的调度优先级，取值范围沿任务priority规则。`submitted_priority`保留原声明，`dispatch_priority`记录有效覆盖；覆盖持久保存并在中心恢复时生效。原request.zip、请求SHA、科学输入、种子、费用和原ID保持。运行中及终态任务保持其调度与执行状态。priority在工程之间全局排序，同级再按resource_share分配；工程内分层安排须同时核对跨工程份额。
+
 `python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items(..., backend="thread")`，DCO按输入数动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，单项固定1核，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
 
 `iter_items(function, items, backend=..., stop_when=..., limits=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。

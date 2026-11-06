@@ -15,7 +15,7 @@ import zipfile
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff
-from .policy import (MIN_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
+from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
@@ -98,6 +98,8 @@ class Coordinator:
             with zipfile.ZipFile(path.parent/'request.zip') as archive:
                 task=json.loads(archive.read('task.json'))
             task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+            if 'dispatch_priority'in value:
+                task['priority']=value['dispatch_priority']
             self._restore_accelerator(task, value)
             job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
             value.setdefault('max_retries',task.get('retries',2))
@@ -531,6 +533,33 @@ class Coordinator:
                            node_targets=grants[name]) for name in shares}
 
     def control(self, changes):
+        if isinstance(changes,dict)and 'job'in changes:
+            if set(changes)!={'job','priority'}:
+                raise ValueError('Queued job control accepts job and priority')
+            identity,priority=changes['job'],changes['priority']
+            if not isinstance(identity,str)or not _ID.fullmatch(identity):
+                raise ValueError('Job id requires 32 lowercase hex characters')
+            if type(priority)is not int or not MIN_PRIORITY<=priority<=MAX_PRIORITY:
+                raise ValueError('priority must be an integer in%d..%d'%(MIN_PRIORITY,MAX_PRIORITY))
+            job=load_job(self.jobs,self.condition,identity)
+            with self.condition:
+                if self.stopping:raise Conflict('Scheduler is stopping')
+                if job['result']['status']!='queued':
+                    raise Conflict('Only queued jobs accept a dispatch priority override')
+                result=job['result']
+                updated=dict(result,submitted_priority=result.get('submitted_priority',job['task']['priority']),
+                             dispatch_priority=priority)
+                # No acceptance/index transition occurs. Publish the one
+                # durable metadata change before it can affect dispatch.
+                atomic_json(job['directory']/'result.json',updated)
+                result.update(updated)
+                # The normalized live descriptor drives allocation. The
+                # immutable request.zip and its identity stay untouched.
+                job['task']['priority']=priority
+                self._publish(job)
+                self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])
+                self.condition.notify_all()
+                return {key:result.get(key)for key in ('id','status','submitted_priority','dispatch_priority','request_sha256')}
         if isinstance(changes, dict) and "node" in changes:
             name = changes["node"]
             node = next((n for n in self.pool.nodes if n.name == name), None)
