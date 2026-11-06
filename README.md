@@ -238,6 +238,10 @@ setup复用系统Python，验证科学依赖后写本机tools/env。已有ngspic
 
 Python和C++是基础环境，不出现在运行能力列表。科学计算的默认Python环境提供NumPy、SciPy、Numba、pymoo、moocore、threadpoolctl、scikit-learn和umap-learn；C++通过`${tool:cxx}`调用。原生工具的完整argv、路径、版本和共享目录只保留在操作员明细与本任务执行回执中。
 
+原生C也使用`${tool:cxx}`驱动，对每个C输入显式指定`-x c`；所需标准头文件和链接选项由源码的构建协议声明。Python业务入口可用任务`env={'NATIVE_CXX': '${tool:cxx}'}`取得已配置编译器，在执行节点构建和加载本机ABI库。源码作为内容资产复用；预编译的ELF共享库与Windows PE DLL分别保存内容身份，并按执行平台选择匹配产物。Windows加载编译器附带的运行库时，用`os.add_dll_directory`管理已知依赖目录的生命周期。
+
+普通`Client`提供语义能力汇总，不提供OS筛选或设备选择；`node`只供操作员使用。跨平台原生任务可省略`node`并使用`requires=[]`，通过上述本机构建使用全部兼容设备。已冻结的平台专属任务由操作员核定路由并受理原ID、原包，业务继续用普通SDK领取和发布；不以其它工具能力代替平台条件。
+
 | 能力 | 就绪条件及独立安装理由 |
 | --- | --- |
 | `ng47` | ngspice 47仿真器及其运行依赖；独立电路仿真工具。 |

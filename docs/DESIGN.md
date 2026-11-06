@@ -43,6 +43,8 @@ results = client.execute(plan, project='my-project',
 
 已有业务入口可以用`command(['${tool:python}', 'runner.py', '--workers', '${cpus}'], max_cpus=...)`。DCO在启动每一步前取得授权，再展开实际核数及数值库环境。任意外部命令在该命令边界使用其授权；需要运行中增减实际并发的输入流使用DCO映射执行器。
 
+任务的`env`同样展开工具占位符；例如`env={'NATIVE_CXX':'${tool:cxx}'}`让Python入口使用当前节点已登记的编译器。原生源码、构建参数和二进制ABI分别记录；在执行节点生成本机库，或选择相同ABI的预编译资产，再由业务加载。基础C/C++不另申请能力，OS不包装成语义能力标签；普通客户端的任务不指定`node`，平台专属冻结输入由操作员按原ID受理。
+
 在DCO任务内，业务入口可调用：
 
 ```python
