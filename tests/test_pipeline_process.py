@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json,subprocess,sys,threading,time,unittest
+from unittest.mock import patch
 
 from remote_compute import Pool,command
 from test_center import center
@@ -37,6 +38,41 @@ results=client.execute(p['plan'],project='process-test',output_dir=p['output'],r
  prepare=prepare if p['mode']=='prepare'else None,publish=publish if p['mode']=='publish'else None)
 print(json.dumps([dict(id=r['id'],status=r['status'],stdout=r['stdout'])for r in results]),flush=True)
 '''
+
+
+class RegistryTransactionTests(unittest.TestCase):
+    def test_registry_reader_and_replacement_share_the_native_lock(self):
+        from remote_compute.bundle import atomic_json
+        from remote_compute.pipeline_control import _Controller
+        with scratch()as folder:
+            controller=_Controller(Path(folder),'registry-test')
+            atomic_json(controller.registry,dict(project='registry-test',ready_tasks=4,directories={},revision=0))
+            opened=threading.Event();release=threading.Event();observed=[]
+            original=Path.read_bytes
+            def read_bytes(path):
+                if path==controller.registry and threading.current_thread()is reader:
+                    with path.open('rb')as stream:
+                        opened.set()
+                        if not release.wait(5):raise RuntimeError('Reader not released')
+                        return stream.read()
+                return original(path)
+            def write():
+                with controller.transaction()as value:
+                    value['revision']+=1;controller.save(value)
+            reader=threading.Thread(target=lambda:observed.append(controller.read()))
+            with patch.object(Path,'read_bytes',read_bytes),ThreadPoolExecutor(1)as writers:
+                reader.start()
+                try:
+                    self.assertTrue(opened.wait(3))
+                    writing=writers.submit(write)
+                    # Longer than atomic_json's full Windows replacement
+                    # retry window; an unlocked reader makes that write fail.
+                    time.sleep(.8)
+                    self.assertFalse(writing.done())
+                finally:release.set();reader.join(timeout=3)
+                writing.result(timeout=3)
+            self.assertEqual(observed[0]['revision'],0)
+            self.assertEqual(controller.read()['revision'],1)
 
 
 class ProcessPipelineTests(unittest.TestCase):

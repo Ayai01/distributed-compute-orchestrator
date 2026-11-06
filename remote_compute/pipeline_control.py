@@ -62,11 +62,16 @@ class _Controller:
         self.configuration=threading.Lock();self.window=None;self.pools=();self.next_reap=0.
         self.registry=self.path/'executions.json'
 
-    def read(self):
+    def _read(self):
         value=json.loads(self.registry.read_bytes())if self.registry.exists()else dict(
             project=self.project,ready_tasks=None,directories={})
         if value['project']!=self.project:raise ValueError('Execution registry belongs to another project')
         return value
+
+    def read(self):
+        # Windows readers must share the writer's short index lock: an open
+        # read handle otherwise denies the writer's atomic replacement.
+        with self.transaction()as value:return value
 
     @contextmanager
     def transaction(self):
@@ -78,7 +83,7 @@ class _Controller:
             except Conflict:
                 if time.monotonic()>=deadline:raise
                 time.sleep(.01)
-        try:yield self.read()
+        try:yield self._read()
         finally:lock.close()
 
     def save(self,value):atomic_json(self.registry,value)

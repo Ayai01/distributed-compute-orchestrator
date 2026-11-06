@@ -818,6 +818,7 @@ class Worker:
         job['parent_memory_mb']=task['memory_mb']
         work = directory / "input"
         deadline = time.monotonic() + task["timeout"]
+        result['deadline']=time.time()+max(0,deadline-time.monotonic())
         state, error = "succeeded", None
         cpu_seconds = 0.0
         accounting = None
@@ -850,7 +851,8 @@ class Worker:
             low_integrity_directory(temporary)
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
-                               REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
+                               REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'],
+                               REMOTE_COMPUTE_DEADLINE=str(deadline))
             callback=job.get('callback',{})
             polling=callback.get('mode')=='poll'
             if polling:callback={**self.callback,**callback}
@@ -889,6 +891,9 @@ class Worker:
                             return value
                         atomic_json(work/'.dco-execution.json',expand(job['execution']))
                     argv=[value.replace('${cpus}',str(task['cpus']))for value in frozen]
+                    if time.monotonic()>=deadline:
+                        state='timed_out'
+                        break
                     step = {"argv": argv, "started": time.time(), "returncode": None}
                     with self.condition:
                         job['rss_sampled'] = False
@@ -959,26 +964,39 @@ class Worker:
         finally:
             self._clean_temp(job)
             self._clean_work(job)
-            with self.condition:
-                self.accelerator_reservations.pop(result['id'], None)
+            while True:
                 if job["cancel"].is_set() and state == "succeeded":
                     state = "cancelled"
-                result.update(status=state, finished=time.time())
-                job["rss_mb"] = 0
-                if error:
-                    result["error"] = error
-                for name in ("stdout", "stderr"):
-                    path = directory / (name + ".log")
-                    if path.exists():
-                        with path.open("rb") as stream:
-                            stream.seek(max(0, path.stat().st_size - 16384))
-                            result[name] = stream.read().decode("utf-8", errors="replace")
-                result["elapsed"] = result["finished"] - result["started"]
-                self._save(job)
-                self.used -= task["cpus"]
-                self.threads.discard(threading.current_thread())
-                archive_job(self.jobs, job)
-                self.condition.notify_all()
+                if 'execution'in task:
+                    try:
+                        from .execution import finish_execution
+                        finish_execution(work/'.dco-results.json',state,error,spec=job['execution'])
+                    except Exception as exc:
+                        result['execution_state_error']=str(exc)
+                with self.condition:
+                    # A cancellation can arrive while the manifest is written
+                    # outside the scheduler lock. Repeat that one transition
+                    # before making the terminal receipt available to fetch.
+                    if job['cancel'].is_set()and state=='succeeded':
+                        state='cancelled';continue
+                    self.accelerator_reservations.pop(result['id'], None)
+                    result.update(status=state, finished=time.time())
+                    job["rss_mb"] = 0
+                    if error:
+                        result["error"] = error
+                    for name in ("stdout", "stderr"):
+                        path = directory / (name + ".log")
+                        if path.exists():
+                            with path.open("rb") as stream:
+                                stream.seek(max(0, path.stat().st_size - 16384))
+                                result[name] = stream.read().decode("utf-8", errors="replace")
+                    result["elapsed"] = result["finished"] - result["started"]
+                    self._save(job)
+                    self.used -= task["cpus"]
+                    self.threads.discard(threading.current_thread())
+                    archive_job(self.jobs, job)
+                    self.condition.notify_all()
+                    break
 
     def _automatic_grant(self,job):
         """Prepare a real kernel grant before expanding its argv and thread env."""

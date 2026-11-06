@@ -39,6 +39,8 @@ def _function(value):
 
 
 def _item(function,item,kwargs):
+    from remote_compute.deadline import check_deadline
+    check_deadline()
     return _function(function)(item,**kwargs)
 
 
@@ -207,9 +209,13 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             if on_capacity:on_capacity(grants.cpus)
             while (not failures and not(stop and stop())and position<len(items)and len(active)<limit
                     and (ready_slots is None or ready_slots()>0)):
+                from remote_compute.deadline import check_deadline
+                try:check_deadline()
+                except TimeoutError as error:
+                    failures.append(error);break
                 operation=_process_item if backend=='process'else _thread_item
-                future=pool.submit(operation,function,items[position],kwargs)
                 if on_start:on_start(position)
+                future=pool.submit(operation,function,items[position],kwargs)
                 active[future]=position;position+=1
                 future.add_done_callback(completed.put)
             stopped=bool(failures or stop and stop())
@@ -373,6 +379,8 @@ def iter_items(function,items,*,kwargs=None,backend='process',stop_when=None,lim
 
 def run_call(function,*,limits=None,**kwargs):
     """Execute a numerical kernel using the grant prepared by the DCO worker."""
+    from remote_compute.deadline import check_deadline
+    check_deadline()
     if os.environ.get('REMOTE_COMPUTE_WORKER')!='1':
         raise RuntimeError('Submit python_call to DCO before executing its kernel')
     if os.environ.get('DCO_ITEM_PROCESS')=='1'or getattr(_local,'item',False)or getattr(_local,'kernel',False):return _function(function)(**kwargs)
@@ -418,26 +426,58 @@ def run_call(function,*,limits=None,**kwargs):
         if lease:lease.refresh(active_cpus=0,ready_cpus=0)
 
 
+def finish_execution(path,status,error=None,*,spec=None):
+    """Finalize only SDK state after its process tree exits; retain paid outputs."""
+    from remote_compute.bundle import atomic_json
+    path=Path(path)
+    if path.is_file():
+        value=json.loads(path.read_text(encoding='utf8'))
+        if 'item_states'not in value:return
+    elif spec is not None:
+        total=len(spec['items'])if spec['mode']=='map'else 1
+        value=dict(completed=0,total=total,items=[],item_states=[dict(index=i,status='pending')for i in range(total)])
+    else:return
+    now=time.time()
+    for item in value['item_states']:
+        if item['status']in ('pending','running'):
+            item.update(status='not_started'if item['status']=='pending'else 'interrupted',finished=now)
+    value.update(status=status,error=error or value.get('error'))
+    atomic_json(path,value)
+
+
 def main(path):
+    from remote_compute.bundle import atomic_json
+    from remote_compute.deadline import check_deadline
     spec=json.loads(Path(path).read_text(encoding='utf8'));validate_execution(spec)
     output=Path('.dco-results.json');records={};error=None
+    total=len(spec['items'])if spec['mode']=='map'else 1
+    states=[dict(index=i,status='pending')for i in range(total)]
+    def save(status='running'):
+        atomic_json(output,dict(completed=len(records),total=total,status=status,
+            items=[records[i]for i in sorted(records)],item_states=states,error=str(error)if error else None))
+    def started(index):
+        states[index].update(status='running',started=time.time());save()
     def publish(index,value,failure):
-        from remote_compute.bundle import atomic_json
         records[index]=dict(index=index,status='failed'if failure else'succeeded',value=value,error=failure)
-        atomic_json(output,dict(completed=len(records),total=len(spec['items'])if spec['mode']=='map'else 1,items=[records[i]for i in sorted(records)]))
+        states[index].update(status=records[index]['status'],finished=time.time());save()
+    save()
     try:
+        check_deadline()
         if spec['mode']=='call':
+            started(0)
             value=run_call(spec['function'],**spec['kwargs']);publish(0,value,None)
         elif spec['mode']=='entry':
+            started(0)
             _single_threaded(False)
             value=_function(spec['function'])(**spec['kwargs']);publish(0,value,None)
-        else:map_items(spec['function'],spec['items'],kwargs=spec['kwargs'],backend=spec.get('backend','process'),on_result=publish)
+        else:_map_items(spec['function'],spec['items'],kwargs=spec['kwargs'],backend=spec.get('backend','process'),on_start=started,on_result=publish)
     except BaseException as caught:
         error=caught
+        if spec['mode']!='map'and states[0]['status']=='running':
+            states[0].update(status='failed',finished=time.time())
     finally:
-        from remote_compute.bundle import atomic_json
-        atomic_json(output,dict(completed=len(records),total=len(spec['items'])if spec['mode']=='map'else 1,
-            status='failed'if error else'succeeded',items=[records[i]for i in sorted(records)],error=str(error)if error else None))
+        save('failed'if error else'succeeded')
+        finish_execution(output,'failed'if error else'succeeded')
     if error:raise error
 
 

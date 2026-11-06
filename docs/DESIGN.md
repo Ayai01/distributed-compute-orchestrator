@@ -56,6 +56,10 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 `map_items`可提供`on_result(index, value, error)`，逐项持久化业务检查点；`python_map`在`.dco-results.json`写入已完成项及最终状态。直接任务声明的返回值须可JSON序列化，大数组、模型及科学记录写声明输出，返回其必要索引。映射项内部的嵌套调用共用该项的1核，不额外借核。
 
+任务`timeout`覆盖整个运输的执行墙钟时间，与网络RPC超时分开。worker向整个子进程树提供同一单调时钟期限`REMOTE_COMPUTE_DEADLINE`，回执`deadline`记录对应UTC时间戳。`remaining_time()`返回剩余秒数，在DCO任务外返回`None`；`check_deadline(reserve_seconds=...)`在剩余时间进入业务落盘预留时抛出`TimeoutError`。业务在真实评价与记账边界检查，沿既有异常路径发布已付前缀、原ID和恢复索引。预留属于原任务时限，硬时限保持。
+
+`.dco-results.json.items`保存已返回结果；独立的`item_states`按原输入索引记录`pending/running/succeeded/failed`及起止时间。SDK在启动前持久标记该输入的执行尝试；进程树退出后，worker将仍在运行的项标为`interrupted`、未有启动尝试的项标为`not_started`，保留完成结果，顶层状态与运输终态一致。评价次数沿业务账本读取。框架记录执行身份和输出，科学数组与付费前缀由业务及时发布；硬终止后的未知付费量保留为未知。
+
 `python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items(..., backend="thread")`，DCO按输入数动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，单项固定1核，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
 
 `iter_items(function, items, backend=..., stop_when=..., limits=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。
