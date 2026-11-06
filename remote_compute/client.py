@@ -742,6 +742,7 @@ class Node:
     known_assets: set = field(default_factory=set)
     known_jobs: set = field(default_factory=set)
     live_jobs: set = field(default_factory=set)
+    memory_holds: dict = field(default_factory=dict)
     host_ip: str = ""
     aliases: list = field(default_factory=list)
     accelerator_reservations: dict = field(default_factory=dict)
@@ -772,7 +773,11 @@ class Node:
     @property
     def memory_unreported(self):
         reported=sum(job.get('memory_mb',0) for job in self.health.get('active_jobs',()) if job['id'] in self.live_jobs)
-        return max(0,self.reserved_memory_mb-reported)
+        return max(0,self.reserved_memory_mb-reported)+sum(row['amount'] for row in self.memory_holds.values())
+
+    def memory_credit(self, identity, declared):
+        job=next((j for j in self.health.get('active_jobs',()) if j['id']==identity),None)
+        return min(job.get('memory_reservation_mb',declared),job.get('memory_commit_reservation_mb',declared)) if job else declared
 
     @property
     def memory_accounted(self):
@@ -918,6 +923,7 @@ class Pool:
                 or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
             raise ValueError("Node weight must be positive; limit is 0/auto or a positive integer")
     def _probe(self, node, full=False, reconnect=False, generation=None):
+        probe_started=time.monotonic()
         client=node.client
         generation = node.connection_generation if generation is None else generation
         try:
@@ -945,6 +951,9 @@ class Pool:
                     return
                 node.last_connected_at=time.monotonic()
                 node.health={**node.health,**value}
+                for identity,row in list(node.memory_holds.items()):
+                    if row.get('after') is not None and probe_started>=row['after']:
+                        node.memory_holds.pop(identity,None)
                 actual_name = value.get('node')
                 renamed = bool(previous_name and actual_name and actual_name != previous_name
                                and actual_name != node.name and actual_name not in node.aliases)
@@ -953,8 +962,9 @@ class Pool:
                 running=[job for job in jobs if job['status']=='running']
                 node.external=sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
                 node.refresh_external_accelerators(running)
-                owned_memory=sum(((job.get('rss_mb') or job['memory_mb']) if value.get('memory_accounting')=='rss' and not job.get('memory_modeled') else
-                                  max(job['memory_mb'],job.get('rss_mb',0))) for job in running if job['id'] in node.known_jobs)
+                owned_memory=sum(job.get('memory_reservation_mb',
+                    (job.get('rss_mb') or job['memory_mb']) if value.get('memory_accounting')=='rss' and not job.get('memory_modeled') else
+                    max(job['memory_mb'],job.get('rss_mb',0))) for job in running if job['id'] in node.known_jobs)
                 node.external_memory_mb=max(0,value.get('memory_reserved_mb',0)-owned_memory)
                 node.known_jobs.intersection_update({job['id'] for job in jobs}|node.live_jobs)
                 if reconnect and node.detached:
@@ -1331,6 +1341,7 @@ class Pool:
             node.reserved -= task.get("cpus", 1)
             node.reserved_memory_mb -= task.get("memory_mb", 256)
             node.live_jobs.discard(job_id)
+            node.memory_holds.pop(job_id,None)
             if result is None:
                 # A lost connection can leave the worker running this job;
                 # its next health snapshot must account for that work.

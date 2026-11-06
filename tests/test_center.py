@@ -598,11 +598,11 @@ class CenterTests(unittest.TestCase):
     def test_freed_cpu_waits_for_running_phase_growth_before_lending_again(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker),Pool([worker]) as pool:
             with center(pool,Path(root)/'center') as (state,client):
-                sleep="import time;time.sleep(30)"
+                sleep="import time;print('ready',flush=True);time.sleep(30)"
                 borrowers=[client.submit(python(sleep,max_cpus=1,memory_mb=64,project='Bench'))['id'] for _ in range(3)]
                 until(lambda:all(client.status(i)['status']=='running' for i in borrowers))
                 active=client.submit(python(sleep,max_cpus=1024,memory_mb=64,project='ARH'))['id']
-                until(lambda:client.status(active)['status']=='running')
+                until(lambda:'ready'in client.logs(active)['stdout'])
                 original=client.status(active)['request_sha256']
                 self.assertEqual(client.resize(active,2)['cpus'],1)
                 waiting=client.submit(python(sleep,max_cpus=1,memory_mb=64,project='Bench'))['id']
@@ -1401,11 +1401,11 @@ class CenterTests(unittest.TestCase):
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
 
     def test_capped_auto_window_counts_partial_grants_and_keeps_prefetch_bounded(self):
-        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
+        hold="from pathlib import Path;import time\nprint('ready',flush=True)\nwhile not Path('release').exists():time.sleep(.02)"
         with scratch() as root, provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
                 ids=[client.submit(python(hold,max_cpus=2,project='capped'))['id'] for _ in range(2)]
-                until(lambda:all(client.status(identity)['status']=='running' for identity in ids))
+                until(lambda:all('ready' in client.logs(identity)['stdout'] for identity in ids))
                 for identity in ids:client.resize(identity,0)
                 self.assertEqual(client.health()['used_cpus'],4)
                 client.resize(ids[0],1)

@@ -1310,6 +1310,11 @@ class Coordinator:
                     raise Conflict('Only a running task can change its CPU grant')
                 old=job['task']['cpus']
                 old_memory=job['task']['memory_mb']
+                if all(value is None for value in (memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb)):
+                    current=job.get('phase_memory',job['task'].get('memory_model')) or {}
+                    if 'base_memory_mb' in current:
+                        base_memory_mb=current['base_memory_mb'];memory_per_cpu_mb=current['memory_per_cpu_mb']
+                        memory_limit_mb=current.get('memory_limit_mb')
                 modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
                 capabilities=node.health.get('capabilities',[])
                 if ('resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities)
@@ -1346,10 +1351,12 @@ class Coordinator:
                 # The report describes work already in flight. Return only
                 # unoccupied slots, then let the owner refill from the grant.
                 granted=max(active_floor,granted)
+                changes_memory=(memory_mb is not None and memory_mb!=old_memory) or modeled
+                credit=node.memory_credit(job.get('worker_id',identity),old_memory) if changes_memory else old_memory
                 granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
-                    old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
+                    credit+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
                 memory=old_memory if memory is None else memory
-                extra=max(0,memory-old_memory)
+                extra=max(0,memory-credit)
                 if granted<active_floor or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
                     if previous_desired is None:job.pop('desired_cpus',None)
                     else:job['desired_cpus']=previous_desired
@@ -1359,13 +1366,20 @@ class Coordinator:
                                      dict(memory_mb=old_memory if memory_mb is None else memory_mb))
                 active_changed=job['result'].get('active_cpus',0)!=(active_cpus or 0)
                 job['result'].update(active_cpus=active_cpus or 0,requested_cpus=cpus)
-                if granted==old and memory==old_memory and not job.get('resize_uncertain') and not active_changed:
+                previous_phase=previous_memory or job['task'].get('memory_model') or dict(memory_mb=old_memory)
+                phase_changed=({key:value for key,value in previous_phase.items() if value is not None} !=
+                               {key:value for key,value in job['phase_memory'].items() if value is not None})
+                if granted==old and memory==old_memory and not phase_changed and not job.get('resize_uncertain') and not active_changed:
                     self._publish(job)
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
                 # Reserve increases before the RPC; return decreases after its ack.
                 held,held_memory=max(old,granted),max(old_memory,memory)
                 node.reserved+=held-old
                 node.reserved_memory_mb+=held_memory-old_memory
+                worker_id=job.get('worker_id',identity)
+                reclaimed=max(0,old_memory-credit) if changes_memory else 0
+                if reclaimed:
+                    node.memory_holds[worker_id]={'amount':max(reclaimed,node.memory_holds.get(worker_id,{}).get('amount',0)), 'after':None}
                 job['task']['cpus']=job['result']['cpus']=held
                 job['task']['memory_mb']=job['result']['memory_mb']=held_memory
                 self._publish(job)
@@ -1379,13 +1393,17 @@ class Coordinator:
                     job['task']['cpus']=job['result']['cpus']=actual
                     job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
                     if self.jobs.get(identity) is job:self._save(job)
+                    hold=node.memory_holds.get(job.get('worker_id',identity))
+                    if hold is not None:hold['after']=time.monotonic()
                     self.pool.condition.notify_all()
                     self.condition.notify_all()
 
             try:
                 worker_id=job.get('worker_id',identity)
                 options={}
-                if memory_mb is not None or modeled:options['memory_mb']=memory
+                if modeled:
+                    options.update(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
+                elif memory_mb is not None:options['memory_mb']=memory
                 if active_cpus is not None:options['active_cpus']=active_cpus
                 result=node.client.resize(worker_id,granted,**options)
             except RemoteError as error:

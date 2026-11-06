@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from remote_compute.worker import Worker
 from remote_compute.client import Node, Pool
+from remote_compute.memory import MemoryObservation
 from test_compute import provider, python, scratch, until
 from test_center import center
 
@@ -59,10 +60,12 @@ class MemoryPolicyTests(unittest.TestCase):
         worker.host=Mock();worker.host.sample.return_value=dict(memory_total_mb=48*GIB,host_memory_available_mb=24*GIB)
         worker.memory_capacity=32*GIB;worker.memory_reserve=16*GIB
         worker.memory_headroom=8*GIB;worker.memory_budget=0
-        worker.jobs={'running':dict(result=dict(status='running'),task=dict(memory_mb=10*GIB),rss_mb=4*GIB,rss_sampled=True)}
+        observation=MemoryObservation(now=0)
+        for now in (0,1,2):observation.observe(4*GIB,now=now)
+        worker.jobs={'running':dict(result=dict(status='running'),task=dict(memory_mb=10*GIB),rss_mb=4*GIB,rss_sampled=True,memory_observation=observation)}
         state=worker._memory_state()
-        self.assertEqual(state['memory_available_mb'],16*GIB)
-        self.assertEqual(state['memory_reserved_mb'],4*GIB)
+        self.assertEqual(state['memory_available_mb'],15*GIB)
+        self.assertEqual(state['memory_reserved_mb'],5*GIB)
         self.assertEqual(state['memory_requested_mb'],10*GIB)
         # Lowering the budget does not rewrite the task's existing grant.
         worker.memory_capacity=3*GIB
