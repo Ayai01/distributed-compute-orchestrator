@@ -20,6 +20,7 @@ DCO操作员独占共享DCO源码、设备配置、能力登记和部署。调�
 - stop_when停止新增并排空；cancel_when沿本次调用拥有的原ID取消并收齐，仍持久发布部分结果和费用。各批次独立管理业务取消条件，不另写取消/状态控制循环。
 - 执行器由DCO管理在途授权与真实就绪需求，按授权调整进程池及内层线程；外层/内层合计不超过授权，串行及长尾及时归还，滚动池只归还空槽。工程使用python_map/python_call及client.execute，不维护执行池或显式借核循环。
 - 窗口、任务和执行器使用一致的max_cpus/requires和内存需求。pending计入受理未明、排队、运行及终态未持久发布的原ID；按 `fetch(delete=False)`、持久发布结果/费用/恢复状态、`delete` 的顺序释放位置并补位。查询用statuses/wait_any或有界页，不高频读取全部历史。
+- 已知冷准备峰值由父任务首槽容纳；不同工作集的映射、流及数值阶段使用map_items/iter_items/run_call的limits分别声明内存。线性模型的base覆盖常驻编排，per-CPU按实测单项工作集；按真实独立项数表达并行需求，不用空内核借核，不把编译预留复制到每个数值项。
 - 工程使用capabilities汇总视图及真实语义能力，不读取节点清单、指定设备或用设备/OS/工具构建身份包装能力白名单。工具环境维护和路由由操作员负责。数值差异沿实际数组、输入、依赖和执行路径定位，验收协议与容差保持。
 - 运行能力仅公布ng47、hsp、chisel、ml、cuda、layout、rtl、onnx。Python/C++为基础环境，不列为能力。Python统一使用`${tool:python}`；Torch声明`ml`，GPU另声明accelerator。禁止新增Python包组合、工程名和设备名后缀；依赖补齐及CPU/ML/CUDA绑定统一由操作员在python_runtimes维护。
 

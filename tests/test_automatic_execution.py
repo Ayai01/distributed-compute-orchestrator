@@ -96,9 +96,79 @@ def shared(value):
         fresh=value not in cache
         if fresh:cache[value]=value*2
     return dict(value=cache[value],new=fresh,pid=os.getpid(),threads=os.environ['REMOTE_COMPUTE_CPUS'],nested=run_call(lambda:1))
+def observed_memory():
+    from remote_compute import Client
+    state=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN','')).status(os.environ['REMOTE_COMPUTE_JOB_ID'])
+    return dict(cpus=state['cpus'],memory_mb=state['memory_mb'])
+def memory_item(value):
+    state=observed_memory();start=time.time();time.sleep(.45)
+    return dict(value=value,state=state,started=start,finished=time.time())
+def phased_memory(backend,stream):
+    from remote_compute import map_items,iter_items,run_call
+    cold=run_call(observed_memory,limits=dict(max_cpus=1,memory_mb=2304))
+    limits=dict(max_cpus=8,base_memory_mb=512,memory_per_cpu_mb=896)
+    if stream:
+        with iter_items('business:memory_item',range(8),backend=backend,limits=limits)as completed:
+            values=[item.value for item in completed]
+    else:values=map_items('business:memory_item',range(8),backend=backend,limits=limits)
+    idle=observed_memory()
+    serial=run_call(observed_memory,limits=dict(max_cpus=1,memory_mb=1536))
+    return dict(cold=cold,values=values,idle=idle,serial=serial,parent=json.loads(os.environ['REMOTE_COMPUTE_MEMORY_MODEL']))
+def expensive_map():
+    from remote_compute import map_items
+    return map_items('business:unexpected_item',[1],limits=dict(memory_mb=1024))
+def capped_map(stream):
+    from remote_compute import map_items,iter_items
+    options=dict(backend='thread',limits=dict(max_cpus=2,memory_mb=512))
+    if stream:
+        with iter_items('business:evaluate',range(8),**options)as completed:
+            return [item.value for item in completed]
+    return map_items('business:evaluate',range(8),**options)
+def unexpected_item(value):
+    from pathlib import Path
+    Path('unexpected-item').write_text('started without phase memory')
+    return value
 '''
 
 class AutomaticExecutionTests(unittest.TestCase):
+    def test_map_and_stream_replace_cold_memory_before_launch_and_return_tail_ram(self):
+        for backend,stream in [('process',False),('thread',False),('process',True)]:
+            with self.subTest(backend=backend,stream=stream),scratch()as root,provider(Path(root)/'worker',cpus=8,memory_mb=8192)as(_,client):
+                task=python_task('business:phased_memory',kwargs=dict(backend=backend,stream=stream),
+                    max_cpus=8,base_memory_mb=512,memory_per_cpu_mb=1792)
+                r=client.run(task,files={'business.py':'import json\n'+FUNCTIONS})
+                self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+                result=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+                self.assertEqual(result['cold'],dict(cpus=1,memory_mb=2304))
+                self.assertEqual(result['parent'],dict(base_memory_mb=512,memory_per_cpu_mb=1792))
+                self.assertEqual(result['idle'],dict(cpus=1,memory_mb=1408))
+                self.assertEqual(result['serial'],dict(cpus=1,memory_mb=1536))
+                self.assertEqual(sorted(v['value']for v in result['values']),list(range(8)))
+                for value in result['values']:
+                    self.assertEqual(value['state']['memory_mb'],512+896*value['state']['cpus'])
+                concurrency=max(sum(v['started']<=point<v['finished']for v in result['values'])for point in [v['started']for v in result['values']])
+                self.assertEqual(concurrency,8)
+
+    def test_unfunded_map_phase_fails_before_its_first_item(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2,memory_mb=512)as(_,client):
+            task=python_task('business:expensive_map',max_cpus=2,memory_mb=64,outputs=['unexpected-item'])
+            r=client.run(task,files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'failed')
+            self.assertIn('Insufficient memory for resource resize',r['stderr'])
+            self.assertNotIn('unexpected-item',r['files'])
+
+    def test_map_and_stream_phase_cap_bounds_real_parallelism(self):
+        for stream in (False,True):
+            with self.subTest(stream=stream),scratch()as root,provider(Path(root)/'worker',cpus=8)as(_,client):
+                task=python_task('business:capped_map',kwargs=dict(stream=stream),max_cpus=8)
+                r=client.run(task,files={'business.py':FUNCTIONS})
+                self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+                self.assertEqual(r['peak_cpus'],2)
+                values=json.loads(r['files']['.dco-results.json'])['items'][0]['value']
+                concurrency=max(sum(v['started']<=point<v['finished']for v in values)for point in [v['started']for v in values])
+                self.assertEqual(concurrency,2)
+
+
     def test_memory_resize_rejection_keeps_the_kernel_running_on_its_funded_grant(self):
         from unittest.mock import patch
         from remote_compute.worker import Conflict

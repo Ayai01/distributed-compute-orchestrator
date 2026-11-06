@@ -83,9 +83,24 @@ def _process_item(function,item,kwargs):
         return value['value']
 
 
+def _phase_resources(maximum,limits):
+    limits=dict(limits or {})
+    memory_fields={'memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb'}
+    if set(limits)-memory_fields-{'max_cpus'}:raise ValueError('Phase limits declare max_cpus and memory requirements')
+    if 'max_cpus'in limits:
+        if type(limits['max_cpus'])is not int or limits['max_cpus']<1:raise ValueError('Phase max_cpus requires a positive integer')
+        maximum=min(maximum,limits['max_cpus'])
+    if limits.get('memory_mb')is not None and any(limits.get(key)is not None for key in memory_fields-{'memory_mb'}):
+        raise ValueError('Declare fixed memory_mb or a base/per-CPU memory model')
+    model=json.loads(os.environ.get('REMOTE_COMPUTE_MEMORY_MODEL','{}'))
+    if memory_fields.intersection(limits):model={key:value for key,value in limits.items()if key in memory_fields}
+    return maximum,model
+
+
 class _Grants:
     """Only the executor exchanges resource messages; business code sees results."""
-    def __init__(self,maximum):
+    def __init__(self,maximum,limits=None):
+        maximum,model=_phase_resources(maximum,limits)
         self.maximum=maximum
         self.cpus=min(maximum,max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1'))))
         self.condition=threading.Condition();self.active=self.ready=0
@@ -95,8 +110,12 @@ class _Grants:
         if url and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
             from remote_compute import Client
             client=Client(url,os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
-            model=json.loads(os.environ.get('REMOTE_COMPUTE_MEMORY_MODEL','{}'))
             self.lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=maximum,cpus=self.cpus,**model)
+            if limits:
+                # Apply a phase's RAM model before launching even its first
+                # item. Keep that ready demand until the executor reports it.
+                self.cpus=self.lease.refresh(active_cpus=0,ready_cpus=maximum)
+                self.ready=maximum
             self.thread=threading.Thread(target=self._run,name='dco-executor-resources',daemon=True)
             self.thread.start()
 
@@ -145,7 +164,7 @@ class _Grants:
             self.lease.refresh(active_cpus=0,ready_cpus=0)
 
 
-def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None):
+def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None,limits=None):
     """Evaluate independent business inputs; DCO owns all resource management.
 
     Functions are importable module:function names or top-level callables.
@@ -171,7 +190,8 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             if on_result:on_result(index,value,None)
         return values if collect else position
     maximum=min(len(items),max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',os.cpu_count()or 1))))
-    grants=_Grants(maximum);position=0;active={};values=[None]*len(items)if collect else None;failures=[];completed=Queue()
+    grants=_Grants(maximum,limits);maximum=grants.maximum
+    position=0;active={};values=[None]*len(items)if collect else None;failures=[];completed=Queue()
     if backend=='thread':
         _single_threaded(False);function=_function(function)
         try:
@@ -224,9 +244,9 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
         grants.report(0,0);grants.close()
 
 
-def map_items(function,items,*,kwargs=None,backend='process',on_result=None):
-    """Evaluate independent inputs; return values in input order."""
-    return _map_items(function,items,kwargs=kwargs,backend=backend,on_result=on_result)
+def map_items(function,items,*,kwargs=None,backend='process',on_result=None,limits=None):
+    """Evaluate independent inputs with optional phase CPU/RAM limits."""
+    return _map_items(function,items,kwargs=kwargs,backend=backend,on_result=on_result,limits=limits)
 
 
 ItemResult=namedtuple('ItemResult','index value error')
@@ -241,9 +261,10 @@ class StreamResultsPending(RuntimeError):
 
 class ItemStream:
     """SDK-owned completion stream; stop new work and drain accepted items."""
-    def __init__(self,function,items,kwargs,backend,stop_when):
+    def __init__(self,function,items,kwargs,backend,stop_when,limits=None):
         items=list(items)
         ceiling=min(max(1,len(items)),max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',os.cpu_count()or 1))))
+        limits=dict(limits or {});ceiling,_=_phase_resources(ceiling,limits)
         self.window=min(ceiling,max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1'))))
         self.queue=Queue(maxsize=ceiling+1);self.cancel=threading.Event();self.finished=False
         self.error=None;self.started=0;self.items=list(items);self.end=object()
@@ -268,7 +289,7 @@ class ItemStream:
             try:
                 _map_items(function,self.items,kwargs=kwargs,backend=backend,collect=False,
                     stop=lambda:self.cancel.is_set()or bool(stop_when and stop_when()),
-                    on_result=publish,ready_slots=slots,on_start=started,on_capacity=capacity,ready_demand=demand)
+                    on_result=publish,ready_slots=slots,on_start=started,on_capacity=capacity,ready_demand=demand,limits=limits)
             except BaseException as error:self.error=error
             finally:self.queue.put_nowait(self.end)
         self.thread=threading.Thread(target=produce,name='dco-completions')
@@ -340,14 +361,14 @@ class ItemStream:
             if self.error:raise self.error
 
 
-def iter_items(function,items,*,kwargs=None,backend='process',stop_when=None):
+def iter_items(function,items,*,kwargs=None,backend='process',stop_when=None,limits=None):
     """Yield index/value/error in completion order; use as a context manager.
 
     stop() stops new launches; continue iteration to publish in-flight results.
     Outstanding results plus active items fit one useful execution window.
     Early exit preserves unconsumed results and reports StreamResultsPending.
     """
-    return ItemStream(function,items,kwargs,backend,stop_when)
+    return ItemStream(function,items,kwargs,backend,stop_when,limits)
 
 
 def run_call(function,*,limits=None,**kwargs):
@@ -367,20 +388,11 @@ def run_call(function,*,limits=None,**kwargs):
         if stream.error:raise stream.error
     lease=None;actual=max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1')))
     maximum=max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',actual)))
-    limits=dict(limits or {})
-    memory_fields={'memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb'}
-    if set(limits)-memory_fields-{'max_cpus'}:raise ValueError('Kernel limits declare max_cpus and memory requirements')
-    if 'max_cpus'in limits:
-        if type(limits['max_cpus'])is not int or limits['max_cpus']<1:raise ValueError('Kernel max_cpus requires a positive integer')
-        maximum=min(maximum,limits['max_cpus'])
-    if limits.get('memory_mb')is not None and any(limits.get(key)is not None for key in memory_fields-{'memory_mb'}):
-        raise ValueError('Declare fixed memory_mb or a base/per-CPU memory model')
+    maximum,model=_phase_resources(maximum,limits)
     actual=min(actual,maximum)
     if os.environ.get('REMOTE_COMPUTE_URL')and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
         from remote_compute import Client
         client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
-        model=json.loads(os.environ.get('REMOTE_COMPUTE_MEMORY_MODEL','{}'))
-        if memory_fields.intersection(limits):model={key:value for key,value in limits.items()if key in memory_fields}
         lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=max(maximum,actual),cpus=actual,**model)
         actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
         lease.refresh(active_cpus=actual,ready_cpus=0)

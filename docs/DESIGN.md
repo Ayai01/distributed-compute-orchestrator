@@ -47,7 +47,8 @@ results = client.execute(plan, project='my-project',
 
 ```python
 from remote_compute import map_items, run_call
-values = map_items('business:evaluate', ready_inputs, kwargs={'mode': 'native'})
+values = map_items('business:evaluate', ready_inputs, kwargs={'mode': 'native'},
+                   limits={'base_memory_mb': 512, 'memory_per_cpu_mb': 896})
 result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 ```
 
@@ -55,11 +56,13 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 `python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items(..., backend="thread")`，DCO按输入数动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，单项固定1核，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
 
-`iter_items(function, items, backend=..., stop_when=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。
+`iter_items(function, items, backend=..., stop_when=..., limits=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。
 
 提前离开上下文时，SDK收齐已开始的工作，将未消费记录的原索引、输入、结果和错误保存到声明输出`.dco-streams/`，并抛出`StreamResultsPending`；其`results/recovery_dir`供业务继续发布。正常消费完毕不生成该目录。恢复记录为本任务可信pickle文件，工程持久发布后随运输副本回收。
 
 串行业务编排使用`python_task`；在原有排空边界进入训练时，`run_call`先等该原ID的SDK stream完成资源归还并检查错误，再取得数值阶段授权。仍有未启动输入的活跃流应先收齐或停止并排空，避免等待消费者自身而死锁。`run_call(..., limits={"max_cpus":8, ...})`声明阶段有用上限和可选内存需求，不改变父任务上限。
+
+`map_items`、`iter_items`和`run_call`均接受阶段`limits`：`max_cpus`取父任务上限内的有用宽度；内存使用固定`memory_mb`或`base_memory_mb + memory_per_cpu_mb × 实际授权CPU`模型，线性模型可加`memory_limit_mb`。省略内存字段时继承父任务模型，显式内存字段替换本阶段模型；父任务声明和后续阶段默认值保持。映射在第一项启动前完成该阶段资源协商，随后按真实在途与就绪项扩缩；尾项结束归还空槽及对应RAM。已知冷编译峰值须由父任务首槽容纳，数值阶段按实测工作集声明，避免把编译预留沿用到每个并行数值项。
 
 ## 持久准备与收齐
 
