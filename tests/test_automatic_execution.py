@@ -131,6 +131,32 @@ def unexpected_item(value):
 '''
 
 class AutomaticExecutionTests(unittest.TestCase):
+    def test_map_continues_after_retained_center_reply_timeout_without_repeating_items(self):
+        code=FUNCTIONS+'''
+def timeout_map():
+    from remote_compute import Client,RemoteError,map_items
+    original=Client.resize;seen=[]
+    def once(client,*args,**kwargs):
+        if not seen:
+            seen.append(1)
+            error=RemoteError('Center resource reply timed out; existing grant retained')
+            error.status_code=409
+            raise error
+        return original(client,*args,**kwargs)
+    Client.resize=once
+    try:
+        values=map_items('business:evaluate',range(8),limits=dict(max_cpus=4,base_memory_mb=32,memory_per_cpu_mb=32))
+        return dict(values=values,timeouts=len(seen))
+    finally:Client.resize=original
+'''
+        with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=4096)as(_,client):
+            task=python_task('business:timeout_map',max_cpus=4,base_memory_mb=32,memory_per_cpu_mb=32)
+            result=client.run(task,files={'business.py':code})
+            self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+            value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
+            self.assertEqual(value['timeouts'],1)
+            self.assertEqual(sorted(row['value']for row in value['values']),list(range(0,16,2)))
+
     def test_map_and_stream_replace_cold_memory_before_launch_and_return_tail_ram(self):
         for backend,stream in [('process',False),('thread',False),('process',True)]:
             with self.subTest(backend=backend,stream=stream),scratch()as root,provider(Path(root)/'worker',cpus=8,memory_mb=8192)as(_,client):

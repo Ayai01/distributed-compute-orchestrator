@@ -9,6 +9,28 @@ from test_center import center
 
 
 class PriorityControlTests(unittest.TestCase):
+    def test_running_reattach_keeps_original_dispatch_override(self):
+        from test_leases import HOLD
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker),Pool([worker])as pool:
+            with center(pool,Path(root)/'first',paused=True)as(state,client):
+                identity=client.submit(python(HOLD,priority=-3,max_cpus=1))['id']
+                client.control(job=identity,priority=2);client.control(paused=False)
+                until(lambda:client.status(identity)['status']=='running')
+                recovered=Path(root)/'second';target=recovered/'jobs'/identity;target.mkdir(parents=True)
+                with state.condition:
+                    for name in ('request.zip','result.json','admission.json'):
+                        source=state.root/'jobs'/identity/name
+                        if source.exists():shutil.copyfile(source,target/name)
+                before=(target/'request.zip').read_bytes()
+                (recovered/'history.index.jsonl').write_text(json.dumps(dict(id=identity,terminal=False,assets=[],worker=identity))+'\n')
+                with Pool([worker])as peers,center(peers,recovered,paused=True)as(restored,other):
+                    until(lambda:restored.jobs[identity].get('node')is not None)
+                    self.assertEqual(restored.jobs[identity]['task']['priority'],2)
+                    self.assertEqual((target/'request.zip').read_bytes(),before)
+                    other.write_job_file(identity,'release','done')
+                    client.wait(identity);other.wait(identity)
+                    self.assertEqual(other.status(identity)['dispatch_priority'],2)
+
     def test_override_reorders_queue_and_preserves_original_id_payload_and_receipt(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,node),Pool([node])as pool:
             with center(pool,Path(root)/'center',paused=True)as(state,client):

@@ -18,7 +18,7 @@ def _object(path):
 
 def _receipt(path, identity):
     value = _object(path)
-    if value.get('id') != identity or value.get('status') not in TERMINAL | {'queued', 'running'}:
+    if value.get('id') != identity or value.get('status') not in TERMINAL | {'queued', 'dispatching', 'running'}:
         raise ValueError('Invalid receipt identity/status: ' + str(path))
     return value
 

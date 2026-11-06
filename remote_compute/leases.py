@@ -42,9 +42,11 @@ class CpuLease:
                 grant = self.client.resize(self.identity, desired, active_cpus=active_cpus, **self.memory)
             except Exception as error:
                 if (getattr(error,'status_code',None)!=409 or
-                        'Insufficient memory for resource resize; existing grant retained'not in str(error)):
+                        not any(message in str(error)for message in (
+                            'Insufficient memory for resource resize; existing grant retained',
+                            'Center resource reply timed out; existing grant retained'))):
                     raise
-                # A refused increase leaves paid CPU/RAM usable. Re-read that
+                # A refused or unanswered resize leaves paid CPU/RAM usable. Re-read that
                 # grant: a new phase may need more memory than it can fund.
                 grant=self.client.status(self.identity)
                 available=grant.get('memory_mb',0)

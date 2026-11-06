@@ -889,6 +889,8 @@ class Coordinator:
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+                if 'dispatch_priority'in job['result']:
+                    task['priority']=job['result']['dispatch_priority']
                 self._restore_accelerator(task, job['result'])
                 automatic=task['cpus']==0;elastic=elastic_cpus(task)
                 grant=remote or job['result']
