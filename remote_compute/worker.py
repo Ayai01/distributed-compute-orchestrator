@@ -1569,6 +1569,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif parts[2:] == ['asset-handoff'] and self.command in {'POST','DELETE'}:
                     value=worker.asset_handoff(identity,json.loads(body)['assets'] if self.command=='POST' else None)
                 elif parts[2:] == ["artifacts"] and self.command == "GET":
+                    if (scheduler and self.headers.get('X-DCO-Artifact-Poll') == '1'
+                            and not worker.prepare_artifacts(identity)):
+                        return self._reply({'id': identity, 'status': 'preparing'}, 202)
                     value = (worker.artifacts(identity,is_connected=self._connected,public=not operator) if hasattr(worker,'pool')
                              else worker.artifacts(identity))
                 elif parts[2:] == ["logs"] and self.command == "GET":

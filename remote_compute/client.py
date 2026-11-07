@@ -609,13 +609,28 @@ class Client:
     def artifacts(self, identity):
         # A center may first need to retrieve the complete remote ZIP. Keep
         # that header wait and its connections separate from status/control.
+        if self.endpoint.scheme not in {'http', 'https'}:
+            return self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/artifacts',binary=True))
         backend=self
         if self.endpoint.scheme in {'http','https'}:
             backend=self.__dict__.get('_result_client')
             if backend is None:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None)))
             backend.timeout=max(120,self.timeout)
-        return self._read_reconnecting(lambda:backend.request("/jobs/"+identity+"/artifacts",binary=True))
+        delay = .2
+        while True:
+            raw = self._read_reconnecting(lambda:backend.request(
+                "/jobs/"+identity+"/artifacts", binary=True, extra_headers={'X-DCO-Artifact-Poll':'1'}))
+            if getattr(backend.connections, 'response_status', 200) != 202:
+                return raw
+            preparation = json.loads(raw)
+            if preparation != {'id': identity, 'status': 'preparing'}:
+                raise RemoteError('Invalid artifact preparation response')
+            # A live preparation acknowledgement renews observation of this
+            # original result. Transport outages keep their bounded reconnect
+            # window, independently of how long the provider transfer takes.
+            time.sleep(delay)
+            delay = min(2, delay*2)
 
     def fetch(self, identity, output_dir=None, *, delete=True):
         raw = self.artifacts(identity)

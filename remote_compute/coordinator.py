@@ -1211,6 +1211,10 @@ class Coordinator:
         if remote.get('status') in TERMINAL and remote['status']!='interrupted':
             job['result'].pop('remote_cancel_pending',None)
             job['result'].pop('cost_incomplete',None)
+        if remote.get('status') in TERMINAL:
+            for key in ('completed', 'total'):
+                if key not in remote:
+                    job['result'].pop(key, None)
         if 'resource_request' not in remote:job['result'].pop('resource_request',None)
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ('id',"assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
@@ -1220,6 +1224,9 @@ class Coordinator:
             assigned['memory_mb']=job['task']['memory_mb']
             assigned['accelerator']=job['task'].get('accelerator')
         job["result"].update(remote, **assigned, center_submitted=submitted)
+        # A full terminal receipt can omit the compact step counters sampled
+        # while running. Refresh them from its explicit final step records.
+        job['result'].update(progress_fields(remote))
         self._attempt_total(job['result'])
         if remote["status"] in TERMINAL:
             job["result"]["total_elapsed"] = time.time() - submitted
@@ -1547,7 +1554,71 @@ class Coordinator:
                 self.condition.notify_all()
             return self.get(identity)
 
-    def artifacts(self, identity, *, is_connected=None, public=False):
+    def prepare_artifacts(self, identity):
+        """Acknowledge slow remote preparation without tying it to an HTTP wait."""
+        job = load_job(self.jobs, self.condition, identity)
+        with self.condition:
+            if job['result']['status'] not in TERMINAL:
+                raise Conflict('Artifacts are available when the job has finished')
+            client = self._client(job)
+            node = job.get('node') or next((n for n in self.pool.nodes if n.client is client), None)
+            if (job['result'].get('cancelled_before_submit') or
+                    job['result']['status'] == 'interrupted' and node is not None and (node.detached or not node.enabled)):
+                client = None
+        from .local import LocalClient
+        if client is None or isinstance(client, LocalClient):
+            return True
+        if (job['directory']/'worker-artifacts.zip').is_file():
+            return True
+        with self.condition:
+            if self.jobs.get(identity) is not job:
+                raise KeyError(identity)
+            preparation = job.get('artifact_preparation')
+            if preparation is not None:
+                if not preparation['done'].is_set():
+                    return False
+                job.pop('artifact_preparation')
+                if preparation.get('error') is not None:
+                    # The provider client has already exhausted its bounded
+                    # reconnect attempt. End this collection attempt, preserving
+                    # the original ID for an explicit subsequent retry.
+                    raise Conflict('Artifact preparation failed: '+str(preparation['error']))
+                return True
+            if self.stopping:
+                raise Conflict('Scheduler is stopping')
+            preparation = {'done': threading.Event()}
+            job['artifact_preparation'] = preparation
+
+            def prepare(job=job):
+                try:
+                    # Keep the original job resident and use the same ID/node
+                    # locks as fetch/delete. Only the durable provider ZIP is
+                    # prepared; no final response or scientific payload is held.
+                    def download():
+                        try:
+                            return self.artifacts(identity, is_connected=lambda: not self.stopping, cache_only=True)
+                        except RemoteError as error:
+                            # This is the same upstream 502 exposed by the
+                            # synchronous HTTP path. Preserve its bounded
+                            # recovery before reporting a preparation failure.
+                            if getattr(error, 'status_code', None) is None:
+                                error.status_code = 502
+                            raise
+                    client._read_reconnecting(download)
+                except Exception as error:
+                    preparation['error'] = error
+                finally:
+                    with self.condition:
+                        preparation['done'].set()
+                        self.threads.discard(threading.current_thread())
+                        self.condition.notify_all()
+
+            thread = threading.Thread(target=prepare, name='artifact-preparation', daemon=True)
+            self.threads.add(thread)
+            thread.start()
+            return False
+
+    def artifacts(self, identity, *, is_connected=None, public=False, cache_only=False):
         job = load_job(self.jobs, self.condition, identity)
         with self.condition:
             if job["result"]["status"] not in TERMINAL:
@@ -1600,6 +1671,8 @@ class Coordinator:
                     if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
                         raise
                 else:
+                    if cache_only:
+                        return
                     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                         files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
                         if result['status']=='interrupted':
