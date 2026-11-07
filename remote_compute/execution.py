@@ -113,11 +113,10 @@ class _Grants:
             from remote_compute import Client
             client=Client(url,os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
             self.lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=maximum,cpus=self.cpus,**model)
-            if limits:
-                # Apply a phase's RAM model before launching even its first
-                # item. Keep that ready demand until the executor reports it.
-                self.cpus=self.lease.refresh(active_cpus=0,ready_cpus=maximum)
-                self.ready=maximum
+            # Task-entry environment can precede a completed stage that
+            # returned its CPUs. Every map first acknowledges its own phase.
+            self.cpus=self.lease.refresh(active_cpus=0,ready_cpus=maximum)
+            self.ready=maximum
             self.thread=threading.Thread(target=self._run,name='dco-executor-resources',daemon=True)
             self.thread.start()
 
@@ -141,7 +140,8 @@ class _Grants:
                 if self.fenced:self.pending_floor=self.active
                 self.condition.notify_all()
                 if self.stopping:return
-                if not self.fenced:self.condition.wait(1)
+                # A report arriving during RPC needs its own acknowledged snapshot.
+                if not self.fenced and (self.active,self.ready)==(active,ready):self.condition.wait(1)
 
     def limit(self):
         with self.condition:
@@ -149,6 +149,16 @@ class _Grants:
             # While a shrinking request is in flight, new items must stay
             # within the active floor already reported in that request.
             return min(self.cpus,self.pending_floor)if self.pending or self.fenced else self.cpus
+
+    def reserve(self,requested):
+        with self.condition:
+            count=max(0,min(requested,self.limit()-self.active))
+            # Include promised starts in the same snapshot used by resize.
+            # Publication callbacks and process creation run after this lock.
+            self.active+=count
+            self.ready=max(0,self.ready-count)
+            if count:self.condition.notify_all()
+            return count
 
     def report(self,active,ready):
         with self.condition:
@@ -205,10 +215,12 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
     pool=ThreadPoolExecutor(max_workers=maximum,thread_name_prefix='dco-item')
     try:
         while active or position<len(items):
-            limit=grants.limit()
             if on_capacity:on_capacity(grants.cpus)
-            while (not failures and not(stop and stop())and position<len(items)and len(active)<limit
-                    and (ready_slots is None or ready_slots()>0)):
+            requested=len(items)-position
+            if failures or stop and stop():requested=0
+            elif ready_slots is not None:requested=min(requested,ready_slots())
+            for _ in range(grants.reserve(requested)):
+                if stop and stop():break
                 from remote_compute.deadline import check_deadline
                 try:check_deadline()
                 except TimeoutError as error:
