@@ -16,6 +16,7 @@ DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行�
 - 冷准备峰值由父任务首槽容纳；`map_items`、`iter_items`和`run_call`用`limits`分别声明阶段CPU上限与内存模型。并行阶段按实测单项工作集声明，避免沿用冷编译的每核预留。
 - 长任务在评价/记账边界调用`check_deadline(reserve_seconds=...)`，为既有异常收尾留出落盘时间；`remaining_time()`返回任务剩余秒数。原`timeout`硬时限保持，映射结果记录各输入的完成、中断与未启动状态，已付前缀由业务持久发布。
 - 操作员用`client.control(job=原ID, priority=整数)`调整排队任务的有效调度优先级；原请求包、请求SHA及科学输入保持，运行中任务沿原授权执行。
+- 操作员确认输入已关闭后，用`client.control(retire_asset=摘要)`回收指定中心资产，或`client.control(node=名称, worker={"retire_asset":摘要})`回收指定worker副本。活跃、未领取及恢复任务、有效生产者交接和在途上传继续保护；其他资产保持。回执返回退役字节数，目录递归回收在控制锁外执行。
 
 完整示例和恢复合同见[DESIGN](docs/DESIGN.md#python接口)。工程使用汇总语义能力；设备选择、共享环境与部署由DCO操作员管理。
 

@@ -166,6 +166,21 @@ class AssetCache:
             return dict(bytes=sum(size for size, _ in self.entries.values()),
                         limit_bytes=self.limit, count=len(self.entries),reclaim=self.reclaimer.snapshot())
 
+    def retire(self, identity):
+        """Retire one explicitly released asset without evicting its neighbours."""
+        if not isinstance(identity,str)or not re.fullmatch(r'[a-f0-9]{64}',identity):
+            raise ValueError('Asset id requires SHA256')
+        with self.lock:
+            path=self._path(identity)
+            present=path.exists()
+            if present and self._linked(path):
+                raise ValueError('Asset path became a link')
+            size=self.entries.get(identity,(0,0))[0] if present else 0
+            self.reclaimer.defer(path)
+            with self.metadata_lock:
+                if self.entries.pop(identity,None) is not None:self.revision+=1
+            return dict(retired_asset=identity,retired=present,bytes=size)
+
     def prune(self, protected):
         with self.lock:
             return self._prune(protected)

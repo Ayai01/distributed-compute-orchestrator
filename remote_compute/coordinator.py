@@ -14,7 +14,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
-from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff
+from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff, retire_asset
 from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
@@ -533,6 +533,8 @@ class Coordinator:
                            node_targets=grants[name]) for name in shares}
 
     def control(self, changes):
+        if isinstance(changes,dict)and set(changes)=={'retire_asset'}:
+            return retire_asset(self,changes['retire_asset'])
         if isinstance(changes,dict)and 'job'in changes:
             if set(changes)!={'job','priority'}:
                 raise ValueError('Queued job control accepts job and priority')
@@ -569,12 +571,14 @@ class Coordinator:
                 self.pool.configure(name, **changes["routing"])
             if "worker" in changes:
                 try:
-                    node.client.control(**changes["worker"])
+                    result=node.client.control(**changes["worker"])
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) == 400:
                         raise ValueError(str(error)) from None
                     raise Conflict(str(error)) from None
                 self.pool.refresh(nodes=[node])
+                if set(changes)=={'node','worker'}and set(changes['worker'])=={'retire_asset'}:
+                    return dict(result,node=name)
             return self.health()
         if isinstance(changes, dict) and set(changes) == {"policy"}:
             self.pool.configure(policy=changes["policy"])

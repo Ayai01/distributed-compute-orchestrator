@@ -1,6 +1,6 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.12**。
+- 当前源码版本：**0.11.13**。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。当前维护入口保存实际运行版本、统一部署、原状态恢复及放行事实；维护门关闭新增工程受理，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
@@ -9,6 +9,8 @@
 运行能力为`ng47、hsp、chisel、ml、cuda、layout、rtl、onnx`。Python/C++是默认基础环境。Chisel及layout按单节点完整工具链登记，具体工具、路径及argv保留在操作员明细和本任务回执中。
 
 Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，Torch任务声明ml，取得CUDA授权后使用cuda后端。设备私有python_runtimes维护完整解释器前缀，项目不选择解释器或设备。新算法补齐所用环境的依赖，禁止扩充Python组合后缀。
+
+通用C++构建使用`${tool:cxx}`。GNU/ELF原生扩展使用`requires=['gxx']`和`${tool:gxx}`；该逻辑工具表达GNU C++17、ELF64目标与原生扩展ABI需求，作为可选构建工具登记。当前实际GNU编译、ELF64/x86_64执行及普通SDK路由资格见`.local/maintenance/gxx-contract-20261107/current.json`；执行能力大类保持上述八项，Python后端沿原语义选择。
 
 2026-11-05现场配置：五个提供者合计182个逻辑线程预算；五台CPU/ML环境、两台CUDA环境已完成逐项依赖、数值接口及最小计算验收。实际预算以运行配置为准。环境、路由和源码部署的原ID回执保存在`.local/maintenance/layout-ku26s-20261104/`，当前维护状态使用页首入口。
 
@@ -45,7 +47,7 @@ stop_when只停止新增并排空；cancel_when取消本次调用的在途原ID�
 
 ## 验证与证据
 
-- 当前核心、原生执行及停止边界合并覆盖836项，832通过、4项按平台跳过；完整原生835项及新增在途下限、最终受影响检查见`.local/maintenance/grant-admission-race-20261107/`。覆盖固定高申请校正、映射RSS/private分账、阶段内存、RPC信用、零余量排队、并发注册表读写、期限与付费前缀发布、硬超时/取消/失败、资源释放、排队优先级覆盖、在途原ID恢复、资源回复超时续行及缩核与启动并发竞态。
+- 当前核心与原生验收覆盖841项，837通过、4项按平台跳过；指定资产引用保护及关联调用链108项通过，见`.local/maintenance/asset-retirement-20261107/`。覆盖固定高申请校正、映射RSS/private分账、阶段内存、RPC信用、零余量排队、并发注册表读写、期限与付费前缀发布、硬超时/取消/失败、资源释放、排队优先级覆盖、在途原ID恢复、资源回复超时续行、缩核与启动并发竞态，以及指定资产退役时的回执/生产者/上传引用保护。
 - Windows长路径贯穿成果枚举、输入保留、领取和原ID删除，保留链接自身的清理边界；26项文件生命周期检查通过，日志`patch-01101-long-output-lifecycle-final.log`。
 - 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
 - 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。

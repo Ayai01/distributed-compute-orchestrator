@@ -76,6 +76,27 @@ def asset_handoff(service, identity, assets=None):
         return {'id':identity}
 
 
+def retire_asset(service, identity):
+    """The operator releases one input after its producers and receipts close."""
+    if not isinstance(identity,str)or not _ASSET.fullmatch(identity):
+        raise ValueError('Asset id requires SHA256')
+    with service.asset_cache.lock, service.condition:
+        if service.stopping:raise Conflict('Service is stopping')
+        references=asset_references(service.jobs)
+        references.update(getattr(service,'accepting_assets',()))
+        now=time.monotonic()
+        for assets,expires in service.asset_handoffs.values():
+            if expires>now:references.update(assets)
+        transfer=service.asset_writes.get(identity)
+        if identity in references or transfer is not None:
+            raise Conflict('Asset is still referenced by a task, producer or upload')
+        result=service.asset_cache.retire(identity)
+        # Legacy uploads have no original-ID handoff. Only this explicit
+        # operator release removes their warm-input ownership hint.
+        if hasattr(service,'legacy_assets'):service.legacy_assets.discard(identity)
+        return result
+
+
 def lock_root(root, role):
     root.mkdir(parents=True, exist_ok=True)
     handle = (root / (role + ".lock")).open("a+b")
@@ -478,6 +499,8 @@ class Worker:
             return {'status': self.benchmark_state, 'benchmark': self.benchmark, 'benchmark_state': self.benchmark_state}
 
     def control(self, value):
+        if isinstance(value,dict)and set(value)=={'retire_asset'}:
+            return retire_asset(self,value['retire_asset'])
         if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "tools", "benchmark"}:
             raise ValueError("Control accepts cpus, memory_mb, memory_reserve_mb, memory_headroom_mb, paused, tools and benchmark")
         if value.get('benchmark'):
