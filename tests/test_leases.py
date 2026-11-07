@@ -54,17 +54,23 @@ class CpuLeaseTests(unittest.TestCase):
     def test_tail_returns_idle_slots_and_peer_expands_without_a_new_cpu_request(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=8) as (_, worker):
             with Pool([worker]) as pool, center(pool, Path(root)/'center') as (_, client):
-                first = client.submit(python(HOLD, project='A',  max_cpus=1024, memory_mb=64))['id']
+                ready_hold=HOLD.replace('while not',"Path('lease-started').write_text('yes')\nwhile not",1)
+                def started(identity):
+                    try:return client.read_job_file(identity,'lease-started')==b'yes'
+                    except RemoteError as error:
+                        if error.status_code==404:return False
+                        raise
+                first = client.submit(python(ready_hold, project='A',  max_cpus=1024, memory_mb=64))['id']
                 remaining = {first}
                 try:
-                    until(lambda: client.status(first)['status'] == 'running')
+                    until(lambda:started(first))
                     lease = client.cpu_lease(first, max_cpus=1024, cpus=1)
                     self.assertEqual(lease.refresh(ready_cpus=1024), 8)
-                    second = client.submit(python(HOLD, project='B',  max_cpus=1024, memory_mb=64))['id']
+                    second = client.submit(python(ready_hold, project='B',  max_cpus=1024, memory_mb=64))['id']
                     remaining.add(second)
                     # The remaining child keeps one CPU; seven unused slots return.
                     self.assertEqual(lease.refresh(active_cpus=1, ready_cpus=0), 1)
-                    until(lambda: client.status(second)['status'] == 'running')
+                    until(lambda:started(second))
                     peer = client.cpu_lease(second, max_cpus=1024, cpus=1)
                     self.assertEqual(peer.refresh(ready_cpus=1024), 7)
                     self.assertEqual(client.status(first)['cpus'] + client.status(second)['cpus'], 8)

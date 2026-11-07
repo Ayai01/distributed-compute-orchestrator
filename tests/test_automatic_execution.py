@@ -101,7 +101,14 @@ def observed_memory():
     state=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN','')).status(os.environ['REMOTE_COMPUTE_JOB_ID'])
     return dict(cpus=state['cpus'],memory_mb=state['memory_mb'])
 def memory_item(value):
+    from pathlib import Path
     state=observed_memory();start=time.time();time.sleep(.45)
+    Path('memory-started-'+str(value)).write_text('yes')
+    deadline=time.monotonic()+5
+    while not all(Path('memory-started-'+str(i)).exists()for i in range(8)):
+        if time.monotonic()>deadline:raise TimeoutError('Eight funded memory-phase items did not start')
+        time.sleep(.01)
+    time.sleep(.1)
     return dict(value=value,state=state,started=start,finished=time.time())
 def phased_memory(backend,stream):
     from remote_compute import map_items,iter_items,run_call
