@@ -1,12 +1,19 @@
 """A real shrink between the capacity snapshot and admission keeps starts funded."""
-import json,unittest
+import json,threading,unittest
 from pathlib import Path
-from remote_compute import python_task
-from test_compute import provider,scratch
+from remote_compute import Pool,RemoteError,python_map,python_task
+from test_compute import provider,scratch,until
+from test_center import center
 
 BUSINESS='''import os,threading,time
 from remote_compute import Client
 from remote_compute import execution
+
+def hold(value):
+    from pathlib import Path
+    Path('started-'+str(value)).write_text('yes')
+    while not Path('release').exists():time.sleep(.02)
+    return value
 
 def evaluate(value):
     start=time.time()
@@ -78,6 +85,40 @@ def run(backend,scenario):
 
 
 class ExecutorAdmissionTests(unittest.TestCase):
+    def test_policy_contraction_preserves_four_started_inputs_until_they_finish(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=4096)as(worker,node),Pool([node])as pool:
+            with center(pool,Path(root)/'center')as(state,client):
+                identity=client.submit(python_map('business:hold',range(5),max_cpus=8,memory_mb=1024,timeout=30),files={'business.py':BUSINESS})['id']
+                def started():
+                    try:return all(client.read_job_file(identity,'started-'+str(i))==b'yes'for i in range(4))
+                    except RemoteError as error:
+                        if error.status_code==404:return False
+                        raise
+                try:
+                    until(started)
+                    self.assertEqual(client.status(identity)['cpus'],4)
+                    original=state.resize;acknowledged=threading.Event();replies=[]
+                    def observed(*args,**kwargs):
+                        value=original(*args,**kwargs)
+                        if kwargs.get('active_cpus')==4:
+                            replies.append(value['cpus']);acknowledged.set()
+                        return value
+                    from unittest.mock import patch
+                    with patch.object(state,'resize',side_effect=observed):
+                        client.control(node='node1',routing={'limit':1})
+                        self.assertTrue(acknowledged.wait(5),'No resource report arrived after policy contraction')
+                    self.assertTrue(all(cpus>=4 for cpus in replies))
+                    self.assertEqual(worker.health()['used_cpus'],4)
+                    self.assertEqual(client.status(identity)['cpus'],4)
+                finally:
+                    try:client.write_job_file(identity,'release','yes')
+                    except RemoteError:pass
+                client.wait(identity,wait_timeout=10);result=client.fetch(identity)
+                self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                values=json.loads(result['files']['.dco-results.json'])['items']
+                self.assertEqual([row['value']for row in values],list(range(5)))
+                self.assertEqual(result['cpus'],1)
+
     def test_shrink_after_snapshot_preserves_all_inputs_and_grant_for_both_backends(self):
       for scenario in ('snapshot','entry','pending'):
         for backend in ('process','thread'):
