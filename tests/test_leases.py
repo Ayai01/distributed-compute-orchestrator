@@ -12,6 +12,17 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class CpuLeaseTests(unittest.TestCase):
+    def test_retained_active_ram_quote_uses_only_a_running_confirmed_grant(self):
+        client=Client();error=RemoteError('Insufficient RAM for active workers; existing grant retained');error.status_code=409
+        for phase,status,cpus,allowed in ((8192,'running',4,True),(16384,'running',4,False),
+                                         (8192,'cancelled',4,False),(8192,'running',3,False)):
+            with self.subTest(phase=phase,status=status,cpus=cpus),patch.object(client,'resize',side_effect=error), \
+                    patch.object(client,'status',return_value=dict(status=status,cpus=cpus,memory_mb=64,memory_phase=dict(memory_mb=phase))):
+                lease=client.cpu_lease('a'*32,max_cpus=8,cpus=4,memory_mb=8192)
+                if allowed:self.assertEqual(lease.refresh(active_cpus=4,ready_cpus=1),4)
+                else:
+                    with self.assertRaises(RemoteError):lease.refresh(active_cpus=4,ready_cpus=1)
+
     def test_retained_adaptive_grant_uses_the_acknowledged_phase_instead_of_raw_estimate(self):
         phase=dict(base_memory_mb=256,memory_per_cpu_mb=768)
         for message in ('Insufficient memory for resource resize; existing grant retained',

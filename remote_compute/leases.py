@@ -45,6 +45,7 @@ class CpuLease:
                 if (getattr(error,'status_code',None)!=409 or
                         not any(message in str(error)for message in (
                             'Insufficient memory for resource resize; existing grant retained',
+                            'Insufficient RAM for active workers; existing grant retained',
                             'Center resource reply timed out; existing grant retained'))):
                     raise
                 # A refused or unanswered resize leaves paid CPU/RAM usable. Re-read that
