@@ -22,6 +22,7 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize, elastic_cpus
+from .memory import plan_memory
 from .compat import unlink
 from .cleanup import AssetCache, remove_owned
 from .acceptance import SubmissionAssets, SubmissionLocks
@@ -473,7 +474,7 @@ class Coordinator:
                         or job.get('cancel') and job['cancel'].is_set()):continue
                 for node in matching(task):
                     if (node.name not in online or node.health.get('paused')
-                            or task['memory_mb']>max(0,min(node.memory_free,self.pool._host_memory_free(node)))
+                            or node.startup_memory(task)>max(0,min(node.memory_free,self.pool._host_memory_free(node)))
                             or task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True))):continue
                     waiting_priority=priority
                     break
@@ -634,7 +635,7 @@ class Coordinator:
                         if not node.error and node.enabled and not node.health.get('paused')]
             online = bool(matching)
             if requirement['fallback_after_seconds'] == 0 and any(
-                    node.can_match_accelerator(node.execution_accelerator(job['task'],available=True)) and node.memory_free >= job['task']['memory_mb']
+                    node.can_match_accelerator(node.execution_accelerator(job['task'],available=True)) and node.memory_free >= node.startup_memory(job['task'])
                     for node in matching):
                 return
         reason = ('unavailable' if not online else
@@ -761,10 +762,11 @@ class Coordinator:
             free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
             if not room or not free:continue
             target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=warm_cache)
-            available_memory=current['memory_mb']+max(0,min(held.memory_free,self.pool._host_memory_free(held)))
+            available_memory=held.memory_credit(job.get('worker_id',identity),current['memory_mb'])+max(0,min(held.memory_free,self.pool._host_memory_free(held)))
             model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
             model.update(job.get('phase_memory',dict(memory_mb=current['memory_mb'])))
-            target,memory=plan_resize(target,available_mb=available_memory,**model)
+            model=held.resize_memory_model(job.get('worker_id',identity),model)
+            target,memory=plan_memory(target,available_memory,**model)if 'adaptive_memory'in held.health.get('capabilities',())else plan_resize(target,available_mb=available_memory,**model)
             if memory is not None and memory>available_memory:continue
             count=max(0,min(target-old,room,free))
             if count:
@@ -791,7 +793,7 @@ class Coordinator:
                          if node.name not in claims and not node.error and node.enabled
                          and not node.health.get('paused') and not node.health.get('queued', 0)
                          and node.capacity-node.external >= width
-                         and min(node.memory_free, self.pool._host_memory_free(node)) >= task['memory_mb']
+                         and min(node.memory_free, self.pool._host_memory_free(node)) >= node.startup_memory(task)
                          and node.can_match_accelerator(node.execution_accelerator(task,available=True))]
                 if ready:
                     node = max(ready, key=lambda node: (node.capacity-node.reserved-node.external, node.name))
@@ -1284,7 +1286,7 @@ class Coordinator:
                 if held is None:
                     if node.name not in memory_available:
                         memory_available[node.name]=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
-                    if task['memory_mb']>memory_available[node.name]:continue
+                    if node.startup_memory(task)>memory_available[node.name]:continue
                     if task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
                 eligible.append(node.name)
             if not eligible:continue
@@ -1366,7 +1368,10 @@ class Coordinator:
                 active_floor=max(1,active_cpus or 0)
                 if active_cpus is not None and (active_cpus>old or active_cpus>desired):
                     raise ValueError('active_cpus must count threads within the existing grant and requested width')
-                desired,_=plan_resize(desired,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,node.memory_capacity)
+                model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
+                model=node.resize_memory_model(job.get('worker_id',identity),model)
+                planner=(lambda width,available,**values:plan_memory(width,available,floor=active_floor,**values))if 'adaptive_memory'in node.health.get('capabilities',())else lambda width,available,**values:plan_resize(width,available_mb=available,**values)
+                desired,_=planner(desired,node.memory_capacity,**model)
                 if desired<active_floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
                 previous_desired=job.get('desired_cpus')
                 previous_memory=job.get('phase_memory')
@@ -1395,8 +1400,7 @@ class Coordinator:
                 granted=max(active_floor,granted)
                 changes_memory=(memory_mb is not None and memory_mb!=old_memory) or modeled
                 credit=node.memory_credit(job.get('worker_id',identity),old_memory) if changes_memory else old_memory
-                granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
-                    credit+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
+                granted,memory=planner(granted,credit+max(0,min(node.memory_free,self.pool._host_memory_free(node))),**model)
                 memory=old_memory if memory is None else memory
                 extra=max(0,memory-credit)
                 if granted<active_floor or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
@@ -1436,7 +1440,10 @@ class Coordinator:
                     job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
                     if self.jobs.get(identity) is job:self._save(job)
                     hold=node.memory_holds.get(job.get('worker_id',identity))
-                    if hold is not None:hold['after']=time.monotonic()
+                    if job.get('worker_id',identity)in node.live_jobs:
+                        if hold is None:
+                            hold=node.memory_holds[job.get('worker_id',identity)]={'amount':0}
+                        hold.update(after=time.monotonic(),credit=actual_memory)
                     self.pool.condition.notify_all()
                     self.condition.notify_all()
 

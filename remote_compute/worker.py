@@ -38,7 +38,7 @@ from .records import Job, JobRecords, active_items, active_values, archive_job, 
 from .receipts import read_receipt
 from .paths import cache_environment
 from .allocation import plan_resize
-from .memory import MemoryObservation, reservation
+from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
@@ -344,7 +344,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
+                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -367,9 +367,11 @@ class Worker:
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
-                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'max_cpus', 'memory_mb', 'started', 'accelerator')},
+                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'active_cpus', 'max_cpus', 'memory_mb', 'started', 'accelerator')},
                                      'rss_mb':round(j.get('rss_mb',0),2),'private_mb':j.get('private_mb'),
                                      'memory_modeled':bool(j.get('memory_phase_model',j['task'].get('memory_model'))),
+                                     'memory_phase_model':j.get('memory_phase_model',j['task'].get('memory_model')),
+                                     'memory_calibrated':bool(j.get('memory_observation')and j['memory_observation'].envelope is not None),
                                      'memory_reservation_mb':reservation(j)[0],
                                      'memory_commit_reservation_mb':reservation(j)[1], **progress_fields(j['result']),
                                      **({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
@@ -641,8 +643,12 @@ class Worker:
             granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
             changes_memory=(memory_mb is not None and memory_mb!=old_memory) or base_memory_mb is not None or memory_per_cpu_mb is not None
             credit=min(reservation(job)) if changes_memory else old_memory
-            granted,memory=plan_resize(granted,memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb,
-                                      min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb'])))
+            model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
+            physical,commit=reservation(job)
+            observation=job.get('memory_observation')
+            model=calibrated_model(model,job.get('memory_phase_model',task.get('memory_model')),result.get('active_cpus',0),physical,commit,
+                                   observation is not None and observation.envelope is not None)
+            granted,memory=plan_memory(granted,min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb'])),floor=floor,**model)
             if granted<floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
             memory=old_memory if memory is None else memory
             extra=max(0,memory-credit)
@@ -651,8 +657,9 @@ class Worker:
             active_changed=result.get('active_cpus',0)!=(active_cpus or 0)
             result.update(active_cpus=active_cpus or 0,requested_cpus=requested_cpus)
             phase_changed=phase_model!=job.get('memory_phase_model',task.get('memory_model'))
-            if phase_changed or memory!=old_memory:
+            if phase_changed or memory!=old_memory or phase_model and granted!=old:
                 job['memory_observation']=MemoryObservation()
+                job.pop('startup_memory_mb',None)
             job['memory_phase_model']=phase_model
             if granted!=old or memory!=old_memory or active_changed:
                 self.used+=granted-old
@@ -716,7 +723,7 @@ class Worker:
                 with self.condition:
                     task['accelerator']=python_accelerator(task,self.python_runtimes,self._accelerator_units(),
                         [unit for items in self.accelerator_reservations.values()for unit in items])
-                if task["memory_mb"] > self.memory_capacity:
+                if startup_memory(task) > self.memory_capacity:
                     raise ValueError("Task memory_mb exceeds worker memory budget")
                 if not supports_python(task,self.python_runtimes):
                     raise ValueError('Requested Python backend is not configured')
@@ -790,7 +797,7 @@ class Worker:
                 with self.condition:
                     if self.stopping:
                         raise Conflict("Worker is stopping")
-                    if task['cpus'] > self.capacity or task['memory_mb'] > self.memory_capacity:
+                    if task['cpus'] > self.capacity or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
                     self.jobs[identity] = job
                     self.asset_handoffs.pop(identity,None)
@@ -806,14 +813,27 @@ class Worker:
     def _schedule(self):
         with self.condition:
             while not self.stopping:
+                host=self.host.sample()
+                critical=max(128,min(1024,int(host.get('memory_total_mb',0)*.02)))
+                pressure=(host.get('host_memory_available_mb',critical)<critical or
+                          host.get('host_commit_available_mb',critical)<critical)
+                if pressure:
+                    if time.monotonic()>=getattr(self,'next_memory_pressure',0):
+                        victim=pressure_victim(active_values(self.jobs),host)
+                        if victim is not None:
+                            victim['result'].update(error_kind='memory_pressure',error='Task terminated under critical host RAM/commit pressure',memory_pressure=host)
+                            victim['memory_pressure']=True;victim['cancel'].set()
+                            self.next_memory_pressure=time.monotonic()+2
+                    self.condition.wait(.25);continue
                 # FIFO prevents a continuous stream of small jobs starving a larger one.
                 if self.queue and not self.paused:
                     job = self.jobs[self.queue[0]]
                     if (self.used + job["task"]["cpus"] <= self.capacity
-                            and job["task"]["memory_mb"] <= self._memory_state()["memory_available_mb"]
+                            and startup_memory(job['task']) <= self._memory_state()["memory_available_mb"]
                             and (job['task'].get('accelerator') is None or self._match_accelerator(job['task']['accelerator']))):
                         self.queue.popleft()
                         self.used += job["task"]["cpus"]
+                        job['startup_memory_mb']=startup_memory(job['task'])
                         self.accelerator_reservations[job['result']['id']]=self._match_accelerator(job['task'].get('accelerator')) or []
                         job["result"].update(status="running", started=time.time())
                         self._save(job)
@@ -963,7 +983,7 @@ class Worker:
                                             accounting_saved_cpu = total_cpu
                                         accounting_saved = time.monotonic()
                             if job["cancel"].is_set() or time.monotonic() >= deadline:
-                                state = "cancelled" if job["cancel"].is_set() else "timed_out"
+                                state = "failed"if job.get('memory_pressure')else "cancelled" if job["cancel"].is_set() else "timed_out"
                                 process.stop()
                                 break
                             job["cancel"].wait(0.05)
@@ -988,6 +1008,8 @@ class Worker:
             self._clean_temp(job)
             self._clean_work(job)
             while True:
+                if job.get('memory_pressure'):
+                    state,error='failed',result['error']
                 if job["cancel"].is_set() and state == "succeeded":
                     state = "cancelled"
                 if 'execution'in task:

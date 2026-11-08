@@ -67,7 +67,7 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
         self.assertEqual(state.resize('0',24,active_cpus=3)['cpus'],24)
         self.assertEqual(node.reserved,24)
 
-    def test_sdk_center_worker_preserve_floor_and_reject_impossible_memory(self):
+    def test_sdk_center_worker_preserve_floor_while_probing_large_estimates(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=1024)as (_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as (_,client):
                 hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
@@ -80,8 +80,8 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
                     self.assertEqual(client.resize(first,4,active_cpus=4)['cpus'],4)
                     self.assertEqual(worker.status(first)['cpus'],4)
                     self.assertEqual(client.status(second)['status'],'queued')
-                    with self.assertRaises(RemoteError):
-                        client.resize(first,4,active_cpus=4,base_memory_mb=128,memory_per_cpu_mb=512)
+                    probe=client.resize(first,4,active_cpus=4,base_memory_mb=128,memory_per_cpu_mb=512)
+                    self.assertEqual((probe['cpus'],probe['memory_mb']),(4,640))
                     self.assertEqual(worker.status(first)['cpus'],4)
                     self.assertEqual(client.resize(first,4,active_cpus=3)['cpus'],3)
                     until(lambda:client.status(second)['status']=='running')

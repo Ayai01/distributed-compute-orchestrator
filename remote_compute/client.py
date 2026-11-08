@@ -792,7 +792,23 @@ class Node:
 
     def memory_credit(self, identity, declared):
         job=next((j for j in self.health.get('active_jobs',()) if j['id']==identity),None)
-        return min(job.get('memory_reservation_mb',declared),job.get('memory_commit_reservation_mb',declared)) if job else declared
+        credit=min(job.get('memory_reservation_mb',declared),job.get('memory_commit_reservation_mb',declared)) if job else declared
+        hold=self.memory_holds.get(identity)
+        # An acknowledged resize already funded this original's new grant.
+        # A stale worker sample must not charge that grant a second time.
+        if hold is not None and hold.get('after')is not None:
+            credit=max(credit,min(declared,hold.get('credit',credit+hold['amount'])))
+        return credit
+
+    def startup_memory(self,task):
+        from .memory import startup_memory
+        return startup_memory(task)if 'adaptive_memory'in self.health.get('capabilities',())else task.get('memory_mb',256)
+
+    def resize_memory_model(self,identity,model):
+        from .memory import calibrated_model
+        row=next((j for j in self.health.get('active_jobs',())if j['id']==identity),{})
+        return calibrated_model(model,row.get('memory_phase_model'),row.get('active_cpus',0),
+            row.get('memory_reservation_mb',0),row.get('memory_commit_reservation_mb',0),row.get('memory_calibrated',False))
 
     @property
     def memory_accounted(self):
@@ -1200,7 +1216,7 @@ class Pool:
         for node in self.nodes:
             health=node.health
             if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
-                    or node.memory_capacity<task.get('memory_mb',256)
+                    or node.memory_capacity<node.startup_memory(task)
                     or not required.issubset(capability_set(health.get('tags',())))
                     or not required_shared.issubset(health.get('shared',()))
                     or not required_tools.issubset(execution_tool_set(tuple(name
@@ -1240,7 +1256,7 @@ class Pool:
                     return node.capacity-node.reserved-node.external-(node_headroom or {}).get(node.name,0)
                 ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
                          and available(n) >= needed(n)
-                         and n.memory_free >= memory_mb and self._host_memory_free(n) >= memory_mb
+                         and n.memory_free >= n.startup_memory(task) and self._host_memory_free(n) >= n.startup_memory(task)
                          and n.health.get("queued", 0) == 0
                          and (task.get('accelerator')is None or
                               n.can_match_accelerator(n.execution_accelerator(task,available=True)))]

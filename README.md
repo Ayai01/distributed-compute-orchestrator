@@ -224,6 +224,8 @@ center.fetch(job["id"], "./results/maintenance")
 
 ## 共享RAM临时目录：Windows共享盘与Linux运行时目录
 
+任务内使用`tempfile.TemporaryDirectory(prefix=...)`，继承worker提供的`TMP/TEMP/TMPDIR`，由上下文回收。不要把业务构建目录硬编码到`Z:/`根目录：DCO的任务TMP包含本机工具写入所需的目录权限标签，输入、输出和已付结果仍按声明持久发布。
+
 Windows 使用 `.codex-shared-ramdisk.json` 和 `Global\CodexSharedRamdiskV1` 在锁内检查/创建唯一共享盘，工程目录独立。`ramdisk_gib` 支持 4、8、16，默认 8；本机配置优先于科研调用的旧容量参数；`python -B main.py ramdisk` 检查/创建。ImDisk 驱动放 `.tools/imdisk/` 后，以管理员运行 `ramdisk --install`。安装登记开机重建任务 `RemoteCompute Shared RAM`。容量扩展失败保留现有盘，先处理它；缩容须先排空本机写入、保全文件，再正常卸载并重建同盘符；启动检查保留较大盘及其文件。
 
 **Linux优先复用系统已有的运行时目录，无需独立内存盘或额外挂载。** 取当前worker用户的`XDG_RUNTIME_DIR`（通常为`/run/user/<UID>`），在其中使用DCO专属子目录；例如UID为1000时，在设备JSON中写入`"temp_root": "/run/user/1000/dco/tmp"`。填写实际绝对路径，JSON中的`$UID`和`$XDG_RUNTIME_DIR`不会由shell展开。使用该用户已有、可写的运行时目录无需sudo，也无需运行`ramdisk`。

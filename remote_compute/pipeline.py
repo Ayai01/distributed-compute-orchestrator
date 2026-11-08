@@ -51,9 +51,10 @@ class ExecutionResults(list):
 
 
 class ExecutionFailure(RuntimeError):
-    def __init__(self,failures,results):
+    def __init__(self,failures,results,remaining=(),blocked=()):
         super().__init__('DCO batch has '+str(len(failures))+' unresolved execution/publication errors')
         self.failures,self.results=failures,results
+        self.remaining,self.blocked=list(remaining),list(blocked)
 
 
 class ExecutionPaused(RuntimeError):
@@ -86,6 +87,7 @@ def execute(client,requests,*,project,output_dir,prepare=None,publish=None,ready
     Each value is a request or {'spec': business_input, 'after': [business_keys]}.
     prepare(spec, job_id) returns task/files/inputs, Deferred, or Skipped.
     publish(receipt) is concurrent, idempotent scientific publication by original ID.
+    Item failures leave independent work running; failed dependencies stay blocked.
     A maintenance gate drains accepted work and raises ExecutionPaused.
     cancel_when cancels this call's accepted originals and still publishes results.
     """
@@ -125,9 +127,9 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
     else:atomic_json(manifest_path,manifest)
     window=call.window
     pending={};preparing={};submitting={};collecting={};deferred=[];rows={}
-    results=ExecutionResults();failures=[];completed=set()
+    results=ExecutionResults();failures=[];completed=set();failed=set();blocked=set()
     ready=_ReadyQueue(catalog)
-    stopped=paused=False;next_poll=next_gate=0.
+    paused=False;next_poll=next_gate=0.
     cancellation=threading.Event();cancel_attempted=set();state_lock=threading.RLock()
 
     def save(row,**changes):
@@ -256,12 +258,20 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
 
     def finish(key):
         completed.add(key)
+        if key in failed or key in blocked:return
         for following in followers.get(key,[]):
-            if dependencies[following].issubset(completed):ready.add(following)
+            if following not in blocked and dependencies[following].issubset(completed):ready.add(following)
 
     def failure(row,stage_name,error):
-        nonlocal stopped
-        failures.append(dict(id=row['id'],key=row['key'],stage=stage_name,error=str(error)));stopped=True
+        failures.append(dict(id=row['id'],key=row['key'],stage=stage_name,error=str(error)))
+        failed.add(row['key'])
+        # A failed original cannot unlock its business descendants. Other
+        # ready inputs retain their own admission and publication lifecycle.
+        descendants=list(followers.get(row['key'],()))
+        while descendants:
+            key=descendants.pop()
+            if key in blocked:continue
+            blocked.add(key);descendants.extend(followers.get(key,()))
 
     with call.pools()as(prep_pool,submit_pool,collect_pool):
         recovering=set()
@@ -282,28 +292,31 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
         for key,after in dependencies.items():
             if not after and key not in recovering:ready.add(key)
         call.recovered()
-        while len(completed)<len(catalog)or preparing or submitting or pending or collecting:
+        while len(completed|failed|blocked)<len(catalog)or preparing or submitting or pending or collecting:
             try:
+                credit_blocked=False;progressed=False
                 if cancelling():paused=True
                 if time.monotonic()>=next_gate:
                     client._read_reconnecting(window.current)
                     paused=paused or bool(stop_when and stop_when())or not window.value.get('accepting',True)
                     next_gate=time.monotonic()+1.
-                if not stopped and not paused:
+                if not paused:
                     now=time.monotonic()
                     while deferred and deferred[0][0]<=now:
                         _,_,key=heappop(deferred);ready.add(key,retry=True)
                     while ready and len(preparing)<4:
                         key=ready.pop();row=row_for(key)
-                        if key in recovering or key in completed:continue
+                        if key in recovering or key in completed or key in failed or key in blocked:continue
                         if row['state']=='skipped':
                             results.skipped.append(key);finish(key);continue
-                        if not call.hold(row):ready.add(key);break
+                        if not call.hold(row):
+                            ready.add(key);credit_blocked=True;break
                         if row['state']in ('collected','published','fetched','publication_failed'):
                             collecting[collect_pool.submit(collect,row)]=row
                         elif row['state']=='accepted':pending[row['id']]=row
                         else:preparing[prep_pool.submit(stage,key,row)]=row
                 for future in [f for f in preparing if f.done()]:
+                    progressed=True
                     row=preparing.pop(future)
                     try:
                         data=future.result()
@@ -318,14 +331,16 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                         elif data=='accepted':pending[row['id']]=row
                         elif data=='fetched':collecting[collect_pool.submit(collect,row)]=row
                         elif data=='paused':paused=True;call.release(row)
-                        elif not stopped and not paused:submitting[submit_pool.submit(submit,row,data)]=row
+                        elif not paused:submitting[submit_pool.submit(submit,row,data)]=row
                         else:call.release(row)
                     except KeyboardInterrupt:paused=True
                     except BaseException as error:
                         failure(row,'prepare',error)
                         try:client.release_assets(row['id'])
                         except Exception as cleanup:failures.append(dict(id=row['id'],stage='input release',error=str(cleanup)))
+                        call.release(row)
                 for future in [f for f in submitting if f.done()]:
+                    progressed=True
                     row=submitting.pop(future)
                     try:
                         if future.result()=='paused':
@@ -348,6 +363,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                             failure(row,'recovery','Accepted original ID missing');pending.pop(job_id)
                     next_poll=time.monotonic()+.5
                 for future in [f for f in collecting if f.done()]:
+                    progressed=True
                     row=collecting.pop(future)
                     try:
                         receipt=future.result();results.append(receipt)
@@ -361,7 +377,12 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                             if row['state']=='collected':finish(row['key'])
                     except BaseException as error:failure(row,'collection/publication',error)
                     call.release(row)
-                if (stopped or paused)and not(preparing or submitting or pending or collecting):break
+                if not(preparing or submitting or pending or collecting):
+                    # Unpublished originals keep their project credits. Once
+                    # those credits prevent further work, return the durable
+                    # failure for recovery rather than waiting on this call.
+                    if paused or failures and credit_blocked and not progressed:break
+                    if len(completed|failed|blocked)==len(catalog):break
                 futures=[*preparing,*submitting,*collecting]
                 if futures:wait(futures,timeout=.05,return_when=FIRST_COMPLETED)
                 elif pending or deferred:time.sleep(.05)
@@ -387,10 +408,12 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
         except KeyboardInterrupt:paused=True
         except Exception as error:failure(row,'drain',error)
     remaining=[key for key in catalog if key not in completed]
+    blocked_keys=[key for key in catalog if key in blocked and key not in completed]
     cancelled=cancellation.is_set()or any(row['status']=='cancelled'for row in results)
     atomic_json(root/'batch.json',dict(status='failed'if failures else'cancelled'if cancelled else'paused'if remaining else'succeeded',
-        completed=len(completed),accepted_results=len(results),skipped=results.skipped,remaining=remaining))
-    if failures:raise ExecutionFailure(failures,results)
+        completed=len(completed),accepted_results=len(results),skipped=results.skipped,remaining=remaining,
+        failures=failures,blocked=blocked_keys))
+    if failures:raise ExecutionFailure(failures,results,remaining,blocked_keys)
     if remaining:raise ExecutionPaused(results,remaining)
     return results
 

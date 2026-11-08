@@ -39,9 +39,9 @@ class GrantTests(unittest.TestCase):
                 until(lambda:'ready'in client.logs(first)['stdout'])
                 second=client.submit(python(HOLD,memory_mb=128))['id']
                 self.assertEqual(client.status(second)['status'],'queued')
-                with self.assertRaises(RemoteError) as rejected:
-                    client.resize(first,4,memory_mb=300)
-                self.assertEqual(rejected.exception.status_code,409)
+                probe=client.resize(first,4,memory_mb=300)
+                self.assertEqual((probe['cpus'],probe['memory_mb']),(1,256))
+                client.resize(first,2,base_memory_mb=128,memory_per_cpu_mb=32)
                 self.assertEqual((client.status(first)['cpus'],worker.status(first)['memory_mb']),(2,192))
                 rejected_by_worker=RemoteError('memory changed after the last host sample')
                 rejected_by_worker.status_code=409
