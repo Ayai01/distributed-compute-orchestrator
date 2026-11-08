@@ -1,6 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.18**。
+- 当前源码版本：**0.11.19**。
+- hybrid同时提供调度中心和进程内本机计算，看板标题为“混合模式”；API逻辑角色为scheduler，操作员明细另给出mode。进程内worker不另开服务端口。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。维护入口保存实际运行版本、源码部署、原状态恢复及受理/派发状态；兼容更新按设备自然空闲重载，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
@@ -8,7 +9,7 @@
 
 运行能力为`ng47、hsp、chisel、ml、cuda、layout、rtl、onnx`。Python/C++是默认基础环境。Chisel及layout按单节点完整工具链登记，具体工具、路径及argv保留在操作员明细和本任务回执中。
 
-普通工程可用任务`platform`声明`linux`或`win32`等真实`sys.platform`值，不指定设备。`capabilities()['platforms']`提供平台发现，`capabilities/admission/window`支持平台过滤；任务匹配、资源规划、加速器回退和worker执行前复核使用同一约束。省略时使用全部兼容平台。公开契约、恢复、CPU分配和启动间隔等140项定向检查全部通过，证据及实际部署状态见`.local/maintenance/platform-routing-20261108/current.json`。
+普通任务禁止指定platform、node和外部cwd；普通能力与准入查询不接受平台筛选。操作员调试保留这些放置功能。工程目标线程数不再作为准入、派发和扩核门槛，同级新任务按占用线程数及启动宽度排序。验证、实际上线和接口审计入口：`.local/maintenance/project-admission-policy-20261108/current.json`。
 
 Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，Torch任务声明ml，取得CUDA授权后使用cuda后端。设备私有python_runtimes维护完整解释器前缀，项目不选择解释器或设备。新算法补齐所用环境的依赖，禁止扩充Python组合后缀。
 
@@ -45,6 +46,8 @@ map_items、iter_items及run_call的limits按阶段声明有用CPU上限和固�
 
 SDK在资源调整被暂时拒绝时保留原授权内已完整筹资的宽度；相同冻结父阶段的已有活跃工作不被冷首槽退路缩为1核，初始未启动阶段保留已筹资的单槽探测。polling按当前worker尝试ID读取授权。查询暂时故障时，同阶段沿用有效授权；调整结果未明时仅保留活跃底线，首次授权及新阶段有界重读并服从原期限。DELETE按原ID幂等确认，丢响应后先核对，必要时仅补一次删除。授权、真实HTTP读超时、期限及执行边界39项定向检查和原进程保持的SDK分发证据见`.local/maintenance/lease-status-outage-20261108/current.json`；DELETE及既有宽度边界证据见`.local/maintenance/delete-and-running-lease-20261108/current.json`。
 
+
+资源POST回复丢失或超时后，SDK先核对当前执行尝试，等待未决租约结束，再有界重试同一资源调整；终态、权限及永久资源错误直接返回，原期限和科研重试预算保持。真实丢响应、原ID恢复及查询故障的14项隔离检查通过，记录见`.local/maintenance/project-admission-policy-20261108/resource-reconciliation.json`。
 
 同工程独立output_dir在同进程或不同进程中并发execute，共享待收窗口；同进程还共享4/2/2准备、提交、领取线程。工程锁只保护共享索引的短读改写，每个输出目录保留恢复所需的单写入者。准备进程退出时归还未用额度，发布失败的原ID跨进程恢复继续占用待收额度。并发调用保持相同ready_tasks及原project。
 

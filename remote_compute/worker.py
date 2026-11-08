@@ -1543,7 +1543,7 @@ class Handler(BaseHTTPRequestHandler):
                 values = query.get('platform', [])
                 if len(values) > 1:
                     raise ValueError('capabilities accepts one platform')
-                value = worker.capabilities(platform=values[0] if values else None)
+                value = worker.capabilities(platform=values[0] if values else None,operator=operator)
             elif parts == ["nodes"] and self.command == "GET" and hasattr(worker, "nodes"):
                 if not operator:
                     return self._reply({"error": "Device list is operator-only; use /capabilities"}, 403)
@@ -1627,8 +1627,8 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         if not operator:
                             with zipfile.ZipFile(io.BytesIO(body)) as archive:
-                                if json.loads(archive.read('task.json')).get('node') is not None:
-                                    raise ValueError('node selection belongs to the DCO operator')
+                                from .policy import validate_operator_fields
+                                validate_operator_fields(json.loads(archive.read('task.json')),False)
                         value = worker.submit(identity,body,callback=json.loads(callback)) if callback else worker.submit(identity,body)
                     if scheduler and not operator and isinstance(value, dict):
                         value = worker.public_result(value)

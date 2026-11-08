@@ -350,7 +350,8 @@ class StatusRows(list):
         port = urlsplit(self.url).port if self.url else None
         port_label = f' | 端口 {port}' if port else ''
         version_label = ' | ' + str(value['version']) if value.get('version') else ''
-        self.title=f"{ABBREVIATION} | {value.get('node','')} | {'调度中心' if center else '算力提供者'}{port_label}{version_label}"
+        role='混合模式' if center and value.get('mode')=='hybrid' else '调度中心' if center else '算力提供者'
+        self.title=f"{ABBREVIATION} | {value.get('node','')} | {role}{port_label}{version_label}"
         self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))
@@ -392,7 +393,7 @@ class StatusRows(list):
         if center:
             for name,a in value.get('projects',{}).items():
                 count=sum(job.get('project')==name for _,job in self.jobs)
-                self.projects.append([_project(name),str(float(a['resource_share'])),f"{count}/{a['used']}",a['target'],a['queued']])
+                self.projects.append([_project(name),str(float(a['resource_share'])),f"{count}/{a['used']}",a['queued']])
             self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
@@ -454,8 +455,8 @@ class StatusRows(list):
         sections.append(('启动基准 1T/All Miter/s | RSS/Res GiB',details,1))
         if self.value.get('role')=='scheduler':
             if width>=42:
-                table=_table(['Proj','Share','Jobs/CPU','Tgt','Q'],self.projects,
-                             [None,5,8,4,4],width,right=(1,2,3,4))
+                table=_table(['Proj','Share','Jobs/CPU','Q'],self.projects,
+                             [None,5,8,4],width,right=(1,2,3))
             else:
                 table=[_line(' '.join(map(str,r)),width) for r in self.projects]
             sections.append(('工程份额',table if self.projects else [_line('等待工程任务',width)],0))
@@ -484,7 +485,7 @@ class StatusRows(list):
             result=[_rule('设备资源',width)]
             result.extend(_line(f'{r[0]} {r[1]} CPU {r[2]} RAM {r[3]}',width) for _,r in self.devices)
             if self.value.get('role')=='scheduler':
-                result.extend([_rule('工程份额',width),_line(' | '.join(f'{r[0]} {r[2]}/{r[3]}'
+                result.extend([_rule('工程份额',width),_line(' | '.join(f'{r[0]} {r[2]} Q{r[3]}'
                                for r in self.projects) or '等待工程任务',width)])
         else:
             result=[]

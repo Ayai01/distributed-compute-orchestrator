@@ -33,7 +33,7 @@ class AdmissionPlanningTests(unittest.TestCase):
             'waiting':queued('C'),
         }
         budgets=state.project_resources()
-        self.assertEqual(budgets['A']['target'],4)
+        self.assertEqual(budgets['A']['capacity'],4)
         self.assertEqual(state._growth_headroom(budgets),{'0':3})
 
     def test_running_warmup_precedes_another_projects_new_task(self):
@@ -46,20 +46,20 @@ class AdmissionPlanningTests(unittest.TestCase):
                            auto_cpus=False,node=None,cancel=threading.Event(),result=dict(status='queued')),
         }
         budgets=state.project_resources()
-        self.assertEqual(budgets['A']['target'],4)
+        self.assertEqual(budgets['A']['capacity'],4)
         self.assertEqual(state._growth_headroom(budgets),{'0':3})
         # A truly serial phase returns its standing demand as well as its
         # lease; it must not hold three unusable slots against new work.
         state.jobs['active']['desired_cpus']=1
         budgets=state.project_resources()
-        self.assertEqual(budgets['A']['target'],1)
+        self.assertEqual(budgets['A']['capacity'],1)
         self.assertEqual(state._growth_headroom(budgets),{})
         # Queue priority does not bypass the first four useful threads.
         state.jobs['active']['desired_cpus']=8
         state.jobs['waiting']['task']['priority']=1
         budgets=state.project_resources()
-        self.assertEqual(budgets['A']['target'],4)
-        self.assertEqual(budgets['B']['target'],0)
+        self.assertEqual(budgets['A']['capacity'],4)
+        self.assertEqual(budgets['B']['capacity'],1)
         self.assertEqual(state._growth_headroom(budgets),{'0':3})
 
     def test_small_start_elastic_jobs_spread_across_idle_devices(self):
@@ -123,7 +123,7 @@ class AdmissionPlanningTests(unittest.TestCase):
                 result=dict(status='dispatching'if index<4 else'queued'))
         resources=state.project_resources()
         self.assertEqual(resources['A']['demand'],18)
-        self.assertEqual(resources['A']['target'],16)
+        self.assertEqual(resources['A']['capacity'],16)
         self.assertEqual(state._growth_headroom(resources),{'0':12})
         state.jobs['0']['desired_cpus']=1
         self.assertEqual(state.project_resources()['A']['demand'],15)
@@ -180,7 +180,7 @@ class AdmissionPlanningTests(unittest.TestCase):
                              memory_capacity_mb=8192,memory_available_mb=8192,host_memory_available_mb=8192)
             pool.nodes.append(node)
         state=Coordinator.__new__(Coordinator)
-        state.pool,state.condition,state.jobs=pool,threading.Condition(),{}
+        state.pool,state.condition,state.jobs=pool,threading.Condition(),{};state.queue=[]
         return state
 
     def test_admission_matches_legacy_capability_aliases_like_dispatch(self):
@@ -198,7 +198,7 @@ class AdmissionPlanningTests(unittest.TestCase):
 
     def test_fixed_cpu_admission_excludes_nodes_below_the_task_width(self):
         window=self.center([2,8]).admission(dict(project='A',cpus=4,queue_ratio=0))
-        self.assertEqual((window['capable_cpus'],window['target_cpus'],window['running_tasks']),(8,8,2))
+        self.assertEqual((window['capable_cpus'],window['running_tasks']),(8,2))
 
     def test_fixed_cpu_window_does_not_combine_remainders_from_separate_devices(self):
         window=self.center([3,3]).admission(dict(project='A',cpus=2,queue_ratio=0))
@@ -213,18 +213,18 @@ class AdmissionPlanningTests(unittest.TestCase):
                     auto_cpus=False,node=None,result=dict(status='queued'))
         resources=state.project_resources()
         for project in ('A','B'):
-            self.assertEqual(sorted(resources[project]['node_targets'].values()),[6,6])
+            self.assertNotIn('node_targets',resources[project])
             window=state.admission(dict(project=project,cpus=4,queue_ratio=0))
-            self.assertEqual((window['target_cpus'],window['running_tasks'],window['in_flight']),(12,3,3))
+            self.assertEqual((window['capable_cpus'],window['running_tasks'],window['in_flight']),(24,6,6))
 
     def test_paused_workers_do_not_inflate_ready_project_share(self):
         state=self.center([2,8])
         state.pool.nodes[1].health['paused']=True
         window=state.admission(dict(project='A',queue_ratio=0))
-        self.assertEqual((window['capable_cpus'],window['target_cpus'],window['running_tasks']),(2,2,2))
+        self.assertEqual((window['capable_cpus'],window['running_tasks']),(2,2))
         state.pool.nodes[0].health['paused']=True
         window=state.admission(dict(project='A',queue_ratio=0))
-        self.assertEqual((window['capable_cpus'],window['target_cpus']),(0,0))
+        self.assertEqual(window['capable_cpus'],0)
 
     def test_cooperative_target_fits_fixed_work_before_dividing_automatic_jobs(self):
         state=self.center([16]);node=state.pool.nodes[0];node.reserved=16
@@ -320,11 +320,11 @@ class AdmissionPlanningTests(unittest.TestCase):
             state.jobs[key]=dict(task=dict(steps=[['echo']],cpus=1,project=key[0],priority=3 if key=='urgent' else 0))
         budgets={'A':dict(used=0,resource_share=1.),'B':dict(used=2,resource_share=1.),'u':dict(used=8,resource_share=1.)}
         iterator=state._queued_candidates(budgets)
-        self.assertEqual(next(iterator),('urgent',False))
-        self.assertEqual(next(iterator),('A1',False))
+        self.assertEqual(next(iterator),'urgent')
+        self.assertEqual(next(iterator),'A1')
         budgets['A']['used']=4
-        self.assertEqual(next(iterator),('B1',False))
-        self.assertEqual(next(iterator),('A2',False))
+        self.assertEqual(next(iterator),'B1')
+        self.assertEqual(next(iterator),'A2')
 
 
 @contextmanager
@@ -420,7 +420,7 @@ class CenterTests(unittest.TestCase):
                         statuses=[state.get(key)['status']for key in ids]
                         self.assertEqual(statuses.count('running'),4)
                         self.assertEqual(statuses.count('queued'),2)
-                        self.assertEqual(state.project_resources()['warmup']['target'],16)
+                        self.assertEqual(state.project_resources()['warmup']['capacity'],16)
                     finally:
                         client.control(paused=True)
                         for key in ids:client.cancel(key)
@@ -850,8 +850,8 @@ class CenterTests(unittest.TestCase):
                 tasks += [python('pass',project='Bench',requires=['physical_profile_a']) for _ in range(10)]
                 identities=[client.submit(task)['id'] for task in tasks]
                 resources=client.health()['projects']
-                self.assertEqual({p:r['target'] for p,r in resources.items()},{'ARH':5,'Bench':5})
-                self.assertEqual(client.admission('ARH',node='node2',max_cpus=1024)['target_cpus'],5)
+                self.assertEqual({p:r['capacity'] for p,r in resources.items()},{'ARH':7,'Bench':10})
+                self.assertEqual(client.admission('ARH',node='node2',max_cpus=1024)['capable_cpus'],6)
                 for identity in identities:client.cancel(identity);client.delete(identity)
 
     def test_auto_reloan_returns_excess_only_when_the_running_task_requests_it(self):
@@ -903,10 +903,9 @@ class CenterTests(unittest.TestCase):
                 identities=[client.submit(python('pass',project=project,requires=['native_only']))['id']
                             for project in ('A','B') for _ in range(4)]
                 resources=client.health()['projects']
-                self.assertEqual([resources[p]['target'] for p in ('A','B')],[1,1])
                 self.assertEqual([resources[p]['capacity'] for p in ('A','B')],[2,2])
                 window=client.admission('B',requires=['native_only'],queue_ratio=1)
-                self.assertEqual((window['target_cpus'],window['in_flight']),(1,129))
+                self.assertEqual((window['capable_cpus'],window['in_flight']),(2,129))
                 for identity in identities:client.cancel(identity);client.delete(identity)
 
     def test_window_tracks_new_worker_capabilities_and_budget_reductions(self):
@@ -1114,7 +1113,7 @@ class CenterTests(unittest.TestCase):
                             self.assertTrue(entered.wait(2))
                             quick=Client(client.url,timeout=.5)
                             self.assertEqual(quick.health()['used_cpus'],4)
-                            self.assertEqual(quick.admission('B')['target_cpus'],2)
+                            self.assertEqual(quick.admission('B')['capable_cpus'],4)
                             self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
                             self.assertEqual(worker.health()['used_cpus'],1)
                             other=quick.submit(python('pass',project='B',max_cpus=4))['id']
@@ -1360,8 +1359,8 @@ class CenterTests(unittest.TestCase):
                 client.control(paused=True)
                 queued=client.submit(python(hold,project='A',max_cpus=1024))['id']
                 other=client.submit(python(hold,project='B',max_cpus=1024))['id']
-                self.assertEqual(client.admission('A',max_cpus=1024,queue_ratio=0)['target_cpus'],12)
-                self.assertEqual(client.admission('B',max_cpus=1024,queue_ratio=0)['target_cpus'],12)
+                self.assertEqual(client.admission('A',max_cpus=1024,queue_ratio=0)['capable_cpus'],12)
+                self.assertEqual(client.admission('B',max_cpus=1024,queue_ratio=0)['capable_cpus'],12)
                 client.control(paused=False)
                 until(lambda:all(client.status(i)['status']=='running'for i in (other,queued)))
                 client.resize(other,0)
@@ -1369,8 +1368,8 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.status(queued)['cpus'],1)
                 self.assertEqual(client.resize(queued,0)['cpus'],4)
                 resources=client.health()['projects']
-                self.assertEqual({name:(row['target'],row['used']) for name,row in resources.items()},
-                                 {'A':(16,16),'B':(8,8)})
+                self.assertEqual({name:(row['capacity'],row['used']) for name,row in resources.items()},
+                                 {'A':(24,16),'B':(12,8)})
                 for identity in (existing,other):
                     client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
                 until(lambda:client.status(queued)['status']=='running')
@@ -1575,9 +1574,9 @@ class CenterTests(unittest.TestCase):
                 client.control(paused=True)
                 identities=[client.submit(python('pass',project='A'))['id'] for _ in range(6)]
                 window=client.window('B',queue_ratio=0)
-                self.assertEqual((window.maximum,window.current()),(6,3))
+                self.assertEqual((window.maximum,window.current()),(6,6))
                 pinned=client.admission('B',queue_ratio=0,node='small')
-                self.assertEqual((pinned['target_cpus'],pinned['max_in_flight']),(2,2))
+                self.assertEqual((pinned['capable_cpus'],pinned['max_in_flight']),(2,2))
                 for identity in identities:client.cancel(identity);client.delete(identity)
                 window.updated=0
                 self.assertEqual(window.current(),6)
@@ -1918,8 +1917,8 @@ class CenterTests(unittest.TestCase):
                 client.control(paused=True)
                 for _ in range(7):client.submit(python('pass',project='A',resource_share=2))
                 window=client.admission('B',resource_share=1,queue_ratio=1)
-                self.assertEqual((window['target_cpus'],window['running_tasks'],window['queued_tasks'],window['in_flight']),(2,2,127,129))
-                self.assertEqual(client.admission('B',resource_share=1,queue_ratio=0)['in_flight'],2)
+                self.assertEqual((window['capable_cpus'],window['running_tasks'],window['queued_tasks'],window['in_flight']),(7,7,122,129))
+                self.assertEqual(client.admission('B',resource_share=1,queue_ratio=0)['in_flight'],7)
                 self.assertEqual(client.admission('B',resource_share=1,queue_ratio=.5)['in_flight'],129)
                 for job in client.status():client.cancel(job['id']);client.delete(job['id'])
     def test_late_parallel_project_enters_as_soon_as_one_thread_is_free(self):

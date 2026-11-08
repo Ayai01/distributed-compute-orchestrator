@@ -48,6 +48,8 @@ python -B main.py --help
 | worker | `python -B main.py --mode worker --host 0.0.0.0 --port 26133` | 独立算力及机器操作 |
 | 连接已有中心 | `python -B main.py --url http://127.0.0.1:26133` | 打开操作看板 |
 
+hybrid看板显示“混合模式”；API逻辑角色仍为scheduler，操作员health的mode区分hybrid与独立scheduler。
+
 所有设备使用同一份源码和启动脚本；角色、地址、端口、预算、工具及路径差异保存在 Git 忽略的 `worker.local.json` 和 `nodes.local.json`。启动优先级为显式 CLI 参数 > 本机配置 > 内置默认值，可用 `--config`、`--nodes` 指定文件；本机配置中的 `mode/host/port/center_port` 同样生效。独立 worker 只需 Python 和本工程，科研目录属于按需登记的共享能力。
 
 重启维护使用 `python -B main.py --start-paused`，或在本机配置设置 `start_paused:true`。中心在启动调度线程前暂停新派发，仍可查询、领取和删除原ID；已受理任务可重连。一次性 `run/spice/rtl/batch` 若会创建暂停中心，立即提示退出。连接已有中心的 `--url` 不继承本机启动设置。`control(paused=False)` 只恢复本次运行；维护完成后显式清除配置中的 `start_paused`，以后启动才自动派发。配置保留期间，每次重启都回到维护暂停。
@@ -252,9 +254,19 @@ Python和C++是基础环境，不出现在运行能力列表。科学计算的�
 
 `memory_mb`用于启动调度估计，不是进程硬内存限额。固定任务经过有效采样后，DCO按近期RSS、Windows private峰值与增长余量校正预留，原申请保留在回执中。已知后续阶段工作集通过base/per-CPU模型声明，按实际并行宽度准备与归还；`memory_limit_mb`限制该模型的调度宽度。新派发及未采样进程保留启动估计，内存不足时仍可提交到队列。任务族的完整实测峰值用于校正下一批申请，不能用单次瞬时RSS替代冷准备或多进程峰值。
 
-普通`Client`使用`client.capabilities()['platforms']`查询在线平台类型；`client.capabilities(platform='linux')`返回该平台的语义能力、CPU/RAM及加速器汇总，不暴露设备身份。平台使用提供者实际`sys.platform`值，例如`linux`、`win32`，不放入`requires`。
+普通`Client`查询`client.capabilities()`获取语义能力、CPU/RAM和无设备身份的加速器汇总。普通模式隐藏设备清单、地址、宿主路径和平台清单；平台与设备不放入`requires`。
 
-`command/python_map/python_call/python_task(..., platform='linux')`只在匹配平台运行；省略`platform`使用全部兼容平台。`client.admission(..., platform='linux')`及`client.window(..., platform='linux')`按相同条件估算资源。`client.execute`的每个任务分别携带平台，共享原工程窗口，可混合Windows/Linux任务。没有匹配提供者时返回明确的匹配失败；worker在展开输入和运行进程前再次核对平台。冻结平台任务直接声明约束，原ID、输入及预算保持；`node`和设备清单仅供操作员。
+普通任务提交禁止指定`platform`、`node`和外部`cwd`，SDK及直接HTTP入口均拒绝。普通`capabilities/admission/window`也拒绝平台过滤。操作员调试可以指定真实`sys.platform`，并按设备选择运行；中心需要操作员令牌。受理后的约束随原ID冻结，输入、费用和恢复身份保持。
+
+| 信息与操作 | 普通工程模式 | 操作员调试／维护 |
+| --- | --- | --- |
+| 能力、CPU/RAM、加速器 | 无设备身份的汇总 | 汇总及设备明细 |
+| 任务输入与资源声明 | argv、文件、资产、能力、max_cpus、内存、时限、重试、优先级、工程名 | 同左及调试放置 |
+| 任务状态与结果 | 原ID、实际CPU/max、内存、进度、费用、业务输出和失败记录 | 同左及设备、路径与执行明细 |
+| 指定设备、平台、外部cwd | 拒绝 | 允许 |
+| 设备清单、服务控制、重启 | 拒绝 | 允许 |
+
+工程CPU目标数不参与准入、派发或扩核；`resource_share`用于同级任务排序。设备配额、超发倍率、真实内存和已授权活跃线程继续约束分配。准备窗口仍按运输中的原ID计数，默认保有真实排队工作。业务代码在执行进程中读取到的环境和自行写入的输出保持原内容。
 
 | 能力 | 就绪条件及独立安装理由 |
 | --- | --- |

@@ -336,6 +336,8 @@ class Client:
     def capabilities(self, *, platform=None):
         """Small aggregate view intended for project adapters."""
         platform = validate_platform(platform)
+        if platform is not None and not self.operator:
+            raise RemoteError('platform selection is operator/debug-only; ordinary requests must omit platform')
         result = self.request('/capabilities' + ('?' + urlencode(dict(platform=platform)) if platform is not None else ''))
         if result.get('protocol') != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
@@ -363,6 +365,9 @@ class Client:
                 time.sleep(.25)
 
     def submit(self, task, *, inputs=None, files=None, job_id=None):
+        from .policy import validate_operator_fields
+        try:validate_operator_fields(task,self.operator)
+        except ValueError as error:raise RemoteError(str(error)) from None
         if 'cpus' in task:
             raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')
         identity = job_id or uuid.uuid4().hex
@@ -412,7 +417,36 @@ class Client:
         action='lease' if (os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
                            and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/')) else 'resize'
         target=os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',identity) if action=='lease' else identity
-        return self.request('/jobs/'+target+'/'+action, request)
+        path='/jobs/'+target+'/'+action
+        def pending(error):
+            return error.status_code==409 and 'A resource request is already pending' in str(error)
+        try:
+            return self.request(path, request)
+        except RemoteError as error:
+            if not (error.transport_retryable or error.status_code in (502,503,504) or pending(error)):
+                raise
+        # Resource changes set a grant; they never start or repeat business
+        # items. Observe the original before replaying that same desired state.
+        # In polling mode the first POST can still be waiting at the worker.
+        def reconnect():
+            current=self.status(target)
+            if current.get('status')!='running':
+                error=RemoteError('Only a running task can change its CPU grant');error.status_code=409
+                raise error
+            if action=='lease' and current.get('resource_request'):
+                error=RemoteError('Waiting for the original resource request to settle');error.transport_retryable=True
+                raise error
+            try:return self.request(path,request)
+            except RemoteError as error:
+                if pending(error):error.transport_retryable=True
+                raise
+        inherited=(identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
+                   and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'))
+        from .deadline import remaining_time,check_deadline
+        remaining=remaining_time()if inherited else None
+        return self._read_reconnecting(reconnect,
+            deadline=time.monotonic()+remaining if remaining is not None else None,
+            check=check_deadline if inherited else None)
 
     def nodes(self):
         if not self.operator:
@@ -425,6 +459,8 @@ class Client:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,requires=list(requires))
         platform = validate_platform(platform)
+        if platform is not None and not self.operator:
+            raise RemoteError('platform selection is operator/debug-only; ordinary requests must omit platform')
         if platform is not None:
             request['platform'] = platform
         if ready_tasks is not None:
@@ -941,7 +977,7 @@ class Pool:
                 node = Node(f"node{index + 1}", entry)
             else:
                 node = Node(entry.get("name", f"node{index + 1}"),
-                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10),ca_file=entry.get('ca_file')),
+                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10),ca_file=entry.get('ca_file'),operator=True),
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
@@ -956,6 +992,7 @@ class Pool:
                         raise ValueError('Node reconnect requires attempts 0..5 and a nonnegative timestamp')
                     node.detached = True
                     node.reconnect_attempts, node.reconnect_after = attempts, after
+            if isinstance(node.client,Client):node.client.operator=True
             self._validate_node(node)
             node.error = 'Checking worker'
             self.nodes.append(node)
@@ -1172,7 +1209,7 @@ class Pool:
                 if any(other is not node and other.client.url==address.rstrip('/') for other in self.nodes):
                     raise ValueError('Configure each worker URL once')
                 if address.rstrip('/')!=node.client.url or ca_file!=getattr(node.client,'ca_file',None):
-                    node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file)
+                    node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file,operator=True)
                     node.connection_generation+=1
                     node.error='Node address changed; checking worker'
                 for key, value in changes.items():
@@ -1188,7 +1225,7 @@ class Pool:
         if name is not None and connection_change:self._save_reconnect(node)
 
     def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None):
-        node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file), weight=weight, limit=limit)
+        node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file,operator=True), weight=weight, limit=limit)
         node.host_ip = host_ip
         node.aliases=[] if aliases is None else aliases
         self._validate_node(node)

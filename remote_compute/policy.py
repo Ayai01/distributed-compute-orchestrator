@@ -255,10 +255,18 @@ def public_capabilities():
         "resize_memory_model",
         "resize_active_cpus",
         "semantic_requires",
-        "task_platform",
+
         "single_thread_weight",
         "asset_cache",
         "accelerators",
         "accelerator_fallback",
         "accelerator_memory_sharing",
     ]
+
+
+def validate_operator_fields(value, operator=False):
+    """Placement and external host paths belong to explicit debugging."""
+    if not operator:
+        for field in ('node','platform','cwd'):
+            if value.get(field) is not None:
+                raise ValueError(field+' selection is operator/debug-only; ordinary tasks must omit '+field)

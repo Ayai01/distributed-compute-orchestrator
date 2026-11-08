@@ -1,4 +1,4 @@
-"""Platform is a public execution constraint, not a provider or tool alias."""
+"""Platform selection belongs to explicit operator debugging."""
 from pathlib import Path
 import sys
 import threading
@@ -27,7 +27,7 @@ class PlatformRoutingTests(unittest.TestCase):
                 tools={'python': dict(available=True)}, python_backends=['cpu', 'ml'])
             pool.nodes.append(node)
         state = Coordinator.__new__(Coordinator)
-        state.pool, state.condition, state.jobs = pool, threading.Condition(), {}
+        state.pool, state.condition, state.jobs = pool, threading.Condition(), {};state.queue=[]
         return state
 
     def test_platform_validation_and_constructor_forwarding(self):
@@ -55,21 +55,20 @@ class PlatformRoutingTests(unittest.TestCase):
 
     def test_aggregate_discovery_and_admission_respect_platform(self):
         state = self.state()
-        self.assertEqual(state.capabilities()['platforms'], ['linux', 'win32'])
+        self.assertEqual(state.capabilities(operator=True)['platforms'], ['linux', 'win32'])
         for platform, cpus, tags in [('linux', 4, ['ng47']), ('win32', 2, ['ml']), ('darwin', 0, [])]:
-            view = state.capabilities(platform=platform)
+            view = state.capabilities(platform=platform,operator=True)
             self.assertEqual(view['cpu']['capacity'], cpus)
             self.assertEqual(view['tags'], tags)
             self.assertEqual(view['platforms'], [platform] if cpus else [])
-            offer = state.admission(dict(project='test', platform=platform))
+            offer = state.admission(dict(project='test', platform=platform),operator=True)
             self.assertEqual(offer['capable_cpus'], cpus)
-            self.assertEqual(offer['target_cpus'], cpus)
             self.assertEqual(offer['platform'], platform)
 
     def test_platform_survives_accelerator_fallback(self):
         state = self.state()
         request = dict(project='test', platform='linux', accelerator=dict(kind='cuda', fallback_after_seconds=0))
-        offer = state.admission(request)
+        offer = state.admission(request,operator=True)
         self.assertEqual(offer['capable_cpus'], 0)
         self.assertEqual(offer['fallback_capable_cpus'], 4)
         task = command(['${tool:python}'], platform='linux', accelerator=request['accelerator'])
@@ -82,6 +81,7 @@ class PlatformRoutingTests(unittest.TestCase):
     def test_worker_rejects_mismatch_before_materializing_or_executing(self):
         wrong = 'linux' if sys.platform != 'linux' else 'win32'
         with scratch() as directory, provider(directory) as (worker, client):
+            client=Client(client.url,operator=True)
             identity = uuid.uuid4().hex
             with self.assertRaisesRegex(RemoteError, 'platform differs'):
                 client.submit(command(['${tool:python}', '-c', 'raise RuntimeError("executed")'],
@@ -99,7 +99,9 @@ class PlatformRoutingTests(unittest.TestCase):
             with provider(root/'worker', cpus=2) as (_, remote), Pool([remote]) as pool:
                 with center(pool, root/'center') as (state, operator):
                     client = Client(operator.url)
-                    self.assertIn('task_platform', client.capabilities()['capabilities'])
+                    self.assertNotIn('platforms',client.capabilities())
+                    with self.assertRaises(RemoteError):client.capabilities(platform=sys.platform)
+                    client=operator
                     self.assertEqual(client.capabilities()['platforms'], [sys.platform])
                     self.assertEqual(client.capabilities(platform=sys.platform)['cpu']['capacity'], 2)
                     self.assertEqual(client.capabilities(platform='darwin')['cpu']['capacity'], 0)
@@ -117,7 +119,7 @@ class PlatformRoutingTests(unittest.TestCase):
                     self.assertEqual(result['stdout'].strip(), sys.platform)
                     self.assertEqual(state.jobs[identity]['task']['platform'], sys.platform)
                     self.assertEqual(result['request_sha256'], accepted['request_sha256'])
-                    self.assertNotIn('assigned_node', result)
+                    self.assertNotIn('assigned_node',Client(operator.url).status(identity))
                     # No provider is an explicit routing failure, never execution on another OS.
                     unmatched = client.submit(dict(task, platform='darwin'), job_id=uuid.uuid4().hex)['id']
                     rejected = client.wait(unmatched)

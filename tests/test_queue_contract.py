@@ -43,7 +43,7 @@ class ReadyQueueTests(unittest.TestCase):
                                 node=None, result=dict(status='queued')) for name in ('A', 'B')}
         before = state.admission(dict(project='A', cpus=4))
         value = state.admission(dict(project='A', cpus=4, ready_tasks=256))
-        for field in ('target_cpus', 'capable_cpus', 'running_tasks'):
+        for field in ('capable_cpus', 'running_tasks'):
             self.assertEqual(value[field], before[field])
         self.assertEqual((value['in_flight'], value['max_in_flight'], value['project_active_tasks']), (256, 256, 1))
         self.assertEqual(value['queued_tasks'], 256-value['running_tasks'])
@@ -76,11 +76,11 @@ class ReadyQueueTests(unittest.TestCase):
     def test_sdk_uses_the_center_project_window_without_extra_poll(self):
         client = Client()
         original = dict(running_tasks=2, queued_tasks=254, in_flight=256, max_in_flight=256,
-                        target_cpus=8, ready_source='center')
+                        capable_cpus=8, ready_source='center')
         with patch.object(client, 'request', return_value=original.copy()) as request:
             window = client.window('A', max_cpus=4, ready_tasks=256)
             self.assertEqual((window.maximum, window.current()), (256, 256))
-            self.assertEqual(window.value['target_cpus'], 8)
+            self.assertEqual(window.value['capable_cpus'], 8)
             self.assertEqual(window.value['ready_source'], 'center')
             self.assertEqual(request.call_count, 1)
 
