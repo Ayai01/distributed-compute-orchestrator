@@ -123,7 +123,7 @@ python_map('business:evaluate', items,
            memory_limit_mb=8192)
 ```
 
-固定`memory_mb`默认为256MiB。模型使用`base_memory_mb + 实际授权核数 × memory_per_cpu_mb`，可选`memory_limit_mb`限制阶段调度包络。声明量用于冷启动和阶段切换估计，稳定运行后固定与线性模型都按任务树实测校正。进程映射完成项退出后，其内存归还；线程共享缓存仍由实际RSS计账。Windows物理RSS与PrivateUsage分别计账，不把已提交但未驻留的页重复扣留。设备预算、系统保留与实时headroom分别记录；看板RAM U/T为物理用量，Admit为可派发额度。
+固定`memory_mb`默认为256MiB。模型使用`base_memory_mb + 实际授权核数 × memory_per_cpu_mb`，可选`memory_limit_mb`限制阶段调度包络。声明量用于冷启动和阶段切换估计，稳定运行后固定与线性模型都按任务树实测校正。进程映射完成项退出后，其内存归还；线程共享缓存仍由实际RSS计账。Windows物理RSS与PrivateUsage分别计账，不把已提交但未驻留的页重复扣留。设备预算、系统保留与实时headroom分别记录；看板RAM U/T为物理用量，Admit为可派发额度。 任务列RAM实/报显示当前任务树RSS与按当前授权核数计算的原始阶段内存估计；校准预留保留在API和明细。两项统一以GiB计算，隐藏单位，保留1位小数，小于0.1显示0.1；缺少数值时显示-。
 
 `memory_mb`与`memory_limit_mb`不设置进程的OS硬内存限额。初次准入允许最多每槽256MiB的冷探测资金，估计超过设备容量仍可按原ID进入队列并取得首槽；未量测的在途派发继续占据账本，防止并发重复花费。取得至少2秒、3次有效任务树采样后，固定和线性模型使用最近10秒RSS/private各自的峰值；包络取峰值125%、峰值加32MiB、峰值加最近2秒正增长速率的2秒增量三者最大值，并覆盖当前实占。
 

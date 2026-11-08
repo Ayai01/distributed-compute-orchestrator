@@ -136,6 +136,17 @@ def _gb(value):
     return f'{(value or 0)/1024:.1f}'
 
 
+def _task_memory(job):
+    """Current RSS / original phase estimate at this CPU grant, in GiB."""
+    phase=job.get('memory_phase')or job.get('memory_phase_model')or job.get('memory_model')or{}
+    declared=phase.get('memory_mb')
+    if declared is None and phase.get('base_memory_mb')is not None:
+        declared=phase['base_memory_mb']+phase['memory_per_cpu_mb']*max(1,job.get('cpus')or 1)
+    if declared is None:declared=job.get('memory_mb')
+    def number(value):return '-'if value is None else f'{max(.1,value/1024):.1f}'
+    return number(job.get('rss_mb'))+'/'+number(declared)
+
+
 def _capabilities(tags):
     labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','layout':'Layout','rtl':'RTL','onnx':'ONNX'}
     return ' '.join(labels[name]for name in execution_capabilities(tags or ())) or '-'
@@ -391,7 +402,7 @@ class StatusRows(list):
             state=job.get('status','running')
             started=job.get('started')
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
-                                 _gb(job.get('memory_mb')),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),compact_tag(job,preferred=_label(job),measure=_width),
+                                 _task_memory(job),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),compact_tag(job,preferred=_label(job),measure=_width),
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
                                  _progress_label(job)])
@@ -491,6 +502,7 @@ class StatusRows(list):
         self.task_page%=self.page_count
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         records=[r if len(r)>7 else [*r,'-'] for r in records]
+        ram_width=max([9]+[_width(r[4])for r in records])
         def tag(record):
             return record[6] if record[9] in ('—','0/1','1/1') else f'{record[9]} {record[6]}'
         # The full progress column appears only when the task panel has room
@@ -498,17 +510,21 @@ class StatusRows(list):
         # the same ratio remains available in the status/API payload.
         show_progress = width >= 140
         if width>=110 and not show_progress:
-            table=_table(['ID','Node','Proj','CPU/max','RAM','Sec','St','Tag'],
+            table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
+                         [4,self.node_width,6,9,ram_width,6,4,None],width,right=(3,4,5))
         elif width>=110:
-            table=_table(['ID','Node','Proj','CPU/max','RAM','Sec','St','Prog','Tag'],
+            table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Prog','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
-                         [4,self.node_width,6,9,4,6,4,6,None],width,right=(3,4,5,6))
-        elif width>=80:
-            table=_table(['ID','Node','Proj','CPU/max','RAM','Sec','St','Tag'],
+                         [4,self.node_width,6,9,ram_width,6,4,6,None],width,right=(3,4,5,6))
+        elif width>=100:
+            table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,9,4,6,4,None],width,right=(3,4,5))
+                         [4,self.node_width,6,9,ram_width,6,4,None],width,right=(3,4,5))
+        elif width>=80:
+            table=_table(['ID','Node','CPU/max','RAM实/报','Sec','St','Tag'],
+                         [[r[i]for i in (0,1,3,4,7,5)]+[tag(r)]for r in records],
+                         [4,self.node_width,9,ram_width,6,4,None],width,right=(2,3,4))
         elif width>=54:
             table=_table(['ID','Node','CPU/max','Sec','Tag'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
                          [4,self.node_width,9,6,None],width,right=(2,3))
