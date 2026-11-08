@@ -1,7 +1,9 @@
 """Cooperative CPU demand at executor boundaries, without a polling thread."""
+import json
+import os
 import time
 from .allocation import plan_resize
-from .memory import same_phase
+from .memory import same_phase, plan_memory
 
 
 class CpuLease:
@@ -50,12 +52,22 @@ class CpuLease:
                     raise
                 # A refused or unanswered resize leaves paid CPU/RAM usable. Re-read that
                 # grant: a new phase may need more memory than it can fund.
-                grant=self.client.status(self.identity)
+                inherited=(self.identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
+                    and self.client.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'))
+                target=(os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',self.identity)
+                    if inherited and os.environ.get('REMOTE_COMPUTE_LEASE')=='1' else self.identity)
+                grant=self.client.status(target)
                 available=grant.get('memory_mb',0)
                 if isinstance(grant.get('memory_phase'),dict)and same_phase(self.memory,grant['memory_phase']):
                     # The provider already funded this phase using its actual
                     # working set. Raw startup estimates must not revoke it.
                     funded,required=min(desired,grant.get('cpus',0)),None
+                elif inherited and grant.get('memory_phase')is None and self._inherited_probe():
+                    # An admitted entry can still own its one-slot cold probe
+                    # when the first expansion was refused. This is the frozen
+                    # parent phase, not authorization for a new business phase.
+                    funded,required=plan_memory(1,available,**self.memory)
+                    funded=min(funded,desired,grant.get('cpus',0))
                 else:
                     funded,required=plan_resize(min(desired,grant.get('cpus',0)),
                         self.memory.get('memory_mb'),self.memory.get('base_memory_mb'),
@@ -69,3 +81,8 @@ class CpuLease:
             self.demand, self.active_cpus = desired, active_cpus
             self.updated = time.monotonic()
         return self.cpus
+
+    def _inherited_probe(self):
+        try:parent=json.loads(os.environ.get('REMOTE_COMPUTE_MEMORY_MODEL','null'))
+        except ValueError:return False
+        return isinstance(parent,dict)and same_phase(self.memory,parent)

@@ -331,12 +331,13 @@ class AdaptiveMemoryTests(unittest.TestCase):
             worker.host.sample=Mock(side_effect=lambda:dict(host))
             with Pool([node])as pool,center(pool,root+'/center')as(_,client):
                 code="from pathlib import Path;import time;Path('partial.txt').write_text('kept');time.sleep(20)"
-                identity=client.submit(python(code,memory_mb=256,outputs=['partial.txt']))['id']
+                identity=client.submit(python(code,memory_mb=256,outputs=['partial.txt'],retries=0))['id']
                 try:
                     until(lambda:any(j.get('rss_mb',0)>0 for j in worker.jobs.values()))
                     host['host_memory_available_mb']=64
                     state=client.wait(identity,wait_timeout=6)
-                    self.assertEqual(state['status'],'failed')
+                    self.assertEqual(state['status'],'interrupted')
+                    self.assertEqual(state['attempts'],[])
                     host['host_memory_available_mb']=2048
                     result=client.fetch(identity,root+'/delivery')
                     self.assertEqual(result['id'],identity)
