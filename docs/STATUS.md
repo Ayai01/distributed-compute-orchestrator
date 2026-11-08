@@ -47,7 +47,7 @@ stop_when只停止新增并排空；cancel_when取消本次调用的在途原ID�
 
 ## 验证与证据
 
-- 当前源码的全量核心/原生扫描与修正后定向复验覆盖891项，887通过、4项按平台跳过；实际ngspice与Verilator通过。集中审查、逐项裁定、运行源码一致性及验证日志见`.local/maintenance/preflight-01115-20261108/validation.json`。覆盖4核优先与空闲扩核、54/1024上限、共享内存基线与实际并行增量、固定/线性内存校正、冷探测准入、中心/worker预算一致、真实RAM/commit压力终止、原ID及付费前缀、超时续行、独立失败隔离、原ID恢复、kill与取消、100ms启动间隔，以及Tag进度与身份在窄栏中的显示。
+- 当前源码的全量核心/原生扫描及定向复验累计覆盖892项，888通过、4项按平台跳过；实际ngspice与Verilator通过。集中审查与全量日志见`.local/maintenance/preflight-01115-20261108/validation.json`；当前发布、显示链路及独立实测入口见`.local/maintenance/ram-pair-phase-20261108/current.json`。覆盖4核优先与空闲扩核、54/1024上限、共享内存基线与实际并行增量、固定/线性内存校正、冷探测准入、中心/worker预算一致、真实RAM/commit压力终止、原ID及付费前缀、超时续行、独立失败隔离、原ID恢复、kill与取消、100ms启动间隔，以及Tag与RAM实/报在窄栏中的显示。
 - Windows长路径贯穿成果枚举、输入保留、领取和原ID删除，保留链接自身的清理边界；26项文件生命周期检查通过，日志`patch-01101-long-output-lifecycle-final.log`。
 - 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
 - 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。

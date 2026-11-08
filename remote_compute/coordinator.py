@@ -410,6 +410,8 @@ class Coordinator:
                 known_ids.add(job.get('worker_id', result.get('worker_id', result['id'])))
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
                     item = {k: result.get(k) for k in ('id','label','status','cpus','max_cpus','memory_mb','started')}
+                    item['memory_phase']=(result.get('memory_phase')or job['task'].get('memory_model')
+                                          or dict(memory_mb=job['task'].get('memory_mb')))
                     item.update(progress_fields(result))
                     item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
                     item['project'] = job.get('task',{}).get('project','')
