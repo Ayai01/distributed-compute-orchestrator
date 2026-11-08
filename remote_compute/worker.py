@@ -686,6 +686,8 @@ class Worker:
             if memory_budget_mb is not None and calibrated and same_phase(requested_memory,previous_memory):
                 field='memory_mb'if model.get('memory_mb')is not None else'base_memory_mb'if model.get('memory_per_cpu_mb')==0 else None
                 actual=max(job.get('rss_mb',0),job.get('private_mb')or 0)
+                if actual>available:
+                    raise Conflict('Insufficient RAM for active workers; existing grant retained')
                 # This width-independent phase already has funded growth room.
                 # A newer padded sample must not charge that margin twice.
                 if field and 0<actual<=available:

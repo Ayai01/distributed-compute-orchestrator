@@ -28,12 +28,15 @@ def calibrated_model(model,previous,active_cpus,physical,commit,calibrated,learn
         per=max(0,max(math.ceil((b-a)/(wb-wa))for i,(wa,a)in enumerate(samples)for wb,b in samples[i+1:]))
         base=max(0,max(math.ceil(value-per*width)for width,value in samples))
     else:
-        if learned is not None and learned.get('memory_per_cpu_mb')is not None:
-            per=min(learned['memory_per_cpu_mb'],memory//active_cpus)
-            base=memory-per*active_cpus
+        if (not fixed and model.get('memory_per_cpu_mb') == 0
+                or learned is not None and learned.get('memory_per_cpu_mb') == 0):
+            base,per=memory,0
         else:
-            base=min(model['base_memory_mb'],memory)
-            per=math.ceil((memory-base)/active_cpus)
+            # One width cannot identify a shared baseline and a per-worker
+            # increment. Charge its whole measured envelope per observed slot
+            # until another width measures that split. Subtracting the declared
+            # base here can turn a cold interpreter into almost free workers.
+            base,per=0,math.ceil(memory/active_cpus)
     result=dict(base_memory_mb=base,memory_per_cpu_mb=per)
     if model.get('memory_limit_mb')is not None:result['memory_limit_mb']=model['memory_limit_mb']
     return result
@@ -47,7 +50,7 @@ def plan_memory(cpus,available_mb,*,floor=1,**model):
     if width>=floor and (memory is None or memory<=available_mb):return width,memory
     # Estimates do not form a hard RAM limit. Actual host pressure terminates
     # an offending process tree and keeps its original receipt and paid work.
-    needed=(model.get('base_memory_mb',0)or 0)+(model.get('memory_per_cpu_mb',0)or 0)
+    needed=(model.get('base_memory_mb',0)or 0)+(model.get('memory_per_cpu_mb',0)or 0)*floor
     needed=model.get('memory_mb')or needed
     probe=min(needed,256*floor)
     if available_mb>=probe:return floor,probe

@@ -23,6 +23,7 @@ class AdaptiveMemoryTests(unittest.TestCase):
                 job['task']['memory_model']=None if fixed else phase
                 job['memory_phase_model']=None if fixed else phase
                 job['result']['memory_phase']=phase
+                job['memory_width_samples']=[(1,128),(2,128)]
                 reply=worker.resize('one',4,active_cpus=2,memory_budget_mb=127,**phase)
                 self.assertEqual((reply['cpus'],reply['memory_mb']),(4,127))
                 self.assertEqual(reply['memory_phase'],phase)
@@ -40,8 +41,9 @@ class AdaptiveMemoryTests(unittest.TestCase):
                 worker.resize('one',4,active_cpus=2,memory_budget_mb=budget,**request)
         worker,job=self.sampled_worker(cpus=2)
         job['memory_width_samples']=[(1,96),(2,128)]
-        reply=worker.resize('one',4,active_cpus=2,memory_budget_mb=127)
-        self.assertEqual(reply['cpus'],2)
+        with self.assertRaises(Conflict):
+            worker.resize('one',4,active_cpus=2,memory_budget_mb=127)
+        self.assertEqual(job['task']['cpus'],2)
 
     def test_shared_working_set_does_not_multiply_with_cpu_count(self):
         model=dict(base_memory_mb=64,memory_per_cpu_mb=1024)
@@ -67,11 +69,13 @@ class AdaptiveMemoryTests(unittest.TestCase):
         self.assertEqual(quote,dict(base_memory_mb=200,memory_per_cpu_mb=200))
         self.assertEqual(plan_memory(64,13000,**quote),(64,13000))
 
-    def test_a_single_width_does_not_replicate_the_declared_shared_baseline(self):
+    def test_a_single_width_quotes_whole_observed_slots_until_shared_baseline_is_measured(self):
         model=dict(base_memory_mb=256,memory_per_cpu_mb=768)
         quote=calibrated_model(model,model,4,128,100,True)
-        self.assertEqual(quote,dict(base_memory_mb=128,memory_per_cpu_mb=0))
-        self.assertEqual(plan_memory(64,1024,**quote),(64,128))
+        self.assertEqual(quote,dict(base_memory_mb=0,memory_per_cpu_mb=32))
+        self.assertEqual(plan_memory(64,1024,**quote),(32,1024))
+        shared=calibrated_model(model,model,8,128,100,True,points=[(4,128),(8,128)])
+        self.assertEqual(plan_memory(64,1024,**shared),(64,128))
 
     def test_short_item_gaps_preserve_the_width_of_the_sampled_work(self):
         observation=MemoryObservation(now=0)
@@ -105,10 +109,37 @@ class AdaptiveMemoryTests(unittest.TestCase):
     def test_same_phase_keeps_learned_cost_while_new_width_warms_up(self):
         worker,job=self.sampled_worker()
         first=worker.resize('one',4,active_cpus=1)
-        self.assertEqual(first['memory_mb'],320)
+        self.assertEqual(first['memory_mb'],512)
         for _ in range(3):
             again=worker.resize('one',4,active_cpus=4)
-            self.assertEqual((again['cpus'],again['memory_mb']),(4,320))
+            self.assertEqual((again['cpus'],again['memory_mb']),(4,512))
+
+    def test_cold_one_slot_quote_does_not_subtract_unmeasured_shared_base(self):
+        model=dict(base_memory_mb=256,memory_per_cpu_mb=512)
+        quote=calibrated_model(model,model,1,286,280,True,
+                               learned=dict(base_memory_mb=256,memory_per_cpu_mb=30),points=[(1,286)])
+        self.assertEqual(quote,dict(base_memory_mb=0,memory_per_cpu_mb=286))
+        self.assertEqual(plan_memory(15,1536,**quote),(5,1430))
+        self.assertEqual(plan_memory(15,4290,**quote),(15,4290))
+
+    def test_probe_funds_every_active_slot_instead_of_only_one(self):
+        quote=dict(base_memory_mb=0,memory_per_cpu_mb=64)
+        self.assertEqual(plan_memory(4,95,floor=2,**quote)[0],0)
+        self.assertEqual(plan_memory(4,128,floor=2,**quote),(2,128))
+        # Estimates remain soft: two cold probes fund 256 MiB each.
+        self.assertEqual(plan_memory(4,550,floor=2,base_memory_mb=0,memory_per_cpu_mb=512),(2,512))
+
+    def test_a_cold_probe_cannot_replace_known_actual_use_with_a_smaller_budget(self):
+        from remote_compute.worker import Conflict
+        worker,job=self.sampled_worker(cpus=2,per=512)
+        job.update(rss_mb=900,private_mb=890,memory_width_samples=[(1,400),(2,1125)])
+        with self.assertRaises(Conflict):worker.resize('one',4,active_cpus=2,memory_budget_mb=550)
+        self.assertEqual(job['task']['cpus'],2)
+
+    def test_explicit_shared_phase_keeps_width_independent_funding(self):
+        model=dict(base_memory_mb=4096,memory_per_cpu_mb=0)
+        quote=calibrated_model(model,model,1,128,100,True)
+        self.assertEqual(plan_memory(64,128,**quote),(64,128))
 
     def test_business_ceiling54_and_general_ceiling1024_are_not_cut_to_group_size(self):
         for maximum,expected in ((54,54),(1024,104)):
@@ -232,8 +263,8 @@ class AdaptiveMemoryTests(unittest.TestCase):
     def test_stable_tree_scales_to_next_width_but_new_phase_uses_its_estimate(self):
         model=dict(base_memory_mb=256,memory_per_cpu_mb=768)
         learned=calibrated_model(model,model,4,1200,1000,True)
-        self.assertEqual(learned,dict(base_memory_mb=256,memory_per_cpu_mb=236))
-        self.assertEqual(plan_memory(8,2400,**learned),(8,2144))
+        self.assertEqual(learned,dict(base_memory_mb=0,memory_per_cpu_mb=300))
+        self.assertEqual(plan_memory(8,2400,**learned),(8,2400))
         changed=dict(base_memory_mb=1024,memory_per_cpu_mb=1024)
         self.assertEqual(calibrated_model(changed,model,4,1200,1000,True),changed)
         self.assertEqual(calibrated_model(model,model,4,1200,1000,False),model)
@@ -244,8 +275,8 @@ class AdaptiveMemoryTests(unittest.TestCase):
                  memory_reservation_mb=1200,memory_commit_reservation_mb=1000)
         node.health=dict(active_jobs=[row])
         learned=node.resize_memory_model('one',model)
-        self.assertEqual(learned,dict(base_memory_mb=256,memory_per_cpu_mb=472))
-        self.assertEqual(plan_memory(8,4800,**learned),(8,4032))
+        self.assertEqual(learned,dict(base_memory_mb=0,memory_per_cpu_mb=600))
+        self.assertEqual(plan_memory(8,4800,**learned),(8,4800))
         row['active_cpus']=0
         self.assertEqual(node.resize_memory_model('one',model),model)
 
