@@ -248,14 +248,15 @@ class RowPainter:
         self.cursor=None
         self.device_names=()
 
-    def frame(self, rows, columns, height, cursor, *, device_names=()):
+    def frame(self, rows, columns, height, cursor, *, device_names=(),cursor_row=None):
         device_names=tuple(sorted(set(device_names)))
         rows=tuple(_clip(row,max(0,columns-1)) for row in rows[:height])
         rows+=('',)*max(0,height-len(rows))
         previous=self.rows if self.size==(columns,height) and self.device_names==device_names else ()
         changes=[f'\x1b[{i+1};1H'+_paint_row(row,device_names)+'\x1b[K' for i,row in enumerate(rows)
                  if i>=len(previous) or row!=previous[i]]
-        position=(height,min(max(0,cursor),max(0,columns-2))+1)
+        row=height if cursor_row is None else max(1,min(height,cursor_row))
+        position=(row,min(max(0,cursor),max(0,columns-2))+1)
         result=''
         if changes:
             result='\x1b[?25l'+''.join(changes)
@@ -567,9 +568,12 @@ class Dashboard:
                     footer, column = _command_rows(self.shell, line, cursor, max(1,columns-1), context, completion)
                     # The footer is an independent fixed-height viewport.  Do
                     # not let a status/output refresh consume its last row.
-                    footer = footer[-reserved:] + ([''] * max(0, reserved-len(footer)))
+                    footer = footer[-reserved:]
+                    cursor_row=len(body)+len(footer)
+                    footer += [''] * max(0,reserved-len(footer))
                     frame = painter.frame(body+footer,columns,height,column,
-                                          device_names=rows.device_labels if isinstance(rows,StatusRows) else ())
+                                          device_names=rows.device_labels if isinstance(rows,StatusRows) else (),
+                                          cursor_row=cursor_row)
                     if frame or opening:
                         # Present the complete new screen with the buffer switch;
                         # later frames can reuse the unchanged rows.

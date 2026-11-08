@@ -276,7 +276,11 @@ class ConsoleTests(unittest.TestCase):
                     self.assertTrue(rows[-2 if height >= 5 else -1].startswith('test> '))
                     self.assertTrue(all(_width(row)<=columns-1 for row in rows[-min(4,height):]))
                     frames.append(list(rows))
-                    return original(painter,rows,width,count,cursor,**options)
+                    frame=original(painter,rows,width,count,cursor,**options)
+                    self.assertEqual(painter.cursor[0],height-1 if height>=5 else height)
+                    if height>=5:self.assertEqual(rows[-1],'')
+                    self.assertNotIn('\n',frame)
+                    return frame
                 dashboard = Dashboard(OperatorShell(),lambda:health)
                 for i in range(30):
                     dashboard.write(f'output {i}\n')
