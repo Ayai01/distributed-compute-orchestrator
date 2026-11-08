@@ -5,7 +5,7 @@ from .policy import canonical_capabilities, validate_platform
 def python_map(function, items, *, kwargs=None, backend='process', **options):
     """Submit independent business inputs to the DCO-owned process executor."""
     task=command(['${tool:python}','-B','${dco}/remote_compute/execution.py','${work}/.dco-execution.json'],
-                 **dict(options,retries=options.get('retries',0)))
+                 **options)
     task['execution']=dict(function=function,items=list(items),kwargs=dict(kwargs or {}),mode='map',backend=backend)
     task['outputs']=list(dict.fromkeys([*task['outputs'],'.dco-results.json','.dco-streams/**/*']))
     return task

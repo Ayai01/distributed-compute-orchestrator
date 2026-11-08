@@ -55,6 +55,13 @@ def _elastic_job(job):
     return job.get('elastic_cpus',job.get('auto_cpus',False))
 
 
+def _infrastructure_interruption(job, outcome):
+    # Named-machine operations may change external state and retain their
+    # explicit retry allowance. Ordinary frozen jobs run in fresh workdirs.
+    return not job['task'].get('cwd') and (outcome.get('status') == 'interrupted'
+        or outcome.get('error_kind') == 'memory_pressure')
+
+
 class Coordinator:
     def __init__(self, pool, root, *, token="", operator_token=None, paused=False):
         started=time.monotonic();self.startup={}
@@ -1006,10 +1013,10 @@ class Coordinator:
                     job['result'].pop('connection_error',None)
                     # Retry is one atomic state transition. A client must not
                     # collect/delete a transient interrupted outcome mid-retry.
-                    if remote['status']!='interrupted' or job['cancel'].is_set():self._update(job, remote)
+                    if not (remote['status']=='interrupted' or _infrastructure_interruption(job,remote)) or job['cancel'].is_set():self._update(job, remote)
                 if remote["status"] in TERMINAL:
                     result = remote
-                    retry=remote['status']=='interrupted'
+                    retry=remote['status']=='interrupted' or _infrastructure_interruption(job,remote)
                     break
                 interval=0.15 if time.time()-job['result']['dispatched']<2 else 0.2
                 if cancel_sent:
@@ -1113,7 +1120,7 @@ class Coordinator:
         measured={key:deepcopy(outcome.get(key,job['result'].get(key))) for key in (
             'started','elapsed','cpus','memory_mb','peak_cpus','peak_rss_mb','cpu_seconds',
             'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds',
-            'cpu_frequency','cost_incomplete') if key in outcome or key in job['result']}
+            'cpu_frequency','cost_incomplete','peak_private_mb','error_kind','memory_pressure') if key in outcome or key in job['result']}
         if 'cpu_seconds' not in outcome:
             measured['cost_incomplete']=True  # A live snapshot is only the known prefix.
         job['result'].update(measured)
@@ -1121,10 +1128,21 @@ class Coordinator:
         self._attempt_total(job['result'])
         self._save(job)
         attempts=job['result'].setdefault('attempts',[])
-        if len(attempts)>=job['result'].get('max_retries',0):return
+        allowance=job['result'].get('max_retries',0)
+        if _infrastructure_interruption(job,outcome):
+            job['result']['infrastructure_retry_limit']=allowance
+        if len(attempts)>=allowance:
+            self._save(job)
+            return
         attempts.append(dict(node=job['node'].name,worker_id=job.get('worker_id',job['result']['id']),
+                             worker_url=job['node'].client.url,
+                             artifact=('.dco-attempts/%04d.zip'%(len(attempts)+1)) if outcome.get('id') else None,
                              status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished'),
                              **measured))
+        cached=job['directory']/'worker-artifacts.zip'
+        if cached.is_file():
+            saved=job['directory']/'attempts'/('%04d.zip'%len(attempts));saved.parent.mkdir(exist_ok=True)
+            cached.replace(saved)
         identity=job['result']['id']
         with zipfile.ZipFile(job['directory']/'request.zip') as archive:
             task=json.loads(archive.read('task.json'))
@@ -1135,12 +1153,12 @@ class Coordinator:
         job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
         for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_cpus','peak_rss_mb','cpu_seconds','total_cpu_seconds','cost_incomplete',
-                    'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency'):
+                    'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency','error_kind','memory_pressure','peak_private_mb'):
             job['result'].pop(key,None)
         job['result'].update(started=None,stdout='',stderr='',steps=[])
         self.queue.append(identity);self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])
         self._save(job)
-        self.activity.notify('Worker stopped; retry original task ['+identity[:4]+']')
+        self.activity.notify('Interrupted; retry original task ['+identity[:4]+']')
 
     @staticmethod
     def _attempt_total(result):
@@ -1648,7 +1666,7 @@ class Coordinator:
             files = {}
             if client:
                 from .local import LocalClient
-                if isinstance(client, LocalClient) and result['status'] != 'interrupted':
+                if isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts'):
                     return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
                 try:
                     if is_connected and not is_connected():
@@ -1690,6 +1708,25 @@ class Coordinator:
                                 job['result'].pop('connection_error',None)
                                 self._update(job,remote)
                                 result=json.loads(json_bytes(job['result']))
+            for index, attempt in enumerate(result.get('attempts',()),1):
+                if not attempt.get('artifact'):continue
+                saved=job['directory']/'attempts'/('%04d.zip'%index)
+                if not saved.is_file():
+                    source=next((n.client for n in self.pool.nodes if n.client.url==attempt.get('worker_url')),None)
+                    if source is None:raise Conflict('Interrupted attempt provider is unavailable')
+                    raw=source.artifacts(attempt['worker_id'])
+                    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                        if json.loads(archive.read('result.json'))['id']!=attempt['worker_id']:
+                            raise ValueError('Interrupted attempt identity mismatch')
+                    saved.parent.mkdir(exist_ok=True)
+                    pending=saved.with_suffix('.partial');pending.write_bytes(raw);pending.replace(saved)
+                raw=saved.read_bytes()
+                if public:
+                    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                        nested={name:archive.read(name) for name in archive.namelist() if name!='result.json'}
+                        nested['result.json']=json_bytes(self.public_result(json.loads(archive.read('result.json'))))
+                    raw=pack(nested)
+                files['files/'+attempt['artifact']]=raw
             files["result.json"] = json_bytes(self.public_result(result) if public else result)
             return pack(files)
 
@@ -1712,6 +1749,12 @@ class Coordinator:
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404:
                         raise
+            for attempt in job['result'].get('attempts',()):
+                source=next((n.client for n in self.pool.nodes if n.client.url==attempt.get('worker_url')),None)
+                if source is not None and attempt.get('artifact'):
+                    try:source.delete(attempt['worker_id'])
+                    except RemoteError as error:
+                        if getattr(error,'status_code',None)!=404:raise
             # The per-ID lock fences collection and deletion. Recursive disk
             # cleanup must leave other jobs' status, leases and files flowing.
             remove_owned(job["directory"])
