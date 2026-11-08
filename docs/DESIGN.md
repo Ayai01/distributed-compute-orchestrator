@@ -49,6 +49,8 @@ results = client.execute(plan, project='my-project',
 
 在DCO任务内，业务入口可调用：
 
+`max_cpus`声明任务已经表达的有用并行宽度。54个独立就绪个体可声明54，广义可扩展搜索可声明1024；当前节点容量、共享配额和RAM约束由DCO施加。运输组规模不是任务内部并行阶段的统一上限。普通单层map的每项只用1核，因此其有用宽度由就绪项数决定；包含其他并行阶段的业务使用python_task及阶段limits表达。
+
 ```python
 from remote_compute import map_items, run_call
 values = map_items('business:evaluate', ready_inputs, kwargs={'mode': 'native'},
@@ -101,6 +103,8 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 `cancel_when()`返回真后，本次调用停止新增，并沿自己已受理及提交竞态中受理的原ID请求取消；同工程其他调用继续。锁存取消时，提交中与已受理原ID的取消意图先写入状态，POST前再次核对；恢复时仍会完成取消。带取消标志且原ID查询404的项保留remaining，释放未受理额度，保持原ID和请求供业务核对，不重新POST。所有终态回执继续fetch、publish和delete，声明的部分输出与费用保留。主动取消的cancelled回执计入已收齐结果，其他执行失败和发布错误仍抛ExecutionFailure；若有未受理项，抛ExecutionPaused并列出remaining，全部收齐则返回回执。stop_when、维护及Ctrl+C本身不请求取消。业务条件和发布回调须支持并发调用。
 
 ## CPU与内存
+
+内存需求分别核对解释器和依赖的常驻基线、输入及缓存、优化器状态、计算工作区与后处理峰值。一个完整优化工作进程的RSS不等同于一次目标函数评价所需内存。线程共享的基线只计一次，独立进程的解释器和依赖按进程数计；`base_memory_mb`与`memory_per_cpu_mb`按实际执行拓扑声明，不采用统一的数学任务MiB/核常数。
 
 中心相邻任务派发至少间隔100ms，每个worker的任务首次进程创建也至少间隔100ms。启动等待使用独立互斥与可取消等待，不持全局调度锁；已运行计算、资源协商和结果领取继续并行。同一任务的后续命令不额外等待启动间隔。
 
