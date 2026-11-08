@@ -560,7 +560,23 @@ class Client:
         return self.request('/jobs/' + identity + '/files/' + quote(str(path), safe='/'), data)
 
     def delete(self, identity):
-        return self.request("/jobs/" + identity, method="DELETE")
+        """Confirm idempotent retirement even when its reply was lost."""
+        for attempt in range(2):
+            try:
+                return self.request("/jobs/" + identity, method="DELETE")
+            except RemoteError as error:
+                if error.status_code==404:return {"deleted":identity}
+                if not error.transport_retryable and error.status_code not in (502,503,504):raise
+                # A timeout can follow completed physical retirement. Observe
+                # this original before repeating only the idempotent DELETE.
+                try:
+                    current=self.status(identity)
+                except RemoteError as observed:
+                    if observed.status_code==404:return {"deleted":identity}
+                    if observed.status_code is not None and observed.status_code not in (502,503,504):raise
+                else:
+                    if current.get('status') not in TERMINAL:raise error
+                if attempt:raise error
 
     def _read_reconnecting(self, read, *, deadline=None, check=None):
         """Keep an existing observation across a bounded transport outage."""

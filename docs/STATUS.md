@@ -43,7 +43,8 @@ map_items、iter_items及run_call的limits按阶段声明有用CPU上限和固�
 
 单一活跃宽度的线性内存标定按完整实测包络筹资每个槽位，取得不同宽度样本后再分解共享基线及增量。多活跃槽的冷探测按完整活跃宽度筹资；已知实际RSS/private超过中心预算时保留原授权并拒绝本轮调整。申报估计与每槽冷探测上限保持软约束，真实提交量危险时继续终止任务树并保留费用及原ID。相关138项检查、默认原ID中断重试与显式retries=0边界、分项产物和费用保留的证据见`.local/maintenance/actual-memory-retry-20261108/current.json`。
 
-SDK在相同冻结父阶段的初始扩核被暂时拒绝时保留已获授权的单槽冷探测，并继续按原间隔协商；polling重试沿当前worker尝试ID读授权。SDK文件由新执行子进程加载，在途解释器保持原模块。该SDK修订及55项租约/执行/内存检查的证据见`.local/maintenance/lease-cold-start-20261108/current.json`。
+SDK在资源调整被暂时拒绝时保留原授权内已完整筹资的宽度；相同冻结父阶段的已有活跃工作不被冷首槽退路缩为1核，初始未启动阶段保留已筹资的单槽探测。polling按当前worker尝试ID读取授权。DELETE按原ID幂等确认，丢响应后先核对，必要时仅补一次删除。相关100项检查及原进程保持的SDK分发证据见`.local/maintenance/delete-and-running-lease-20261108/current.json`。
+
 
 同工程独立output_dir在同进程或不同进程中并发execute，共享待收窗口；同进程还共享4/2/2准备、提交、领取线程。工程锁只保护共享索引的短读改写，每个输出目录保留恢复所需的单写入者。准备进程退出时归还未用额度，发布失败的原ID跨进程恢复继续占用待收额度。并发调用保持相同ready_tasks及原project。
 

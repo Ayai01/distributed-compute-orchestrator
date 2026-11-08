@@ -62,16 +62,20 @@ class CpuLease:
                     # The provider already funded this phase using its actual
                     # working set. Raw startup estimates must not revoke it.
                     funded,required=min(desired,grant.get('cpus',0)),None
-                elif inherited and grant.get('memory_phase')is None and self._inherited_probe():
-                    # An admitted entry can still own its one-slot cold probe
-                    # when the first expansion was refused. This is the frozen
-                    # parent phase, not authorization for a new business phase.
-                    funded,required=plan_memory(1,available,**self.memory)
-                    funded=min(funded,desired,grant.get('cpus',0))
                 else:
                     funded,required=plan_resize(min(desired,grant.get('cpus',0)),
                         self.memory.get('memory_mb'),self.memory.get('base_memory_mb'),
                         self.memory.get('memory_per_cpu_mb'),self.memory.get('memory_limit_mb'),available)
+                    if inherited and grant.get('memory_phase')is None and self._inherited_probe():
+                        # Keep a fully funded width; the cold-slot fallback must
+                        # not replace an existing multithread grant with one.
+                        if active_cpus and grant.get('cpus',0)>=active_cpus and available>0 and (funded<active_cpus or required is not None and required>available):
+                            # Retain already running work without funding a new
+                            # start. The executor fences completions during RPC.
+                            funded,required=active_cpus,None
+                        elif not active_cpus and (funded<1 or required is not None and required>available):
+                            funded,required=plan_memory(1,available,**self.memory)
+                            funded=min(funded,desired,grant.get('cpus',0))
                 if (grant.get('status')!='running' or funded<max(1,active_cpus) or
                         required is not None and required>available):
                     raise error

@@ -17,6 +17,42 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class CpuLeaseTests(unittest.TestCase):
+    def test_inherited_full_funding_keeps_idle_authorized_slots_but_underfunding_keeps_only_active(self):
+        client=Client();identity='a'*32;phase=dict(base_memory_mb=512,memory_per_cpu_mb=1024)
+        error=RemoteError('Insufficient memory for resource resize; existing grant retained');error.status_code=409
+        env=dict(REMOTE_COMPUTE_JOB_ID=identity,REMOTE_COMPUTE_URL=client.url,REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(phase))
+        for memory,expected in ((3584,3),(256,2)):
+            with self.subTest(memory=memory),patch.dict(os.environ,env),patch.object(client,'resize',side_effect=error), \
+                    patch.object(client,'status',return_value=dict(status='running',cpus=3,memory_mb=memory,memory_phase=None)):
+                lease=client.cpu_lease(identity,max_cpus=9,cpus=4,**phase)
+                self.assertEqual(lease.refresh(active_cpus=2,ready_cpus=6),expected)
+
+    def test_fixed_parent_still_gets_its_funded_initial_probe(self):
+        client=Client();identity='a'*32;phase=dict(memory_mb=8192)
+        error=RemoteError('Insufficient memory for resource resize; existing grant retained');error.status_code=409
+        env=dict(REMOTE_COMPUTE_JOB_ID=identity,REMOTE_COMPUTE_URL=client.url,REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(phase))
+        with patch.dict(os.environ,env),patch.object(client,'resize',side_effect=error), \
+                patch.object(client,'status',return_value=dict(status='running',cpus=1,memory_mb=256,memory_phase=None)):
+            self.assertEqual(client.cpu_lease(identity,max_cpus=8,**phase).refresh(ready_cpus=8),1)
+
+    def test_unconfirmed_inherited_running_width_is_not_reduced_to_one_probe(self):
+        client=Client();identity='a'*32;phase=dict(base_memory_mb=512,memory_per_cpu_mb=1024)
+        error=RemoteError('Insufficient memory for resource resize; existing grant retained');error.status_code=409
+        env=dict(REMOTE_COMPUTE_JOB_ID=identity,REMOTE_COMPUTE_URL=client.url,REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(phase))
+        with patch.dict(os.environ,env),patch.object(client,'resize',side_effect=error), \
+                patch.object(client,'status',return_value=dict(status='running',cpus=3,memory_mb=3584,memory_phase=None)):
+            lease=client.cpu_lease(identity,max_cpus=9,cpus=4,**phase)
+            self.assertEqual(lease.refresh(active_cpus=3,ready_cpus=6),3)
+        with patch.dict(os.environ,env),patch.object(client,'resize',side_effect=error), \
+                patch.object(client,'status',return_value=dict(status='running',cpus=3,memory_mb=256,memory_phase=None)):
+            lease=client.cpu_lease(identity,max_cpus=9,cpus=4,**phase)
+            self.assertEqual(lease.refresh(active_cpus=3,ready_cpus=6),3)
+        with patch.dict(os.environ,{**env,'REMOTE_COMPUTE_MEMORY_MODEL':json.dumps(dict(memory_mb=8192))}), \
+                patch.object(client,'resize',side_effect=error), \
+                patch.object(client,'status',return_value=dict(status='running',cpus=3,memory_mb=256,memory_phase=None)):
+            lease=client.cpu_lease(identity,max_cpus=9,cpus=4,memory_mb=8192)
+            self.assertEqual(lease.refresh(active_cpus=3,ready_cpus=6),3)
+
     def test_real_map_starts_one_inherited_probe_during_refusal_then_expands(self):
         for backend in ('process','thread'):
             for fixed in (False,True):
