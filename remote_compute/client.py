@@ -588,7 +588,7 @@ class Client:
             try:
                 return read()
             except RemoteError as error:
-                transient=(getattr(error,'status_code',None) in (502,503)
+                transient=(getattr(error,'status_code',None) in (502,503,504)
                            or getattr(error,'transport_retryable',False))
                 remaining=expires-time.monotonic()
                 if not transient or remaining<=0:

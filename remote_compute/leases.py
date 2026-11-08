@@ -4,6 +4,7 @@ import os
 import time
 from .allocation import plan_resize
 from .memory import same_phase, plan_memory
+from .deadline import check_deadline, remaining_time
 
 
 class CpuLease:
@@ -21,6 +22,7 @@ class CpuLease:
         self.memory_mb = memory_mb
         self.updated = float('-inf')
         self.demand = self.active_cpus = None
+        self.confirmed = None
 
     def refresh(self, *, active_cpus=0, ready_cpus=None):
         """Report in-flight threads and immediately runnable demand; return CPUs.
@@ -56,7 +58,7 @@ class CpuLease:
                     and self.client.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/'))
                 target=(os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',self.identity)
                     if inherited and os.environ.get('REMOTE_COMPUTE_LEASE')=='1' else self.identity)
-                grant=self.client.status(target)
+                grant=self._retained_status(target,desired,active_cpus,error,inherited)
                 available=grant.get('memory_mb',0)
                 if isinstance(grant.get('memory_phase'),dict)and same_phase(self.memory,grant['memory_phase']):
                     # The provider already funded this phase using its actual
@@ -83,8 +85,37 @@ class CpuLease:
             self.cpus = grant['cpus']
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
             self.demand, self.active_cpus = desired, active_cpus
+            # Only a successfully negotiated or validated usable grant can
+            # survive a read outage. The constructor's CPU seed is not one.
+            self.confirmed = (dict(cpus=self.cpus,memory_mb=self.memory_mb,
+                memory_phase=dict(self.memory)) if grant.get('supported') is not False
+                and self.cpus>0 and (not self.memory or self.memory_mb is not None
+                and self.memory_mb>0) else None)
             self.updated = time.monotonic()
         return self.cpus
+
+    def _retained_status(self,target,desired,active,error,inherited):
+        try:
+            return self.client.status(target)
+        except Exception as observed:
+            if (getattr(observed,'status_code',None) not in (502,503,504)
+                    and not getattr(observed,'transport_retryable',False)):
+                raise
+        if inherited:check_deadline()
+        cached=self.confirmed
+        if cached is not None and same_phase(self.memory,cached['memory_phase']):
+            width=min(desired,cached['cpus'])
+            if 'Center resource reply timed out; existing grant retained' in str(error):
+                # The unanswered resize could have returned idle slots. Keep
+                # its active floor until an authoritative observation arrives.
+                width=min(width,max(1,active))
+            return dict(cached,status='running',cpus=width)
+        # No new work starts from an unverified seed or a different phase.
+        # Retry only observation, within the original execution deadline.
+        remaining=remaining_time() if inherited else None
+        return self.client._read_reconnecting(lambda:self.client.status(target),
+            deadline=time.monotonic()+remaining if remaining is not None else None,
+            check=check_deadline if inherited else None)
 
     def _inherited_probe(self):
         try:parent=json.loads(os.environ.get('REMOTE_COMPUTE_MEMORY_MODEL','null'))
