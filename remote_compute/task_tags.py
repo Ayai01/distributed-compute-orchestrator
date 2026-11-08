@@ -4,7 +4,7 @@ import re
 MAX_TAG=24
 _METHODS={'fiber-mo':'F','fiber_mo':'F','agemoea2':'AGE','age-moea2':'AGE','age2':'AGE',
           'maoea_hap':'HAP','maoea-hap':'HAP','nsga-ii':'N2','nsga2':'N2','nsga-iii':'N3','nsga3':'N3',
-          'nsde-r':'NDR','nsder':'NDR','hybrid_v4':'HV4','hybrid_mf':'HMF','readout':'RD'}
+          'nsde-r':'NDR','nsder':'NDR','hybrid_v4':'HV4','hybrid_mf':'HMF','readout':'RD','ladder':'LDR'}
 
 
 def _word(value,limit):
@@ -22,6 +22,7 @@ def compact_tag(job,width=MAX_TAG,preferred=None,measure=len):
     clean=text.replace('...','').replace('\u2026','')
     if clean==text and measure(text)<=limit:return text
     progress=re.match(r'^(\d+/\d+|\d+%)\s+',clean)
+    if progress:clean=clean[progress.end():]
     source=raw+' '+clean;lower=source.lower()
     case=re.search(r'(?:p75_)?(precision|dynamic)(\d+)_(local|relaxed)(\d+)',lower)
     if case:
@@ -36,13 +37,18 @@ def compact_tag(job,width=MAX_TAG,preferred=None,measure=len):
     existing=re.search(r'\bs([0-9a-f]{4})(?:b\d+|:[0-9a-f]{4})?\b',source,re.I)
     pair=re.search(r'\b([A-Za-z][\w-]*)\s+(?:seed[=: ]*)?(\d{4,})\b',raw)
     full_seed=re.search(r'\bseed[=: ]+(\d+)\b',source,re.I)
+    counter=re.search(r'\b(block|group|batch)[-:= ]+(\d+)\b',source,re.I)
+    compact_counter=re.search(r'\b([bg])(\d+)\b',source,re.I)
     if existing:identity='s'+existing[1].lower()
-    elif full_seed or pair:identity='s'+format(int(full_seed[1]if full_seed else pair[2])&0xffff,'04x')
+    elif full_seed:identity='s'+format(int(full_seed[1])&0xffff,'04x')
+    elif counter:identity=('g'if counter[1].lower()=='group'else'b')+counter[2]
+    elif compact_counter:identity=compact_counter[0].lower()
+    elif pair:identity='s'+format(int(pair[2])&0xffff,'04x')
     else:
         short=re.search(r'(?<!\w)([0-9a-f]{4})(?!\w)',clean,re.I)
-        identity=':'+short[1].lower()if short else':'+str(job.get('id','????'))[-4:]
+        identity=':'+short[1].lower()if short else':'+str(job['id'])[-4:]if job.get('id')else''
     role=re.search(r'(?<!\w)-(KCL|GEO|ADJ|INV|C[123]|PROXY|GATE)\b',source,re.I)
-    if pair:method=pair[1]
+    if pair and not counter:method=pair[1]
     elif role:method='-'+role[1].upper()
     else:
         method=next((key for key in _METHODS if re.search(r'(?<!\w)'+re.escape(key)+r'(?!\w)',source,re.I)),None)

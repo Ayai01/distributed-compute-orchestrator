@@ -38,7 +38,7 @@ from .records import Job, JobRecords, active_items, active_values, archive_job, 
 from .receipts import read_receipt
 from .paths import cache_environment
 from .allocation import plan_resize
-from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim
+from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
@@ -367,10 +367,13 @@ class Worker:
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
-                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'active_cpus', 'max_cpus', 'memory_mb', 'started', 'accelerator')},
+                    "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'active_cpus', 'max_cpus', 'memory_mb', 'memory_phase', 'started', 'accelerator')},
                                      'rss_mb':round(j.get('rss_mb',0),2),'private_mb':j.get('private_mb'),
                                      'memory_modeled':bool(j.get('memory_phase_model',j['task'].get('memory_model'))),
                                      'memory_phase_model':j.get('memory_phase_model',j['task'].get('memory_model')),
+                                     'memory_adaptive_model':j.get('memory_adaptive_model'),
+                                     'memory_width_samples':j.get('memory_width_samples'),
+                                     'memory_sample_cpus':getattr(j.get('memory_observation'),'active_cpus',0),
                                      'memory_calibrated':bool(j.get('memory_observation')and j['memory_observation'].envelope is not None),
                                      'memory_reservation_mb':reservation(j)[0],
                                      'memory_commit_reservation_mb':reservation(j)[1], **progress_fields(j['result']),
@@ -614,11 +617,13 @@ class Worker:
             return Path(prefix[0]).as_posix()
         return _VAR.sub(substitute, text)
 
-    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None, memory_budget_mb=None):
         if type(cpus) is not int or cpus<0:
             raise ValueError('resize cpus must be nonnegative; 0 uses the current worker budget')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
+        if memory_budget_mb is not None and (type(memory_budget_mb)is not int or memory_budget_mb<1):
+            raise ValueError('resize memory_budget_mb must be a positive integer in MiB')
         if active_cpus is not None and (type(active_cpus) is not int or active_cpus<0):
             raise ValueError('active_cpus must count nonnegative in-flight threads')
         with self.condition:
@@ -628,10 +633,11 @@ class Worker:
             old=task['cpus']
             old_memory=task['memory_mb']
             if all(value is None for value in (memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb)):
-                current=job.get('memory_phase_model',task.get('memory_model')) or {}
+                current=job.get('memory_phase_model',task.get('memory_model'))or result.get('memory_phase')or dict(memory_mb=old_memory)
                 if 'base_memory_mb' in current:
                     base_memory_mb=current['base_memory_mb'];memory_per_cpu_mb=current['memory_per_cpu_mb']
                     memory_limit_mb=current.get('memory_limit_mb')
+                else:memory_mb=current['memory_mb']
             phase_model=(dict(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,
                               memory_limit_mb=memory_limit_mb) if base_memory_mb is not None or memory_per_cpu_mb is not None else
                          None if memory_mb is not None else job.get('memory_phase_model',task.get('memory_model')))
@@ -644,11 +650,25 @@ class Worker:
             changes_memory=(memory_mb is not None and memory_mb!=old_memory) or base_memory_mb is not None or memory_per_cpu_mb is not None
             credit=min(reservation(job)) if changes_memory else old_memory
             model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
+            requested_memory={k:v for k,v in model.items()if v is not None}
+            previous_memory=result.get('memory_phase')or job.get('memory_phase_model',task.get('memory_model'))
+            if not requested_memory:requested_memory=previous_memory or {}
             physical,commit=reservation(job)
             observation=job.get('memory_observation')
-            model=calibrated_model(model,job.get('memory_phase_model',task.get('memory_model')),result.get('active_cpus',0),physical,commit,
-                                   observation is not None and observation.envelope is not None)
-            granted,memory=plan_memory(granted,min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb'])),floor=floor,**model)
+            observed_cpus=getattr(observation,'active_cpus',0)or result.get('active_cpus',0)
+            calibrated=bool(observation and observation.envelope is not None and (memory_mb is not None or observed_cpus))
+            samples=job.get('memory_width_samples',[])
+            sampled_at=job.get('memory_width_sampled_at',time.monotonic())
+            if time.monotonic()-sampled_at>=10:samples=[];sampled_at=time.monotonic()
+            if calibrated and observed_cpus and same_phase(requested_memory,previous_memory):
+                points=dict(samples);width=observed_cpus
+                points.pop(width,None);points[width]=max(physical,commit)
+                samples=list(points.items())[-8:]
+            model=calibrated_model(model,previous_memory,observed_cpus,physical,commit,
+                                   calibrated,job.get('memory_adaptive_model'),samples)
+            available=min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb']))
+            if memory_budget_mb is not None:available=min(available,memory_budget_mb)
+            granted,memory=plan_memory(granted,available,floor=floor,**model)
             if granted<floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
             memory=old_memory if memory is None else memory
             extra=max(0,memory-credit)
@@ -656,12 +676,19 @@ class Worker:
                 raise Conflict('Insufficient memory for resource resize; existing grant retained')
             active_changed=result.get('active_cpus',0)!=(active_cpus or 0)
             result.update(active_cpus=active_cpus or 0,requested_cpus=requested_cpus)
-            phase_changed=phase_model!=job.get('memory_phase_model',task.get('memory_model'))
-            if phase_changed or memory!=old_memory or phase_model and granted!=old:
+            result['memory_phase']=requested_memory
+            phase_changed=not same_phase(phase_model,job.get('memory_phase_model',task.get('memory_model')))
+            phase_changed=phase_changed or memory_mb is not None and not same_phase(requested_memory,previous_memory)
+            if phase_changed:
+                job.pop('memory_adaptive_model',None);job.pop('memory_width_samples',None);job.pop('memory_width_sampled_at',None)
+            elif calibrated and (phase_model or memory_mb is not None):
+                job['memory_adaptive_model']=dict(model)
+                if samples:job.update(memory_width_samples=samples,memory_width_sampled_at=sampled_at)
+            if phase_changed or granted!=old:
                 job['memory_observation']=MemoryObservation()
                 job.pop('startup_memory_mb',None)
             job['memory_phase_model']=phase_model
-            if granted!=old or memory!=old_memory or active_changed:
+            if granted!=old or memory!=old_memory or active_changed or phase_changed:
                 self.used+=granted-old
                 task['cpus']=result['cpus']=granted
                 task['memory_mb']=result['memory_mb']=memory
@@ -669,7 +696,7 @@ class Worker:
                 result['resize_count']=result.get('resize_count',0)+1
                 self._save(job)
                 self.condition.notify_all()
-            return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus)
+            return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus,memory_phase=requested_memory)
 
     def lease(self, identity, request):
         """A task asks locally; the center answers through its existing poll."""
@@ -916,6 +943,11 @@ class Worker:
                     if job["cancel"].is_set():
                         state = "cancelled"
                         break
+                    with self.condition:
+                        job['rss_sampled']=False;job['rss_mb']=0
+                        for key in ('private_mb','memory_adaptive_model','memory_width_samples','memory_width_sampled_at'):job.pop(key,None)
+                        job['memory_observation']=MemoryObservation()
+                        result['memory_phase']=None
                     self._automatic_grant(job)
                     environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
                     self._accelerator_environment(result['id'],environment)
@@ -923,7 +955,7 @@ class Worker:
                         if key not in task['env']:environment[key]=str(task['cpus'])
                     environment.update(REMOTE_COMPUTE_CPUS=str(task['cpus']),
                         REMOTE_COMPUTE_MAX_CPUS=str(min(task['max_cpus'],self.cpu_limit)),
-                        REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(task.get('memory_model',{})))
+                        REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(task.get('memory_model')or dict(memory_mb=job['parent_memory_mb'])))
                     for name,text in templates.items():
                         inside(work,name).write_text(text.replace('${cpus}',str(task['cpus'])),encoding='utf8')
                     if 'execution'in task:
@@ -939,10 +971,6 @@ class Worker:
                         break
                     step = {"argv": argv, "started": time.time(), "returncode": None}
                     with self.condition:
-                        job['rss_sampled'] = False
-                        job['rss_mb'] = 0
-                        job.pop('private_mb',None)
-                        job['memory_observation']=MemoryObservation()
                         result["steps"].append(step)
                         self._save(job)
                     source = inside(work, task["stdin"]).open("rb") if "stdin" in task else nullcontext(None)
@@ -967,7 +995,7 @@ class Worker:
                                     if 'private_mb'in usage:
                                         job['private_mb']=usage['private_mb']
                                         result['peak_private_mb']=max(result.get('peak_private_mb',0),usage['private_mb'])
-                                    job['memory_observation'].observe(usage['rss_mb'],usage.get('private_mb'))
+                                    job['memory_observation'].observe(usage['rss_mb'],usage.get('private_mb'),active_cpus=result.get('active_cpus',0))
                                     physical,commit=reservation(job)
                                     result.update(memory_reservation_mb=physical,memory_commit_reservation_mb=commit)
                                 result["peak_rss_mb"] = max(result["peak_rss_mb"], usage["rss_mb"])
@@ -1583,6 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif parts[2:] == ['resize'] and self.command == 'POST':
                     request = json.loads(body)
                     options={k:request[k] for k in ('active_cpus','memory_mb','base_memory_mb','memory_per_cpu_mb','memory_limit_mb') if k in request}
+                    if not scheduler and 'memory_budget_mb'in request:options['memory_budget_mb']=request['memory_budget_mb']
                     value = worker.resize(identity, request['cpus'], **options)
                     if scheduler and not operator and isinstance(value, dict):
                         value = worker.public_result(value)

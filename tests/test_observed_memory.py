@@ -128,7 +128,7 @@ class ObservedMemoryTests(unittest.TestCase):
                 receipt=client.run(task)
                 self.assertEqual(receipt['status'],'succeeded',receipt.get('stderr'))
                 self.assertEqual(receipt['memory_mb'],64)
-                self.assertEqual(json.loads(receipt['stdout'].strip()),{})
+            self.assertEqual(json.loads(receipt['stdout'].strip()),dict(memory_mb=64))
 
     def test_actual_high_request_low_usage_unblocks_windows_commit(self):
         with scratch()as root,provider(root+'/worker',cpus=2,memory_mb=512,memory_headroom_mb=0)as(worker,node):

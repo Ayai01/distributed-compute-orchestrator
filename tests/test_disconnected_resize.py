@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock
 
 from remote_compute.coordinator import Coordinator
+from remote_compute.client import Node
 import test_center
 
 
@@ -44,8 +45,8 @@ class DisconnectedResizeTests(unittest.TestCase):
         client.status.side_effect = [dict(id=identity, status='running',
                                          resource_request=dict(request_id=1, cpus=4)), final, final]
         client.request.return_value = {'accepted': True}
-        node = SimpleNamespace(client=client, name='worker', capacity=8, memory_capacity=1024,
-                               health={'capabilities': ['resize']}, detached=False, enabled=True)
+        node = Node('worker',client)
+        node.health=dict(capabilities=['resize'],cpus=8,memory_capacity_mb=1024)
         task = dict(cpus=1, max_cpus=8, memory_mb=64, project='Analog-Opt-Bench')
         job = dict(node=node, task=task, cancel=threading.Event(), reattach=True,
                    result=dict(id=identity, status='running', submitted=time.time() - 10,

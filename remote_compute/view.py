@@ -125,7 +125,7 @@ def _table(headers, records, widths, width, right=()):
     def row(values):
         cells=[]
         for index,(value,size) in enumerate(zip(values,widths)):
-            if headers[index]=='Tag':value=compact_tag({'label':value},size,measure=_width)
+            if headers[index]=='Tag':value=compact_tag({'label':value,'id':values[0]if values is not headers else''},size,measure=_width)
             cells.append(_cell(value,size,index in right))
         return ' | '.join(cells)
     divider = '+' + '+'.join('-'*(size+2) for size in widths) + '+'
@@ -519,7 +519,7 @@ class StatusRows(list):
             table=[_line('ID CPU Tag',width)]
             for r in records:
                 prefix=f'{r[0]} {r[3]} '
-                fitted=compact_tag({'label':tag(r)},max(1,width-4-_width(prefix)),measure=_width)
+                fitted=compact_tag({'label':tag(r),'id':r[0]},max(1,width-4-_width(prefix)),measure=_width)
                 table.append(_line(prefix+fitted,width))
         title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页'
         if not self.records:

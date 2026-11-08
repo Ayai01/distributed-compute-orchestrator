@@ -9,11 +9,32 @@ def startup_memory(task):
     return min(task.get('memory_mb',256),256*max(1,task.get('cpus',1)))
 
 
-def calibrated_model(model,previous,active_cpus,physical,commit,calibrated):
-    """Scale a stable whole-tree envelope; retain new-phase declarations."""
+def same_phase(model,previous):
     clean=lambda value:{k:v for k,v in (value or {}).items()if v is not None}
-    if not calibrated or not active_cpus or clean(model)!=clean(previous)or 'base_memory_mb'not in model:return model
-    result=dict(base_memory_mb=0,memory_per_cpu_mb=max(1,math.ceil(max(physical,commit)/active_cpus)))
+    return clean(model)==clean(previous)
+
+
+def calibrated_model(model,previous,active_cpus,physical,commit,calibrated,learned=None,points=None):
+    """Separate the shared working set from observed width-dependent growth."""
+    fixed=model.get('memory_mb')is not None
+    if not same_phase(model,previous)or not(fixed or model.get('base_memory_mb')is not None):return model
+    if not calibrated or not fixed and not active_cpus:return dict(learned)if learned is not None else model
+    memory=math.ceil(max(physical,commit))
+    if not active_cpus:return dict(learned)if learned is not None else dict(memory_mb=memory)
+    samples=dict(points or ());samples[active_cpus]=memory
+    samples=sorted((width,value)for width,value in samples.items()if width>0)
+    if fixed and len(samples)<2 and (learned is None or learned.get('memory_per_cpu_mb')is None):return dict(memory_mb=memory)
+    if len(samples)>1:
+        per=max(0,max(math.ceil((b-a)/(wb-wa))for i,(wa,a)in enumerate(samples)for wb,b in samples[i+1:]))
+        base=max(0,max(math.ceil(value-per*width)for width,value in samples))
+    else:
+        if learned is not None and learned.get('memory_per_cpu_mb')is not None:
+            per=min(learned['memory_per_cpu_mb'],memory//active_cpus)
+            base=memory-per*active_cpus
+        else:
+            base=min(model['base_memory_mb'],memory)
+            per=math.ceil((memory-base)/active_cpus)
+    result=dict(base_memory_mb=base,memory_per_cpu_mb=per)
     if model.get('memory_limit_mb')is not None:result['memory_limit_mb']=model['memory_limit_mb']
     return result
 
@@ -52,11 +73,13 @@ class MemoryObservation:
         self.started = time.monotonic() if now is None else now
         self.samples = deque()
         self.envelope = None
+        self.active_cpus = 0
 
-    def observe(self, rss, private=None, now=None):
+    def observe(self, rss, private=None, now=None, active_cpus=0):
         now = time.monotonic() if now is None else now
         if rss <= 0:
             return
+        self.active_cpus=max(self.active_cpus,active_cpus)
         private=rss if private is None else private
         if self.samples and now-self.samples[-1][0] < .25:
             at,peak_rss,peak_private=self.samples[-1]

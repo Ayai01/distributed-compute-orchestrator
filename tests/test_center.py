@@ -778,7 +778,7 @@ class CenterTests(unittest.TestCase):
             until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
             self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
-    def test_host_health_failure_rejects_memory_growth_then_recovers_original_job(self):
+    def test_host_health_failure_uses_only_funded_probe_then_recovers_original_job(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=2,memory_mb=1024,memory_reserve_mb=0) as (worker,remote), \
                 Pool([remote]) as pool,center(pool,Path(root)/'center') as (_,client):
             identity=client.submit(python("from pathlib import Path;import time\nwhile not Path('done').exists():time.sleep(.01)",memory_mb=512))['id']
@@ -786,11 +786,11 @@ class CenterTests(unittest.TestCase):
             with patch.object(pool,'_probe',return_value=None):
                 pool.refresh()
                 with pool.condition:pool.nodes[0].error='temporary health timeout'
-                with self.assertRaises(RemoteError) as denied:client.resize(identity,1,memory_mb=768)
-                self.assertEqual(denied.exception.status_code,409)
-                self.assertIn('Insufficient memory',str(denied.exception))
-                self.assertEqual((remote.status(identity)['cpus'],remote.status(identity)['memory_mb']),(1,512))
-                self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
+                probe=client.resize(identity,1,memory_mb=768)
+                self.assertEqual((probe['cpus'],probe['memory_mb']),(1,256))
+                self.assertEqual(probe['memory_phase'],dict(memory_mb=768))
+                self.assertEqual((remote.status(identity)['cpus'],remote.status(identity)['memory_mb']),(1,256))
+                self.assertEqual(pool.nodes[0].reserved_memory_mb,256)
             pool.refresh()
             grant=client.resize(identity,1,memory_mb=768)
             self.assertEqual((grant['cpus'],grant['memory_mb']),(1,768))
@@ -925,7 +925,7 @@ class CenterTests(unittest.TestCase):
                     self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
     def test_modeled_resize_rejection_preserves_existing_grant_and_demand(self):
-        with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=512,memory_reserve_mb=0) as (_,worker):
+        with scratch() as root,provider(Path(root)/'worker',cpus=4,memory_mb=128,memory_reserve_mb=0) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
                 identity=client.submit(python('import time;time.sleep(30)',memory_mb=64))['id']
                 until(lambda:client.status(identity)['status']=='running')
@@ -1538,8 +1538,8 @@ class CenterTests(unittest.TestCase):
                     identity=client.submit(python('import time; time.sleep(30)',max_cpus=4))['id']
                     until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
                     original=pool.nodes[0].client.resize
-                    def lost_reply(*args):
-                        original(*args)
+                    def lost_reply(*args,**kwargs):
+                        original(*args,**kwargs)
                         raise RemoteError('connection closed after accepting resize')
                     with patch.object(pool.nodes[0].client,'resize',side_effect=lost_reply) as resize:
                         self.assertEqual(client.resize(identity,4)['cpus'],4)

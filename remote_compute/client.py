@@ -397,7 +397,7 @@ class Client:
         from .leases import CpuLease
         return CpuLease(self, identity, **options)
 
-    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None, _memory_budget_mb=None):
         """Borrow idle slots or return them; active_cpus counts in-flight threads."""
         if type(cpus) is not int or cpus < 0:
             raise ValueError('resize cpus must be a nonnegative integer')
@@ -406,7 +406,7 @@ class Client:
         request = dict(cpus=cpus)
         for key, value in dict(active_cpus=active_cpus, memory_mb=memory_mb,
                               base_memory_mb=base_memory_mb, memory_per_cpu_mb=memory_per_cpu_mb,
-                              memory_limit_mb=memory_limit_mb).items():
+                              memory_limit_mb=memory_limit_mb,memory_budget_mb=_memory_budget_mb).items():
             if value is not None:request[key] = value
         action='lease' if (os.environ.get('REMOTE_COMPUTE_LEASE')=='1' and identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
                            and self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/')) else 'resize'
@@ -807,8 +807,8 @@ class Node:
     def resize_memory_model(self,identity,model):
         from .memory import calibrated_model
         row=next((j for j in self.health.get('active_jobs',())if j['id']==identity),{})
-        return calibrated_model(model,row.get('memory_phase_model'),row.get('active_cpus',0),
-            row.get('memory_reservation_mb',0),row.get('memory_commit_reservation_mb',0),row.get('memory_calibrated',False))
+        return calibrated_model(model,row.get('memory_phase')or row.get('memory_phase_model'),row.get('memory_sample_cpus')or row.get('active_cpus',0),
+            row.get('memory_reservation_mb',0),row.get('memory_commit_reservation_mb',0),row.get('memory_calibrated',False),row.get('memory_adaptive_model'),row.get('memory_width_samples'))
 
     @property
     def memory_accounted(self):

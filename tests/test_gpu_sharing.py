@@ -62,7 +62,7 @@ class GPUSharingTests(unittest.TestCase):
     def test_zero_wait_prefers_available_gpu_then_falls_back_under_same_id(self):
         scheduler=object.__new__(Coordinator);node=SimpleNamespace(error=None,enabled=True,health={},
             can_match_accelerator=Mock(return_value=True),execution_accelerator=lambda task,**options:task.get('accelerator'),
-            memory_free=8192,capacity=8,reserved=0,external=0)
+            memory_free=8192,capacity=8,reserved=0,external=0,startup_memory=lambda task:task['memory_mb'])
         scheduler.pool=SimpleNamespace(condition=threading.Condition(),_matching=lambda unused:[node]);scheduler._save=Mock()
         job={'task':{'accelerator':dict(self.request,fallback_after_seconds=0),'memory_mb':4096},
             'result':{'id':'original','status':'queued','submitted':0},'node':None}

@@ -121,9 +121,9 @@ def phased_memory(backend,stream):
     idle=observed_memory()
     serial=run_call(observed_memory,limits=dict(max_cpus=1,memory_mb=1536))
     return dict(cold=cold,values=values,idle=idle,serial=serial,parent=json.loads(os.environ['REMOTE_COMPUTE_MEMORY_MODEL']))
-def expensive_map():
+def overestimated_map():
     from remote_compute import map_items
-    return map_items('business:unexpected_item',[1],limits=dict(memory_mb=1024))
+    return map_items('business:probe_item',[1],limits=dict(memory_mb=1024))
 def capped_map(stream):
     from remote_compute import map_items,iter_items
     options=dict(backend='thread',limits=dict(max_cpus=2,memory_mb=512))
@@ -131,9 +131,9 @@ def capped_map(stream):
         with iter_items('business:evaluate',range(8),**options)as completed:
             return [item.value for item in completed]
     return map_items('business:evaluate',range(8),**options)
-def unexpected_item(value):
+def probe_item(value):
     from pathlib import Path
-    Path('unexpected-item').write_text('started without phase memory')
+    Path('probe-item').write_text('started with funded phase memory')
     return value
 '''
 
@@ -182,13 +182,21 @@ def timeout_map():
                 concurrency=max(sum(v['started']<=point<v['finished']for v in result['values'])for point in [v['started']for v in result['values']])
                 self.assertEqual(concurrency,8)
 
-    def test_unfunded_map_phase_fails_before_its_first_item(self):
+    def test_overestimated_map_phase_starts_with_a_funded_probe(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2,memory_mb=512)as(_,client):
-            task=python_task('business:expensive_map',max_cpus=2,memory_mb=64,outputs=['unexpected-item'])
+            task=python_task('business:overestimated_map',max_cpus=2,memory_mb=64,outputs=['probe-item'])
+            r=client.run(task,files={'business.py':FUNCTIONS})
+            self.assertEqual(r['status'],'succeeded',r.get('stderr'))
+            self.assertIn('probe-item',r['files'])
+            self.assertEqual(json.loads(r['files']['.dco-results.json'])['items'][0]['value'],[1])
+
+    def test_unfunded_probe_fails_before_its_first_item(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2,memory_mb=192,memory_headroom_mb=0)as(_,client):
+            task=python_task('business:overestimated_map',max_cpus=2,memory_mb=64,outputs=['probe-item'])
             r=client.run(task,files={'business.py':FUNCTIONS})
             self.assertEqual(r['status'],'failed')
-            self.assertIn('Insufficient memory for resource resize',r['stderr'])
-            self.assertNotIn('unexpected-item',r['files'])
+            self.assertIn('Insufficient RAM for active workers',r['stderr'])
+            self.assertNotIn('probe-item',r['files'])
 
     def test_map_and_stream_phase_cap_bounds_real_parallelism(self):
         for stream in (False,True):
@@ -436,22 +444,27 @@ def timeout_map():
             self.assertEqual(len({v['pid']for v in values}),1)
             self.assertEqual({v['threads']for v in values},{'1'})
 
-    def test_memory_model_limits_actual_width_and_keeps_future_ram_reserved(self):
+    def test_cold_model_funds_initial_width_then_reserves_observed_memory(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=8,memory_mb=512,memory_headroom_mb=0)as(worker,client):
             task=python_map('business:variable',[1.2]*8,max_cpus=8,base_memory_mb=64,memory_per_cpu_mb=128)
             self.assertEqual(task['memory_mb'],192)
             identity=client.submit(task,files={'business.py':FUNCTIONS})['id']
-            deadline=time.monotonic()+10;observed=False
+            deadline=time.monotonic()+10;observed=reclaimed=False
             while time.monotonic()<deadline:
                 snapshot=worker.health()
                 active=next((row for row in snapshot['active_jobs']if row['id']==identity),{})
                 state=client.status(identity)
-                if active.get('cpus')==3:
+                if active.get('cpus')==3 and not active.get('memory_calibrated'):
                     observed=True;self.assertEqual(active['memory_mb'],448)
                     self.assertGreaterEqual(snapshot['memory_reserved_mb'],448)
+                if active.get('memory_calibrated'):
+                    reclaimed|=active['memory_reservation_mb']<active['memory_mb']
+                    self.assertGreaterEqual(active['memory_reservation_mb'],active['rss_mb'])
                 if state['status']in ('succeeded','failed'):break
                 time.sleep(.05)
             result=client.fetch(identity)
             self.assertEqual(result['status'],'succeeded',result.get('stderr'))
             self.assertTrue(observed)
-            self.assertLessEqual(result['peak_cpus'],3)
+            self.assertTrue(reclaimed)
+            self.assertLessEqual(result['peak_cpus'],8)
+            self.assertEqual(len(json.loads(result['files']['.dco-results.json'])['items']),8)

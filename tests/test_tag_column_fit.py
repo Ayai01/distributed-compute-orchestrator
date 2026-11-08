@@ -5,6 +5,25 @@ from remote_compute.view import format_status,_width
 
 
 class TagColumnTests(unittest.TestCase):
+    def test_progress_does_not_become_the_subject_or_invent_question_mark_identity(self):
+        self.assertEqual(compact_tag(dict(label='1/2 RACER ladder block-170')),'1/2 RACER LDR b170')
+        self.assertNotIn('?',compact_tag(dict(label='A long operation without an assigned identity')))
+
+    def test_live_ladder_tags_keep_distinct_block_numbers_in_narrow_panels(self):
+        jobs=[dict(id=('%04x'%number)+'f'*28,label='RACER ladder block-'+str(number),
+                   project='RACER-MO-ladder-first10',status='running',cpus=4,max_cpus=13,
+                   completed=1,total=2,memory_mb=256)for number in (170,171)]
+        value=dict(role='scheduler',nodes=[dict(name='Aya1-PC',capacity=24,active_jobs=jobs)])
+        original=deepcopy(value)
+        for width in (54,80,110,120,135,140,180,200):
+            rows=format_status(value,width=width).fit(40)
+            for number in (170,171):
+                row=next(line for line in rows if ('%04x'%number)in line)
+                self.assertNotIn('????',row,(width,row))
+                self.assertNotIn('1 RACER',row,(width,row))
+                self.assertTrue('b'+str(number)in row or'block-'+str(number)in row,(width,row))
+        self.assertEqual(value,original)
+
     def test_hash_only_and_embedded_hashes_get_readable_short_tags(self):
         self.assertEqual(compact_tag({'label':'a'*20}),'RUN :aaaa')
         value=compact_tag({'label':'PSL seed '+('b'*32)+' ev:10k'})

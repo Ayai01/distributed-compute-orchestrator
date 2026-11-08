@@ -12,6 +12,31 @@ HOLD = "from pathlib import Path;import time\nwhile not Path('release').exists()
 
 
 class CpuLeaseTests(unittest.TestCase):
+    def test_retained_adaptive_grant_uses_the_acknowledged_phase_instead_of_raw_estimate(self):
+        phase=dict(base_memory_mb=256,memory_per_cpu_mb=768)
+        for message in ('Insufficient memory for resource resize; existing grant retained',
+                        'Center resource reply timed out; existing grant retained'):
+            client=Client();error=RemoteError(message);error.status_code=409
+            with self.subTest(message=message),patch.object(client,'resize',side_effect=error), \
+                    patch.object(client,'status',return_value=dict(status='running',cpus=8,memory_mb=512,memory_phase=phase)):
+                lease=client.cpu_lease('a'*32,max_cpus=8,**phase)
+                self.assertEqual(lease.refresh(ready_cpus=8),8)
+
+    def test_an_acknowledged_adaptive_phase_does_not_fund_a_different_phase(self):
+        client=Client();error=RemoteError('Center resource reply timed out; existing grant retained');error.status_code=409
+        with patch.object(client,'resize',side_effect=error), \
+                patch.object(client,'status',return_value=dict(status='running',cpus=8,memory_mb=512,
+                             memory_phase=dict(base_memory_mb=256,memory_per_cpu_mb=768))):
+            lease=client.cpu_lease('a'*32,max_cpus=8,base_memory_mb=1024,memory_per_cpu_mb=768)
+            with self.assertRaises(RemoteError):lease.refresh(ready_cpus=8)
+
+    def test_unspecified_phase_does_not_authorize_a_new_large_fixed_phase(self):
+        client=Client();error=RemoteError('Center resource reply timed out; existing grant retained');error.status_code=409
+        with patch.object(client,'resize',side_effect=error), \
+                patch.object(client,'status',return_value=dict(status='running',cpus=8,memory_mb=512,memory_phase={})):
+            lease=client.cpu_lease('a'*32,max_cpus=8,memory_mb=8192)
+            with self.assertRaises(RemoteError):lease.refresh(ready_cpus=8)
+
     def test_retained_resource_reply_reuses_funded_width_and_throttles_retries(self):
         for message in ('Insufficient memory for resource resize; existing grant retained',
                           'Center resource reply timed out; existing grant retained'):

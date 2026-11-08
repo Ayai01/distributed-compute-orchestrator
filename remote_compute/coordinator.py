@@ -989,6 +989,11 @@ class Coordinator:
                             reply={'grant':self.admission(options) if operation=='admission' else self.resize(job['result']['id'],**options)}
                         except (Conflict,RemoteError,ValueError) as error:
                             reply={'error':str(error)}
+                        grant=reply.get('grant',{})
+                        if isinstance(grant,dict)and 'memory_phase'in grant:
+                            # This poll predates the resize it requested.
+                            # Keep the acknowledged phase when publishing it.
+                            remote['memory_phase']=grant['memory_phase']
                         node.client.request('/jobs/'+identity+'/lease',{'request_id':request['request_id'],**reply})
                         job['lease_answered']=request['request_id']
                     if remote['status'] in TERMINAL:
@@ -1355,10 +1360,11 @@ class Coordinator:
                 old=job['task']['cpus']
                 old_memory=job['task']['memory_mb']
                 if all(value is None for value in (memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb)):
-                    current=job.get('phase_memory',job['task'].get('memory_model')) or {}
+                    current=job.get('phase_memory')or job['result'].get('memory_phase')or job['task'].get('memory_model')or {}
                     if 'base_memory_mb' in current:
                         base_memory_mb=current['base_memory_mb'];memory_per_cpu_mb=current['memory_per_cpu_mb']
                         memory_limit_mb=current.get('memory_limit_mb')
+                    elif 'adaptive_memory'in node.health.get('capabilities',()):memory_mb=current.get('memory_mb',old_memory)
                 modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
                 capabilities=node.health.get('capabilities',[])
                 if ('resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities)
@@ -1400,7 +1406,7 @@ class Coordinator:
                 granted=max(active_floor,granted)
                 changes_memory=(memory_mb is not None and memory_mb!=old_memory) or modeled
                 credit=node.memory_credit(job.get('worker_id',identity),old_memory) if changes_memory else old_memory
-                granted,memory=planner(granted,credit+max(0,min(node.memory_free,self.pool._host_memory_free(node))),**model)
+                granted,memory=planner(granted,min(node.memory_capacity,credit+max(0,min(node.memory_free,self.pool._host_memory_free(node)))),**model)
                 memory=old_memory if memory is None else memory
                 extra=max(0,memory-credit)
                 if granted<active_floor or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
@@ -1430,7 +1436,7 @@ class Coordinator:
                 job['task']['memory_mb']=job['result']['memory_mb']=held_memory
                 self._publish(job)
 
-            def commit(actual,actual_memory):
+            def commit(actual,actual_memory,memory_phase=None):
                 with self.condition,self.pool.condition:
                     # Completion may have released this task while the RPC waited.
                     if job.get('worker_id',identity) in node.live_jobs:
@@ -1438,6 +1444,7 @@ class Coordinator:
                         node.reserved_memory_mb+=actual_memory-job['task']['memory_mb']
                     job['task']['cpus']=job['result']['cpus']=actual
                     job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
+                    if memory_phase is not None:job['result']['memory_phase']=memory_phase
                     if self.jobs.get(identity) is job:self._save(job)
                     hold=node.memory_holds.get(job.get('worker_id',identity))
                     if job.get('worker_id',identity)in node.live_jobs:
@@ -1452,7 +1459,8 @@ class Coordinator:
                 options={}
                 if modeled:
                     options.update(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
-                elif memory_mb is not None:options['memory_mb']=memory
+                elif memory_mb is not None:options['memory_mb']=memory_mb if 'adaptive_memory'in capabilities else memory
+                if 'adaptive_memory'in capabilities:options['_memory_budget_mb']=memory
                 if active_cpus is not None:options['active_cpus']=active_cpus
                 result=node.client.resize(worker_id,granted,**options)
             except RemoteError as error:
@@ -1473,8 +1481,9 @@ class Coordinator:
                     with self.condition:job['resize_uncertain']=True
                     raise
                 result=dict(id=identity,cpus=observed['cpus'],memory_mb=observed['memory_mb'])
+                if isinstance(observed.get('memory_phase'),dict):result['memory_phase']=observed['memory_phase']
             with self.condition:job.pop('resize_uncertain',None)
-            commit(result['cpus'],result.get('memory_mb',old_memory))
+            commit(result['cpus'],result.get('memory_mb',old_memory),result.get('memory_phase'))
             return dict(result,id=identity,node=node.name,requested_cpus=cpus)
 
     def _client(self, job):
