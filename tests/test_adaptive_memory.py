@@ -14,6 +14,35 @@ from test_center import center
 
 
 class AdaptiveMemoryTests(unittest.TestCase):
+    def test_funded_shared_margin_allows_growth_without_repricing_the_same_padding(self):
+        for fixed in (False,True):
+            with self.subTest(fixed=fixed):
+                worker,job=self.sampled_worker(cpus=2)
+                phase=dict(memory_mb=8192)if fixed else dict(base_memory_mb=4096,memory_per_cpu_mb=4096)
+                job['task']['memory_mb']=8192 if fixed else 12288
+                job['task']['memory_model']=None if fixed else phase
+                job['memory_phase_model']=None if fixed else phase
+                job['result']['memory_phase']=phase
+                reply=worker.resize('one',4,active_cpus=2,memory_budget_mb=127,**phase)
+                self.assertEqual((reply['cpus'],reply['memory_mb']),(4,127))
+                self.assertEqual(reply['memory_phase'],phase)
+                self.assertEqual(job['memory_adaptive_model'].get('memory_mb',job['memory_adaptive_model'].get('base_memory_mb')),128)
+
+    def test_funded_padding_does_not_approve_unknown_growth_or_actual_overuse(self):
+        from remote_compute.worker import Conflict
+        for changed,budget in ((False,95),(True,127)):
+            worker,job=self.sampled_worker(cpus=2)
+            phase=dict(base_memory_mb=4096,memory_per_cpu_mb=4096)
+            job['task'].update(memory_model=phase,memory_mb=12288);job['memory_phase_model']=phase
+            job['result']['memory_phase']=phase
+            request=dict(base_memory_mb=8192,memory_per_cpu_mb=8192)if changed else phase
+            with self.subTest(changed=changed,budget=budget),self.assertRaises(Conflict):
+                worker.resize('one',4,active_cpus=2,memory_budget_mb=budget,**request)
+        worker,job=self.sampled_worker(cpus=2)
+        job['memory_width_samples']=[(1,96),(2,128)]
+        reply=worker.resize('one',4,active_cpus=2,memory_budget_mb=127)
+        self.assertEqual(reply['cpus'],2)
+
     def test_shared_working_set_does_not_multiply_with_cpu_count(self):
         model=dict(base_memory_mb=64,memory_per_cpu_mb=1024)
         quote=calibrated_model(model,model,4,1024,1000,True,points=[(1,1024),(4,1024)])

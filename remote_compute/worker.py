@@ -666,8 +666,16 @@ class Worker:
                 samples=list(points.items())[-8:]
             model=calibrated_model(model,previous_memory,observed_cpus,physical,commit,
                                    calibrated,job.get('memory_adaptive_model'),samples)
+            adaptive_model=model
             available=min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb']))
             if memory_budget_mb is not None:available=min(available,memory_budget_mb)
+            if memory_budget_mb is not None and calibrated and same_phase(requested_memory,previous_memory):
+                field='memory_mb'if model.get('memory_mb')is not None else'base_memory_mb'if model.get('memory_per_cpu_mb')==0 else None
+                actual=max(job.get('rss_mb',0),job.get('private_mb')or 0)
+                # This width-independent phase already has funded growth room.
+                # A newer padded sample must not charge that margin twice.
+                if field and 0<actual<=available:
+                    model={**model,field:min(model[field],int(available))}
             granted,memory=plan_memory(granted,available,floor=floor,**model)
             if granted<floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
             memory=old_memory if memory is None else memory
@@ -682,7 +690,7 @@ class Worker:
             if phase_changed:
                 job.pop('memory_adaptive_model',None);job.pop('memory_width_samples',None);job.pop('memory_width_sampled_at',None)
             elif calibrated and (phase_model or memory_mb is not None):
-                job['memory_adaptive_model']=dict(model)
+                job['memory_adaptive_model']=dict(adaptive_model)
                 if samples:job.update(memory_width_samples=samples,memory_width_sampled_at=sampled_at)
             if phase_changed or granted!=old:
                 job['memory_observation']=MemoryObservation()
