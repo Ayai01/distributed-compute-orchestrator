@@ -37,7 +37,7 @@ from .cleanup import AssetCache, Reclaimer, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .receipts import read_receipt
 from .paths import cache_environment
-from .allocation import plan_resize
+from .allocation import plan_resize,cpu_capacity,validate_cpu_overcommit
 from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
@@ -209,7 +209,7 @@ def validate_task(task, capacity, *, allow_auto=False):
 
 
 class Worker:
-    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, temp_root=None, cache_root=None, accelerators=None, python_runtimes=None):
+    def __init__(self, root, cpus=0, *, tools=None, shared=None, env=None, token="", tags=(), memory_mb=0, memory_reserve_mb=DEFAULT_MEMORY_RESERVE_MB, memory_headroom_mb=DEFAULT_MEMORY_HEADROOM_MB, cpu_limit=None, cpu_overcommit_factor=1.5, temp_root=None, cache_root=None, accelerators=None, python_runtimes=None):
         started=time.monotonic()
         self.startup={}
         self.root = Path(root).expanduser().resolve()
@@ -226,6 +226,7 @@ class Worker:
         self.capacity = cpu_budget(cpus) if cpus else self.cpu_limit
         if self.capacity > self.cpu_limit:
             raise ValueError(f'CPU budget exceeds configured cpu_limit={self.cpu_limit}')
+        self.cpu_overcommit_factor=validate_cpu_overcommit(cpu_overcommit_factor)
         self.activity = Activity()
         self.save_settings = None
         self.configuration_revision = 0
@@ -286,6 +287,7 @@ class Worker:
         self.condition = threading.Condition(threading.RLock())
         self.start_lock = threading.Lock()
         self.next_start = 0.0
+        self.start_interval = .5
         # Keep one bounded history index per worker root.  Sharing the parent
         # index would mix local-fresh (and any future worker roots) and force
         # startup to reopen unrelated job directories.
@@ -351,7 +353,9 @@ class Worker:
             disk = shutil.disk_usage(self.root)
             value = {**identity, "platform": sys.platform,
                     "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
-                    "cpus": self.capacity, "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
+                    "cpus": self._cpu_capacity(resources), "base_cpus":self.capacity,
+                    "cpu_overcommit_factor":self.cpu_overcommit_factor,
+                    "cpu_limit": self.cpu_limit, "used_cpus": self.used, "queued": len(self.queue),
                     "tools": self.tool_info, "python_backends": sorted(self.python_runtimes), "shared": sorted(self.shared), "tags": self.tags, "paused": self.paused,
                     "accelerators": self.accelerators,
                     "accelerator_used": len({unit[:2] for items in self.accelerator_reservations.values() for unit in items}),
@@ -506,14 +510,15 @@ class Worker:
     def control(self, value):
         if isinstance(value,dict)and set(value)=={'retire_asset'}:
             return retire_asset(self,value['retire_asset'])
-        if not isinstance(value, dict) or set(value) - {"cpus", "paused", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "tools", "benchmark"}:
-            raise ValueError("Control accepts cpus, memory_mb, memory_reserve_mb, memory_headroom_mb, paused, tools and benchmark")
+        if not isinstance(value, dict) or set(value) - {"cpus", "cpu_overcommit_factor", "paused", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "tools", "benchmark"}:
+            raise ValueError("Control accepts cpus, cpu_overcommit_factor, memory_mb, memory_reserve_mb, memory_headroom_mb, paused, tools and benchmark")
         if value.get('benchmark'):
             return self.calibrate()
         if "cpus" in value and (type(value["cpus"]) is not int or not 0 <= value["cpus"] <= self.cpu_limit):
             raise ValueError(f"cpus must be in 0..{self.cpu_limit} (0 = automatic)")
         if "paused" in value and not isinstance(value["paused"], bool):
             raise ValueError("paused must be true or false")
+        if 'cpu_overcommit_factor'in value:validate_cpu_overcommit(value['cpu_overcommit_factor'])
         for key in ('memory_mb','memory_reserve_mb','memory_headroom_mb'):
             if key in value and (type(value[key]) is not int or value[key]<0):
                 raise ValueError(key+' must be a nonnegative integer')
@@ -537,6 +542,7 @@ class Worker:
                 self.configuration_revision += 1
             if "cpus" in value:
                 self.capacity = value["cpus"] or self.cpu_limit
+            if 'cpu_overcommit_factor'in value:self.cpu_overcommit_factor=float(value['cpu_overcommit_factor'])
             if "paused" in value:
                 self.paused = value["paused"]
             if "memory_mb" in value:
@@ -546,10 +552,15 @@ class Worker:
             if any(key in value for key in ('memory_mb','memory_reserve_mb')):
                 self.memory_capacity=self.memory_budget or max(0,self.host.sample()['memory_total_mb']-self.memory_reserve)
             if self.save_settings:
-                self.save_settings({key: value[key] for key in ('cpus', 'memory_mb','memory_reserve_mb','memory_headroom_mb') if key in value})
+                self.save_settings({key: value[key] for key in ('cpus','cpu_overcommit_factor','memory_mb','memory_reserve_mb','memory_headroom_mb') if key in value})
             self.activity.notify('Resources ' + json.dumps(value, ensure_ascii=False))
             self.condition.notify_all()
             return self.health()
+
+    def _cpu_capacity(self,host=None):
+        if self.cpu_overcommit_factor==1:return self.capacity
+        return cpu_capacity(self.capacity,self.used,(self.host.sample()if host is None else host).get('cpu_percent'),
+                            self.cpu_overcommit_factor)
 
     def _memory_state(self):
         host = self.host.sample()
@@ -642,11 +653,13 @@ class Worker:
                               memory_limit_mb=memory_limit_mb) if base_memory_mb is not None or memory_per_cpu_mb is not None else
                          None if memory_mb is not None else job.get('memory_phase_model',task.get('memory_model')))
             requested_cpus=cpus
-            cpus=min(cpus or self.capacity,task.get('max_cpus',self.capacity))
+            capacity=self._cpu_capacity()
+            cpus=min(cpus or capacity,task.get('max_cpus',capacity))
             floor=max(1,active_cpus or 0)
-            if active_cpus is not None and (active_cpus>old or active_cpus>cpus):
+            if active_cpus is not None and (active_cpus>old or requested_cpus and active_cpus>cpus):
                 raise ValueError('active_cpus must count threads within the existing grant and requested width')
-            granted=min(cpus,old+max(0,self.capacity-self.used)) if cpus>old else cpus
+            cpus=max(cpus,floor)
+            granted=max(floor,min(cpus,max(0,capacity-self.used+old)))
             changes_memory=(memory_mb is not None and memory_mb!=old_memory) or base_memory_mb is not None or memory_per_cpu_mb is not None
             credit=min(reservation(job)) if changes_memory else old_memory
             model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
@@ -754,7 +767,7 @@ class Worker:
                         raise Conflict("Job id already contains a different request")
                     return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                task = validate_task(json.loads(archive.read("task.json")), self.capacity)
+                task = validate_task(json.loads(archive.read("task.json")), int(self.capacity*self.cpu_overcommit_factor))
                 with self.condition:
                     task['accelerator']=python_accelerator(task,self.python_runtimes,self._accelerator_units(),
                         [unit for items in self.accelerator_reservations.values()for unit in items])
@@ -832,7 +845,7 @@ class Worker:
                 with self.condition:
                     if self.stopping:
                         raise Conflict("Worker is stopping")
-                    if task['cpus'] > self.capacity or startup_memory(task) > self.memory_capacity:
+                    if task['cpus'] > int(self.capacity*self.cpu_overcommit_factor) or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
                     self.jobs[identity] = job
                     self.asset_handoffs.pop(identity,None)
@@ -863,14 +876,15 @@ class Worker:
                 # FIFO prevents a continuous stream of small jobs starving a larger one.
                 if self.queue and not self.paused:
                     job = self.jobs[self.queue[0]]
-                    if (self.used + job["task"]["cpus"] <= self.capacity
+                    if (self.used + job["task"]["cpus"] <= self._cpu_capacity(host)
                             and startup_memory(job['task']) <= self._memory_state()["memory_available_mb"]
                             and (job['task'].get('accelerator') is None or self._match_accelerator(job['task']['accelerator']))):
                         self.queue.popleft()
+                        job['cpu_overcommit']=self.used+job['task']['cpus']>self.capacity
                         self.used += job["task"]["cpus"]
                         job['startup_memory_mb']=startup_memory(job['task'])
                         self.accelerator_reservations[job['result']['id']]=self._match_accelerator(job['task'].get('accelerator')) or []
-                        job["result"].update(status="running", started=time.time())
+                        job["result"].update(status="running", started=time.time(),cpu_overcommit=job['cpu_overcommit'])
                         self._save(job)
                         thread = threading.Thread(target=self._execute, args=(job,), name="compute-job", daemon=True)
                         self.threads.add(thread)
@@ -882,14 +896,17 @@ class Worker:
         # Serialize only initial OS process creation, outside the scheduler
         # condition. Cancellation wakes the pacing wait without starting it.
         with self.start_lock:
-            if self.stopping or job['cancel'].wait(max(0,self.next_start-time.monotonic())):
+            interval=1. if job.get('cpu_overcommit')else .5
+            deadline=self.next_start+max(0,interval-self.start_interval)
+            if self.stopping or job['cancel'].wait(max(0,deadline-time.monotonic())):
                 return None
             if self.stopping or job['cancel'].is_set():
                 return None
             try:
                 return Process(*args, **kwargs)
             finally:
-                self.next_start = time.monotonic() + .1
+                self.next_start = time.monotonic() + interval
+                self.start_interval=interval
 
     def _execute(self, job):
         task, result, directory = job["task"], job["result"], job["directory"]
@@ -962,7 +979,7 @@ class Worker:
                     for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','NUMBA_NUM_THREADS'):
                         if key not in task['env']:environment[key]=str(task['cpus'])
                     environment.update(REMOTE_COMPUTE_CPUS=str(task['cpus']),
-                        REMOTE_COMPUTE_MAX_CPUS=str(min(task['max_cpus'],self.cpu_limit)),
+                        REMOTE_COMPUTE_MAX_CPUS=str(task['max_cpus']),
                         REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(task.get('memory_model')or dict(memory_mb=job['parent_memory_mb'])))
                     for name,text in templates.items():
                         inside(work,name).write_text(text.replace('${cpus}',str(task['cpus'])),encoding='utf8')
@@ -1081,7 +1098,7 @@ class Worker:
 
     def _automatic_grant(self,job):
         """Prepare a real kernel grant before expanding its argv and thread env."""
-        task=job['task'];maximum=min(task['max_cpus'],self.capacity)
+        task=job['task'];maximum=task['max_cpus']
         if task.get('execution',{}).get('mode')=='entry':maximum=1
         if task.get('execution',{}).get('mode')=='map':
             maximum=min(maximum,max(1,len(task['execution']['items'])))

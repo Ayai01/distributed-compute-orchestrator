@@ -27,7 +27,7 @@ from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle,
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids)
 from .auth import lan_endpoint
-from .allocation import elastic_cpus
+from .allocation import elastic_cpus,cpu_capacity
 
 
 from .runtimes import (supports_python, execution_bindings, execution_tool_set, capability_set,
@@ -765,11 +765,21 @@ class Node:
     network_checked_at: float = 0.0
     network_samples: list = field(default_factory=list)
     network: dict = field(default_factory=dict)
+    dispatch_lock: object = field(default_factory=threading.Lock,repr=False,compare=False)
+    next_dispatch: float = 0.0
+    dispatch_interval: float = .5
+
+    @property
+    def base_capacity(self):
+        available = self.health.get('base_cpus',self.health.get('cpus',0))
+        return min(available, self.limit) if self.limit else available
 
     @property
     def capacity(self):
-        available = self.health.get("cpus", 0)
-        return min(available, self.limit) if self.limit else available
+        # Transport reservations waiting for startup do not prove a full worker.
+        used=min(self.reserved+self.external,self.health.get('used_cpus',self.reserved+self.external))
+        return cpu_capacity(self.base_capacity,used,self.health.get('cpu_percent'),
+                            self.health.get('cpu_overcommit_factor',1.0))
 
     @property
     def memory_capacity(self):
@@ -1178,7 +1188,9 @@ class Pool:
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
                  "timeout": getattr(n.client,'timeout',10),
                  "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),
-                 "capacity": n.capacity, "reserved": n.reserved, "external_cpus": n.external,
+                 "capacity": n.capacity, "base_capacity":n.base_capacity,
+                 "cpu_overcommit_factor":n.health.get('cpu_overcommit_factor',1.0),
+                 "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),
                  "benchmark": n.health.get("benchmark"), "benchmark_state": n.health.get("benchmark_state", "ready"), "asset_cache": n.health.get("asset_cache"),

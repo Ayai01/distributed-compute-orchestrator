@@ -2,6 +2,19 @@
 import math
 
 
+def validate_cpu_overcommit(value):
+    if isinstance(value,bool)or not isinstance(value,(int,float))or not math.isfinite(value)or not 1<=value<=1.5:
+        raise ValueError('cpu_overcommit_factor must be a finite number in 1..1.5')
+    return float(value)
+
+
+def cpu_capacity(base,used,percent,factor):
+    """Lend bounded slots only after the base grant fills below 90% host CPU."""
+    if used>=base and percent is not None and math.isfinite(percent)and 0<=percent<90:
+        return int(base*factor)
+    return base
+
+
 def elastic_cpus(task):
     """The accepted request can change width beyond its startup grant."""
     initial=task.get('cpus',1)

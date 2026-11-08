@@ -520,7 +520,7 @@ def main(argv=None):
                 saved = read_json(path)
                 saved.pop('migrate_root_from', None)
                 atomic_json(path, saved, private=True)
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "temp_root", "cache_root", "accelerators", "python_runtimes") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "cpu_overcommit_factor", "temp_root", "cache_root", "accelerators", "python_runtimes") if key in config}
             if options.get('cache_root') is None:
                 options['cache_root'] = ROOT / '.local/cache'
             if options.get('temp_root') is None:

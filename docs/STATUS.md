@@ -1,6 +1,6 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.15**。
+- 当前源码版本：**0.11.16**。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。维护入口保存实际运行版本、源码部署、原状态恢复及受理/派发状态；兼容更新按设备自然空闲重载，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
@@ -47,7 +47,7 @@ stop_when只停止新增并排空；cancel_when取消本次调用的在途原ID�
 
 ## 验证与证据
 
-- 当前源码的全量核心/原生扫描及定向复验累计覆盖895项，891通过、4项按平台跳过；实际ngspice与Verilator通过。集中审查与全量日志见`.local/maintenance/preflight-01115-20261108/validation.json`；当前三步分配顺序、发布与核验入口见`.local/maintenance/strict-order-20261108/current.json`；显示链路与独立实测入口见`.local/maintenance/ram-pair-phase-20261108/current.json`。覆盖4核优先与空闲扩核、54/1024上限、共享内存基线与实际并行增量、固定/线性内存校正、冷探测准入、中心/worker预算一致、真实RAM/commit压力终止、原ID及付费前缀、超时续行、独立失败隔离、原ID恢复、kill与取消、100ms启动间隔，以及Tag与RAM实/报在窄栏中的显示。
+- 当前源码的全量核心/原生基线及定向复验累计覆盖903项，899通过、4项按平台跳过；实际ngspice与Verilator通过。本轮198项相关检查中197通过、1项按平台跳过，最后43项定向核验通过。当前超发、启动间隔、发布与核验入口见`.local/maintenance/cpu-overcommit-20261108/current.json`；三步顺序见`.local/maintenance/strict-order-20261108/current.json`；显示链路与独立实测见`.local/maintenance/ram-pair-phase-20261108/current.json`；全量基线日志见`.local/maintenance/preflight-01115-20261108/validation.json`。覆盖4核优先与空闲扩核、54/1024上限、CPU超发及90%门槛、普通/超发任务0.5/1秒启动间隔、共享内存与实际并行增量、固定/线性校正、冷探测准入、真实RAM/commit压力终止、原ID及付费前缀、超时续行、独立失败隔离、原ID恢复、kill与取消，以及Tag与RAM实/报的窄栏显示。
 - Windows长路径贯穿成果枚举、输入保留、领取和原ID删除，保留链接自身的清理边界；26项文件生命周期检查通过，日志`patch-01101-long-output-lifecycle-final.log`。
 - 托管映射、数值内核、内存模型、线程共享缓存、依赖发布、非阻塞准备、维护/Ctrl+C排空和原ID恢复均有隔离检查。
 - 部署、现场执行、实际版本/PID/状态根与原状态恢复以本次维护目录`current.json`及对应证明为准。
