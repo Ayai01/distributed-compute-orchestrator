@@ -43,7 +43,7 @@ from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_stat
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
                      normalize_accelerators, aggregate_accelerators, canonical_capabilities,
-                     canonical_capability, clean_tool_snapshot)
+                     canonical_capability, clean_tool_snapshot, validate_platform)
 
 _ID = re.compile(r"[a-f0-9]{32}\Z")
 _ASSET = re.compile(r"[a-f0-9]{64}\Z")
@@ -128,7 +128,7 @@ def cpu_budget(value=0):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator", "platform"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     maximum=task.get('max_cpus',task.get('cpus') or 1024)
@@ -160,6 +160,7 @@ def validate_task(task, capacity, *, allow_auto=False):
         raise ValueError(f'single_thread_weight must be in (0, {MAX_SINGLE_THREAD_WEIGHT:g}]')
     task['accelerator'] = normalize_accelerator_requirement(task.get('accelerator'))
     task['requires'] = canonical_capabilities(task.get('requires', ()))
+    validate_platform(task.get('platform'))
     if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
         raise ValueError(f"Task cpus must be in 1..{capacity}")
     if 'max_cpus' in task and (type(task['max_cpus']) is not int or task['max_cpus']<1 or cpus>task['max_cpus']):
@@ -768,6 +769,8 @@ class Worker:
                     return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), int(self.capacity*self.cpu_overcommit_factor))
+                if task.get('platform') is not None and task['platform'] != sys.platform:
+                    raise ValueError('Task platform differs from worker sys.platform')
                 with self.condition:
                     task['accelerator']=python_accelerator(task,self.python_runtimes,self._accelerator_units(),
                         [unit for items in self.accelerator_reservations.values()for unit in items])
@@ -1534,7 +1537,11 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.health(brief=self.headers.get("X-DCO-Brief")=="1",
                                           sample=self.headers.get("X-DCO-Sample")=="1")
             elif parts == ['capabilities'] and self.command == 'GET' and scheduler:
-                value = worker.capabilities()
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                values = query.get('platform', [])
+                if len(values) > 1:
+                    raise ValueError('capabilities accepts one platform')
+                value = worker.capabilities(platform=values[0] if values else None)
             elif parts == ["nodes"] and self.command == "GET" and hasattr(worker, "nodes"):
                 if not operator:
                     return self._reply({"error": "Device list is operator-only; use /capabilities"}, 403)

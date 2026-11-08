@@ -25,7 +25,7 @@ import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack, native_path
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
-                     MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids)
+                     MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
 from .allocation import elastic_cpus,cpu_capacity
 
@@ -333,9 +333,10 @@ class Client:
             self._status_sample=(time.monotonic(),{j['id']:j for j in result['active_jobs'] or []})
         return result
 
-    def capabilities(self):
+    def capabilities(self, *, platform=None):
         """Small aggregate view intended for project adapters."""
-        result = self.request('/capabilities')
+        platform = validate_platform(platform)
+        result = self.request('/capabilities' + ('?' + urlencode(dict(platform=platform)) if platform is not None else ''))
         if result.get('protocol') != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
         # Existing services can retain legacy bindings for accepted jobs while
@@ -418,11 +419,14 @@ class Client:
             raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None, platform=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         if node is not None and not self.operator:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,requires=list(requires))
+        platform = validate_platform(platform)
+        if platform is not None:
+            request['platform'] = platform
         if ready_tasks is not None:
             request['ready_tasks'] = validate_ready_tasks(ready_tasks)
         if accelerator is not None:
@@ -1228,6 +1232,7 @@ class Pool:
         for node in self.nodes:
             health=node.health
             if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
+                    or task.get('platform') is not None and health.get('platform') != task['platform']
                     or node.memory_capacity<node.startup_memory(task)
                     or not required.issubset(capability_set(health.get('tags',())))
                     or not required_shared.issubset(health.get('shared',()))
@@ -1259,7 +1264,7 @@ class Pool:
                     return None
                 matching = self._matching(task)
                 if not matching:
-                    raise RemoteError("No matching online node for task CPU count, tools, shared paths, node name and tags")
+                    raise RemoteError("No matching online node for task platform, CPU count, tools, shared paths, node name and tags")
                 def needed(node):
                     # Automatic jobs can start with a partial grant. Waiting for
                     # an entire target reserved idle CPUs behind long-running jobs.

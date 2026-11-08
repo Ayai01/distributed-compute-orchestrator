@@ -1,12 +1,14 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.16**。
+- 当前源码版本：**0.11.17**。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。维护入口保存实际运行版本、源码部署、原状态恢复及受理/派发状态；兼容更新按设备自然空闲重载，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
 ## 能力与环境
 
 运行能力为`ng47、hsp、chisel、ml、cuda、layout、rtl、onnx`。Python/C++是默认基础环境。Chisel及layout按单节点完整工具链登记，具体工具、路径及argv保留在操作员明细和本任务回执中。
+
+普通工程可用任务`platform`声明`linux`或`win32`等真实`sys.platform`值，不指定设备。`capabilities()['platforms']`提供平台发现，`capabilities/admission/window`支持平台过滤；任务匹配、资源规划、加速器回退和worker执行前复核使用同一约束。省略时使用全部兼容平台。公开契约、恢复、CPU分配和启动间隔等140项定向检查全部通过，证据及实际部署状态见`.local/maintenance/platform-routing-20261108/current.json`。
 
 Python任务统一使用`${tool:python}`。普通科学计算使用cpu后端，Torch任务声明ml，取得CUDA授权后使用cuda后端。设备私有python_runtimes维护完整解释器前缀，项目不选择解释器或设备。新算法补齐所用环境的依赖，禁止扩充Python组合后缀。
 

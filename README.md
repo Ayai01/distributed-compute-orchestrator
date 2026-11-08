@@ -252,7 +252,9 @@ Python和C++是基础环境，不出现在运行能力列表。科学计算的�
 
 `memory_mb`用于启动调度估计，不是进程硬内存限额。固定任务经过有效采样后，DCO按近期RSS、Windows private峰值与增长余量校正预留，原申请保留在回执中。已知后续阶段工作集通过base/per-CPU模型声明，按实际并行宽度准备与归还；`memory_limit_mb`限制该模型的调度宽度。新派发及未采样进程保留启动估计，内存不足时仍可提交到队列。任务族的完整实测峰值用于校正下一批申请，不能用单次瞬时RSS替代冷准备或多进程峰值。
 
-普通`Client`提供语义能力汇总，不提供OS筛选或设备选择；`node`只供操作员使用。跨平台原生任务可省略`node`并使用`requires=[]`，通过上述本机构建使用全部兼容设备。已冻结的平台专属任务由操作员核定路由并受理原ID、原包，业务继续用普通SDK领取和发布；不以其它工具能力代替平台条件。
+普通`Client`使用`client.capabilities()['platforms']`查询在线平台类型；`client.capabilities(platform='linux')`返回该平台的语义能力、CPU/RAM及加速器汇总，不暴露设备身份。平台使用提供者实际`sys.platform`值，例如`linux`、`win32`，不放入`requires`。
+
+`command/python_map/python_call/python_task(..., platform='linux')`只在匹配平台运行；省略`platform`使用全部兼容平台。`client.admission(..., platform='linux')`及`client.window(..., platform='linux')`按相同条件估算资源。`client.execute`的每个任务分别携带平台，共享原工程窗口，可混合Windows/Linux任务。没有匹配提供者时返回明确的匹配失败；worker在展开输入和运行进程前再次核对平台。冻结平台任务直接声明约束，原ID、输入及预算保持；`node`和设备清单仅供操作员。
 
 | 能力 | 就绪条件及独立安装理由 |
 | --- | --- |

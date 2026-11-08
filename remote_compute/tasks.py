@@ -1,5 +1,5 @@
 """Task constructors; callers keep their measurement and scientific semantics."""
-from .policy import canonical_capabilities
+from .policy import canonical_capabilities, validate_platform
 
 
 def python_map(function, items, *, kwargs=None, backend='process', **options):
@@ -28,7 +28,8 @@ def python_task(function, *, kwargs=None, **options):
 def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
-            accelerator=None):
+            accelerator=None, platform=None):
+    platform = validate_platform(platform)
     model=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
     if model:
         if memory_mb is not None:raise ValueError('Declare fixed memory_mb or a base/per-CPU memory model')
@@ -47,6 +48,8 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
     if model:task['memory_model']=dict(base_memory_mb=base,memory_per_cpu_mb=per,**({'memory_limit_mb':memory_limit_mb}if memory_limit_mb is not None else{}))
     if accelerator is not None:
         task["accelerator"] = accelerator
+    if platform is not None:
+        task['platform'] = platform
     if single_thread_weight != 1.0 or isinstance(single_thread_weight, bool):
         task['single_thread_weight'] = single_thread_weight
     if cwd is not None:

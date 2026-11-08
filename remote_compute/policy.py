@@ -24,6 +24,13 @@ MAX_ACCELERATORS = 16
 MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
 
 
+def validate_platform(value):
+    """An optional exact sys.platform value, independent of tool capabilities."""
+    if value is not None and (not isinstance(value, str) or not re.fullmatch('[a-z][a-z0-9_]{0,31}', value)):
+        raise ValueError('platform requires an exact sys.platform value such as linux or win32')
+    return value
+
+
 def validate_ready_tasks(value):
     if value is not None and (type(value) is not int or not 1 <= value <= MAX_READY_TASKS):
         raise ValueError('ready_tasks requires an integer from 1 to %d' % MAX_READY_TASKS)
@@ -248,6 +255,7 @@ def public_capabilities():
         "resize_memory_model",
         "resize_active_cpus",
         "semantic_requires",
+        "task_platform",
         "single_thread_weight",
         "asset_cache",
         "accelerators",

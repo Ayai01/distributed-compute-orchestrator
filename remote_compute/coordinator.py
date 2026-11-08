@@ -19,7 +19,7 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
-                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks)
+                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .memory import plan_memory
@@ -43,7 +43,7 @@ def _matching_pass(pool):
     cache={}
     def matching(task):
         accelerator=task.get('accelerator')
-        key=(task.get('node'),task.get('cpus',1)or 1,task.get('memory_mb',256),
+        key=(task.get('node'),task.get('platform'),task.get('cpus',1)or 1,task.get('memory_mb',256),
              execution_bindings(task),capability_set(task.get('requires',())),
              json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
         if key not in cache:cache[key]=tuple(pool._matching(task))
@@ -179,6 +179,7 @@ class Coordinator:
         maximum_cpus = request.get('max_cpus')
         ready_tasks = validate_ready_tasks(request.get('ready_tasks'))
         requires = canonical_capabilities(request.get('requires', []))
+        platform = validate_platform(request.get('platform'))
         accelerator = normalize_accelerator_requirement(request.get('accelerator'))
         if not operator and request.get('node') is not None:
             raise ValueError('node selection belongs to the DCO operator; use requires for capabilities')
@@ -201,6 +202,7 @@ class Coordinator:
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')
                   and n.capacity>=max(1,cpus)
                   and (not node_name or n.name==node_name)
+                  and (platform is None or n.health.get('platform') == platform)
                   and set(requires).issubset(canonical_capabilities(n.health.get('tags',())))
                   ]
         fallback_capable = (sum(n.capacity for n in eligible)
@@ -270,7 +272,7 @@ class Coordinator:
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         value = dict(project=project,resource_share=share,queue_ratio=ratio,target_cpus=target,capable_cpus=capable,accepting=getattr(self,'accepting',True),
-                    accelerator=accelerator,fallback_capable_cpus=fallback_capable,
+                    accelerator=accelerator,platform=platform,fallback_capable_cpus=fallback_capable,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
@@ -304,15 +306,17 @@ class Coordinator:
         with self.condition, self.pool.condition:
             return self._health()
 
-    def capabilities(self):
+    def capabilities(self, *, platform=None):
         """Return the scheduler's aggregate project-facing capability view.
 
         This deliberately has no node names, URLs, paths, jobs, project
         quotas, or placement policy.  The operator console continues to use
         :meth:`health` for that private view.
         """
+        platform = validate_platform(platform)
         with self.condition, self.pool.condition:
-            online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled]
+            online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled
+                      and (platform is None or n.health.get('platform') == platform)]
             tags = set()
             accelerator_profiles = []
             for node in online:
@@ -326,6 +330,7 @@ class Coordinator:
                 'protocol': PROTOCOL,
                 'role': 'scheduler',
                 'version': __version__,
+                'platforms': sorted({n.health['platform'] for n in online if n.health.get('platform')}),
                 'capabilities': public_capabilities(),
                 'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
                 'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],

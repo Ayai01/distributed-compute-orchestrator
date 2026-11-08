@@ -45,7 +45,7 @@ results = client.execute(plan, project='my-project',
 
 已有业务入口可以用`command(['${tool:python}', 'runner.py', '--workers', '${cpus}'], max_cpus=...)`。DCO在启动每一步前取得授权，再展开实际核数及数值库环境。任意外部命令在该命令边界使用其授权；需要运行中增减实际并发的输入流使用DCO映射执行器。
 
-任务的`env`同样展开工具占位符；例如`env={'NATIVE_CXX':'${tool:cxx}'}`让Python入口使用当前节点已登记的编译器。原生源码、构建参数和二进制ABI分别记录；在执行节点生成本机库，或选择相同ABI的预编译资产，再由业务加载。基础C/C++不另申请能力，OS不包装成语义能力标签；普通客户端的任务不指定`node`，平台专属冻结输入由操作员按原ID受理。
+任务的`env`同样展开工具占位符；例如`env={'NATIVE_CXX':'${tool:cxx}'}`让Python入口使用当前节点已登记的编译器。原生源码、构建参数和二进制ABI分别记录；在执行节点生成本机库，或选择相同ABI的预编译资产，再由业务加载。基础C/C++不另申请能力，OS不包装成语义能力标签。普通客户端通过可选`platform`声明实际`sys.platform`值，例如`linux`或`win32`；省略时使用全部兼容平台，设备选择仍由DCO负责。平台筛选同时参与准入、资源规划、缓存匹配及加速器回退；worker在展开输入前复核。未匹配任务按标准匹配失败发布原ID回执。
 
 在DCO任务内，业务入口可调用：
 
@@ -157,13 +157,13 @@ CPU/RAM增长先预留，远端确认后提交；减少确认后归还。同一�
 
 Python/C++为基础环境，不列能力。禁止包组合、设备、OS、工程名或构建后缀。工具链必须在单节点完整，不能跨节点拼凑可用性。Python统一`${tool:python}`，由操作员`python_runtimes`绑定CPU、ML或已授权CUDA解释器；路径和工具argv只在操作员视图及原任务回执保留。
 
-普通工程查询`client.capabilities()`，返回汇总语义能力、CPU/RAM总量和无设备ID的加速器档案。`shared:alias`是明确的数据位置要求，用于`${shared:alias}`；源码、数据及模型优先作为内容资产，不把共享目录名称包装成运行能力。
+普通工程查询`client.capabilities()`，返回`platforms`平台类型、汇总语义能力、CPU/RAM总量和无设备ID的加速器档案。`capabilities(platform='linux')`过滤汇总范围；`admission/window`接受同一可选`platform`。公开协议能力`task_platform`表示支持该契约，与运行工具能力分开。`shared:alias`是明确的数据位置要求，用于`${shared:alias}`；源码、数据及模型优先作为内容资产，不把共享目录名称包装成运行能力。
 
 GPU任务声明`requires=['ml']`及`accelerator={'kind':'cuda', ...}`。默认整卡独占；`sharing:'memory', max_jobs:2, memory_mb:...`表示每任务显存预留，同时受卡容量余量和参与者最小max_jobs限制。CPU回退显式声明`fallback_after_seconds`；无在线兼容GPU时立即回退，排队达到阈值时沿同ID回退。首次派发后执行选择冻结，回执保留请求及实际加速器。
 
 ## 任务、内容与结果
 
-公开任务包含`steps/max_cpus/timeout/outputs/env/assets/render/label/priority/requires/memory_mb/project`等业务需求。内存模型保存在`memory_model`，托管函数保存在`execution`。`node/cwd`及机器操作仅供操作员。
+公开任务包含`steps/max_cpus/timeout/outputs/env/assets/render/label/priority/requires/platform/memory_mb/project`等业务需求。内存模型保存在`memory_model`，托管函数保存在`execution`。`node/cwd`及机器操作仅供操作员。
 
 | 占位符 | 含义 |
 | --- | --- |
