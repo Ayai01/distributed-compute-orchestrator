@@ -468,18 +468,6 @@ class Coordinator:
         largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
         with self.condition,self.pool.condition:
             matching=_matching_pass(self.pool)
-            waiting_priority=MIN_PRIORITY
-            for job in active_values(self.jobs):
-                task=job.get('task',{});priority=task.get('priority',0)
-                if (priority<=waiting_priority or job.get('node') is not None or job.get('recover')
-                        or job['result']['status']!='queued'
-                        or job.get('cancel') and job['cancel'].is_set()):continue
-                for node in matching(task):
-                    if (node.name not in online or node.health.get('paused')
-                            or node.startup_memory(task)>max(0,min(node.memory_free,self.pool._host_memory_free(node)))
-                            or task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True))):continue
-                    waiting_priority=priority
-                    break
             for job in active_values(self.jobs):
                 if job['result']['status'] in TERMINAL:
                     continue
@@ -499,7 +487,6 @@ class Coordinator:
                 if paused:demand=task.get('cpus',0)
                 demands[name] = demands.get(name, 0) + demand
                 if (held is not None and not paused and _elastic_job(job)
-                        and task.get('priority',0)>=waiting_priority
                         and not (job.get('cancel') and job['cancel'].is_set())):
                     width=min(4,demand)
                     warm_demands[name]=warm_demands.get(name,0)+width
@@ -741,7 +728,7 @@ class Coordinator:
                     if not groups[group]:del groups[group]
                     yield key,borrowing
 
-    def _growth_headroom(self, task, resources):
+    def _growth_headroom(self, resources):
         """Give existing elastic work its first four useful threads.
 
         This holds no worker lease and never changes an active pool. Its owner
@@ -750,13 +737,12 @@ class Coordinator:
         """
         protected,groups={},{}
         warm_cache={}
-        for identity,job in sorted(active_items(self.jobs),key=lambda row:-row[1].get('task',{}).get('priority',0)):
+        for identity,job in sorted(active_items(self.jobs),key=lambda row:(row[1]['result'].get('submitted',0),row[0])):
             held=job.get('node');current=job.get('task',{})
             startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
             desired=min(4,job.get('desired_cpus',startup));old=current.get('cpus',0)
             if (held is None or desired<=old
                     or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
-                    or current.get('priority',0)<task.get('priority',0)
                     or held.error or not held.enabled or held.health.get('paused')):
                 continue
             group=current.get('project') or 'default';resource=resources[group]
@@ -823,7 +809,7 @@ class Coordinator:
                     for identity in self.queue:
                         self._fallback_accelerator(self.jobs[identity])
                     budgets = self.project_resources()
-                    growth = {}
+                    growth = None
                     fixed = None
                     # Within the same priority and CPU mode, place constrained
                     # work first so flexible jobs retain the other devices.
@@ -838,12 +824,11 @@ class Coordinator:
                         if not borrowing and (room <= 0 or (job['task']['cpus'] or 1) > room):
                             continue
                         try:
-                            priority=job['task']['priority']
-                            if priority not in growth:
-                                growth[priority]=self._growth_headroom(job['task'],budgets)
+                            if growth is None:
+                                growth=self._growth_headroom(budgets)
                             if fixed is None:
                                 fixed = self._fixed_queue_claims(budgets)
-                            headroom = dict(growth[priority])
+                            headroom = dict(growth)
                             for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
                                 headroom[name] = max(headroom.get(name, 0), count)
                             node = self.pool._acquire(job["task"], block=False,
@@ -861,7 +846,7 @@ class Coordinator:
                         self.queue.remove(identity)
                         job["node"] = node
                         budget['used'] += job['task']['cpus']
-                        growth.clear()
+                        growth = None
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              cpus=job['task']['cpus'])
@@ -1260,13 +1245,13 @@ class Coordinator:
         fixed-width requests retain their indivisible admission contract.
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
-        resource=resources[group];priority=current['task'].get('priority',0)
+        resource=resources[group]
         if desired==1:
             # The plan grants at most the requested width and at least one.
             # A one-thread phase therefore has the exact target without a plan.
             return 1
-        if warm_cache is not None and (group,priority) in warm_cache:
-            return max(1,warm_cache[group,priority].get(identity,{}).get(current['node'].name,0))
+        if warm_cache is not None and group in warm_cache:
+            return max(1,warm_cache[group].get(identity,{}).get(current['node'].name,0))
         members={key:job for key,job in active_items(self.jobs)
                  if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
                  and (job['task'].get('project') or 'default')==group}
@@ -1282,10 +1267,9 @@ class Coordinator:
         for key,job in members.items():
             task=job['task'];held=job.get('node')
             automatic=key==identity or _elastic_job(job)
-            if held is not None and (not automatic or task.get('priority',0)<priority):
+            if held is not None and not automatic:
                 if held.name in capacities:capacities[held.name]=max(0,capacities[held.name]-task['cpus'])
                 continue
-            if task.get('priority',0)<priority:continue
             wanted={**task,'cpus':0} if automatic else task
             eligible=[]
             for node in matching(wanted):
@@ -1323,15 +1307,14 @@ class Coordinator:
             pinned=[key for key in running if name in rooms[key]]
             if sum(min(4,running[key])for key in pinned)<=capacity:continue
             remaining=capacity
-            for key in sorted(pinned,key=lambda key:(-members[key]['task'].get('priority',0),
-                    members[key]['result'].get('submitted',0),key)):
+            for key in sorted(pinned,key=lambda key:(members[key]['result'].get('submitted',0),key)):
                 count=min(remaining,4,running[key],rooms[key][name])
                 warm[key]={name:count};remaining-=count
         if warm_cache is not None:
             # One growth pass asks each elastic peer for its first four useful
-            # threads. The same group/priority has one unchanged warm plan;
+            # threads. The same group has one unchanged warm plan;
             # wider idle growth is handled separately at the phase boundary.
-            warm_cache[group,priority]=warm
+            warm_cache[group]=warm
             return max(1,warm.get(identity,{}).get(current['node'].name,0))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
         entrants=weighted_node_threads(spare,{key:1. for key in waiting},waiting,rooms)

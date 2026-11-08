@@ -34,7 +34,7 @@ class AdmissionPlanningTests(unittest.TestCase):
         }
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['target'],4)
-        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{'0':3})
+        self.assertEqual(state._growth_headroom(budgets),{'0':3})
 
     def test_running_warmup_precedes_another_projects_new_task(self):
         state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
@@ -47,19 +47,20 @@ class AdmissionPlanningTests(unittest.TestCase):
         }
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['target'],4)
-        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{'0':3})
+        self.assertEqual(state._growth_headroom(budgets),{'0':3})
         # A truly serial phase returns its standing demand as well as its
         # lease; it must not hold three unusable slots against new work.
         state.jobs['active']['desired_cpus']=1
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['target'],1)
-        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{})
-        # Explicit priority still outranks the default four-thread warmup.
+        self.assertEqual(state._growth_headroom(budgets),{})
+        # Queue priority does not bypass the first four useful threads.
         state.jobs['active']['desired_cpus']=8
         state.jobs['waiting']['task']['priority']=1
         budgets=state.project_resources()
-        self.assertEqual(budgets['B']['target'],1)
-        self.assertEqual(state._growth_headroom(state.jobs['waiting']['task'],budgets),{})
+        self.assertEqual(budgets['A']['target'],4)
+        self.assertEqual(budgets['B']['target'],0)
+        self.assertEqual(state._growth_headroom(budgets),{'0':3})
 
     def test_small_start_elastic_jobs_spread_across_idle_devices(self):
         state=self.center([20,30,52,16,16]);pool=state.pool
@@ -123,7 +124,7 @@ class AdmissionPlanningTests(unittest.TestCase):
         resources=state.project_resources()
         self.assertEqual(resources['A']['demand'],18)
         self.assertEqual(resources['A']['target'],16)
-        self.assertEqual(state._growth_headroom(state.jobs['4']['task'],resources),{'0':12})
+        self.assertEqual(state._growth_headroom(resources),{'0':12})
         state.jobs['0']['desired_cpus']=1
         self.assertEqual(state.project_resources()['A']['demand'],15)
 
@@ -266,11 +267,11 @@ class AdmissionPlanningTests(unittest.TestCase):
         active=job('A',1,node,True);active['desired_cpus']=4
         state.jobs={'active':active,'borrower':job('B',2,node),'waiting':job('B',1)}
         candidate=state.jobs['waiting']['task']
-        def headroom():return state._growth_headroom(candidate,state.project_resources())
+        def headroom():return state._growth_headroom(state.project_resources())
         self.assertEqual(headroom(),{'0':1})
-        # Higher priority work can use the free slot, without changing A's demand.
+        # A queued priority override cannot consume A's warmup slot.
         candidate['priority']=1
-        self.assertEqual(headroom(),{})
+        self.assertEqual(headroom(),{'0':1})
         candidate['priority']=0
         active['phase_memory']=dict(base_memory_mb=64,memory_per_cpu_mb=1024)
         node.health['memory_available_mb']=100
@@ -291,9 +292,27 @@ class AdmissionPlanningTests(unittest.TestCase):
         waiting=dict(task=dict(active['task'],cpus=0),auto_cpus=True,node=None,
             cancel=threading.Event(),result=dict(status='queued'))
         state.jobs={'active':active,'waiting':waiting}
-        self.assertEqual(state._growth_headroom(waiting['task'],state.project_resources()),{'0':3})
+        self.assertEqual(state._growth_headroom(state.project_resources()),{'0':3})
         active['task']['cpus']=4;active['desired_cpus']=16;node.reserved=4
-        self.assertEqual(state._growth_headroom(waiting['task'],state.project_resources()),{})
+        self.assertEqual(state._growth_headroom(state.project_resources()),{})
+
+    def test_three_stages_keep_large_ceiling_and_follow_ready_demand(self):
+        state=self.center([16]);node=state.pool.nodes[0];node.reserved=1
+        active=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=1024,memory_mb=64,project='A',priority=-1),
+            elastic_cpus=True,node=node,cancel=threading.Event(),result=dict(status='running'),desired_cpus=64)
+        waiting=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=1024,memory_mb=64,project='A',priority=10),
+            elastic_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued'))
+        state.jobs={'active':active,'waiting':waiting}
+        resources=state.project_resources()
+        self.assertEqual(state._growth_headroom(resources),{'0':3})
+        self.assertEqual(state._cooperative_cpu_target('active',64,resources),4)
+        active['task']['cpus']=4;node.reserved=4
+        self.assertEqual(state._cooperative_cpu_target('active',64,state.project_resources()),4)
+        del state.jobs['waiting']
+        self.assertEqual(state._cooperative_cpu_target('active',64,state.project_resources()),16)
+        active['desired_cpus']=2
+        self.assertEqual(state._cooperative_cpu_target('active',2,state.project_resources()),2)
+        self.assertEqual(active['task']['max_cpus'],1024)
 
     def test_queue_rechecks_used_threads_per_share_after_each_allocation(self):
         state=self.center([16]);state.queue=['A1','A2','B1','urgent']

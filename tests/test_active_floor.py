@@ -56,16 +56,38 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
         state.jobs['waiting']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=24,
             memory_mb=64,project='B'),node=None,cancel=threading.Event(),result=dict(status='queued'))
         self.assertEqual(state.resize('0',24,active_cpus=4)['cpus'],4)
-        # Returning one completed child is a safe boundary, even while three
-        # siblings are still computing. Fairness may reclaim only that slot.
+        # A new task's priority does not dilute the first four useful slots.
+        # A real tail can return its unused slot while siblings keep computing.
         state.jobs['waiting']['task']['priority']=1
-        self.assertEqual(state.resize('0',24,active_cpus=3)['cpus'],3)
+        self.assertEqual(state.resize('0',24,active_cpus=3)['cpus'],4)
+        # Only a real reduction in useful demand frees a warmup slot.
+        self.assertEqual(state.resize('0',3,active_cpus=3)['cpus'],3)
         self.assertEqual(node.reserved,23)
         del state.jobs['waiting']
         for key in list(state.jobs)[1:]:
             node.reserved-=state.jobs[key]['task']['cpus'];node.live_jobs.remove(key);del state.jobs[key]
         self.assertEqual(state.resize('0',24,active_cpus=3)['cpus'],24)
         self.assertEqual(node.reserved,24)
+
+    def test_later_priority_keeps_older_same_project_warmup_and_active_floor(self):
+        state=fixtures.AdmissionPlanningTests().center([5]);node=state.pool.nodes[0]
+        node.health['capabilities']=['resize','resize_active_cpus']
+        node.reserved=2;node.reserved_memory_mb=128;state.stopping=False
+        state._publish=lambda job:None;state._save=lambda job:None
+        node.client.resize=lambda identity,cpus,**kw:dict(id=identity,cpus=cpus,memory_mb=64)
+        for key,priority,submitted in [('older',-1,0),('later',10,1)]:
+            node.live_jobs.add(key)
+            state.jobs[key]=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=1024,
+                memory_mb=64,project='A',priority=priority),elastic_cpus=True,node=node,
+                cancel=threading.Event(),desired_cpus=64,
+                result=dict(id=key,status='running',cpus=1,memory_mb=64,submitted=submitted))
+        self.assertEqual(state.resize('later',64,active_cpus=1)['cpus'],1)
+        self.assertEqual(state.resize('older',64,active_cpus=1)['cpus'],4)
+        self.assertEqual(node.reserved,5)
+        self.assertEqual(state.resize('later',64,active_cpus=1)['cpus'],1)
+        self.assertEqual(state.resize('older',1,active_cpus=1)['cpus'],1)
+        self.assertEqual(state.resize('later',64,active_cpus=1)['cpus'],4)
+        self.assertEqual(node.reserved,5)
 
     def test_sdk_center_worker_preserve_floor_while_probing_large_estimates(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=1024)as (_,worker):

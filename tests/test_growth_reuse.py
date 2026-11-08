@@ -51,9 +51,9 @@ class GrowthReuseTests(unittest.TestCase):
                 state.jobs[str(index)]=job
             resources=state.project_resources()
             candidate=dict(priority=rng.choice([-1,0,2]))
-            actual=state._growth_headroom(candidate,resources)
+            actual=state._growth_headroom(resources)
             state.__class__=UncachedCenter
-            expected=state._growth_headroom(candidate,resources)
+            expected=state._growth_headroom(resources)
             self.assertEqual(actual,expected,'scenario '+str(case))
 
     def test_repeated_peers_do_not_repeat_the_group_allocation(self):
@@ -66,11 +66,11 @@ class GrowthReuseTests(unittest.TestCase):
         node.reserved=64
         resources=state.project_resources()
         with patch.object(module,'weighted_node_threads',wraps=module.weighted_node_threads)as allocation:
-            actual=state._growth_headroom({},resources)
+            actual=state._growth_headroom(resources)
             calls=allocation.call_count
         state.__class__=UncachedCenter
         with patch.object(module,'weighted_node_threads',wraps=module.weighted_node_threads)as allocation:
-            expected=state._growth_headroom({},resources)
+            expected=state._growth_headroom(resources)
             old_calls=allocation.call_count
         self.assertEqual(actual,expected)
         self.assertEqual(calls,1)

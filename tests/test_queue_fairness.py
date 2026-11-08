@@ -63,6 +63,25 @@ class AutomaticQueueFairnessTests(unittest.TestCase):
                 self.assertEqual(client.status(high)['cpus'],1)
                 self.finish(client,[*busy,low,high])
 
+    def test_high_priority_waiter_preserves_existing_four_then_enters_with_one(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                first=client.submit(python(HOLD,max_cpus=1024,priority=-1,project='existing'))['id']
+                until(lambda:'ready'in client.logs(first)['stdout'])
+                client.control(paused=True)
+                client.resize(first,1,active_cpus=1)
+                later=client.submit(python(HOLD,max_cpus=1,priority=10,project='new'))['id']
+                self.assertEqual(client.resize(first,64,active_cpus=1)['cpus'],4)
+                client.control(paused=False)
+                self.assertEqual(client.status(later)['status'],'queued')
+                self.assertEqual(client.resize(first,1,active_cpus=1)['cpus'],1)
+                until(lambda:'ready'in client.logs(later)['stdout'])
+                self.assertEqual(worker.status(later)['initial_cpus'],1)
+                client.write_job_file(later,'release','done');client.wait(later)
+                self.assertEqual(client.resize(first,64,active_cpus=1)['cpus'],4)
+                self.assertEqual(client.status(first)['max_cpus'],1024)
+                self.finish(client,[first,later])
+
     def test_memory_blocked_work_does_not_hold_an_unused_cpu(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=256,memory_headroom_mb=0)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
