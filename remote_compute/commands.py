@@ -542,7 +542,7 @@ class SchedulerShell(Shell):
             self.pool.refresh()
             value = self.pool.snapshot()
         print("分配策略:", value["policy"])
-        table(value["nodes"], ["name", "capacity", "used_cpus", "cpu_percent", "memory_available_mb", "memory_reserved_mb", "weight", "enabled", "paused"])
+        table(value["nodes"], ["name", "base_capacity", "capacity", "used_cpus", "cpu_percent", "memory_available_mb", "memory_reserved_mb", "weight", "enabled", "paused"])
 
     def do_status(self, _line):
         """查看中心和每台设备的实时资源、标签、访问IP和任务。"""
@@ -808,7 +808,8 @@ class SchedulerShell(Shell):
         self.pool.refresh()
 
     def do_cpus(self, line):
-        """cpus [节点] N：设置CPU预算；省略节点即本机，0为自动，现有任务自然收尾。
+        """cpus [节点] N：设置基础CPU预算；省略节点即本机，0为自动，现有任务自然收尾。
+        超发按配置倍率临时增加准入，基础预算保持。
         例：cpus 16；cpus Aya1-TX 30。设置自动保存，下次启动继续使用。
         """
         args = words(line)
@@ -824,10 +825,11 @@ class SchedulerShell(Shell):
             self.pool.refresh()
             snapshot = self.pool.snapshot()
         row = next(row for row in snapshot['nodes'] if row['name'] == name)
-        budget = row['capacity']
+        budget = row.get('base_capacity',row['capacity'])
         limit = row['limit']
         print(name+' CPU配置已保存：设备 '+str(count if int(count) else '自动')+
-              '；中心上限 '+str(limit or '自动')+'；有效预算 '+str(budget)+'。')
+              '；中心上限 '+str(limit or '自动')+'；基础预算 '+str(budget)+
+              '；当前准入 '+str(row['capacity'])+'。')
 
     def do_memory(self, line):
         """memory [节点] RAM：设置任务RAM预算；8G=8GiB，无单位按MiB，0为自动。
@@ -944,7 +946,7 @@ class WorkerShell(Shell):
     def do_status(self, _line):
         """查看本节点CPU预算和实时占用。"""
         value = self.worker.health()
-        display({k: value[k] for k in ("node", "platform", "cpus", "logical_cpus", "used_cpus", "cpu_percent", "queued",
+        display({k: value[k] for k in ("node", "platform", "base_cpus", "cpus", "logical_cpus", "used_cpus", "cpu_percent", "queued",
                                       "memory_total_mb", "memory_available_mb", "memory_reserved_mb", "rss_mb", "paused", "tags")})
 
     def do_memory(self, line):
@@ -967,7 +969,7 @@ class WorkerShell(Shell):
             table(rows,["id", "status", "label", "cpus"])
 
     def do_cpus(self, line):
-        """cpus N：设置本设备CPU预算并保存；例如 cpus 16，0为自动。"""
+        """cpus N：设置本设备基础CPU预算并保存；例如 cpus 16，0为自动，超发倍率保持。"""
         self.worker.control({"cpus": int(line)})
         self.do_status("")
 

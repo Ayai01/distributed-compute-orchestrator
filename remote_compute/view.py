@@ -363,7 +363,8 @@ class StatusRows(list):
                 continue
             name=node.get('node') or node.get('name') or '-'
             allocated=(node.get('reserved',0)+node.get('external_cpus',0) if 'reserved' in node else node.get('used_cpus',0))
-            threads=f"{allocated}/{node.get('capacity',0)}({node.get('logical_cpus','?')})"
+            budget=node.get('base_capacity',node.get('base_cpus',node.get('capacity',0)))
+            threads=f"{allocated}/{budget}({node.get('logical_cpus','?')})"
             total=node.get('memory_total_mb') or 0
             available=node.get('host_memory_available_mb') or 0
             memory=f'{_gb(total-available)}/{_gb(total)}'

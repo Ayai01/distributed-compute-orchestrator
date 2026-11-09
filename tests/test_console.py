@@ -66,6 +66,31 @@ class ConsoleTests(unittest.TestCase):
         keyboard=patch('remote_compute.console._PosixKeyboard',side_effect=lambda:sys.modules['msvcrt'])
         keyboard.start();self.addCleanup(keyboard.stop)
 
+    def test_cpu_budget_stays_stable_while_admission_ceiling_changes(self):
+        for capacity in (20,16,20):
+            with self.subTest(capacity=capacity):
+                node=dict(name='Aya1-PC',node='Aya1-PC',base_capacity=16,capacity=capacity,
+                          logical_cpus=28,reserved=20,external_cpus=0,used_cpus=20,active_jobs=[])
+                centre=format_status(dict(role='scheduler',node='Aya1-PC',cpus=capacity,
+                    used_cpus=20,nodes=[node],projects={}),width=110)
+                self.assertIn('20/16(28)','\n'.join(centre))
+                self.assertEqual(node['capacity'],capacity)
+                worker=format_status(dict(role='worker',node='Aya1-PC',base_cpus=16,
+                    cpus=capacity,used_cpus=20,logical_cpus=28),width=110)
+                self.assertIn('20/16(28)','\n'.join(worker))
+
+    def test_cpu_command_distinguishes_saved_base_from_borrowed_capacity(self):
+        centre=Mock();pool=Mock()
+        centre.control.return_value=dict(nodes=[dict(name='Aya1-PC',base_capacity=16,capacity=20,limit=0)])
+        shell=SchedulerShell(pool,centre)
+        try:
+            output=io.StringIO()
+            with redirect_stdout(output),patch('remote_compute.commands.socket.gethostname',return_value='Aya1-PC'):
+                shell.onecmd('cpus 16')
+            centre.control.assert_called_once_with(node='Aya1-PC',worker={'cpus':16})
+            self.assertIn('基础预算 16；当前准入 20',output.getvalue())
+        finally:shell.close()
+
     def test_dashboard_colors_are_width_neutral_and_respect_no_color(self):
         import remote_compute.console as console
         with patch.object(console, '_COLOR_ENABLED', True):
@@ -201,7 +226,7 @@ class ConsoleTests(unittest.TestCase):
             with redirect_stdout(output),patch('remote_compute.commands.socket.gethostname',return_value='local-device'):
                 shell.onecmd('cpus 12')
                 center.control.assert_called_with(node='local-device',worker={'cpus':12})
-                self.assertIn('中心上限 8；有效预算 8',output.getvalue())
+                self.assertIn('中心上限 8；基础预算 8；当前准入 8',output.getvalue())
                 pool.refresh.assert_not_called()
                 shell.onecmd('memory 1.5G')
                 center.control.assert_called_with(node='local-device',worker={'memory_mb':1536})
