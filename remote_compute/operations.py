@@ -37,11 +37,14 @@ def clean_pending(service, *, discard=None):
     retired,shared=[],[]
     for asset in sorted(assets):
         try:
-            with service.asset_cache.lock,service.condition:
-                protected=asset_references(service.jobs)|set(getattr(service,'accepting_assets',()))
-                for held,expires in service.asset_handoffs.values():
-                    if expires>time.monotonic():protected.update(held)
-                transfer=service.asset_writes.get(asset)
+            with service.asset_cache.lock:
+                with service.condition:
+                    protected=asset_references(service.jobs)|set(getattr(service,'accepting_assets',()))
+                    for held,expires in service.asset_handoffs.values():
+                        if expires>time.monotonic():protected.update(held)
+                    transfer=service.asset_writes.get(asset)
+                # New references publish through this cache lock. Keep that
+                # fence while releasing the scheduler condition before I/O.
                 if asset in protected or transfer is not None and transfer.locked():
                     shared.append(asset)
                     continue

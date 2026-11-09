@@ -79,6 +79,21 @@ class CleanCommandTests(unittest.TestCase):
             self.assertEqual(client.status(identity)['status'],'cancelled')
             state.delete(identity)
 
+    def test_asset_retirement_leaves_the_dispatch_lock_available(self):
+        with scratch()as root,provider(root)as(state,raw):
+            client=Client(raw.url,operator=True);state.control(dict(paused=True))
+            asset=client.sync_files({'model':b'data'})
+            client.submit(python('pass',assets={'model':asset}))
+            original=state.asset_cache.retire;acquired=[]
+            def retire(identity):
+                def probe():
+                    with state.condition:acquired.append(True)
+                thread=threading.Thread(target=probe);thread.start();thread.join(2)
+                self.assertEqual(acquired,[True])
+                return original(identity)
+            with patch.object(state.asset_cache,'retire',side_effect=retire):
+                self.assertEqual(client.clean()['status'],'completed')
+
     def test_endpoint_and_sdk_refuse_nonoperator_cleanup(self):
         with scratch()as root,provider(root)as(_,client):
             with self.assertRaisesRegex(RemoteError,'operator-only'):client.clean()
@@ -88,6 +103,11 @@ class CleanCommandTests(unittest.TestCase):
                 public=Client(operator.url)
                 with self.assertRaises(RemoteError)as rejected:public.request('/clean',{})
                 self.assertEqual(rejected.exception.status_code,403)
+        # A role header cannot bypass the configured TCP trust boundary.
+        with scratch()as root,provider(root,token='private',trusted_networks=[])as(_,raw):
+            untrusted=Client(raw.url,operator=True)
+            with self.assertRaises(RemoteError)as rejected:untrusted.clean()
+            self.assertEqual(rejected.exception.status_code,401)
 
     def test_shell_clean_rejects_parameters_before_deleting(self):
         with scratch()as root,provider(root)as(state,client):
