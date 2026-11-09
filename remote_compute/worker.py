@@ -1311,6 +1311,13 @@ class Worker:
         self._prune_assets()
         return {"deleted": identity}
 
+    def clean(self):
+        from .operations import clean_pending
+        def discard(job):
+            self._clean_temp(job)
+            if job['result'].get('cleanup_error'):raise OSError(job['result']['cleanup_error'])
+        return clean_pending(self,discard=discard)
+
     def asset_handoff(self, identity, assets=None):
         return asset_handoff(self, identity, assets)
 
@@ -1555,6 +1562,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply({"error": "Scheduler control is operator-only"}, 403)
                 value = worker.control(json.loads(body))
                 worker.activity.notify('Control ' + body.decode('utf-8'), self.client_address[0])
+            elif parts == ['clean'] and self.command == 'POST':
+                if not operator:
+                    return self._reply({'error':'Queue cleanup is operator-only'},403)
+                value=worker.clean()
             elif parts == ["restart"] and self.command == "POST":
                 if scheduler and not operator:
                     return self._reply({"error": "Scheduler restart is operator-only"}, 403)

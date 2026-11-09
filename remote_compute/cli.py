@@ -210,10 +210,12 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
             if args.calibrate:
                 changes['benchmark'] = True
             display(dispatch.control(node=args.node, worker=changes) if dispatch else next(n.client for n in pool.nodes if n.name == args.node).control(**changes))
-        elif args.action == 'kill':
+        elif args.action in {'kill','clean'}:
             from .commands import kill_job
-            client=dispatch or next(n.client for n in pool.nodes if args.node is None or n.name==args.node)
-            display(kill_job(client,args.identity))
+            client=dispatch or pool.nodes[0].client
+            result=client.clean()if args.action=='clean'else kill_job(client,args.identity)
+            display(result)
+            if result.get('status')=='incomplete':return 1
         else:
             client = dispatch or next(n.client for n in pool.nodes if n.name == args.node)
             method = getattr(client, args.action)
@@ -360,10 +362,11 @@ def main(argv=None):
     sub.add_parser("sync_cache", parents=[cache_parser()], add_help=False)
     item = sub.add_parser("sync")
     item.add_argument("source")
-    for action in ("kill", "cancel", "logs", "fetch", "delete"):
+    sub.add_parser('clean',help='删除所连接端点当前未启动的排队任务及其记录')
+    for action in ("kill", "logs", "fetch", "delete"):
         item = sub.add_parser(action)
         item.add_argument("identity")
-        item.add_argument("--node", default=None if action=='kill' else socket.gethostname())
+        if action!='kill':item.add_argument("--node", default=socket.gethostname())
         if action == "fetch":
             item.add_argument("--output", required=True)
     args = parser.parse_args(invocation)

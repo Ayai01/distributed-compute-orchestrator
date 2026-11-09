@@ -7,6 +7,7 @@ from urllib.parse import unquote
 from .client import Client, RemoteError, _check_cancelled
 from .worker import Conflict
 from .bundle import progress
+from .policy import validate_status_ids
 
 
 class LocalClient(Client):
@@ -27,9 +28,18 @@ class LocalClient(Client):
                 result = worker.control(data)
                 worker.activity.notify('Control ' + str(data), 'local')
                 return result
+            if parts == ['clean'] and method == 'POST':
+                return worker.clean()
             if parts == ['jobs']:
                 with worker.condition:
                     return [(progress(worker.get(identity)) if brief else worker.get(identity)) for identity in worker.jobs]
+            if parts == ['jobs','status'] and method == 'POST':
+                values={}
+                for identity in validate_status_ids(data.get('ids')):
+                    try:values[identity]=progress(worker.get(identity))
+                    except (KeyError,FileNotFoundError):
+                        values[identity]=dict(id=identity,status='unknown',status_code=404)
+                return values
             if len(parts) == 2 and parts[0] == 'assets':
                 job_id = (extra_headers or {}).get('X-DCO-Asset-Job')
                 return worker.asset(parts[1], data, **({'job_id':job_id} if job_id else {}))

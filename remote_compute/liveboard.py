@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0.1'
+PUBLISHER_VERSION = '1.0.2'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -59,6 +59,7 @@ def snapshot(health, nodes, *, now=None):
         rows.append(dict(id=name, name=name, status=status,
                          cpu_used=number(n.get('reserved', 0)+n.get('external_cpus', 0)),
                          cpu_capacity=number(n.get('capacity')), cpu_base=number(n.get('base_capacity')),
+                         cpu_total=number(n.get('logical_cpus')),
                          cpu_percent=number(n.get('cpu_percent')), memory_used_mb=used,
                          memory_total_mb=total,
                          capabilities=[x for x in EXECUTION_CAPABILITIES if x in n.get('tags', ())]))
@@ -105,6 +106,7 @@ def snapshot(health, nodes, *, now=None):
                                cpu_used=number(health.get('used_cpus')),
                                cpu_capacity=number((health.get('cpu') or {}).get('capacity')),
                                cpu_base=sum(r['cpu_base'] or 0 for r in rows if r['status'] in ('online', 'paused')),
+                               cpu_total=memory_sum('logical_cpus'),
                                cpu_percent=round(sum(p*c for p,c in weighted)/sum(c for _,c in weighted), 1) if weighted else None,
                                memory_used_mb=max(0, total-free) if total is not None and free is not None else None,
                                memory_total_mb=total),

@@ -34,6 +34,20 @@ class LiveboardTests(unittest.TestCase):
         self.assertIsNone(value['source']['uptime_seconds'])
         self.assertEqual(value['nodes'][0]['capabilities'],['ng47','ml'])
 
+    def test_total_threads_are_physical_deduplicated_and_independent_of_grants(self):
+        nodes=[self.node(capacity=10,base_capacity=6,logical_cpus=8),
+               self.node(name='sibling',capacity=4,base_capacity=2,logical_cpus=8),
+               self.node(name='other',machine_id='other',capacity=3,base_capacity=2,logical_cpus=4)]
+        value=live.snapshot(self.health(),nodes)
+        self.assertEqual(value['summary']['cpu_total'],12)
+        self.assertEqual([n['cpu_total']for n in value['nodes']],[8,8,4])
+        self.assertEqual(value['nodes'][0]['cpu_base'],6)
+        self.assertEqual(value['nodes'][0]['cpu_capacity'],10)
+        nodes[0]['capacity']=6
+        self.assertEqual(live.snapshot(self.health(),nodes)['summary']['cpu_total'],12)
+        nodes[2]['logical_cpus']=None
+        self.assertIsNone(live.snapshot(self.health(),nodes)['summary']['cpu_total'])
+
     def test_task_progress_is_explicit_and_job_width_elapsed_are_real(self):
         jobs=[dict(id='a'*32,label='Task',status='running',cpus=2,max_cpus=64,
                    project='project',started=90,completed=2,total=8,argv=['SECRET']),

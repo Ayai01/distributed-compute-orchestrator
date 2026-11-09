@@ -81,6 +81,8 @@ hybrid 本机 worker 由中心进程内调用，不开额外端口；`local://�
 python -B main.py --url http://127.0.0.1:26133 nodes
 python -B main.py --url http://127.0.0.1:26133 jobs
 python -B main.py --url http://127.0.0.1:26133 kill ab12
+python -B main.py --url http://127.0.0.1:26133 kill all
+python -B main.py --url http://127.0.0.1:26133 clean
 python -B main.py --url http://127.0.0.1:26133 run examples/spice/task.json --input examples/spice --output results/divider
 python -B main.py --url http://127.0.0.1:26133 spice examples/spice/divider.spice --output results/divider-direct
 python -B main.py --url http://127.0.0.1:26133 rtl examples/rtl --top tb --sources tb.sv --output results/rtl
@@ -90,7 +92,9 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 
 `TASK_ID` 换成实际 ID。单任务成功返回 0，任务失败返回 1，配置/通信错误返回 2。自动化保存返回 ID，用原 ID 查状态、日志和取回结果；短暂断连继续查询原任务。成功取回默认清理服务端副本，`--keep` 用于显式保留。任务 JSON、SDK 与恢复语义见 [DESIGN](docs/DESIGN.md)。
 
-`kill <id>` 终止一个排队或运行中的任务及其子进程。支持完整ID和唯一的至少4位短ID；有歧义时列出候选，不执行终止。任务进入`cancelled`，原ID、已完成输出与费用继续供`logs/fetch`领取。它沿用任务取消接口；脚本使用`client.cancel(完整ID)`。
+`kill <id|all>` 是终端统一的任务终止命令。ID支持完整值和唯一的至少4位短ID；有歧义时列出候选，不执行终止。`kill all`按执行时的活动快照取消所连接端点的全部排队及运行任务；中心使用原任务ID，worker仅操作本设备。后续新提交任务和已结束任务保持各自状态；全局受理、暂停设置保持。任务及其子进程终止后进入`cancelled`，原ID、已完成输出与费用继续供`logs/fetch`领取。批量操作返回完成与待确认的原ID，未全部确认时一次性CLI返回非零。终端不提供重复的`cancel`命令；SDK及HTTP任务取消接口保留，脚本使用`client.cancel(完整ID)`。
+
+`clean`无需参数，删除所连接端点当前未启动的排队任务，以及对应输入、日志、回执、尝试归档、临时目录和独占资产缓存。服务先在调度锁内摘出全部选中任务，再沿原ID清理文件；运行及派发中的在途任务、已结束结果、后续新提交任务继续保留。共享资产按真实引用保留。删除后的原ID查询为404；索引删除标记防止重启恢复已删除任务。命令仅供操作员使用，不改变受理或暂停状态；部分清理失败返回原ID/错误，一次性CLI返回非零。SDK操作员接口为`client.clean()`。
 
 任务总表不要在长时间运行的中心上读取全部历史。CLI `jobs` 使用最近页；SDK 可用 `client.status_page(limit=256, offset=0)` 读取有界页，返回 `items/total/offset/limit/has_more`，按完整 ID继续查单项。完整任务查询使用原ID或批状态接口。
 
@@ -109,7 +113,8 @@ python -B main.py --url http://127.0.0.1:26133 fetch TASK_ID --output results/re
 | `cpus 16` / `memory 8G` | 当前本机预算，保存到设备配置 |
 | `cpus Aya1-TX 16` / `memory Aya1-TX 8G` | 指定设备预算 |
 | `calibrate` / `calibrate Aya1-TX` | 人工触发全部/指定设备校准；启动、重连及定期更新均不自动校准 |
-| `logs ab12` / `kill ab12` | 查看日志 / 终止指定任务及子进程，保留回执 |
+| `logs ab12` / `kill ab12` / `kill all` | 查看日志 / 终止指定任务 / 终止当前全部排队及运行任务，保留回执 |
+| `clean` | 删除当前未启动的排队任务及其记录、输入和独占缓存 |
 | `fetch ab12 "D:/结果"` | 取回并清理任务副本 |
 | `pause Aya1-TX` / `resume Aya1-TX` | 停止/恢复接收新任务，已有任务继续 |
 | `restart --wait` / `restart Aya1-TX --wait` | 等空闲后在原终端重载中心/worker |

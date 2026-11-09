@@ -60,6 +60,9 @@ def _paint_row(row, device_names=()):
                for match in title_pattern.finditer(row, 0, paint_end)]
     if task:
         matches.append((*task.span('id'), '\x1b[36m'))
+    if re.match(r'\| 候选: ',row):
+        for match in re.finditer(r'(?<![\w])[0-9a-f]{4}(?![\w])',row[:paint_end],re.I):
+            matches.append((*match.span(),'\x1b[36m'))
     for match in re.finditer(r'\[([0-9a-f]{4})\]', row[:paint_end], re.I):
         matches.append((*match.span(1), '\x1b[36m'))
     if device_pattern:

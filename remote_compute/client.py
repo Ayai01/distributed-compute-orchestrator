@@ -577,6 +577,11 @@ class Client:
     def cancel(self, identity):
         return self.request("/jobs/" + identity + "/cancel", {})
 
+    def clean(self):
+        """Operator cleanup of queued tasks; active and finished receipts remain."""
+        if not self.operator:raise RemoteError('Queue cleanup is operator-only')
+        return self.request('/clean',{})
+
     def logs(self, identity):
         return self.request("/jobs/" + identity + "/logs")
 

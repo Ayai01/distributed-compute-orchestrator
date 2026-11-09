@@ -1745,6 +1745,10 @@ class Coordinator:
         self._prune_assets()
         return {"deleted": identity}
 
+    def clean(self):
+        from .operations import clean_pending
+        return clean_pending(self)
+
     def _prune_assets(self, *, recent=True):
         with self.asset_cache.lock:
             with self.condition:

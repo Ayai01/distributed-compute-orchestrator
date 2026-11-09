@@ -183,7 +183,7 @@ MACHINE_ACTIONS = {"exec", "python", "ls", "read", "put", "get"}
 COMMAND_TREE = (
     ('查看', ('status', 'nodes', 'jobs')),
     ('资源', ('cpus', 'memory', 'calibrate', 'pause', 'resume', 'policy', 'set')),
-    ('任务', ('run', 'spice', 'rtl', 'batch', 'sync_cache', 'logs', 'kill', 'cancel', 'fetch', 'wait')),
+    ('任务', ('run', 'spice', 'rtl', 'batch', 'sync_cache', 'logs', 'kill', 'clean', 'fetch', 'wait')),
     ('设备与文件', ('add', 'scan', 'save', 'exec', 'python', 'ls', 'read', 'put', 'get', 'restart')),
     ('终端', ('help', 'quit')),
 )
@@ -275,21 +275,88 @@ def ram_mib(value):
     return amount
 
 
+def active_job_rows(client):
+    """Take one live snapshot; never enumerate retained task history."""
+    health=client.health()
+    rows=list(health.get('active_jobs') or [])+list(health.get('queued_jobs') or [])
+    for node in health.get('nodes') or []:rows.extend(node.get('active_jobs') or [])
+    return {row['id']:row for row in rows if row.get('status') not in TERMINAL}
+
+
 def active_job_identity(client, prefix):
     """Resolve a kill target from live state without scanning cold history."""
     if len(prefix)==32 and all(c in '0123456789abcdef' for c in prefix):
         if client.status(prefix)['status'] in TERMINAL:raise ValueError('任务已结束：'+prefix)
         return prefix
-    health=client.health()
-    rows=list(health.get('active_jobs') or [])+list(health.get('queued_jobs') or [])
-    for node in health.get('nodes') or []:rows.extend(node.get('active_jobs') or [])
-    return job_identity(list({row['id']:row for row in rows}.values()),prefix)
+    return job_identity(active_job_rows(client).values(),prefix)
+
+
+def kill_all(client, *, wait_timeout=30):
+    """Cancel only the original IDs in this endpoint's invocation snapshot."""
+    identities=list(active_job_rows(client))
+    if not identities:
+        return dict(status='completed',matched=0,finished=0,pending=[],errors={},jobs=[])
+    # A center's device panel may include tasks submitted directly to a worker.
+    # Confirm ownership by original ID, rather than guessing from display fields.
+    errors={}
+    def read(identities):
+        states=client.statuses(identities)
+        for identity,state in states.items():
+            if state['status'] in TERMINAL:
+                # Brief polling intentionally omits provenance flags. Confirm
+                # the exact receipt before calling remote termination complete.
+                try:states[identity]=client.status(identity)
+                except (RemoteError,OSError) as error:
+                    states[identity]=dict(id=identity,status='unknown')
+                    errors[identity]=str(error)
+        return states
+    try:states=read(identities)
+    except (RemoteError,OSError) as error:
+        return dict(status='incomplete',matched=len(identities),finished=0,pending=identities,
+                    errors={identity:str(error)for identity in identities},jobs=[])
+    targets=[identity for identity in identities if states[identity]['status'] not in TERMINAL
+             and states[identity]['status']!='unknown']
+    def cancel(identity):
+        try:return identity,client.cancel(identity),None
+        except (RemoteError,OSError) as error:return identity,None,str(error)
+    with ThreadPoolExecutor(max_workers=min(8,len(targets)or 1),thread_name_prefix='console-kill') as executor:
+        for identity,result,error in executor.map(cancel,targets):
+            if error:errors[identity]=error
+            else:states[identity]=result
+    def confirmed(state):
+        return state['status'] in TERMINAL and not state.get('remote_cancel_pending')
+    deadline=time.monotonic()+wait_timeout
+    while True:
+        pending=[identity for identity in targets if states[identity]['status'] not in TERMINAL
+                 and states[identity]['status']!='unknown']
+        if not pending or time.monotonic()>=deadline:break
+        try:states.update(read(pending))
+        except (RemoteError,OSError) as error:
+            errors.update((identity,str(error))for identity in pending)
+            break
+        if any(not confirmed(states[identity])for identity in pending):
+            time.sleep(min(.15,max(0,deadline-time.monotonic())))
+    pending=[identity for identity in identities if not confirmed(states[identity])]
+    for identity in identities:
+        if confirmed(states[identity]):errors.pop(identity,None)
+        elif states[identity]['status']=='unknown':
+            errors[identity]='原ID在此端点未找到；请核对归属或原ID领取状态'
+    return dict(status='incomplete' if pending else 'completed',matched=len(identities),
+                finished=len(identities)-len(pending),pending=pending,errors=errors,
+                jobs=[{key:states[identity][key]for key in ('id','status','remote_cancel_pending','cost_incomplete')
+                       if key in states[identity]}for identity in identities])
 
 
 def kill_job(client, prefix):
+    if prefix=='all':return kill_all(client)
     identity=active_job_identity(client,prefix)
     client.cancel(identity)
-    return client.wait(identity,wait_timeout=30)
+    try:result=client.wait(identity,wait_timeout=30)
+    except (RemoteError,OSError) as error:
+        return dict(status='incomplete',pending=[identity],errors={identity:str(error)})
+    if result.get('remote_cancel_pending'):
+        return dict(status='incomplete',pending=[identity],jobs=[result])
+    return result
 
 
 def job_identity(rows, prefix):
@@ -324,6 +391,7 @@ class Shell(cmd.Cmd):
         names = [n.get('name') or n.get('node') for n in nodes]
         jobs = [(n.get('name') or n.get('node'), j) for n in nodes for j in n.get('active_jobs') or []]
         jobs.extend((snapshot.get('node'), j) for j in snapshot.get('active_jobs') or [])
+        jobs.extend((None,j)for j in snapshot.get('queued_jobs') or [])
         scheduler = hasattr(self, 'pool')
         choices = []
         if index == 0 or command == 'help' and index == 1:
@@ -339,13 +407,11 @@ class Shell(cmd.Cmd):
         elif command == 'set' and index >= 2:
             choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
         elif command == 'kill' and index == 1:
-            choices = [j.get('id') for _,j in jobs if j.get('status') not in TERMINAL]
-        elif scheduler and index == 1 and command in {'cpus','memory','calibrate','set','pause','resume','jobs','restart','logs','cancel','fetch'}:
-            choices = names + ([j.get('id') for _, j in jobs] if command in {'jobs','logs','cancel','fetch'} else [])
-        elif command in {'jobs','logs','cancel','delete','fetch'} and index == (2 if scheduler else 1):
+            choices = ['all']+[j.get('id') for _,j in jobs if j.get('status') not in TERMINAL]
+        elif scheduler and index == 1 and command in {'cpus','memory','calibrate','set','pause','resume','jobs','restart','logs','fetch'}:
+            choices = names + ([j.get('id') for _, j in jobs] if command in {'jobs','logs','fetch'} else [])
+        elif command in {'jobs','logs','delete','fetch'} and index == (2 if scheduler else 1):
             choices = [j.get('id') for node, j in jobs if not scheduler or node == tokens[1]]
-            if not scheduler and command == 'cancel':
-                choices.append('all')
         if prefix.startswith('-') or not prefix:
             parser = (submission_parser(command) if command in {'run','spice','rtl'} else
                       machine_parser(command) if command in MACHINE_ACTIONS else
@@ -369,7 +435,7 @@ class Shell(cmd.Cmd):
         allowed = {command for _title, commands in self.command_groups for command in commands.split()}
         for title, tree_commands in COMMAND_TREE:
             selected = [command for command in tree_commands if command in allowed and (all_commands or command in {
-                'status','jobs','cpus','memory','calibrate','pause','resume','logs','kill','cancel','fetch','sync_cache','restart','help','quit'})]
+                'status','jobs','cpus','memory','calibrate','pause','resume','logs','kill','clean','fetch','sync_cache','restart','help','quit'})]
             if not selected:
                 continue
             print('\n'+title)
@@ -393,6 +459,8 @@ class Shell(cmd.Cmd):
             print('  cpus 16                 将本设备预算设为16线程')
             print('  logs ab12               查看4位任务ID的日志')
         print('  help cpus               查看单条指令的参数和例子')
+        print('  kill ab12 / kill all    终止指定任务 / 当前全部排队和运行任务，保留回执')
+        print('  clean                   删除当前未启动的排队任务及其文件、回执')
         print('help all 查看其余指令。Tab 补全；PgUp/PgDn 翻任务页；Ctrl+PgUp/Ctrl+PgDn 翻输出；↑/↓ 历史。')
 
     def default(self, line):
@@ -463,7 +531,7 @@ class Shell(cmd.Cmd):
 class SchedulerShell(Shell):
     prompt = "调度> "
     command_groups = (('查看','status nodes jobs'),('调资源','cpus memory calibrate pause resume'),
-                      ('任务','logs kill cancel fetch wait run spice rtl batch sync_cache'),
+                      ('任务','logs kill clean fetch wait run spice rtl batch sync_cache'),
                       ('维护','restart policy set add save exec python ls read put get'),('帮助','help quit'))
 
     def __init__(self, pool, center=None):
@@ -862,18 +930,17 @@ class SchedulerShell(Shell):
             print(f'{node.name} 算力校准: {state}')
         self.pool.refresh()
 
-    def do_cancel(self, line):
-        """cancel 任务ID：取消任务及其子进程；可用唯一4位ID，例如 cancel ab12。"""
-        client, identity, _ = self._job(line)
-        display(client.cancel(identity))
-
     def do_kill(self, line):
-        """kill 任务ID：终止指定任务及子进程，支持唯一短ID，保留结果及费用。"""
+        """kill 任务ID|all：终止指定任务或当前全部排队/运行任务，保留结果及费用。"""
         if self.center:
             display(kill_job(self.center,line.strip()))
         else:
-            client,identity,_=self._job(line)
-            display(kill_job(client,identity))
+            display(kill_job(self._node(socket.gethostname()).client,line.strip()))
+
+    def do_clean(self,line):
+        """clean：彻底删除当前未启动的排队任务及其记录，保留在途和已完成任务。"""
+        if line.strip():raise ValueError('clean 不接受参数')
+        display((self.center or self._node(socket.gethostname()).client).clean())
 
     def do_logs(self, line):
         """logs 任务ID：查看日志末尾；可用唯一4位ID，例如 logs ab12。"""
@@ -937,7 +1004,7 @@ class RemoteWorker:
 class WorkerShell(Shell):
     prompt = "算力> "
     command_groups = (('资源','status cpus memory pause resume'),
-                      ('任务','jobs logs kill cancel delete'),('终端','help quit'))
+                      ('任务','jobs logs kill clean delete'),('终端','help quit'))
 
     def __init__(self, worker):
         super().__init__()
@@ -981,32 +1048,17 @@ class WorkerShell(Shell):
         """恢复启动新任务。"""
         self.worker.control({"paused": False})
 
-    def do_cancel(self, line):
-        """cancel 任务ID|all：取消任务及其子进程。"""
-        with self.worker.condition:
-            rows = [{'id':identity} for identity in self.worker.jobs]
-            identities = [identity for identity,_ in active_items(self.worker.jobs)] if line.strip() == "all" else [job_identity(rows,line.strip())]
-        for identity in identities:
-            self.worker.cancel(identity)
-        print("已发出取消。")
-
     def do_kill(self, line):
-        """kill 任务ID：终止一个任务及其子进程，保留回执。"""
-        prefix=line.strip()
-        if isinstance(self.worker,RemoteWorker):
-            display(kill_job(self.worker.client,prefix))
-            return
-        else:
-            with self.worker.condition:
-                identity=job_identity([{'id':key}for key,_ in active_items(self.worker.jobs)],prefix)
-        self.worker.cancel(identity)
-        deadline=time.monotonic()+30
-        with self.worker.condition:
-            while self.worker.get(identity)['status'] not in TERMINAL:
-                remaining=deadline-time.monotonic()
-                if remaining<=0:raise RuntimeError('任务终止仍在处理中；请用原ID查询状态')
-                self.worker.condition.wait(min(.1,remaining))
-        display(self.worker.get(identity))
+        """kill 任务ID|all：终止本设备指定任务或当前全部排队/运行任务，保留回执。"""
+        from .local import LocalClient
+        client=self.worker.client if isinstance(self.worker,RemoteWorker)else LocalClient(self.worker)
+        display(kill_job(client,line.strip()))
+
+    def do_clean(self,line):
+        """clean：彻底删除本设备未启动的排队任务及其记录，保留在途和已完成任务。"""
+        if line.strip():raise ValueError('clean 不接受参数')
+        client=self.worker.client if isinstance(self.worker,RemoteWorker)else self.worker
+        display(client.clean())
 
     def do_logs(self, line):
         """logs 任务ID：查看日志；支持唯一4位ID，例如 logs ab12。"""

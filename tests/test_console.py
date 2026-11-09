@@ -104,6 +104,20 @@ class ConsoleTests(unittest.TestCase):
             painter.frame(['任务运行'], 40, 1, 0)
         self.assertNotIn('\x1b[', painter.rows[0])
 
+    def test_completion_ids_are_cyan_including_numeric_short_ids(self):
+        import remote_compute.console as console
+        shell=WorkerShell(Mock());completion=CommandCompletion()
+        identities=[prefix+'a'*28 for prefix in('01a8','0228','049d','0866','0a9b','0bfc')]
+        context=dict(usage='kill 任务ID|all',matches=identities,start=5,end=5,prefix='')
+        rows,_=_command_rows(shell,'kill ',5,110,context,completion)
+        with patch.object(console,'_COLOR_ENABLED',True):
+            painted=_paint_row(rows[1])
+            for identity in identities:self.assertIn('\x1b[36m'+identity[:4]+'\x1b[0m',painted)
+            self.assertEqual(re.sub(r'\x1b\[[0-9;]*m','',painted),rows[1])
+            self.assertIn('\x1b[33m1024\x1b[0m',_paint_row('| 最大CPU 1024 |'))
+            self.assertNotIn('\x1b[36mall',_paint_row('| 候选: all  [0228] |'))
+            self.assertIn('[\x1b[36m0228\x1b[0m]',_paint_row('| 候选: all  [0228] |'))
+
     def test_two_column_section_color_stops_before_task_content(self):
         import remote_compute.console as console
         jobs = [dict(id=f'a{i:03x}'+'b'*28, project='Bench', label='probe',
@@ -208,7 +222,12 @@ class ConsoleTests(unittest.TestCase):
         worker = WorkerShell(Mock())
         local = dict(active_jobs=[dict(id=identity)])
         self.assertEqual(worker.suggest('logs ab', 7, local)['matches'], [identity])
-        self.assertIn('all', worker.suggest('cancel ', 7, local)['matches'])
+        self.assertIn('all', worker.suggest('kill ', 5, local)['matches'])
+        self.assertNotIn('cancel',suggest('')['matches'])
+        queued='0123'+'2'*28
+        snapshot['queued_jobs']=[dict(id=queued,status='queued')]
+        self.assertEqual(suggest('kill 012')['matches'],[queued])
+        self.assertIn('all',suggest('kill ')['matches'])
         self.assertEqual(worker.suggest('cpus ', 5, local)['matches'], [])
 
     def test_operator_short_ids_local_resource_defaults_and_actionable_errors(self):
@@ -219,6 +238,8 @@ class ConsoleTests(unittest.TestCase):
         center.control.return_value=center.nodes.return_value
         center.logs.return_value=dict(stdout='ready')
         center.cancel.return_value=dict(status='cancelled')
+        center.health.return_value=dict(queued_jobs=[dict(id=identity,status='queued')])
+        center.wait.return_value=dict(id=identity,status='cancelled')
         center.fetch.return_value=dict(status='succeeded',output_dir='D:/结果')
         shell=SchedulerShell(pool,center)
         try:
@@ -234,10 +255,11 @@ class ConsoleTests(unittest.TestCase):
                 center.logs.assert_called_with(identity)
                 shell.onecmd('fetch abcd "D:/结果"')
                 center.fetch.assert_called_with(identity,'D:/结果')
-                shell.onecmd('cancel local-device abcd')
+                shell.onecmd('kill abcd')
                 center.cancel.assert_called_once_with(identity)
                 center.status.return_value=[dict(id=identity),dict(id='abcd'+'2'*28)]
-                shell.onecmd('cancel abcd')
+                center.health.return_value['queued_jobs'].append(dict(id='abcd'+'2'*28,status='queued'))
+                shell.onecmd('kill abcd')
                 self.assertEqual(center.cancel.call_count,1)
                 shell.onecmd('cpus local-device wrong')
                 shell.onecmd('cpuss 12')
