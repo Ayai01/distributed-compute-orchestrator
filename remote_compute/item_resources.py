@@ -71,7 +71,7 @@ class ItemResources:
         self._publish()
 
     def _publish(self):
-        available=not self.remaining and (self.grants.cpus>self.grants.active or self.grants.pending or self.grants.fenced)
+        available=not self.remaining and self.grants.limit()>self.grants.active
         for index,item in self.items.items():
             # Parent writes offer/known-demand; only this item writes its
             # requested width. Separate aligned words never overwrite a peer.
@@ -90,12 +90,8 @@ class ItemResources:
             item=self.items[index];item['desired']=min(self.maximum,maximum)
             struct.pack_into('=I',self.signals,index*16+8,item['desired'])
             self._report()
-            revision=self.grants.report_revision
-            if not self.remaining and self.grants.limit()<=self.grants.active and self.grants.lease is not None:
-                # Wait for one acknowledged demand snapshot, never for a full
-                # requested width. The condition releases the parent lock.
-                self.grants.condition.wait_for(lambda:(self.grants.ack_revision>=revision and not self.grants.pending and not self.grants.fenced)
-                                               or self.grants.error or self.stopped)
+            # Growth is asynchronous. A numerical batch always has its funded
+            # lane slot; it must not wait for an optional distributed resize.
             if self.grants.error:raise self.grants.error
             if self.stopped:raise RuntimeError('DCO item executor stopped')
             if not self.remaining:

@@ -62,7 +62,7 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 两级并行使用`python_map(..., item_max_cpus=8, max_cpus=80)`或`map_items(..., item_max_cpus=8, limits=...)`；默认`item_max_cpus=1`。多核子项使用process后端，业务在完成的评价批边界调用`run_call(kernel, limits={'max_cpus':8}, ...)`。父执行器先为未启动lane分配1核，外层就绪lane全部启动后，才把额外授权分给子项数值批；10条最多8核的搜索可申报80，有不同宽度时max_cpus申报真实有用宽度总和。子项阶段上限按自身有用宽度给出，例如普通串行项保持1。
 
-父执行器独占分布式租约。子项通过每次映射私有的Windows named pipe或Unix socket接收父授权，不占TCP端口、不访问中心租约。父active floor含已承诺启动的lane及运行中的数值线程；待确认的缩核期间不复用未受保护的槽位。多核阶段仅等待本次需求快照的一次确认，按实际可用授权运行，不等待申报上限全部满足。只有1核可给时，子项读取私有共享状态，在需求变化时单向通知父级，稳定单核批次省去双向IPC；父授权更新后再通过原握手取得额外核数。短首批可先以1核运行，后续批次使用新授权。完成、异常和取消归还资源，线程设置先恢复1再归还阶段授权。内存由父map的聚合声明/limits及DCO实测标定管理；子项`run_call`的limits仅声明max_cpus，避免把共享父基线重复计入每个子项。业务数值库的线程数必须跟随本批实际`REMOTE_COMPUTE_CPUS`；SDK调整已加载的Numba/Torch/BLAS线程，Numba初始池上限保留item_max_cpus。DLL控制器在导入状态变化后重建，稳定批次复用控制器；单核快路保留批后轻量复位。
+父执行器独占分布式租约。子项通过每次映射私有的Windows named pipe或Unix socket接收父授权，不占TCP端口、不访问中心租约。父active floor含已承诺启动的lane及运行中的数值线程；待确认的缩核期间不复用未受保护的槽位。子项只从父已经确认的授权中取得额外核数；扩核RPC在途时继续使用已确认的1核，后续批次再使用增加的授权。只有1核可给时，子项读取私有共享状态，在需求变化时单向通知父级，稳定单核批次省去双向IPC。完成、异常和取消归还资源，线程设置先恢复1再归还阶段授权。独占整个任务的python_map在计算和发布完成后随进程结束其资源更新器；退出不等待可选扩核的迟到回执，worker沿原任务ID释放全部授权及待处理租约。入口内的map_items阶段仍收齐阶段资源归还后交接下一阶段。内存由父map的聚合声明/limits及DCO实测标定管理；子项run_call的limits仅声明max_cpus，避免把共享父基线重复计入每个子项。业务数值库的线程数必须跟随本批实际REMOTE_COMPUTE_CPUS；SDK调整已加载的Numba/Torch/BLAS线程，Numba初始池上限保留item_max_cpus。DLL控制器在导入状态变化后重建，稳定批次复用控制器；单核快路保留批后轻量复位。
 
 任务`timeout`覆盖整个运输的执行墙钟时间，与网络RPC超时分开。worker向整个子进程树提供同一单调时钟期限`REMOTE_COMPUTE_DEADLINE`，回执`deadline`记录对应UTC时间戳。`remaining_time()`返回剩余秒数，在DCO任务外返回`None`；`check_deadline(reserve_seconds=...)`在剩余时间进入业务落盘预留时抛出`TimeoutError`。业务在真实评价与记账边界检查，沿既有异常路径发布已付前缀、原ID和恢复索引。预留属于原任务时限，硬时限保持。
 

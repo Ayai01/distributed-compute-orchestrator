@@ -98,31 +98,28 @@ class ItemResourcesTests(unittest.TestCase):
                     self.assertEqual(factory.call_count,2)
                     factory.return_value.limit.assert_called_with(limits=2)
         finally:execution._threadpool_controller,execution._threadpool_module_count,execution._kernel_thread_count=old
-    def test_pending_shrink_fences_competing_item_stages_and_close_wakes_waiter(self):
+    def test_pending_shrink_preserves_baselines_without_waiting_for_optional_extras(self):
         from unittest.mock import Mock
         with patch.dict(os.environ,{'REMOTE_COMPUTE_URL':'','REMOTE_COMPUTE_CPUS':'8'}):
             grants=_Grants(8);resources=ItemResources(grants,8,2)
             grants.lease=Mock();resources.reserve(0,2)
             resources.report(0)
             grants.pending=True;grants.pending_floor=2
-            results={};errors=[]
+            results={}
             def enter(index):
-                try:results[index]=resources.stage(index,8)
-                except RuntimeError as error:errors.append(str(error))
+                results[index]=resources.stage(index,8)
             threads=[threading.Thread(target=enter,args=(index,))for index in(0,1)]
             for thread in threads:thread.start()
-            with grants.condition:
-                self.assertTrue(grants.condition.wait_for(lambda:all(item['desired']==8 for item in resources.items.values()),timeout=2))
-                self.assertEqual(grants.active,2)
-                grants.cpus=4;grants.pending=False;grants.fenced=False;grants.ack_revision=grants.report_revision
-                grants.condition.notify_all()
             for thread in threads:thread.join(2);self.assertFalse(thread.is_alive())
-            self.assertLessEqual(sum(results.values()),4)
+            self.assertEqual(results,{0:1,1:1});self.assertEqual(grants.active,2)
+            with grants.condition:grants.cpus=4;grants.pending=False;grants.fenced=False
+            self.assertEqual(resources.stage(0,8),3)
+            self.assertEqual(resources.stage(1,8),1)
+            self.assertEqual(grants.active,4)
             resources.release(0);resources.release(1)
             grants.pending=True;grants.pending_floor=2
-            waiter=threading.Thread(target=enter,args=(0,));waiter.start()
-            resources.close();waiter.join(2)
-            self.assertFalse(waiter.is_alive());self.assertEqual(len(errors),1)
+            self.assertEqual(resources.stage(0,8),1)
+            resources.close()
             grants.lease=None;grants.close()
 
     def test_failed_thread_reset_still_leaves_the_item_stage(self):
@@ -136,7 +133,7 @@ class ItemResourcesTests(unittest.TestCase):
             self.assertEqual([call.args[0]for call in channel.request.call_args_list],['enter','leave'])
         finally:execution._local.item_channel=None
 
-    def test_cancel_while_item_waits_for_its_parent_phase_ack(self):
+    def test_cancel_while_parent_resize_is_pending(self):
         with scratch()as root,provider(root,cpus=1,cpu_limit=8)as(state,client):
             original=state.resize;pending=threading.Event();release=threading.Event()
             def resize(identity,cpus,**kwargs):
@@ -144,12 +141,29 @@ class ItemResourcesTests(unittest.TestCase):
                     pending.set();release.wait(8)
                 return original(identity,cpus,**kwargs)
             with patch.object(state,'resize',side_effect=resize):
-                identity=client.submit(python_map('business:lane',[2],item_max_cpus=8,max_cpus=8,timeout=25,retries=0),files={'business.py':BUSINESS})['id']
+                identity=client.submit(python_map('business:lane',[200],item_max_cpus=8,max_cpus=8,timeout=25,retries=0),files={'business.py':BUSINESS})['id']
                 try:
                     self.assertTrue(pending.wait(8))
                     client.cancel(identity)
                 finally:release.set()
                 self.assertEqual(client.wait(identity,wait_timeout=8)['status'],'cancelled')
+            self.assertEqual(state.health()['used_cpus'],0)
+
+    def test_finished_whole_map_exits_without_waiting_for_optional_late_ack(self):
+        with scratch()as root,provider(root,cpus=1,cpu_limit=8)as(state,client):
+            original=state.resize;pending=threading.Event();release=threading.Event()
+            def resize(identity,cpus,**kwargs):
+                if kwargs.get('active_cpus',0)and cpus>1:
+                    pending.set();release.wait(12)
+                return original(identity,cpus,**kwargs)
+            with patch.object(state,'resize',side_effect=resize):
+                identity=client.submit(python_map('business:lane',[2,2,2],item_max_cpus=8,max_cpus=8,timeout=20,retries=0),files={'business.py':BUSINESS})['id']
+                try:
+                    self.assertEqual(client.wait(identity,wait_timeout=6)['status'],'succeeded')
+                    self.assertTrue(pending.is_set())
+                    result=client.fetch(identity)
+                    self.assertEqual(json.loads(result['files']['.dco-results.json'])['completed'],3)
+                finally:release.set()
             self.assertEqual(state.health()['used_cpus'],0)
     def test_confirmed_inherited_grant_survives_the_centers_initial_queued_sample(self):
         from remote_compute import Client,RemoteError

@@ -113,7 +113,6 @@ class _Grants:
         self.cpus=min(maximum,max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1'))))
         self.condition=threading.Condition();self.active=self.ready=0
         self.pending=False;self.fenced=False;self.pending_floor=0;self.error=None;self.stopping=False
-        self.revision=0;self.report_revision=0;self.ack_revision=-1
         self.thread=None;self.lease=None
         url=os.environ.get('REMOTE_COMPUTE_URL','')
         if url and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
@@ -134,7 +133,6 @@ class _Grants:
                 if not self.active and not self.ready and self.cpus==1 and not self.fenced:
                     self.condition.wait(.1);continue
                 active,ready=self.active,self.ready
-                report_revision=self.report_revision
                 self.pending=True;self.pending_floor=active
             try:
                 actual=self.lease.refresh(active_cpus=active,ready_cpus=ready)
@@ -143,7 +141,7 @@ class _Grants:
                     self.error=error;self.pending=False;self.condition.notify_all()
                 return
             with self.condition:
-                self.cpus=actual;self.pending=False;self.revision+=1;self.ack_revision=report_revision
+                self.cpus=actual;self.pending=False
                 self.fenced=self.active<active
                 if self.fenced:self.pending_floor=self.active
                 observer=getattr(self,'observer',None)
@@ -176,17 +174,23 @@ class _Grants:
             if self.lease is not None and active<self.active and not self.pending:
                 self.fenced=True;self.pending_floor=active
             self.active,self.ready=active,ready
-            if changed:self.report_revision+=1;self.condition.notify_all()
+            if changed:self.condition.notify_all()
 
-    def close(self):
+    def close(self,*,task_finished=False):
         with self.condition:
-            self.stopping=True;self.condition.notify_all()
+            self.stopping=True;pending=self.pending;self.condition.notify_all()
+        # A whole-task map exits immediately after publishing its results.
+        # Its daemon updater belongs to that exiting process. The worker then
+        # releases the original task and ends any pending lease request.
+        if task_finished:
+            if self.thread and not pending:self.thread.join()
+            return
         if self.thread:self.thread.join()
         if self.lease and not self.error:
             self.lease.refresh(active_cpus=0,ready_cpus=0)
 
 
-def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None,limits=None,item_max_cpus=1):
+def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None,limits=None,item_max_cpus=1,owns_task=False):
     """Evaluate independent business inputs; DCO owns all resource management.
 
     Functions are importable module:function names or top-level callables.
@@ -283,7 +287,8 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
     finally:
         pool.shutdown(wait=True)
         if resources:resources.close()
-        grants.report(0,0);grants.close()
+        if resources and owns_task:grants.close(task_finished=True)
+        else:grants.report(0,0);grants.close()
 
 
 def map_items(function,items,*,kwargs=None,backend='process',on_result=None,limits=None,item_max_cpus=1):
@@ -542,7 +547,7 @@ def main(path):
             _single_threaded(False)
             value=_function(spec['function'])(**spec['kwargs']);publish(0,value,None)
         else:_map_items(spec['function'],spec['items'],kwargs=spec['kwargs'],backend=spec.get('backend','process'),on_start=started,on_result=publish,
-                       item_max_cpus=int(os.environ.get('REMOTE_COMPUTE_ITEM_MAX_CPUS','1')))
+                       item_max_cpus=int(os.environ.get('REMOTE_COMPUTE_ITEM_MAX_CPUS','1')),owns_task=True)
     except BaseException as caught:
         error=caught
         if spec['mode']!='map'and states[0]['status']=='running':
