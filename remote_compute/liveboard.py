@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0'
+PUBLISHER_VERSION = '1.0.1'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -182,7 +182,9 @@ def collect(config):
     token = Path(config['operator_token_file']).read_text(encoding='utf8').strip()
     opener = build_opener(ProxyHandler({}), NoRedirect())
     started = time.perf_counter()
-    health = read_json(opener, Request(url+'/health'), 2, MAX_SOURCE_BYTES)
+    # This existing endpoint waits behind scheduler planning. Allow the normal
+    # loaded response while keeping the wait isolated in this bounded sidecar.
+    health = read_json(opener, Request(url+'/health'), 5, MAX_SOURCE_BYTES)
     nodes = read_json(opener, Request(url+'/nodes', headers={
         'Authorization':'Bearer '+token, 'X-DCO-Role':'operator'}), 2, MAX_SOURCE_BYTES)
     if not isinstance(health, dict) or not isinstance(nodes, dict) or not isinstance(nodes.get('nodes'), list):

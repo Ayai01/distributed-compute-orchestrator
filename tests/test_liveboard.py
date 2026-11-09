@@ -166,6 +166,27 @@ class LiveboardTests(unittest.TestCase):
         finally:
             server.shutdown();server.server_close();thread.join()
 
+    def test_loaded_health_can_wait_for_planning_without_triggering_retry(self):
+        import threading,time
+        from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+        health=self.health()
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self,*_):pass
+            def do_GET(self):
+                if self.path=='/health':time.sleep(2.1)
+                data=live.encode(health if self.path=='/health'else dict(nodes=[]))
+                self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers()
+                self.wfile.write(data)
+        server=ThreadingHTTPServer(('127.0.0.1',0),Handler);server.daemon_threads=True
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:
+                token=Path(folder)/'operator.token';token.write_text('private')
+                value,_=live.collect(dict(source_url='http://127.0.0.1:'+str(server.server_port),operator_token_file=str(token)))
+                self.assertEqual(value['summary']['queued'],7)
+        finally:
+            server.shutdown();server.server_close();thread.join()
+
     def test_source_or_upload_failure_records_only_safe_error_and_no_offline_queue(self):
         with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:
             folder=Path(folder);cfg=folder/'liveboard.local.json'

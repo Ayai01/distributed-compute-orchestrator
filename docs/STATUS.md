@@ -2,7 +2,7 @@
 
 - 当前源码版本：**0.11.19**。
 - hybrid同时提供调度中心和进程内本机计算，看板标题为“混合模式”；API逻辑角色为scheduler，操作员明细另给出mode。进程内worker不另开服务端口。
-- 私有远程展示使用独立发布器1.0，核心调度版本保持0.11.19。采样、体积、失效状态和服务归属入口为`.local/maintenance/liveboard-20261108/`；字段合同为其中`contract.md`。任务比例只使用显式进度，缺失的历史完成数及中心uptime为null。部署状态以该目录`current.json`为准。
+- 私有远程展示使用独立发布器1.0.1，核心调度版本保持0.11.19。采样、体积、失效状态和服务归属入口为`.local/maintenance/liveboard-20261108/`；字段合同为其中`contract.md`。任务比例只使用显式进度，缺失的历史完成数及中心uptime为null。部署状态以该目录`current.json`为准。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。维护入口保存实际运行版本、源码部署、原状态恢复及受理/派发状态；兼容更新按设备自然空闲重载，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 
