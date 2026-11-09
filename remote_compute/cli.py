@@ -255,6 +255,12 @@ def check_tools(config):
 
 def supervise(argv):
     """Keep the service terminal alive across requested code/config reloads."""
+    from .liveboard import supervised_publisher
+    with supervised_publisher(ROOT):
+        return _supervise(argv)
+
+
+def _supervise(argv):
     while True:
         process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv])
         while True:
