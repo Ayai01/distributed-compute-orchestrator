@@ -1,6 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.20**；各服务实际运行版本及空闲重载状态见维护入口。
+- 当前源码版本：**0.11.21**；各服务实际运行版本及空闲重载状态见维护入口。
+- worker在准备命令与正文的切换处，容量调整被明确拒绝并保留原授权时，继续使用原CPU/RAM槽位，不将资源暂时不足记为业务失败。源码、隔离三步入口回归及实际生效状态见`.local/maintenance/automatic-grant-ram-20261109/current.json`。
 - SDK提供`python_map/map_items(item_max_cpus=...)`与子项`run_call`阶段授权；父租约保证完整lane优先及长尾内核扩展。按SDK签名及源码revision识别该接口；交付、隔离保存输入0FE验证和五台源码部署入口为`.local/maintenance/nested-item-cpu-20261109/current.json`，服务引擎无需重载。
 - CPU U/B按已授权/基础预算（系统逻辑线程）显示；动态准入容量单独保留在API、nodes明细及cpus回执。源码验证和各窗口实际重载状态见`.local/maintenance/cpu-budget-label-20261109/current.json`。
 - 终端统一使用`kill <id|all>`，补全ID统一青色；`clean`删除未启动排队任务及其记录、临时物和独占缓存。源码验证、部署及窗口实际重载状态见`.local/maintenance/kill-all-20261109/current.json`。

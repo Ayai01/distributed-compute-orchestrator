@@ -246,6 +246,34 @@ def timeout_map():
             self.assertTrue(refused)
             self.assertEqual(json.loads(r['files']['.dco-results.json'])['completed'],6)
 
+    def test_prepared_entry_keeps_its_cpu_after_retained_ram_refusal(self):
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from remote_compute.worker import Conflict
+        for centered in (False,True):
+            with self.subTest(centered=centered),scratch()as root,ExitStack()as stack:
+                worker,client=stack.enter_context(provider(Path(root)/'worker',cpus=1))
+                owner=worker
+                if centered:
+                    pool=stack.enter_context(Pool([client]))
+                    owner,client=stack.enter_context(center(pool,Path(root)/'center'))
+                refused=[]
+                def resize(*args,**options):
+                    refused.append(args[0])
+                    raise Conflict('Insufficient RAM for active workers; existing grant retained')
+                task=python_task('business:kernel',max_cpus=1,memory_mb=2048,retries=0)
+                task['steps'][:0]=[['${tool:python}','-B','-c',"print('prepared')"]for _ in range(2)]
+                with patch.object(owner,'resize',side_effect=resize):
+                    result=client.run(task,files={'business.py':FUNCTIONS})
+                self.assertEqual(result['status'],'succeeded',result.get('error'))
+                self.assertEqual(len(refused),2)
+                self.assertEqual([step['returncode']for step in result['steps']],[0,0,0])
+                self.assertEqual(result.get('attempts',[]),[])
+                execution=json.loads(result['files']['.dco-results.json'])
+                self.assertEqual(execution['completed'],1)
+                self.assertEqual(execution['items'][0]['value'],dict(grant=1,threads=1))
+                self.assertEqual(worker.health()['used_cpus'],0)
+
     def test_slow_consumer_bounds_started_and_buffered_results_and_returns_idle_grant(self):
         from test_compute import until
         with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,client):

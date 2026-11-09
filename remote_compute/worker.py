@@ -1120,8 +1120,12 @@ class Worker:
                 client.resize(callback.get('job_id',job['result']['id']),**request)
             else:self.resize(job['result']['id'],**request)
         except Exception as error:
-            retained='Insufficient memory for resource resize; existing grant retained'
-            if (retained not in str(error)or not(isinstance(error,Conflict)or getattr(error,'status_code',None)==409)):
+            # Every command keeps this task's funded slot. Both admission
+            # refusal paths retain it; neither failure cancels prepared work.
+            retained=('Insufficient memory for resource resize; existing grant retained',
+                      'Insufficient RAM for active workers; existing grant retained')
+            if (not any(message in str(error)for message in retained)
+                    or not(isinstance(error,Conflict)or getattr(error,'status_code',None)==409)):
                 raise
 
     def _clean_work(self, job, *, discard=False):
