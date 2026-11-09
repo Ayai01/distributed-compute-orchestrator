@@ -22,7 +22,8 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize, elastic_cpus
-from .memory import plan_memory
+from .memory import plan_memory, startup_memory
+from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
 from .cleanup import AssetCache, remove_owned
 from .acceptance import SubmissionAssets, SubmissionLocks
@@ -660,6 +661,7 @@ class Coordinator:
                                   "single_thread_weight": task.get('single_thread_weight',1.0),
                                   "accelerator": task.get('accelerator'),
                                   "max_retries": task.get('retries',2), "attempts": [],
+                                  "resource_recovery_limit":len(RESOURCE_RECOVERY_DELAYS)if reentrant_computation(task)else 0,
                                   "memory_mb": task["memory_mb"], "request_sha256": digest,
                                   "submitted": time.time(), "started": None, "finished": None,
                                   "stdout": "", "stderr": "", "steps": [],
@@ -695,11 +697,12 @@ class Coordinator:
         """Priority, fewer occupied project threads, then small startup widths."""
         from collections import deque
         matching=_matching_pass(self.pool)
+        ready=[key for key in self.queue if self.jobs[key]['result'].get('resource_retry_after',0)<=time.time()]
         counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
-                        for node in matching(self.jobs[key]['task'])) for key in self.queue}
-        for priority in sorted({self.jobs[key]['task']['priority'] for key in self.queue},reverse=True):
+                        for node in matching(self.jobs[key]['task'])) for key in ready}
+        for priority in sorted({self.jobs[key]['task']['priority'] for key in ready},reverse=True):
             groups={}
-            for key in sorted(self.queue,key=lambda key:(self.jobs[key]['task'].get('cpus',1)or 1,counts[key])):
+            for key in sorted(ready,key=lambda key:(self.jobs[key]['task'].get('cpus',1)or 1,counts[key])):
                 task=self.jobs[key]['task']
                 if task['priority']==priority:groups.setdefault(task.get('project')or'default',deque()).append(key)
             while groups:
@@ -750,6 +753,7 @@ class Coordinator:
         with self.pool.condition:
             for identity in sorted(self.queue, key=order):
                 job = self.jobs[identity]; task = job['task']
+                if job['result'].get('resource_retry_after',0)>time.time():continue
                 group = task.get('project') or 'default'; resource = resources[group]
                 width = task['cpus']
                 if (job.get('auto_cpus') or width <= 1 or group in groups or job['cancel'].is_set()
@@ -809,7 +813,8 @@ class Coordinator:
                             node = self.pool._acquire(job["task"], block=False,
                                 cpu_limit=1 if job.get('auto_cpus') else None,
                                 partial_cpus=True,job_id=job.get('worker_id',identity),
-                                node_headroom=headroom)
+                                node_headroom=headroom,memory_floor=job['result'].get('resource_recovery_memory_mb',0),
+                                resource_recovery=bool(job['result'].get('resource_recovery_count')))
                         except (RuntimeError, ValueError) as error:
                             job["result"].update(status="failed", error=str(error), finished=time.time())
                             self._save(job)
@@ -826,6 +831,8 @@ class Coordinator:
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              cpus=job['task']['cpus'])
+                        job['result'].pop('resource_retry_after',None)
+                        job['result'].pop('resource_wait_reason',None)
                         if job['result'].get('accelerator')!=job['task'].get('accelerator'):
                             job['result'].setdefault('requested_accelerator',job['result'].get('accelerator'))
                             job['result']['accelerator']=job['task'].get('accelerator')
@@ -839,7 +846,8 @@ class Coordinator:
                         thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
                         self.threads.add(thread)
                         thread.start()
-                self.condition.wait(.5 if self.paused else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None)
+                delayed=self.queue and all(self.jobs[key]['result'].get('resource_retry_after',0)>time.time()for key in self.queue)
+                self.condition.wait(.5 if self.paused or delayed else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None)
 
     def _recover_running(self):
         """Reattach accepted work from fresh worker snapshots; never resubmit it."""
@@ -915,6 +923,12 @@ class Coordinator:
                     if 'max_cpus' not in node.health.get('capabilities',[]):
                         worker_task.pop('max_cpus',None)
                     files['task.json'] = json_bytes(worker_task)
+                    recovery=job['directory']/'resource-resume.json'
+                    if recovery.is_file():
+                        previous=job['directory']/'attempts'/('%04d.zip'%len(job['result']['attempts']))
+                        if previous.is_file():carry_outputs(files,previous.read_bytes())
+                        snapshot=json.loads(recovery.read_bytes())
+                        if snapshot is not None:files['input/.dco-resource-resume.json']=json_bytes(snapshot)
                     payload = pack(files)
                 callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
                 if callback:callback={**callback,'job_id':job['result']['id']}
@@ -995,11 +1009,37 @@ class Coordinator:
                     self._save(job)
         finally:
             self.pool._release(node, task, result,job_id=identity)
+            if retry and result and resource_recovery(job['task'],result) and not job['cancel'].is_set():
+                try:self._prepare_resource_recovery(job,result)
+                except Exception as error:
+                    job['resource_recovery_error']=str(error)
+                    job['resource_recovery_business_failure']=isinstance(error,BusinessItemFailure)
             with self.condition:
                 self.threads.discard(threading.current_thread())
                 if retry and not self.stopping and not job['cancel'].is_set():self._retry(job,result)
+                elif retry and job['cancel'].is_set():
+                    self._update(job,{**result,'status':'cancelled','finished':time.time()})
                 archive_job(self.jobs, job)
                 self.condition.notify_all()
+
+    def _prepare_resource_recovery(self,job,outcome):
+        """Fetch paid checkpoints outside the scheduling lock before requeue."""
+        count=sum(a.get('error_kind')=='memory_pressure'for a in job['result'].get('attempts',[]))
+        if count>=len(RESOURCE_RECOVERY_DELAYS):return
+        worker=job.get('worker_id',job['result']['id'])
+        cached=job['directory']/'worker-artifacts.zip'
+        raw=cached.read_bytes()if cached.is_file()else job['node'].client.artifacts(worker)
+        with zipfile.ZipFile(io.BytesIO(raw))as archive:
+            if json.loads(archive.read('result.json'))['id']!=worker:
+                raise ValueError('Resource recovery artifact identity mismatch')
+        if not cached.is_file():
+            pending=cached.with_suffix('.partial')
+            try:pending.write_bytes(raw);pending.replace(cached)
+            finally:unlink(pending)
+        path=job['directory']/'resource-resume.json'
+        previous=json.loads(path.read_bytes())if path.is_file()else None
+        snapshot=resume_map(job['task'],job['result']['id'],job['result']['request_sha256'],raw,previous)
+        atomic_json(path,snapshot)
 
     def _pace_submission(self, job):
         # Planning can reserve fair shares in one pass. Pace only the actual
@@ -1094,9 +1134,20 @@ class Coordinator:
         self._save(job)
         attempts=job['result'].setdefault('attempts',[])
         allowance=job['result'].get('max_retries',0)
+        recovering=resource_recovery(job['task'],outcome)
+        if recovering:
+            used=sum(a.get('error_kind')=='memory_pressure'for a in attempts)
+            allowance=len(RESOURCE_RECOVERY_DELAYS)
+            job['result']['resource_recovery_limit']=allowance
+            if job.get('resource_recovery_error'):
+                job['result']['resource_recovery_error']=job.pop('resource_recovery_error')
+                if job.pop('resource_recovery_business_failure',False):
+                    job['result'].update(status='failed',error_kind='business_failure',error=job['result']['resource_recovery_error'])
+                self._save(job);return
+        else:used=sum(not resource_recovery(job['task'],a)for a in attempts)
         if _infrastructure_interruption(job,outcome):
             job['result']['infrastructure_retry_limit']=allowance
-        if len(attempts)>=allowance:
+        if used>=allowance:
             self._save(job)
             return
         attempts.append(dict(node=job['node'].name,worker_id=job.get('worker_id',job['result']['id']),
@@ -1104,6 +1155,15 @@ class Coordinator:
                              artifact=('.dco-attempts/%04d.zip'%(len(attempts)+1)) if outcome.get('id') else None,
                              status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished'),
                              **measured))
+        if recovering:
+            job['result'].update(resource_recovery_count=used+1,
+                resource_retry_after=time.time()+RESOURCE_RECOVERY_DELAYS[used],
+                resource_wait_reason='memory recovery: cooldown and measured working-set headroom',
+                resource_recovery_memory_mb=max(startup_memory({**job['task'],'cpus':1}),outcome.get('memory_reservation_mb')or 0,
+                    outcome.get('memory_commit_reservation_mb')or 0,
+                    max(outcome.get('peak_rss_mb',0),outcome.get('peak_private_mb',0))*1.25,
+                    max(outcome.get('peak_rss_mb',0),outcome.get('peak_private_mb',0))+32),
+                resource_recovery_policy='same identity; completed map items retained; unknown running prefixes preserved')
         cached=job['directory']/'worker-artifacts.zip'
         if cached.is_file():
             saved=job['directory']/'attempts'/('%04d.zip'%len(attempts));saved.parent.mkdir(exist_ok=True)
@@ -1243,6 +1303,7 @@ class Coordinator:
             return max(1,warm_cache[group].get(identity,{}).get(current['node'].name,0))
         members={key:job for key,job in active_items(self.jobs)
                  if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
+                 and job['result'].get('resource_retry_after',0)<=time.time()
                  and (job['task'].get('project') or 'default')==group}
         nodes={node.name:node for node in self.pool.nodes
                if node.enabled and not node.error and not node.health.get('paused')}
@@ -1324,7 +1385,7 @@ class Coordinator:
             if any(row.get(name,0) for row in entrants.values()):spare[name]=0
         for key in self.queue:
             queued=self.jobs[key]
-            if queued['cancel'].is_set():continue
+            if queued['cancel'].is_set()or queued['result'].get('resource_retry_after',0)>time.time():continue
             task=queued['task'];startup=task.get('cpus',1)or 1
             for node in matching(task):
                 if (spare.get(node.name,0)>=startup and not node.health.get('paused')
@@ -1684,6 +1745,7 @@ class Coordinator:
                         files = {name: archive.read(name) for name in archive.namelist() if name != "result.json"}
                         if result['status']=='interrupted':
                             remote=json.loads(archive.read('result.json'))
+                            if remote.get('error_kind')=='memory_pressure':remote['status']='interrupted'
                             with self.condition:
                                 job['result'].pop('error',None)
                                 job['result'].pop('connection_error',None)
@@ -1702,12 +1764,20 @@ class Coordinator:
                     saved.parent.mkdir(exist_ok=True)
                     pending=saved.with_suffix('.partial');pending.write_bytes(raw);pending.replace(saved)
                 raw=saved.read_bytes()
+                if attempt.get('error_kind')=='memory_pressure':
+                    with zipfile.ZipFile(io.BytesIO(raw))as archive:
+                        for name in archive.namelist():
+                            if name.startswith('files/')and not name.endswith('/'):
+                                files.setdefault(name,archive.read(name))
                 if public:
                     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                         nested={name:archive.read(name) for name in archive.namelist() if name!='result.json'}
                         nested['result.json']=json_bytes(self.public_result(json.loads(archive.read('result.json'))))
                     raw=pack(nested)
                 files['files/'+attempt['artifact']]=raw
+            recovery=job['directory']/'resource-resume.json'
+            if recovery.is_file():
+                restore_map_results(files,json.loads(recovery.read_bytes()),status=result['status'],error=result.get('error'))
             files["result.json"] = json_bytes(self.public_result(result) if public else result)
             return pack(files)
 

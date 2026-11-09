@@ -1,6 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.21**；各服务实际运行版本及空闲重载状态见维护入口。
+- 当前源码版本：**0.11.22**；各服务实际运行版本及空闲重载状态见维护入口。
+- 内存警戒先限制新增并发并在安全边界等待，持续真实临界或耗尽才保护性终止；可重入SDK计算的资源恢复独立于retries，沿原ID有界退避并保留已成功map项。验证、连续中断及部署状态见`.local/maintenance/resource-recovery-20261109/current.json`。
 - worker在准备命令与正文的切换处，容量调整被明确拒绝并保留原授权时，继续使用原CPU/RAM槽位，不将资源暂时不足记为业务失败。源码、隔离三步入口回归及实际生效状态见`.local/maintenance/automatic-grant-ram-20261109/current.json`。
 - SDK提供`python_map/map_items(item_max_cpus=...)`与子项`run_call`阶段授权；父租约保证完整lane优先及长尾内核扩展。按SDK签名及源码revision识别该接口；交付、隔离保存输入0FE验证和五台源码部署入口为`.local/maintenance/nested-item-cpu-20261109/current.json`，服务引擎无需重载。
 - CPU U/B按已授权/基础预算（系统逻辑线程）显示；动态准入容量单独保留在API、nodes明细及cpus回执。源码验证和各窗口实际重载状态见`.local/maintenance/cpu-budget-label-20261109/current.json`。
@@ -47,7 +48,7 @@ map_items、iter_items及run_call的limits按阶段声明有用CPU上限和固�
 
 固定内存估计在有效采样后按任务树近期RSS/private峰值和增长余量校正；原声明、实际物理占用、提交量与调度包络分开记录。Windows文件映射RSS不重复计为private提交。显式阶段模型保留已知峰值，模型任务的CPU增减同步调整RAM；固定任务仅调整CPU不重新扣留已回收差额；线性模型按稳定任务树实测与实际活跃宽度校正扩容预留。初次准入支持有资金的冷探测，实际RAM或提交余量危险时按低优先级及当前占用终止任务树，保留原ID、部分输出与费用。零内存余量仍接受排队，成功、失败、取消及超时释放运行预留。当前证据入口：`.local/maintenance/observed-memory-20261106/`。
 
-单一活跃宽度的线性内存标定按完整实测包络筹资每个槽位，取得不同宽度样本后再分解共享基线及增量。多活跃槽的冷探测按完整活跃宽度筹资；已知实际RSS/private超过中心预算时保留原授权并拒绝本轮调整。申报估计与每槽冷探测上限保持软约束，真实提交量危险时继续终止任务树并保留费用及原ID。相关138项检查、默认原ID中断重试与显式retries=0边界、分项产物和费用保留的证据见`.local/maintenance/actual-memory-retry-20261108/current.json`。
+单一活跃宽度的线性内存标定按完整实测包络筹资每个槽位，取得不同宽度样本后再分解共享基线及增量。多活跃槽的冷探测按完整活跃宽度筹资；已知实际RSS/private超过中心预算时保留原授权并拒绝本轮调整。申报估计与每槽冷探测上限保持软约束，压力保护及资源恢复使用上述当前维护入口；标定与分项费用证据见`.local/maintenance/actual-memory-retry-20261108/current.json`。
 
 SDK在资源调整被暂时拒绝时保留原授权内已完整筹资的宽度；相同冻结父阶段的已有活跃工作不被冷首槽退路缩为1核，初始未启动阶段保留已筹资的单槽探测。polling按当前worker尝试ID读取授权。查询暂时故障时，同阶段沿用有效授权；调整结果未明时仅保留活跃底线，首次授权及新阶段有界重读并服从原期限。DELETE按原ID幂等确认，丢响应后先核对，必要时仅补一次删除。授权、真实HTTP读超时、期限及执行边界39项定向检查和原进程保持的SDK分发证据见`.local/maintenance/lease-status-outage-20261108/current.json`；DELETE及既有宽度边界证据见`.local/maintenance/delete-and-running-lease-20261108/current.json`。
 

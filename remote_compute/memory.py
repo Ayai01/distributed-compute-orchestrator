@@ -1,7 +1,82 @@
 """Per-command working-set and private-commit envelopes for admission."""
 from collections import deque
 import math
+import os
+from pathlib import Path
+import threading
 import time
+
+PRESSURE_GRACE_SECONDS=2.0
+PRESSURE_RECOVERY_SECONDS=2.0
+COMMIT_EMERGENCY_MB=128
+
+
+def pressure_threshold(host):
+    return max(128,min(1024,int(host.get('memory_total_mb',0)*.02)))
+
+
+class PressureGuard:
+    """Warn and drain at boundaries before an actual sustained emergency."""
+    def __init__(self):
+        self.warning_since=None;self.critical_since=None;self.recovered_since=None
+        self.state=dict(limited=False,waiting=False,terminate=False)
+
+    def update(self,host,now=None):
+        now=time.monotonic()if now is None else now
+        threshold=pressure_threshold(host)
+        physical=host.get('host_memory_available_mb',threshold)
+        commit=host.get('host_commit_available_mb',threshold)
+        warning=physical<threshold or commit<threshold
+        critical=physical<threshold or commit<COMMIT_EMERGENCY_MB
+        if warning:
+            if self.warning_since is None:self.warning_since=now
+            self.recovered_since=None
+        elif self.warning_since is not None:
+            if self.recovered_since is None:self.recovered_since=now
+            if now-self.recovered_since>=PRESSURE_RECOVERY_SECONDS:self.warning_since=None
+        if critical:
+            if self.critical_since is None:self.critical_since=now
+        else:self.critical_since=None
+        settling=not warning and self.warning_since is not None
+        waiting=settling or critical or warning and now-self.warning_since<PRESSURE_GRACE_SECONDS
+        terminate=critical and (min(physical,commit)<32 or now-self.critical_since>=PRESSURE_GRACE_SECONDS)
+        self.state=dict(limited=warning or settling,waiting=bool(waiting),terminate=bool(terminate),
+            warning=warning,physical_threshold_mb=threshold,commit_emergency_mb=COMMIT_EMERGENCY_MB,
+            warning_seconds=0 if self.warning_since is None else round(now-self.warning_since,3))
+        return self.state
+
+
+_boundary_sample=(None,0.0,False)
+
+
+def memory_waiting():
+    """A local worker signal; stable kernels do no per-batch filesystem I/O."""
+    global _boundary_sample
+    path=os.environ.get('REMOTE_COMPUTE_MEMORY_WAIT')
+    if not path:return False
+    sampled,until,waiting=_boundary_sample;now=time.monotonic()
+    if sampled!=path or now>=until:
+        waiting=Path(path).is_file();_boundary_sample=(path,now+.1,waiting)
+    return waiting
+
+
+def memory_boundary():
+    """Wait before starting another item/kernel, within its original deadline."""
+    from .deadline import check_deadline
+    if not memory_waiting():return
+    from .compat import unlink
+    root=os.environ.get('REMOTE_COMPUTE_JOB_DIR')
+    marker=None;expired=False
+    if root:
+        folder=Path(root)/'input/.dco-memory-waits';folder.mkdir(parents=True,exist_ok=True)
+        marker=folder/('%s-%s'%(os.getpid(),threading.get_ident()));marker.touch()
+    try:
+        while memory_waiting():
+            check_deadline();time.sleep(.05)
+    except TimeoutError:
+        expired=True;raise
+    finally:
+        if marker is not None and not expired:unlink(marker)
 
 
 def startup_memory(task):
@@ -59,10 +134,10 @@ def plan_memory(cpus,available_mb,*,floor=1,**model):
 
 def pressure_victim(jobs,host):
     """Choose one low-priority consumer when real RAM or commit is critical."""
-    threshold=max(128,min(1024,int(host.get('memory_total_mb',0)*.02)))
+    threshold=pressure_threshold(host)
     physical=host.get('host_memory_available_mb',threshold)
     commit=host.get('host_commit_available_mb',threshold)
-    if physical>=threshold and commit>=threshold:return None
+    if physical>=threshold and commit>=COMMIT_EMERGENCY_MB:return None
     private=commit<physical
     candidates=[j for j in jobs if j['result']['status']=='running'and not j['cancel'].is_set()
                 and j.get('private_mb'if private else 'rss_mb',j.get('rss_mb',0))>0]

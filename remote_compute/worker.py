@@ -35,10 +35,11 @@ from .telemetry import Activity
 from .client import RemoteError
 from .cleanup import AssetCache, Reclaimer, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
+from .compat import unlink
 from .receipts import read_receipt
 from .paths import cache_environment
 from .allocation import plan_resize,cpu_capacity,validate_cpu_overcommit
-from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase
+from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
@@ -239,6 +240,10 @@ class Worker:
         self.configured_tags = set(canonical_capabilities(tags))
         self.paused = False
         self.host = Host()
+        self.pressure_guard=PressureGuard()
+        self.memory_wait_file=self.root/'memory-pressure.wait'
+        unlink(self.memory_wait_file)
+        self.memory_wait_signaled=False
         total_mb = self.host.sample()["memory_total_mb"]
         if any(type(value) is not int or value<0 for value in (memory_mb,memory_reserve_mb,memory_headroom_mb)):
             raise ValueError("Memory budget and headroom must be nonnegative integer MiB")
@@ -362,6 +367,8 @@ class Worker:
                     "accelerator_used": len({unit[:2] for items in self.accelerator_reservations.values() for unit in items}),
                     "accelerator_jobs": sum(bool(items) for items in self.accelerator_reservations.values()),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
+                    "memory_pressure_state":dict(self.pressure_guard.state),
+                    "memory_wait_signal_error":getattr(self,'memory_wait_signal_error',None),
                     "configuration_revision": self.configuration_revision,
                     "startup_recoveries": self.startup_recoveries,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
@@ -661,6 +668,7 @@ class Worker:
                 raise ValueError('active_cpus must count threads within the existing grant and requested width')
             cpus=max(cpus,floor)
             granted=max(floor,min(cpus,max(0,capacity-self.used+old)))
+            if self.pressure_guard.state['limited']:granted=min(granted,floor)
             changes_memory=(memory_mb is not None and memory_mb!=old_memory) or base_memory_mb is not None or memory_per_cpu_mb is not None
             credit=min(reservation(job)) if changes_memory else old_memory
             model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
@@ -867,14 +875,22 @@ class Worker:
         with self.condition:
             while not self.stopping:
                 host=self.host.sample()
-                critical=max(128,min(1024,int(host.get('memory_total_mb',0)*.02)))
-                pressure=(host.get('host_memory_available_mb',critical)<critical or
-                          host.get('host_commit_available_mb',critical)<critical)
-                if pressure:
-                    if time.monotonic()>=getattr(self,'next_memory_pressure',0):
+                pressure=self.pressure_guard.update(host)
+                if pressure['waiting']!=self.memory_wait_signaled:
+                    try:
+                        if pressure['waiting']:self.memory_wait_file.touch()
+                        else:unlink(self.memory_wait_file)
+                    except OSError as error:
+                        self.memory_wait_signal_error=str(error)
+                    else:
+                        self.memory_wait_signaled=pressure['waiting']
+                        self.memory_wait_signal_error=None
+                if pressure['limited']:
+                    if pressure['terminate']and time.monotonic()>=getattr(self,'next_memory_pressure',0):
                         victim=pressure_victim(active_values(self.jobs),host)
                         if victim is not None:
-                            victim['result'].update(error_kind='memory_pressure',error='Task terminated under critical host RAM/commit pressure',memory_pressure=host)
+                            victim['result'].update(error_kind='memory_pressure',error='Task terminated under critical host RAM/commit pressure',
+                                memory_pressure={**host,'guard':dict(pressure),'victim_priority':victim['task'].get('priority',0)})
                             victim['memory_pressure']=True;victim['cancel'].set()
                             self.next_memory_pressure=time.monotonic()+2
                     self.condition.wait(.25);continue
@@ -965,14 +981,21 @@ class Worker:
                                REMOTE_COMPUTE_LEASE='1' if polling else '0',
                                REMOTE_COMPUTE_CA=callback.get('ca_file') or '',
                                REMOTE_COMPUTE_PYTHON_ARGV=json.dumps(job.get('python_argv',[])),
+                               REMOTE_COMPUTE_MEMORY_WAIT=str(self.memory_wait_file),
                                REMOTE_COMPUTE_HOME=str(Path(__file__).resolve().parent.parent))
             self._accelerator_environment(result['id'], environment)
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 templates=job.get('templates',{})
                 for frozen in job['commands']:
+                    with self.condition:
+                        while (self.pressure_guard.state['waiting'] and not self.stopping
+                               and not job['cancel'].is_set() and time.monotonic()<deadline):
+                            self.condition.wait(.1)
                     if job["cancel"].is_set():
                         state = "cancelled"
                         break
+                    if time.monotonic()>=deadline:
+                        state='timed_out';break
                     with self.condition:
                         job['rss_sampled']=False;job['rss_mb']=0
                         for key in ('private_mb','memory_adaptive_model','memory_width_samples','memory_width_sampled_at'):job.pop(key,None)
@@ -1063,6 +1086,13 @@ class Worker:
         except Exception as exc:
             state, error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
+            waiting=work/'.dco-memory-waits'
+            if (state!='succeeded'and not job['cancel'].is_set() and
+                    (waiting.is_dir()and any(waiting.iterdir()) or
+                     self.pressure_guard.state['waiting']and time.monotonic()>=deadline)):
+                job['memory_pressure']=True
+                result.update(error_kind='memory_pressure',error='Task deadline reached while waiting for host memory recovery',
+                              memory_pressure={**self.host.sample(),'guard':dict(self.pressure_guard.state)})
             self._clean_temp(job)
             self._clean_work(job)
             while True:
@@ -1391,6 +1421,7 @@ class Worker:
         self._prune_assets(recent=False)
         self.asset_cache.reclaimer.close()
         if self.temp_reclaimer:self.temp_reclaimer.close()
+        unlink(self.memory_wait_file)
         if self.temp_root:
             try:
                 self.temp_root.rmdir()

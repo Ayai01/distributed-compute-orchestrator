@@ -40,6 +40,8 @@ class PressureRetryTests(unittest.TestCase):
         host=dict(memory_total_mb=48907,host_memory_available_mb=11786,host_commit_available_mb=8192)
         self.assertIsNone(pressure_victim([job],host))
         host['host_commit_available_mb']=908
+        self.assertIsNone(pressure_victim([job],host))
+        host['host_commit_available_mb']=64
         self.assertIs(pressure_victim([job],host),job)
 
     def test_default_retries_recover_pressure_under_same_public_id(self):

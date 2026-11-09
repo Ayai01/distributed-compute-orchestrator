@@ -1278,7 +1278,7 @@ class Pool:
                  "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
-                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version')},
+                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version','memory_pressure_state')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                   "timing_labels": len(n.durations), "error": n.error} for n in self.nodes]}
 
@@ -1306,7 +1306,8 @@ class Pool:
             result.append(node)
         return result
 
-    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, node_headroom=None):
+    def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, node_headroom=None,
+                 memory_floor=0,resource_recovery=False):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
@@ -1329,9 +1330,13 @@ class Pool:
                     return min(cpu_limit,node.capacity,task.get('max_cpus',node.capacity)) if automatic and cpu_limit and not partial_cpus else cpus
                 def available(node):
                     return node.capacity-node.reserved-node.external-(node_headroom or {}).get(node.name,0)
+                def memory_ready(node):
+                    floor=max(memory_floor,node.startup_memory(task))
+                    return (node.memory_free>=floor and self._host_memory_free(node)>=floor
+                        and not(resource_recovery and node.health.get('memory_pressure_state',{}).get('limited')))
                 ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
                          and available(n) >= needed(n)
-                         and n.memory_free >= n.startup_memory(task) and self._host_memory_free(n) >= n.startup_memory(task)
+                         and memory_ready(n)
                          and n.health.get("queued", 0) == 0
                          and (task.get('accelerator')is None or
                               n.can_match_accelerator(n.execution_accelerator(task,available=True)))]

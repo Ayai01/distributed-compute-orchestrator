@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock,patch
 
 from remote_compute import Pool,python_map,python_task
-from remote_compute.memory import calibrated_model,plan_memory,pressure_victim,MemoryObservation
+from remote_compute.memory import calibrated_model,plan_memory,pressure_victim,MemoryObservation,PressureGuard
 from remote_compute.client import Node
 from remote_compute.worker import Worker
 from test_compute import scratch,provider,python,until
@@ -94,6 +94,7 @@ class AdaptiveMemoryTests(unittest.TestCase):
 
     def sampled_worker(self,cpus=1,per=768):
         worker=Worker.__new__(Worker);worker.condition=threading.Condition(threading.RLock())
+        worker.pressure_guard=PressureGuard()
         worker.capacity=4;worker.used=cpus;worker.memory_capacity=1024;worker.stopping=False
         worker.cpu_overcommit_factor=1.0
         worker._memory_state=Mock(return_value=dict(memory_available_mb=897));worker._save=Mock()

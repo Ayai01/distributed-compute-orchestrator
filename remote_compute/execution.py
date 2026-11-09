@@ -40,6 +40,8 @@ def _function(value):
 
 def _item(function,item,kwargs):
     from remote_compute.deadline import check_deadline
+    from remote_compute.memory import memory_boundary
+    memory_boundary()
     check_deadline()
     target=_function(function)
     if getattr(_local,'item_channel',None)is not None:_kernel_threads(1)
@@ -236,9 +238,10 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
     pool=ThreadPoolExecutor(max_workers=min(len(items),maximum),thread_name_prefix='dco-item')
     try:
         while active or position<len(items):
+            from remote_compute.memory import memory_waiting,memory_boundary
             if on_capacity:on_capacity(grants.cpus)
             requested=len(items)-position
-            if failures or stop and stop():requested=0
+            if failures or stop and stop() or memory_waiting():requested=0
             elif ready_slots is not None:requested=min(requested,ready_slots())
             starts=resources.reserve(position,requested)if resources else grants.reserve(requested)
             for _ in range(starts):
@@ -264,6 +267,7 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             else:grants.report(len(active),0 if stopped else ready())
             if not active:
                 if stopped or grants.error:break
+                memory_boundary()
                 time.sleep(.02);continue
             try:done=[completed.get(timeout=.1)]
             except Empty:done=[]
@@ -457,6 +461,8 @@ def run_call(function,*,limits=None,**kwargs):
     if os.environ.get('REMOTE_COMPUTE_WORKER')!='1':
         raise RuntimeError('Submit python_call to DCO before executing its kernel')
     if getattr(_local,'kernel',False):return _function(function)(**kwargs)
+    from remote_compute.memory import memory_boundary
+    memory_boundary()
     channel=getattr(_local,'item_channel',None)
     if channel is not None:
         if set(limits or {})-{'max_cpus'}:
@@ -528,6 +534,18 @@ def main(path):
     output=Path('.dco-results.json');records={};error=None
     total=len(spec['items'])if spec['mode']=='map'else 1
     states=[dict(index=i,status='pending')for i in range(total)]
+    resume=Path('.dco-resource-resume.json')
+    if spec['mode']=='map'and resume.is_file():
+        previous=json.loads(resume.read_text(encoding='utf8'))
+        if (previous['id']!=os.environ.get('REMOTE_COMPUTE_JOB_ID')
+                or previous['function']!=spec['function']or previous['total']!=total):
+            raise ValueError('Resource recovery does not match the original map')
+        for row in previous['items']:
+            index=row['index']
+            if type(index)is not int or not 0<=index<total or row['status']!='succeeded' or index in records:
+                raise ValueError('Invalid completed resource recovery item')
+            records[index]=row
+            states[index].update(status='succeeded',resource_recovered=True)
     def save(status='running'):
         atomic_json(output,dict(completed=len(records),total=total,status=status,
             items=[records[i]for i in sorted(records)],item_states=states,error=str(error)if error else None))
@@ -539,6 +557,8 @@ def main(path):
     save()
     try:
         check_deadline()
+        from remote_compute.memory import memory_boundary
+        memory_boundary()
         if spec['mode']=='call':
             started(0)
             value=run_call(spec['function'],**spec['kwargs']);publish(0,value,None)
@@ -546,8 +566,11 @@ def main(path):
             started(0)
             _single_threaded(False)
             value=_function(spec['function'])(**spec['kwargs']);publish(0,value,None)
-        else:_map_items(spec['function'],spec['items'],kwargs=spec['kwargs'],backend=spec.get('backend','process'),on_start=started,on_result=publish,
-                       item_max_cpus=int(os.environ.get('REMOTE_COMPUTE_ITEM_MAX_CPUS','1')),owns_task=True)
+        else:
+            pending=[i for i in range(total)if i not in records]
+            _map_items(spec['function'],[spec['items'][i]for i in pending],kwargs=spec['kwargs'],backend=spec.get('backend','process'),
+                on_start=lambda i:started(pending[i]),on_result=lambda i,value,failure:publish(pending[i],value,failure),
+                item_max_cpus=int(os.environ.get('REMOTE_COMPUTE_ITEM_MAX_CPUS','1')),owns_task=True)
     except BaseException as caught:
         error=caught
         if spec['mode']!='map'and states[0]['status']=='running':
