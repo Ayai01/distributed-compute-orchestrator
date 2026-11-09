@@ -233,28 +233,51 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
             raise RuntimeError('Original request identity differs')
         save(row,state='accepted');return 'accepted'
 
-    def collect(row):
+    def collect(row,queued=None):
         directory=Path(row['directory']);receipt_path=directory/'receipt.json'
+        started=time.monotonic();timing=dict(row.get('collection_timing',{}))
+        timing.setdefault('enqueued_at',queued[1]if queued else time.time())
+        timing.setdefault('queue_seconds',max(0,started-queued[0])if queued else 0.0)
         if row['state']not in ('fetched','publication_failed','published','collected'):
-            receipt=client.fetch(row['id'],directory/'result',delete=False)
-            receipt['business_key']=row['key'];atomic_json(receipt_path,receipt);save(row,state='fetched')
+            fetched=time.monotonic()
+            try:receipt=client.fetch(row['id'],directory/'result',delete=False)
+            except BaseException:
+                timing['fetch_seconds']=time.monotonic()-fetched
+                save(row,collection_timing=dict(timing));raise
+            timing['fetch_seconds']=time.monotonic()-fetched
+            transport=getattr(client,'last_fetch_timing',lambda:{})()
+            if isinstance(transport,dict)and transport.get('id')==row['id']:timing['transport']=transport
+            receipt['business_key']=row['key']
+            persisted=time.monotonic();atomic_json(receipt_path,receipt)
+            timing['receipt_write_seconds']=time.monotonic()-persisted
+            save(row,state='fetched',collection_timing=dict(timing))
         else:
             receipt=json.loads(receipt_path.read_bytes())
             if (directory/'result').is_dir():receipt['output_dir']=str(directory/'result')
         if row['state']not in ('published','collected'):
+            published=time.monotonic()
             try:
                 if publish:publish(receipt)
             except BaseException:
-                save(row,state='publication_failed');raise
-            save(row,state='published')
+                timing['publication_seconds']=timing.get('publication_seconds',0)+time.monotonic()-published
+                save(row,state='publication_failed',collection_timing=dict(timing));raise
+            timing['publication_seconds']=timing.get('publication_seconds',0)+time.monotonic()-published
+            save(row,state='published',collection_timing=dict(timing))
         if row['state']!='collected':
+            retired=time.monotonic()
             try:client.delete(row['id'])
             except RemoteError as error:
-                if error.status_code!=404:raise
-            save(row,state='collected')
+                if error.status_code!=404:
+                    timing['retirement_seconds']=timing.get('retirement_seconds',0)+time.monotonic()-retired
+                    save(row,collection_timing=dict(timing));raise
+            timing['retirement_seconds']=timing.get('retirement_seconds',0)+time.monotonic()-retired
+            save(row,state='collected',collection_timing=dict(timing))
         payload=directory/'request.zip'
         if payload.exists():payload.unlink()
         return receipt
+
+    def queue_collection(row):
+        return collect_pool.submit(collect,row,(time.monotonic(),time.time()))
 
     def finish(key):
         completed.add(key)
@@ -283,7 +306,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
             row=row_for(key)
             if row['state']in ('collected','published','fetched','publication_failed'):
                 if row['state']!='collected':call.hold(row,recovered=True)
-                collecting[collect_pool.submit(collect,row)]=row;recovering.add(key)
+                collecting[queue_collection(row)]=row;recovering.add(key)
             elif row['state']=='accepted':
                 call.hold(row,recovered=True);pending[row['id']]=row;recovering.add(key)
             elif row['state']=='submitting'or row.get('recovery')and row['state']=='new'or row.get('cancel_requested'):
@@ -312,7 +335,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                         if not call.hold(row):
                             ready.add(key);credit_blocked=True;break
                         if row['state']in ('collected','published','fetched','publication_failed'):
-                            collecting[collect_pool.submit(collect,row)]=row
+                            collecting[queue_collection(row)]=row
                         elif row['state']=='accepted':pending[row['id']]=row
                         else:preparing[prep_pool.submit(stage,key,row)]=row
                 for future in [f for f in preparing if f.done()]:
@@ -329,7 +352,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                             client.release_assets(row['id']);finish(row['key'])
                             call.release(row)
                         elif data=='accepted':pending[row['id']]=row
-                        elif data=='fetched':collecting[collect_pool.submit(collect,row)]=row
+                        elif data=='fetched':collecting[queue_collection(row)]=row
                         elif data=='paused':paused=True;call.release(row)
                         elif not paused:submitting[submit_pool.submit(submit,row,data)]=row
                         else:call.release(row)
@@ -358,7 +381,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                             try:cancel_original(row,state)
                             except Exception as error:failure(row,'cancel',error)
                         if state['status']in TERMINAL:
-                            pending.pop(job_id);collecting[collect_pool.submit(collect,row)]=row
+                            pending.pop(job_id);collecting[queue_collection(row)]=row
                         elif state['status']=='unknown':
                             failure(row,'recovery','Accepted original ID missing');pending.pop(job_id)
                     next_poll=time.monotonic()+.5

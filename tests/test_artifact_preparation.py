@@ -15,6 +15,26 @@ from test_compute import provider, python, scratch
 
 
 class ArtifactPreparationTests(unittest.TestCase):
+    def test_prepared_zip_poll_does_not_add_a_two_second_idle_tail(self):
+        with scratch()as root,provider(Path(root)/'worker')as(_,node):
+            with Pool([node])as pool,center(pool,Path(root)/'center')as(_,client):
+                identity=client.submit(python("print('unchanged result')"))['id'];client.wait(identity)
+                original=pool.nodes[0].client.artifacts
+                def delayed(i):
+                    time.sleep(1.7);return original(i)
+                output=Path(root)/'returned'
+                with patch.object(pool.nodes[0].client,'artifacts',side_effect=delayed):
+                    started=time.monotonic();result=client.fetch(identity,output,delete=False)
+                    self.assertLess(time.monotonic()-started,2.8)
+                timing=client.last_fetch_timing()
+                self.assertGreaterEqual(timing['preparing_responses'],3)
+                self.assertEqual(timing['requests'],timing['preparing_responses']+1)
+                self.assertGreater(timing['archive_bytes'],0)
+                self.assertGreaterEqual(timing['expanded_bytes'],0)
+                self.assertGreaterEqual(timing['prepare_sleep_seconds'],1.6)
+                self.assertEqual(result,client.fetch(identity,output,delete=False))
+                client.delete(identity)
+
     def test_lru_eviction_before_background_load_keeps_original_preparation(self):
         with scratch() as root, provider(Path(root)/'worker') as (_, node):
             with Pool([node]) as pool, center(pool, Path(root)/'center') as (state, client):

@@ -30,6 +30,35 @@ class ReadyQueueTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_collection_timings_separate_local_queue_fetch_publish_and_retirement(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                ids=[client.submit(task(i)['task'])['id']for i in range(6)]
+                for identity in ids:client.wait(identity)
+                fetch,delete=client.fetch,client.delete
+                guard=threading.Lock();active=peak=0
+                def slow_fetch(*args,**kwargs):
+                    nonlocal active,peak
+                    with guard:active+=1;peak=max(peak,active)
+                    try:time.sleep(.12);return fetch(*args,**kwargs)
+                    finally:
+                        with guard:active-=1
+                def slow_delete(*args,**kwargs):time.sleep(.03);return delete(*args,**kwargs)
+                with patch.object(client,'fetch',side_effect=slow_fetch),patch.object(client,'delete',side_effect=slow_delete):
+                    result=client.execute({str(i):dict(job_id=identity)for i,identity in enumerate(ids)},project='collection-timing',output_dir=Path(root)/'delivery',publish=lambda r:time.sleep(.02))
+                self.assertEqual(len(result),6)
+                self.assertEqual(peak,2)
+                states=[json.loads(p.read_bytes())for p in (Path(root)/'delivery/jobs').glob('*/state.json')]
+                self.assertTrue(all(s['state']=='collected'for s in states))
+                timings=[s['collection_timing']for s in states]
+                self.assertTrue(any(t['queue_seconds']>=.1 for t in timings))
+                for timing in timings:
+                    self.assertGreaterEqual(timing['fetch_seconds'],.12)
+                    self.assertGreaterEqual(timing['publication_seconds'],.02)
+                    self.assertGreaterEqual(timing['retirement_seconds'],.03)
+                    self.assertGreater(timing['transport']['archive_bytes'],0)
+                self.assertTrue(all(s['status']=='unknown'for s in client.statuses(ids).values()))
+
     def test_cancellation_fence_after_submitting_save_survives_recovery_without_reposting(self):
         from remote_compute.bundle import atomic_json
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):

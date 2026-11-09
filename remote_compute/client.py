@@ -678,28 +678,46 @@ class Client:
             if backend is None:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None)))
             backend.timeout=max(120,self.timeout)
+        metrics=self.__dict__.setdefault('_artifact_timing',threading.local())
+        stats=dict(requests=0,request_seconds=0.0,preparing_responses=0,prepare_sleep_seconds=0.0)
+        metrics.value=stats
+        def read():
+            started=time.monotonic()
+            try:return backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers={'X-DCO-Artifact-Poll':'1'})
+            finally:
+                stats['requests']+=1;stats['request_seconds']+=time.monotonic()-started
         delay = .2
         while True:
-            raw = self._read_reconnecting(lambda:backend.request(
-                "/jobs/"+identity+"/artifacts", binary=True, extra_headers={'X-DCO-Artifact-Poll':'1'}))
+            raw = self._read_reconnecting(read)
             if getattr(backend.connections, 'response_status', 200) != 202:
                 return raw
             preparation = json.loads(raw)
             if preparation != {'id': identity, 'status': 'preparing'}:
                 raise RemoteError('Invalid artifact preparation response')
+            stats['preparing_responses']+=1
             # A live preparation acknowledgement renews observation of this
             # original result. Transport outages keep their bounded reconnect
             # window, independently of how long the provider transfer takes.
-            time.sleep(delay)
-            delay = min(2, delay*2)
+            started=time.monotonic();time.sleep(delay)
+            stats['prepare_sleep_seconds']+=time.monotonic()-started
+            delay = min(.5, delay*2)
 
     def fetch(self, identity, output_dir=None, *, delete=True):
-        raw = self.artifacts(identity)
+        started=time.monotonic()
+        metrics=self.__dict__.setdefault('_artifact_timing',threading.local());metrics.value=None
+        fetched=self.__dict__.setdefault('_fetch_timing',threading.local());fetched.value=dict(id=identity)
+        try:raw = self.artifacts(identity)
+        except BaseException:
+            fetched.value=dict(id=identity,stage='artifacts',artifacts_seconds=time.monotonic()-started,**(metrics.value or {}))
+            raise
+        received=time.monotonic()
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             result = json.loads(archive.read("result.json"))
+            expanded=sum(item.file_size for item in archive.infolist())
             names = [name for name in archive.namelist() if name.startswith("files/")]
             result["files"] = ({name[6:]: archive.read(name) for name in names} if output_dir is None
                                else sorted({name[6:] for name in names}))
+        decoded=time.monotonic()
         if output_dir is not None:
             directory=Path(output_dir).resolve()
             with zipfile.ZipFile(io.BytesIO(raw))as archive:
@@ -707,10 +725,21 @@ class Client:
             directory=native_path(directory,force=long)
             unpack(raw,directory)
             result["output_dir"] = str(directory)
+        unpacked=time.monotonic()
+        fetched.value=dict(id=identity,artifacts_seconds=received-started,decode_seconds=decoded-received,
+            unpack_seconds=unpacked-decoded,total_seconds=unpacked-started,
+            archive_bytes=len(raw),expanded_bytes=expanded,**(metrics.value or {}))
         result["url"] = self.url
+        retired=time.monotonic()
         if delete:
             self.delete(identity)
+        fetched.value['delete_seconds']=time.monotonic()-retired if delete else 0.0
+        fetched.value['total_seconds']=time.monotonic()-started
         return result
+
+    def last_fetch_timing(self):
+        """Local transport timings for this thread; the original receipt stays immutable."""
+        return dict(getattr(getattr(self,'_fetch_timing',None),'value',{}))
 
     def run(self, task, *, inputs=None, files=None, output_dir=None, keep=False, on_submit=None, job_id=None):
         identity = job_id or uuid.uuid4().hex
