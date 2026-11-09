@@ -78,7 +78,13 @@ class CpuLease:
                         elif not active_cpus and (funded<1 or required is not None and required>available):
                             funded,required=plan_memory(1,available,**self.memory)
                             funded=min(funded,desired,grant.get('cpus',0))
-                if (grant.get('status')!='running' or funded<max(1,active_cpus) or
+                # A worker can run before the center replaces its initial
+                # queued/dispatching sample. Only an inherited, previously
+                # confirmed grant may bridge that observation lag.
+                executing=(grant.get('status')=='running' or inherited
+                    and os.environ.get('REMOTE_COMPUTE_WORKER')=='1' and self.confirmed is not None
+                    and grant.get('status')in('queued','dispatching'))
+                if (not executing or funded<max(1,active_cpus) or
                         required is not None and required>available):
                     raise error
                 grant={**grant,'cpus':funded}

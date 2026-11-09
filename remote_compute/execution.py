@@ -41,7 +41,9 @@ def _function(value):
 def _item(function,item,kwargs):
     from remote_compute.deadline import check_deadline
     check_deadline()
-    return _function(function)(item,**kwargs)
+    target=_function(function)
+    if getattr(_local,'item_channel',None)is not None:_kernel_threads(1)
+    return target(item,**kwargs)
 
 
 def _single_threaded(item_process=True):
@@ -54,6 +56,10 @@ def _single_threaded(item_process=True):
 _local=threading.local()
 _streams=set()
 _streams_lock=threading.Lock()
+_threadpool_controller=None
+_threadpool_legacy_limits=None
+_threadpool_module_count=-1
+_kernel_thread_count=None
 
 
 def _thread_item(function,item,kwargs):
@@ -64,12 +70,12 @@ def _thread_item(function,item,kwargs):
     finally:_local.item=False
 
 
-def _process_item(function,item,kwargs):
+def _process_item(function,item,kwargs,channel=None):
     # One process lifetime per business item returns its allocator/model RAM
     # when that item completes, including a map's long tail.
     with tempfile.TemporaryDirectory(prefix='dco-item-')as folder:
         root=Path(folder);request=root/'request.pkl';result=root/'result.pkl'
-        request.write_bytes(pickle.dumps((function,item,kwargs),protocol=4))
+        request.write_bytes(pickle.dumps((function,item,kwargs,channel),protocol=4))
         prefix=json.loads(os.environ.get('REMOTE_COMPUTE_PYTHON_ARGV','[]'))or[sys.executable]
         child=subprocess.Popen([*prefix,'-B',str(Path(__file__).resolve()),'--item',str(request),str(result)],
             stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt'else 0)
@@ -107,6 +113,7 @@ class _Grants:
         self.cpus=min(maximum,max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1'))))
         self.condition=threading.Condition();self.active=self.ready=0
         self.pending=False;self.fenced=False;self.pending_floor=0;self.error=None;self.stopping=False
+        self.revision=0;self.report_revision=0;self.ack_revision=-1
         self.thread=None;self.lease=None
         url=os.environ.get('REMOTE_COMPUTE_URL','')
         if url and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
@@ -127,6 +134,7 @@ class _Grants:
                 if not self.active and not self.ready and self.cpus==1 and not self.fenced:
                     self.condition.wait(.1);continue
                 active,ready=self.active,self.ready
+                report_revision=self.report_revision
                 self.pending=True;self.pending_floor=active
             try:
                 actual=self.lease.refresh(active_cpus=active,ready_cpus=ready)
@@ -135,9 +143,11 @@ class _Grants:
                     self.error=error;self.pending=False;self.condition.notify_all()
                 return
             with self.condition:
-                self.cpus=actual;self.pending=False
+                self.cpus=actual;self.pending=False;self.revision+=1;self.ack_revision=report_revision
                 self.fenced=self.active<active
                 if self.fenced:self.pending_floor=self.active
+                observer=getattr(self,'observer',None)
+                if observer:observer()
                 self.condition.notify_all()
                 if self.stopping:return
                 # A report arriving during RPC needs its own acknowledged snapshot.
@@ -166,7 +176,7 @@ class _Grants:
             if self.lease is not None and active<self.active and not self.pending:
                 self.fenced=True;self.pending_floor=active
             self.active,self.ready=active,ready
-            if changed:self.condition.notify_all()
+            if changed:self.report_revision+=1;self.condition.notify_all()
 
     def close(self):
         with self.condition:
@@ -176,17 +186,20 @@ class _Grants:
             self.lease.refresh(active_cpus=0,ready_cpus=0)
 
 
-def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None,limits=None):
+def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None,limits=None,item_max_cpus=1):
     """Evaluate independent business inputs; DCO owns all resource management.
 
     Functions are importable module:function names or top-level callables.
-    Each item receives one process and one CPU; results keep input order.
+    Each item receives one process; optional item kernel stages share the
+    parent's grant. Results keep input order.
     """
     items=list(items);kwargs=dict(kwargs or {})
     if not items:return []if collect else 0
     if os.environ.get('REMOTE_COMPUTE_WORKER')!='1':
         raise RuntimeError('Submit python_map to DCO before executing its items')
     if backend not in ('process','thread'):raise ValueError('backend requires process or thread')
+    if type(item_max_cpus)is not int or item_max_cpus<1:raise ValueError('item_max_cpus requires a positive integer')
+    if item_max_cpus>1 and backend!='process':raise ValueError('Multicore items require the process backend')
     if os.environ.get('DCO_ITEM_PROCESS')=='1' or getattr(_local,'item',False)or getattr(_local,'kernel',False):
         values=[];position=0
         for index,item in enumerate(items):
@@ -201,8 +214,12 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             if collect:values.append(value)
             if on_result:on_result(index,value,None)
         return values if collect else position
-    maximum=min(len(items),max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',os.cpu_count()or 1))))
+    maximum=min(len(items)*item_max_cpus,max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',os.cpu_count()or 1))))
     grants=_Grants(maximum,limits);maximum=grants.maximum
+    resources=None
+    if item_max_cpus>1:
+        from remote_compute.item_resources import ItemResources
+        resources=ItemResources(grants,item_max_cpus,len(items))
     position=0;active={};values=[None]*len(items)if collect else None;failures=[];completed=Queue()
     if backend=='thread':
         _single_threaded(False);function=_function(function)
@@ -212,14 +229,15 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
         else:threadpool_limits(limits=1)
         torch=sys.modules.get('torch')
         if torch is not None:torch.set_num_threads(1)
-    pool=ThreadPoolExecutor(max_workers=maximum,thread_name_prefix='dco-item')
+    pool=ThreadPoolExecutor(max_workers=min(len(items),maximum),thread_name_prefix='dco-item')
     try:
         while active or position<len(items):
             if on_capacity:on_capacity(grants.cpus)
             requested=len(items)-position
             if failures or stop and stop():requested=0
             elif ready_slots is not None:requested=min(requested,ready_slots())
-            for _ in range(grants.reserve(requested)):
+            starts=resources.reserve(position,requested)if resources else grants.reserve(requested)
+            for _ in range(starts):
                 if stop and stop():break
                 from remote_compute.deadline import check_deadline
                 try:check_deadline()
@@ -227,7 +245,9 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
                     failures.append(error);break
                 operation=_process_item if backend=='process'else _thread_item
                 if on_start:on_start(position)
-                future=pool.submit(operation,function,items[position],kwargs)
+                if resources:
+                    future=pool.submit(operation,function,items[position],kwargs,resources.channel(position))
+                else:future=pool.submit(operation,function,items[position],kwargs)
                 active[future]=position;position+=1
                 future.add_done_callback(completed.put)
             stopped=bool(failures or stop and stop())
@@ -236,7 +256,8 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
                 if failures or stop and stop():return 0
                 if ready_demand:return ready_demand(len(active),remaining)
                 return min(remaining,ready_slots()if ready_slots else len(items))
-            grants.report(len(active),0 if stopped else ready())
+            if resources:resources.report(0 if stopped else ready())
+            else:grants.report(len(active),0 if stopped else ready())
             if not active:
                 if stopped or grants.error:break
                 time.sleep(.02);continue
@@ -245,6 +266,7 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             while not completed.empty():done.append(completed.get_nowait())
             for future in done:
                 index=active.pop(future)
+                if resources:resources.finish(index)
                 try:
                     value=future.result()
                     if collect:values[index]=value
@@ -253,18 +275,20 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
                     failures.append(error)
                     if on_result:on_result(index,None,str(error))
             if grants.error:failures.append(grants.error)
-            grants.report(len(active),ready())
+            if resources:resources.report(ready())
+            else:grants.report(len(active),ready())
         if failures:raise RuntimeError('DCO execution failed: '+str(failures[0]))from failures[0]
         if grants.error:raise grants.error
         return values if collect else position
     finally:
         pool.shutdown(wait=True)
+        if resources:resources.close()
         grants.report(0,0);grants.close()
 
 
-def map_items(function,items,*,kwargs=None,backend='process',on_result=None,limits=None):
+def map_items(function,items,*,kwargs=None,backend='process',on_result=None,limits=None,item_max_cpus=1):
     """Evaluate independent inputs with optional phase CPU/RAM limits."""
-    return _map_items(function,items,kwargs=kwargs,backend=backend,on_result=on_result,limits=limits)
+    return _map_items(function,items,kwargs=kwargs,backend=backend,on_result=on_result,limits=limits,item_max_cpus=item_max_cpus)
 
 
 ItemResult=namedtuple('ItemResult','index value error')
@@ -389,13 +413,60 @@ def iter_items(function,items,*,kwargs=None,backend='process',stop_when=None,lim
     return ItemStream(function,items,kwargs,backend,stop_when,limits)
 
 
+def _kernel_threads(count,*,reset=False):
+    global _threadpool_controller,_threadpool_legacy_limits,_threadpool_module_count,_kernel_thread_count
+    changed=_kernel_thread_count!=count or os.environ.get('REMOTE_COMPUTE_CPUS')!=str(count)
+    imported=len(sys.modules)!=_threadpool_module_count
+    if not(changed or imported or reset):return
+    if changed or reset:
+        for key in ('REMOTE_COMPUTE_CPUS','OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
+            if os.environ.get(key)!=str(count):os.environ[key]=str(count)
+        ceiling=int(os.environ.get('REMOTE_COMPUTE_ITEM_MAX_CPUS',count))
+        if os.environ.get('NUMBA_NUM_THREADS')!=str(max(count,ceiling)):os.environ['NUMBA_NUM_THREADS']=str(max(count,ceiling))
+    if imported:
+        # Discover DLLs once after imports, never once per evaluation batch.
+        try:
+            from threadpoolctl import ThreadpoolController
+        except ImportError:
+            _threadpool_controller=None
+            try:from threadpoolctl import threadpool_limits
+            except ImportError:_threadpool_legacy_limits=None
+            else:_threadpool_legacy_limits=threadpool_limits
+        else:_threadpool_controller=ThreadpoolController();_threadpool_legacy_limits=None
+        _threadpool_module_count=len(sys.modules)
+    if _threadpool_controller is not None:_threadpool_controller.limit(limits=count)
+    elif _threadpool_legacy_limits is not None:_threadpool_legacy_limits(limits=count)
+    torch=sys.modules.get('torch')
+    if torch is not None and torch.get_num_threads()!=count:torch.set_num_threads(count)
+    numba=sys.modules.get('numba')
+    if numba is not None:
+        actual=min(count,numba.config.NUMBA_NUM_THREADS)
+        if numba.get_num_threads()!=actual:numba.set_num_threads(actual)
+    _kernel_thread_count=count
+
+
 def run_call(function,*,limits=None,**kwargs):
     """Execute a numerical kernel using the grant prepared by the DCO worker."""
     from remote_compute.deadline import check_deadline
     check_deadline()
     if os.environ.get('REMOTE_COMPUTE_WORKER')!='1':
         raise RuntimeError('Submit python_call to DCO before executing its kernel')
-    if os.environ.get('DCO_ITEM_PROCESS')=='1'or getattr(_local,'item',False)or getattr(_local,'kernel',False):return _function(function)(**kwargs)
+    if getattr(_local,'kernel',False):return _function(function)(**kwargs)
+    channel=getattr(_local,'item_channel',None)
+    if channel is not None:
+        if set(limits or {})-{'max_cpus'}:
+            raise ValueError('Declare aggregate item RAM on the parent map; item stages accept max_cpus')
+        maximum,_=_phase_resources(int(os.environ['REMOTE_COMPUTE_ITEM_MAX_CPUS']),limits)
+        actual=channel.request('enter',maximum)
+        try:
+            _local.kernel=True
+            target=_function(function);_kernel_threads(actual)
+            return target(**kwargs)
+        finally:
+            _local.kernel=False
+            try:_kernel_threads(1,reset=True)
+            finally:channel.request('leave')
+    if os.environ.get('DCO_ITEM_PROCESS')=='1'or getattr(_local,'item',False):return _function(function)(**kwargs)
     # A final item can be consumed just before its stream returns resources.
     # Finish that SDK-owned boundary before borrowing for the numerical stage.
     with _streams_lock:streams=list(_streams)
@@ -416,25 +487,13 @@ def run_call(function,*,limits=None,**kwargs):
         lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=max(maximum,actual),cpus=actual,**model)
         actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
         lease.refresh(active_cpus=actual,ready_cpus=0)
-    def threads(count):
-        os.environ['REMOTE_COMPUTE_CPUS']=str(count)
-        for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','NUMBA_NUM_THREADS'):
-            os.environ[key]=str(count)
-        try:
-            from threadpoolctl import threadpool_limits
-        except ImportError:pass
-        else:threadpool_limits(limits=count)
-        torch=sys.modules.get('torch')
-        if torch is not None:torch.set_num_threads(count)
-        numba=sys.modules.get('numba')
-        if numba is not None:numba.set_num_threads(min(count,numba.config.NUMBA_NUM_THREADS))
     try:
         _local.kernel=True
-        threads(actual)
-        return _function(function)(**kwargs)
+        target=_function(function);_kernel_threads(actual)
+        return target(**kwargs)
     finally:
         _local.kernel=False
-        threads(1)
+        _kernel_threads(1,reset=True)
         if lease:lease.refresh(active_cpus=0,ready_cpus=0)
 
 
@@ -482,7 +541,8 @@ def main(path):
             started(0)
             _single_threaded(False)
             value=_function(spec['function'])(**spec['kwargs']);publish(0,value,None)
-        else:_map_items(spec['function'],spec['items'],kwargs=spec['kwargs'],backend=spec.get('backend','process'),on_start=started,on_result=publish)
+        else:_map_items(spec['function'],spec['items'],kwargs=spec['kwargs'],backend=spec.get('backend','process'),on_start=started,on_result=publish,
+                       item_max_cpus=int(os.environ.get('REMOTE_COMPUTE_ITEM_MAX_CPUS','1')))
     except BaseException as caught:
         error=caught
         if spec['mode']!='map'and states[0]['status']=='running':
@@ -495,12 +555,21 @@ def main(path):
 
 def item_main(request,result):
     _single_threaded()
+    channel=None
     try:
-        function,item,kwargs=pickle.loads(Path(request).read_bytes())
+        function,item,kwargs,*channels=pickle.loads(Path(request).read_bytes())
+        endpoint=channels[0]if channels else None
+        if endpoint is not None:
+            from remote_compute.item_resources import ItemChannel
+            channel=_local.item_channel=ItemChannel(*endpoint)
+            os.environ['REMOTE_COMPUTE_ITEM_MAX_CPUS']=str(channel.maximum)
+            os.environ['NUMBA_NUM_THREADS']=os.environ['REMOTE_COMPUTE_ITEM_MAX_CPUS']
         value=dict(ok=True,value=_item(function,item,kwargs))
     except BaseException:
         import traceback
         value=dict(ok=False,error=traceback.format_exc()[-8192:])
+    finally:
+        if channel is not None:channel.close();_local.item_channel=None
     Path(result).write_bytes(pickle.dumps(value,protocol=4))
 
 

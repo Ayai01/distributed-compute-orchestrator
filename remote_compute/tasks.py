@@ -2,10 +2,13 @@
 from .policy import canonical_capabilities, validate_platform
 
 
-def python_map(function, items, *, kwargs=None, backend='process', **options):
+def python_map(function, items, *, kwargs=None, backend='process', item_max_cpus=1, **options):
     """Submit independent business inputs to the DCO-owned process executor."""
     task=command(['${tool:python}','-B','${dco}/remote_compute/execution.py','${work}/.dco-execution.json'],
                  **options)
+    if type(item_max_cpus)is not int or item_max_cpus<1:raise ValueError('item_max_cpus requires a positive integer')
+    if item_max_cpus>1 and backend!='process':raise ValueError('Multicore items require the process backend')
+    if item_max_cpus>1:task['env']['REMOTE_COMPUTE_ITEM_MAX_CPUS']=str(item_max_cpus)
     task['execution']=dict(function=function,items=list(items),kwargs=dict(kwargs or {}),mode='map',backend=backend)
     task['outputs']=list(dict.fromkeys([*task['outputs'],'.dco-results.json','.dco-streams/**/*']))
     return task

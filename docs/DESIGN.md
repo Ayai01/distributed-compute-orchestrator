@@ -4,7 +4,7 @@
 
 DCO负责准备、排队、能力路由、CPU/RAM/加速器分配、实际执行、领取和原ID恢复。工程提供业务工作、冻结输入、真实有用并行上限、能力和内存需求，并负责科学测量、评分、有限预算、结果解释与持久发布。
 
-`max_cpus`是整批任务的并行上限，当前映射需求由在途项数与可启动项数共同决定。全部输入已经启动后，执行器按剩余在途项数收缩授权；单线程项继续按单线程执行。终端`CPU/max`分别显示当前授权和整批上限。核对扩核应同时查看原ID的`requested_cpus`、`active_cpus`及逐项启动/完成记录。
+`max_cpus`是整批任务的并行上限，当前映射需求由在途项数、可启动项数及子项数值阶段需求共同决定。全部输入已经启动后，单线程映射按剩余在途项数收缩授权；声明`item_max_cpus`的进程映射可把余核用于子项数值阶段。终端`CPU/max`分别显示当前授权和整批上限。核对扩核应同时查看原ID的`requested_cpus`、`active_cpus`及逐项启动/完成记录。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -58,7 +58,11 @@ values = map_items('business:evaluate', ready_inputs, kwargs={'mode': 'native'},
 result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 ```
 
-`map_items`可提供`on_result(index, value, error)`，逐项持久化业务检查点；`python_map`在`.dco-results.json`写入已完成项及最终状态。直接任务声明的返回值须可JSON序列化，大数组、模型及科学记录写声明输出，返回其必要索引。映射项内部的嵌套调用共用该项的1核，不额外借核。
+`map_items`可提供`on_result(index, value, error)`，逐项持久化业务检查点；`python_map`在`.dco-results.json`写入已完成项及最终状态。直接任务声明的返回值须可JSON序列化，大数组、模型及科学记录写声明输出，返回其必要索引。默认映射项内部的嵌套调用共用该项的1核。
+
+两级并行使用`python_map(..., item_max_cpus=8, max_cpus=80)`或`map_items(..., item_max_cpus=8, limits=...)`；默认`item_max_cpus=1`。多核子项使用process后端，业务在完成的评价批边界调用`run_call(kernel, limits={'max_cpus':8}, ...)`。父执行器先为未启动lane分配1核，外层就绪lane全部启动后，才把额外授权分给子项数值批；10条最多8核的搜索可申报80，有不同宽度时max_cpus申报真实有用宽度总和。子项阶段上限按自身有用宽度给出，例如普通串行项保持1。
+
+父执行器独占分布式租约。子项通过每次映射私有的Windows named pipe或Unix socket接收父授权，不占TCP端口、不访问中心租约。父active floor含已承诺启动的lane及运行中的数值线程；待确认的缩核期间不复用未受保护的槽位。多核阶段仅等待本次需求快照的一次确认，按实际可用授权运行，不等待申报上限全部满足。只有1核可给时，子项读取私有共享状态，在需求变化时单向通知父级，稳定单核批次省去双向IPC；父授权更新后再通过原握手取得额外核数。短首批可先以1核运行，后续批次使用新授权。完成、异常和取消归还资源，线程设置先恢复1再归还阶段授权。内存由父map的聚合声明/limits及DCO实测标定管理；子项`run_call`的limits仅声明max_cpus，避免把共享父基线重复计入每个子项。业务数值库的线程数必须跟随本批实际`REMOTE_COMPUTE_CPUS`；SDK调整已加载的Numba/Torch/BLAS线程，Numba初始池上限保留item_max_cpus。DLL控制器在导入状态变化后重建，稳定批次复用控制器；单核快路保留批后轻量复位。
 
 任务`timeout`覆盖整个运输的执行墙钟时间，与网络RPC超时分开。worker向整个子进程树提供同一单调时钟期限`REMOTE_COMPUTE_DEADLINE`，回执`deadline`记录对应UTC时间戳。`remaining_time()`返回剩余秒数，在DCO任务外返回`None`；`check_deadline(reserve_seconds=...)`在剩余时间进入业务落盘预留时抛出`TimeoutError`。业务在真实评价与记账边界检查，沿既有异常路径发布已付前缀、原ID和恢复索引。预留属于原任务时限，硬时限保持。
 
@@ -66,7 +70,7 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 中心操作员使用`client.control(job=原ID, priority=整数)`调整已受理排队任务的调度优先级，取值范围沿任务priority规则。`submitted_priority`保留原声明，`dispatch_priority`记录有效覆盖；覆盖持久保存并在中心恢复时生效。原request.zip、请求SHA、科学输入、种子、费用和原ID保持。运行中及终态任务保持其调度与执行状态。priority在工程之间对新任务全局排序，同级再按resource_share分配；新任务的priority不得跳过已有任务的前四个有用核。工程内分层安排须同时核对跨工程份额。
 
-`python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items(..., backend="thread")`，DCO按输入数动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，单项固定1核，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
+`python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items`，DCO按真实需求动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，默认单项1核、可声明进程子项内核上限，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
 
 `iter_items(function, items, backend=..., stop_when=..., limits=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。
 
