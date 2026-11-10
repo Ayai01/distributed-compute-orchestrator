@@ -7,6 +7,7 @@
 - SDK提供`python_map/map_items(item_max_cpus=...)`与子项`run_call`阶段授权；父租约保证完整lane优先及长尾内核扩展。按SDK签名及源码revision识别该接口；交付、隔离保存输入0FE验证和五台源码部署入口为`.local/maintenance/nested-item-cpu-20261109/current.json`，服务引擎无需重载。
 - 固定数值核入口在首次授权不足时，保留未满足需求并在启动前有界复核一次；冷内存单槽探测后可取得空闲核心，忙设备仍按实际授权执行。隔离复现、回归和SDK实际分发状态见`.local/maintenance/kernel-entry-grant-20261110/current.json`；在途固定线程原生核继续原宽度。
 - 确定性执行前资产引用拒绝的零CPU回执机制、历史原ID独立结清证明及维护生效状态见`.local/maintenance/pre-execution-accounting-20261110/current.json`；原历史回执及科学输入保持。
+- lease转发TLS意外EOF的已确认授权保留、未知空槽限制、隔离HTTP注入验证及SDK分发状态见`.local/maintenance/forwarded-lease-eof-20261110/current.json`。原已完成子项与累计CPU费用保留；在途进程继续使用其已导入SDK。
 - CPU U/B按已授权/基础预算（系统逻辑线程）显示；动态准入容量单独保留在API、nodes明细及cpus回执。源码验证和各窗口实际重载状态见`.local/maintenance/cpu-budget-label-20261109/current.json`。
 - 终端统一使用`kill <id|all>`，补全ID统一青色；`clean`删除未启动排队任务及其记录、临时物和独占缓存。源码验证、部署及窗口实际重载状态见`.local/maintenance/kill-all-20261109/current.json`。
 - hybrid同时提供调度中心和进程内本机计算，看板标题为“混合模式”；API逻辑角色为scheduler，操作员明细另给出mode。进程内worker不另开服务端口。

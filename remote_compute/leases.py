@@ -6,6 +6,9 @@ from .allocation import plan_resize
 from .memory import same_phase, plan_memory
 from .deadline import check_deadline, remaining_time
 
+# Independently loaded SDK modules keep this wire marker local.
+RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
+
 
 class CpuLease:
     """Keep an executor's usable grant current while its ready work changes."""
@@ -50,7 +53,8 @@ class CpuLease:
                         not any(message in str(error)for message in (
                             'Insufficient memory for resource resize; existing grant retained',
                             'Insufficient RAM for active workers; existing grant retained',
-                            'Center resource reply timed out; existing grant retained'))):
+                            'Center resource reply timed out; existing grant retained',
+                            RESOURCE_TRANSPORT_RETAINED))):
                     raise
                 # A refused or unanswered resize leaves paid CPU/RAM usable. Re-read that
                 # grant: a new phase may need more memory than it can fund.
@@ -101,8 +105,17 @@ class CpuLease:
         return self.cpus
 
     def _retained_status(self,target,desired,active,error,inherited):
+        uncertain=any(message in str(error)for message in (
+            'Center resource reply timed out; existing grant retained',RESOURCE_TRANSPORT_RETAINED))
+        def observe():
+            grant=self.client.status(target)
+            if uncertain:
+                # A late resize may still return idle slots after this read.
+                # Preserve the reported active floor, not those unsettled slots.
+                grant=dict(grant,cpus=min(grant.get('cpus',0),max(1,active)))
+            return grant
         try:
-            return self.client.status(target)
+            return observe()
         except Exception as observed:
             if (getattr(observed,'status_code',None) not in (502,503,504)
                     and not getattr(observed,'transport_retryable',False)):
@@ -111,7 +124,7 @@ class CpuLease:
         cached=self.confirmed
         if cached is not None and same_phase(self.memory,cached['memory_phase']):
             width=min(desired,cached['cpus'])
-            if 'Center resource reply timed out; existing grant retained' in str(error):
+            if uncertain:
                 # The unanswered resize could have returned idle slots. Keep
                 # its active floor until an authoritative observation arrives.
                 width=min(width,max(1,active))
@@ -119,7 +132,7 @@ class CpuLease:
         # No new work starts from an unverified seed or a different phase.
         # Retry only observation, within the original execution deadline.
         remaining=remaining_time() if inherited else None
-        return self.client._read_reconnecting(lambda:self.client.status(target),
+        return self.client._read_reconnecting(observe,
             deadline=time.monotonic()+remaining if remaining is not None else None,
             check=check_deadline if inherited else None)
 

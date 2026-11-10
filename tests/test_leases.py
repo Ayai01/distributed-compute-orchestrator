@@ -141,7 +141,8 @@ class CpuLeaseTests(unittest.TestCase):
             with self.subTest(message=message),patch.object(client,'resize',side_effect=error), \
                     patch.object(client,'status',return_value=dict(status='running',cpus=8,memory_mb=512,memory_phase=phase)):
                 lease=client.cpu_lease('a'*32,max_cpus=8,**phase)
-                self.assertEqual(lease.refresh(ready_cpus=8),8)
+                expected=1 if 'timed out'in message else 8
+                self.assertEqual(lease.refresh(ready_cpus=8),expected)
 
     def test_an_acknowledged_adaptive_phase_does_not_fund_a_different_phase(self):
         client=Client();error=RemoteError('Center resource reply timed out; existing grant retained');error.status_code=409
@@ -166,12 +167,13 @@ class CpuLeaseTests(unittest.TestCase):
                     patch.object(client,'status',return_value=dict(status='running',cpus=4,memory_mb=512)), \
                     patch('remote_compute.leases.time.monotonic',return_value=10)as clock:
                 lease=client.cpu_lease('a'*32,max_cpus=8,base_memory_mb=128,memory_per_cpu_mb=128)
-                self.assertEqual(lease.refresh(ready_cpus=8),3)
+                expected=1 if 'timed out'in message else 3
+                self.assertEqual(lease.refresh(ready_cpus=8),expected)
                 self.assertEqual(lease.memory_mb,512)
-                self.assertEqual(lease.refresh(ready_cpus=8),3)
+                self.assertEqual(lease.refresh(ready_cpus=8),expected)
                 self.assertEqual(resize.call_count,1)
                 clock.return_value=11
-                self.assertEqual(lease.refresh(ready_cpus=8),3)
+                self.assertEqual(lease.refresh(ready_cpus=8),expected)
                 self.assertEqual(resize.call_count,2)
                 clock.return_value=12
                 self.assertEqual(lease.refresh(ready_cpus=8),8)

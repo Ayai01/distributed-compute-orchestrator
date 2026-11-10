@@ -34,10 +34,14 @@ import math
 import os
 import re
 import secrets
+
 from urllib.parse import urlsplit
 from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python, execution_bindings, capability_set
 from . import __version__
 from .policy import validate_operator_fields
+
+
+RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
 
 
 def _matching_pass(pool):
@@ -977,7 +981,10 @@ class Coordinator:
                             operation=options.pop('_operation','resize')
                             reply={'grant':self.admission(options) if operation=='admission' else self.resize(job['result']['id'],**options)}
                         except (Conflict,RemoteError,ValueError) as error:
-                            reply={'error':str(error)}
+                            message=str(error)
+                            if isinstance(error,RemoteError)and (error.transport_retryable or error.status_code in (502,503,504)):
+                                message=RESOURCE_TRANSPORT_RETAINED+': '+message
+                            reply={'error':message}
                         grant=reply.get('grant',{})
                         if isinstance(grant,dict)and 'memory_phase'in grant:
                             # This poll predates the resize it requested.

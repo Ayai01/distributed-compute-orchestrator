@@ -49,6 +49,9 @@ class RequestCancelled(RemoteError):
     """A caller stopped its transfer or local wait, preserving accepted work."""
 
 
+RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
+
+
 def _check_cancelled(cancel):
     if cancel is not None and cancel():
         raise RequestCancelled('Transfer cancelled before task submission')
@@ -319,7 +322,7 @@ class Client:
                 if not retryable or attempt==attempts-1:
                     error=RemoteError(f'{self.url}{path}: {exc}')
                     error.transport_code=getattr(exc,'winerror',None) or getattr(exc,'errno',None)
-                    error.transport_retryable=isinstance(exc,(ConnectionError,TimeoutError,http.client.HTTPException))
+                    error.transport_retryable=isinstance(exc,(ConnectionError,TimeoutError,http.client.HTTPException,ssl.SSLEOFError))
                     raise error from None
                 time.sleep(min(1,.1*2**attempt))
         return raw if binary else json.loads(raw)
@@ -423,6 +426,14 @@ class Client:
         try:
             return self.request(path, request)
         except RemoteError as error:
+            if error.status_code==409 and RESOURCE_TRANSPORT_RETAINED not in str(error)and any(marker in str(error)for marker in (
+                    'UNEXPECTED_EOF_WHILE_READING','EOF occurred in violation of protocol')):
+                # A polling center can forward a peer TLS failure as a conflict.
+                # The resize outcome is uncertain; observe the retained grant,
+                # rather than treating an optional resource reply as map failure.
+                retained=RemoteError(RESOURCE_TRANSPORT_RETAINED+': '+str(error))
+                retained.status_code=409
+                raise retained from None
             if not (error.transport_retryable or error.status_code in (502,503,504) or pending(error)):
                 raise
         # Resource changes set a grant; they never start or repeat business

@@ -676,13 +676,16 @@ class StatusReadReconnectTests(unittest.TestCase):
         request.assert_called_once_with('/jobs/'+'a'*32+'/resize',dict(cpus=1,memory_mb=256))
         sleep.assert_not_called()
 
-    def test_resize_transport_outage_retains_original_identity_without_replay(self):
+    def test_resize_outage_only_observes_original_within_reconnect_budget(self):
         client=Client();error=self.outage()
-        with patch.object(client,'request',side_effect=error) as request,patch('remote_compute.client.time.sleep') as sleep:
+        with patch.object(client,'request',side_effect=error) as request,patch('remote_compute.client.time.sleep') as sleep, \
+             patch('remote_compute.client.time.monotonic',side_effect=[0,60,120]):
             with self.assertRaises(RemoteError):client.resize('a'*32,1,memory_mb=256)
-        self.assertEqual(request.call_count,1)
-        self.assertEqual(request.call_args.args[0],'/jobs/'+'a'*32+'/resize')
-        sleep.assert_not_called()
+        paths=[call.args[0]for call in request.call_args_list]
+        self.assertEqual(paths[0],'/jobs/'+'a'*32+'/resize')
+        self.assertTrue(all(path=='/jobs/'+'a'*32 for path in paths[1:]))
+        self.assertLessEqual(request.call_count,4)
+        sleep.assert_called_once()
 
     def test_resize_sends_one_current_request_without_capability_probes(self):
         client=Client();identity='b'*32
@@ -872,7 +875,7 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(deadlines[-1], ('/health', .05))
             self.assertEqual(client.timeout, .05)
 
-    def test_timed_out_resize_is_not_replayed_and_original_grant_can_be_queried(self):
+    def test_lost_resize_replies_reconcile_original_with_a_finite_budget(self):
         identity = 'd'*32
         calls, state = [], dict(id=identity, status='running', cpus=4, memory_mb=512)
         def accepted_resize(key, cpus, **options):
@@ -882,13 +885,19 @@ class TransportTests(unittest.TestCase):
             return dict(id=key, cpus=state['cpus'], memory_mb=state['memory_mb'])
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
             client = Client(remote.url, timeout=1, lease_timeout=.05)
+            reconnect=client._read_reconnecting
+            def bounded(read,**options):
+                return reconnect(read,**{**options,'deadline':time.monotonic()+.4})
             with patch.object(worker, 'resize', side_effect=accepted_resize), \
-                    patch.object(worker, 'get', side_effect=lambda key:dict(state)):
+                    patch.object(worker, 'get', side_effect=lambda key:dict(state)), \
+                    patch.object(client,'_read_reconnecting',side_effect=bounded):
                 with self.assertRaisesRegex(RemoteError, 'timed out'):
                     client.resize(identity, 1, memory_mb=128)
                 observed = client.status(identity)
                 self.assertEqual(observed, dict(id=identity, status='running', cpus=1, memory_mb=128))
-                self.assertEqual(calls, [identity])
+                self.assertTrue(calls)
+                self.assertLessEqual(len(calls),4)
+                self.assertEqual(set(calls),{identity})
 
     def test_retained_job_listing_does_not_block_a_lease_reply(self):
         entered, release = threading.Event(), threading.Event()
