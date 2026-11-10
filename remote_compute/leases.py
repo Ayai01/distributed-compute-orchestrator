@@ -90,8 +90,15 @@ class CpuLease:
                     and grant.get('status')in('queued','dispatching'))
                 if (not executing or funded<max(1,active_cpus) or
                         required is not None and required>available):
-                    raise error
-                grant={**grant,'cpus':funded}
+                    if (inherited and executing and not active_cpus
+                            and os.environ.get('REMOTE_COMPUTE_WORKER')=='1'
+                            and grant.get('cpus',0)>=1 and available>0):
+                        # A paid preparation phase can end below the next
+                        # phase's first-slot estimate. Negotiate that slot at
+                        # this safe boundary before starting any new body.
+                        grant=self._wait_for_phase(target)
+                    else:raise error
+                else:grant={**grant,'cpus':funded}
             self.cpus = grant['cpus']
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
             self.demand, self.active_cpus = desired, active_cpus
@@ -103,6 +110,37 @@ class CpuLease:
                 and self.memory_mb>0) else None)
             self.updated = time.monotonic()
         return self.cpus
+
+    def _wait_for_phase(self,target):
+        from .client import RemoteError
+        def waiting():
+            error=RemoteError('Waiting for the first funded slot of the new memory phase')
+            error.transport_retryable=True
+            return error
+        def settle():
+            current=self.client.status(target)
+            if current.get('status')!='running':
+                error=RemoteError('Only a running task can change its CPU grant');error.status_code=409
+                raise error
+            if current.get('resource_request'):raise waiting()
+            if (isinstance(current.get('memory_phase'),dict)
+                    and same_phase(self.memory,current['memory_phase'])
+                    and current.get('cpus',0)>=1 and current.get('memory_mb',0)>0):
+                return dict(current,cpus=1)
+            try:
+                return self.client.resize(self.identity,1,active_cpus=0,**self.memory)
+            except RemoteError as error:
+                if error.status_code==409 and any(message in str(error)for message in (
+                        'Insufficient memory for resource resize; existing grant retained',
+                        'Insufficient RAM for active workers; existing grant retained',
+                        'Center resource reply timed out; existing grant retained',
+                        RESOURCE_TRANSPORT_RETAINED)):
+                    raise waiting() from error
+                raise
+        remaining=remaining_time()
+        return self.client._read_reconnecting(settle,
+            deadline=time.monotonic()+remaining if remaining is not None else None,
+            check=check_deadline)
 
     def _retained_status(self,target,desired,active,error,inherited):
         uncertain=any(message in str(error)for message in (
