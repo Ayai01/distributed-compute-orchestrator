@@ -317,7 +317,8 @@ class AdmissionPlanningTests(unittest.TestCase):
     def test_queue_rechecks_used_threads_per_share_after_each_allocation(self):
         state=self.center([16]);state.queue=['A1','A2','B1','urgent']
         for key in state.queue:
-            state.jobs[key]=dict(task=dict(steps=[['echo']],cpus=1,project=key[0],priority=3 if key=='urgent' else 0))
+            state.jobs[key]=dict(task=dict(steps=[['echo']],cpus=1,project=key[0],priority=3 if key=='urgent' else 0),
+                                result=dict(status='queued'))
         budgets={'A':dict(used=0,resource_share=1.),'B':dict(used=2,resource_share=1.),'u':dict(used=8,resource_share=1.)}
         iterator=state._queued_candidates(budgets)
         self.assertEqual(next(iterator),'urgent')
