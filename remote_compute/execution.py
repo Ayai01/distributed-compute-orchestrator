@@ -497,6 +497,12 @@ def run_call(function,*,limits=None,**kwargs):
         client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
         lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=max(maximum,actual),cpus=actual,**model)
         actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
+        if actual<maximum:
+            # A cold RAM probe can fund one slot before the phase is known.
+            # Confirm the still-ready width once before freezing the kernel;
+            # busy hosts may retain the smaller grant without waiting for peers.
+            check_deadline()
+            actual=lease.refresh(active_cpus=actual,ready_cpus=maximum-actual)
         lease.refresh(active_cpus=actual,ready_cpus=0)
     try:
         _local.kernel=True
