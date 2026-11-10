@@ -423,13 +423,14 @@ class StatusRows(list):
 
     def _resources(self, width):
         records=[r for _,r in self.devices]
+        cpu_width=max([10]+[_width(r[1])for r in records])
         if width>=100:
             table=_table(['Node','CPU U/B','CPU%','1T/All','RAM U/T','Admit','GPU','RSS/Res'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
-                         [max([11]+[_width(f'#{r[10]} ')+self.node_width for r in records]),10,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
+                         [max([11]+[_width(f'#{r[10]} ')+self.node_width for r in records]),cpu_width,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
             table=_table(['Node','CPU U/B','CPU%','RAM U/T','Admit'],[r[:5] for r in records],
-                         [self.node_width,10,6,None,5],width,right=(1,2,3,4))
+                         [self.node_width,cpu_width,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
         for node,r in self.devices:

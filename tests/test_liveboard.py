@@ -1,13 +1,40 @@
 import json
+import gzip
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch, Mock
 
 from remote_compute import liveboard as live
+from remote_compute.liveboard_wire import encode as cbor
 
 
 class LiveboardTests(unittest.TestCase):
+    def test_cbor_matches_rfc8949_typed_value_vectors(self):
+        vectors=[(0,'00'),(23,'17'),(24,'1818'),(1000,'1903e8'),(-1,'20'),(-1000,'3903e7'),
+                 (2**32,'1b0000000100000000'),(True,'f5'),(False,'f4'),(None,'f6'),
+                 (1.1,'fb3ff199999999999a'),('水','63e6b0b4'),([1,2],'820102'),
+                 ({'a':1},'a1616101')]
+        for value,expected in vectors:
+            with self.subTest(value=value):self.assertEqual(cbor(value).hex(),expected)
+        for invalid in (float('nan'),float('inf'),2**64,-2**64-1,{1:'not text'},b'bytes'):
+            with self.subTest(value=invalid),self.assertRaises(ValueError):cbor(invalid)
+
+    def test_snapshot_separates_maximum_cpu_and_memory_meanings(self):
+        n=self.node(base_capacity=96,capacity=96,logical_cpus=104,cpu_overcommit_factor=1.25,
+            rss_mb=200,memory_reserved_mb=280,memory_reserve_mb=4096,memory_headroom_mb=2048,
+            memory_pressure_state=dict(physical_threshold_mb=640),active_jobs=[dict(id='a',status='running',
+                cpus=4,max_cpus=64,memory_mb=280,memory_phase=dict(base_memory_mb=512,memory_per_cpu_mb=1024))])
+        value=live.snapshot(self.health(),[n]);row=value['nodes'][0]
+        self.assertEqual((row['cpu_base'],row['cpu_capacity'],row['cpu_max_capacity'],row['cpu_total']),(96,96,120,104))
+        self.assertEqual((row['memory_actual_mb'],row['memory_reported_mb'],row['memory_reserved_mb']),(200,4608,280))
+        self.assertEqual((row['memory_reserve_mb'],row['memory_headroom_mb'],row['host_memory_floor_mb']),(4096,2048,640))
+        self.assertEqual(row['host_memory_used_mb'],20000)
+        self.assertEqual(value['jobs'][0]['memory_reported_mb'],4608)
+        summary=live.snapshot(self.health(),[n,dict(n,name='same-host')])['summary']
+        for key in ('memory_actual_mb','memory_reported_mb','memory_reserved_mb','memory_reserve_mb','host_memory_floor_mb'):
+            self.assertEqual(summary[key],row[key])
+
     def node(self, **changes):
         value = dict(name='node', enabled=True, capacity=8, base_capacity=8, reserved=4,
                      external_cpus=0, logical_cpus=8, cpu_percent=50, machine_id='hardware',
@@ -124,6 +151,20 @@ class LiveboardTests(unittest.TestCase):
                     live.upload(dict(upload_file=str(path)),value)
             path.write_text(json.dumps(dict(url='http://example.test/manage/live/id/update/',token='s'*48)))
             with self.assertRaises(ValueError):live.upload(dict(upload_file=str(path)),value)
+
+    def test_upload_uses_gzip_cbor_without_stringifying_numbers(self):
+        with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:
+            path=Path(folder)/'upload.local.json'
+            path.write_text(json.dumps(dict(url='https://example.test/manage/live/id/update/',token='s'*48)))
+            value=live.snapshot(self.health(),[self.node()])
+            with patch.object(live,'read_json',return_value=dict(instance=dict(sequence=4)))as read:
+                size,sequence=live.upload(dict(upload_file=str(path),transport='cbor-gzip'),value)
+            request=read.call_args.args[1]
+            self.assertEqual(request.get_header('Content-type'),'application/cbor')
+            self.assertEqual(request.get_header('Content-encoding'),'gzip')
+            self.assertEqual(gzip.decompress(request.data),cbor(dict(data=value)))
+            self.assertLess(size,len(live.encode(dict(data=value))))
+            self.assertEqual(sequence,4)
 
     def test_disabled_or_failed_optional_launcher_preserves_main_service(self):
         with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:

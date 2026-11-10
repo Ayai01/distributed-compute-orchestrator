@@ -266,7 +266,7 @@ Python和C++是基础环境，不出现在运行能力列表。科学计算的�
 
 普通任务提交禁止指定`platform`、`node`和外部`cwd`，SDK及直接HTTP入口均拒绝。普通`capabilities/admission/window`也拒绝平台过滤。操作员调试可以指定真实`sys.platform`，并按设备选择运行；中心需要操作员令牌。受理后的约束随原ID冻结，输入、费用和恢复身份保持。
 
-操作员远程展示由独立`python -B -m remote_compute.liveboard`发布器提供，配置位于`.local/liveboard.local.json`，启用后随本机supervisor自动启动单例，退出时收尾。现行中心可单独启动发布器接入。`--stop`禁用发布，不影响计算与原终端。它只读取本机普通health及缓存nodes，不读取历史回执或增加worker轮询；按白名单上传`dco.live.v1`，最多16设备、16工程、32任务、8提醒、64KiB。活跃15秒、空闲60秒，未变化抑制与60秒存活快照，失败退避至300秒；只保留最新快照。凭据留本机私有文件，上传只更新data，网页不连接DCO控制接口。字段和状态入口见STATUS。
+操作员远程展示由独立`python -B -m remote_compute.liveboard`发布器提供，配置位于`.local/liveboard.local.json`，启用后随本机supervisor自动启动单例，退出时收尾。现行中心可单独启动发布器接入。`--stop`禁用发布，不影响计算与原终端。它只读取本机普通health及缓存nodes，不读取历史回执或增加worker轮询；按白名单上传`dco.live.v1`，最多16设备、16工程、32任务、8提醒、64KiB语义包。`transport: "cbor-gzip"`使用CBOR二进制整数/浮点和gzip压缩；接收端须支持`application/cbor`及`Content-Encoding: gzip`。省略transport时使用JSON。活跃15秒、空闲60秒，未变化抑制与60秒存活快照，失败退避至300秒；只保留最新快照。凭据留本机私有文件，上传只更新data，网页不连接DCO控制接口。字段和状态入口见STATUS。
 
 | 信息与操作 | 普通工程模式 | 操作员调试／维护 |
 | --- | --- | --- |

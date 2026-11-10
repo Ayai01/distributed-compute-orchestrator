@@ -79,6 +79,20 @@ class ConsoleTests(unittest.TestCase):
                     cpus=capacity,used_cpus=20,logical_cpus=28),width=110)
                 self.assertIn('20/16(28)','\n'.join(worker))
 
+    def test_overcommitted_three_digit_cpu_counts_remain_complete(self):
+        nodes=[dict(name='ku26s',base_capacity=96,capacity=120,logical_cpus=104,
+                    reserved=114,external_cpus=0,active_jobs=[]),
+               dict(name='wide',base_capacity=1024,capacity=1536,logical_cpus=1024,
+                    reserved=1200,external_cpus=0,active_jobs=[])]
+        for width in (54,56,80,100,110,120,160,200):
+            with self.subTest(width=width):
+                rows=format_status(dict(role='scheduler',node='Aya1-PC',cpus=1656,
+                    used_cpus=1314,nodes=nodes,projects={}),width=width).fit(42)
+                rendered='\n'.join(rows)
+                self.assertIn('114/96(104)',rendered)
+                self.assertIn('1200/1024(1024)',rendered)
+                self.assertTrue(all(_width(row)==width for row in rows))
+
     def test_cpu_command_distinguishes_saved_base_from_borrowed_capacity(self):
         centre=Mock();pool=Mock()
         centre.control.return_value=dict(nodes=[dict(name='Aya1-PC',base_capacity=16,capacity=20,limit=0)])

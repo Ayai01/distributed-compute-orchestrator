@@ -8,7 +8,7 @@
 - CPU U/B按已授权/基础预算（系统逻辑线程）显示；动态准入容量单独保留在API、nodes明细及cpus回执。源码验证和各窗口实际重载状态见`.local/maintenance/cpu-budget-label-20261109/current.json`。
 - 终端统一使用`kill <id|all>`，补全ID统一青色；`clean`删除未启动排队任务及其记录、临时物和独占缓存。源码验证、部署及窗口实际重载状态见`.local/maintenance/kill-all-20261109/current.json`。
 - hybrid同时提供调度中心和进程内本机计算，看板标题为“混合模式”；API逻辑角色为scheduler，操作员明细另给出mode。进程内worker不另开服务端口。
-- 私有远程展示使用独立发布器1.0.2；节点及按物理机器去重的汇总提供固定逻辑线程总量`cpu_total`，与基础预算`cpu_base`和动态准入`cpu_capacity`分别显示。采样、体积、失效状态和服务归属入口为`.local/maintenance/liveboard-20261108/`；字段合同为其中`contract.md`。任务比例只使用显式进度，缺失的历史完成数及中心uptime为null。部署状态以该目录`current.json`为准。
+- 私有远程展示的独立发布器源码为1.0.3；`cpu_total`为固定逻辑线程总量，`cpu_base`为基础预算，`cpu_capacity`为动态准入，`cpu_max_capacity`为按实际倍率计算的最大超发容量。节点内存提供整机物理已用、任务树RSS、原阶段申报、校准预留、预算保留及实际物理警戒线。CBOR+gzip传输、语义合同、验证及实际发布状态见`.local/maintenance/display-transport-20261109/current.json`和`contract.md`。原展示归属和入口见`.local/maintenance/liveboard-20261108/`。任务比例只使用显式进度，缺失的历史完成数及中心uptime为null。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。维护入口保存实际运行版本、源码部署、原状态恢复及受理/派发状态；兼容更新按设备自然空闲重载，原ID继续执行和领取。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。
 

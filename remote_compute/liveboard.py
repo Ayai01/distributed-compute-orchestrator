@@ -3,6 +3,8 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import gzip
+import io
 import json
 import math
 import os
@@ -19,12 +21,13 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from .bundle import atomic_json
 from .runtimes import EXECUTION_CAPABILITIES
 from .startup import Cancelled, single_instance
+from .liveboard_wire import encode as encode_cbor
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0.2'
+PUBLISHER_VERSION = '1.0.3'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -46,27 +49,48 @@ def text(value, limit=64):
     return ''.join(c for c in str(value or '') if c.isprintable())[:limit]
 
 
+def reported_memory(job):
+    phase=job.get('memory_phase')or job.get('memory_phase_model')or{}
+    if phase.get('memory_mb')is not None:return number(phase['memory_mb'])
+    base,per=number(phase.get('base_memory_mb')),number(phase.get('memory_per_cpu_mb'))
+    if base is not None and per is not None:return base+per*max(1,job.get('cpus')or 1)
+    return number(job.get('memory_mb'))
+
+
 def snapshot(health, nodes, *, now=None):
     """Allowlist fields; never copy source dictionaries or error messages."""
     now = time.time() if now is None else now
-    rows, jobs, projects, machines, alerts = [], [], {}, {}, []
+    rows, jobs, projects, machines, machine_rows, alerts = [], [], {}, {}, {}, []
     for n in nodes:
         name = text(n.get('name'), 48)
         status = ('offline' if n.get('error') else 'disabled' if not n.get('enabled', True)
                   else 'paused' if n.get('paused') else 'online')
         total, free = number(n.get('memory_total_mb')), number(n.get('host_memory_available_mb'))
         used = max(0, total-free) if total is not None and free is not None else None
+        base,factor=number(n.get('base_capacity')),number(n.get('cpu_overcommit_factor'))
+        active=[j for j in n.get('active_jobs')or()if j.get('status')in('running','dispatching')]
+        reported=[reported_memory(j)for j in active]
         rows.append(dict(id=name, name=name, status=status,
                          cpu_used=number(n.get('reserved', 0)+n.get('external_cpus', 0)),
                          cpu_capacity=number(n.get('capacity')), cpu_base=number(n.get('base_capacity')),
                          cpu_total=number(n.get('logical_cpus')),
+                         cpu_overcommit_factor=factor,
+                         cpu_max_capacity=math.floor(base*factor)if base is not None and factor is not None else None,
                          cpu_percent=number(n.get('cpu_percent')), memory_used_mb=used,
                          memory_total_mb=total,
+                         host_memory_total_mb=total,host_memory_used_mb=used,
+                         memory_actual_mb=number(n.get('rss_mb')),
+                         memory_reported_mb=sum(reported)if all(v is not None for v in reported)else None,
+                         memory_reserved_mb=number(n.get('memory_reserved_mb')),
+                         memory_reserve_mb=number(n.get('memory_reserve_mb')),
+                         memory_headroom_mb=number(n.get('memory_headroom_mb')),
+                         host_memory_floor_mb=number((n.get('memory_pressure_state')or{}).get('physical_threshold_mb')),
                          capabilities=[x for x in EXECUTION_CAPABILITIES if x in n.get('tags', ())]))
         if status == 'offline':
             alerts.append(dict(code='node_offline', level='warning', node=name, text='设备离线'))
         if status != 'offline':
             machines.setdefault(n.get('machine_id') or name, n)
+            machine_rows.setdefault(n.get('machine_id')or name,rows[-1])
         for j in n.get('active_jobs') or ():
             if j.get('status') not in ('running', 'queued', 'dispatching'):
                 continue
@@ -83,6 +107,8 @@ def snapshot(health, nodes, *, now=None):
                              tag=text(j.get('label'), 96), project=project, node=name,
                              status=text(j.get('status'), 16), cpus=number(j.get('cpus')),
                              max_cpus=number(j.get('max_cpus')), rss_mb=number(j.get('rss_mb')),
+                             memory_reported_mb=reported_memory(j),
+                             memory_reserved_mb=number(j.get('memory_reservation_mb')),
                              elapsed_seconds=int(max(0, now-started)) if started is not None else None,
                              progress=progress))
     if health.get('paused'):
@@ -95,6 +121,9 @@ def snapshot(health, nodes, *, now=None):
     def memory_sum(key):
         values = [number(n.get(key)) for n in physical]
         return sum(values) if values and all(v is not None for v in values) else None
+    def display_memory_sum(key):
+        values=[row[key]for row in machine_rows.values()]
+        return sum(values)if values and all(v is not None for v in values)else None
     total, free = memory_sum('memory_total_mb'), memory_sum('host_memory_available_mb')
     mode = 'hybrid' if any(str(n.get('url', '')).startswith('local://') for n in nodes) else 'scheduler'
     all_jobs = len(jobs)
@@ -107,9 +136,15 @@ def snapshot(health, nodes, *, now=None):
                                cpu_capacity=number((health.get('cpu') or {}).get('capacity')),
                                cpu_base=sum(r['cpu_base'] or 0 for r in rows if r['status'] in ('online', 'paused')),
                                cpu_total=memory_sum('logical_cpus'),
+                               cpu_max_capacity=sum(r['cpu_max_capacity']or 0 for r in rows if r['status']in('online','paused')),
                                cpu_percent=round(sum(p*c for p,c in weighted)/sum(c for _,c in weighted), 1) if weighted else None,
                                memory_used_mb=max(0, total-free) if total is not None and free is not None else None,
-                               memory_total_mb=total),
+                               memory_total_mb=total,
+                               memory_actual_mb=display_memory_sum('memory_actual_mb'),
+                               memory_reported_mb=display_memory_sum('memory_reported_mb'),
+                               memory_reserved_mb=display_memory_sum('memory_reserved_mb'),
+                               memory_reserve_mb=display_memory_sum('memory_reserve_mb'),
+                               host_memory_floor_mb=display_memory_sum('host_memory_floor_mb')),
                   nodes=rows[:16], projects=sorted(projects.values(), key=lambda p: (-p['cpu_used'], p['name']))[:16],
                   jobs=sorted(jobs, key=lambda j: (j['status'] != 'running', -(j['cpus'] or 0), j['id']))[:32],
                   alerts=alerts[:8],
@@ -218,11 +253,21 @@ def upload(config, value):
             or not target.path.startswith('/manage/live/') or not target.path.endswith('/update/')
             or not isinstance(token, str) or not 32 <= len(token) <= 128 or '\n' in token or '\r' in token):
         raise ValueError('Invalid display upload configuration')
-    data = encode(dict(data=value))
-    if len(data) > MAX_BYTES:
+    envelope=dict(data=value)
+    if len(encode(envelope)) > MAX_BYTES:
         raise ValueError('Display upload exceeds size budget')
-    request = Request(url, data=data, headers={'Content-Type':'application/json',
-                       'Authorization':'Bearer '+token}, method='POST')
+    transport=config.get('transport','json')
+    if transport not in ('json','cbor-gzip'):raise ValueError('Unsupported display transport')
+    data=encode(envelope)
+    if transport=='cbor-gzip':
+        stream=io.BytesIO()
+        with gzip.GzipFile(fileobj=stream,mode='wb',compresslevel=3,mtime=0)as compressor:
+            compressor.write(encode_cbor(envelope))
+        data=stream.getvalue()
+    headers={'Content-Type':'application/json'if transport=='json'else'application/cbor',
+             'Authorization':'Bearer '+token}
+    if transport=='cbor-gzip':headers['Content-Encoding']='gzip'
+    request = Request(url, data=data, headers=headers, method='POST')
     reply = read_json(build_opener(ProxyHandler({}), NoRedirect()), request, 4, 16384)
     if not isinstance(reply, dict) or not isinstance(reply.get('instance'), dict):
         raise ValueError('Invalid display upload response')
@@ -275,7 +320,8 @@ def run(config_path, *, owner_pid=None, once=False, send=True):
                 wait = IDLE_SECONDS
                 try:
                     value, metrics = collect(config)
-                    state.update(metrics, sampled_at=value['sampled_at'], snapshot_bytes=len(encode(dict(data=value))))
+                    state.update(metrics, sampled_at=value['sampled_at'], snapshot_bytes=len(encode(dict(data=value))),
+                                 transport=config.get('transport','json'))
                     atomic_json(config['sample_file'], value, private=True)
                     signature = fingerprint(value)
                     if not owner.alive() or stopped.is_set():
