@@ -14,7 +14,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
-from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff, retire_asset
+from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff, retire_asset, missing_task_assets
 from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
@@ -906,6 +906,18 @@ class Coordinator:
         try:
             if not job.pop('reattach',False):
                 payload = (job['directory'] / 'request.zip').read_bytes()
+                missing=missing_task_assets(task)
+                if missing:
+                    # This accepted ID has not been submitted to any worker.
+                    # The zero covers this attempt's task process tree only;
+                    # _update retains earlier attempts and their paid/unknown cost.
+                    result=dict(status='failed',error_kind='pre_execution',
+                        error='Undeclared task asset references: '+', '.join(missing),
+                        rejected_before_submit=True,task_process_started=False,
+                        cpu_seconds=0,cpu_accounting_scope='task_process_tree',
+                        started=None,finished=time.time(),steps=[],stdout='',stderr='')
+                    with self.condition:self._update(job,result)
+                    return
                 if (job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task
                         or 'retries' in task or task.get('node') is not None
                         or 'requested_accelerator' in job['result']):
@@ -1692,7 +1704,7 @@ class Coordinator:
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Artifacts are available when the job has finished")
             result, client = json.loads(json_bytes(job['result'])), self._client(job)
-            if result.get('cancelled_before_submit'):client=None
+            if result.get('cancelled_before_submit')or result.get('rejected_before_submit'):client=None
             node=job.get('node') or next((n for n in self.pool.nodes if n.client is client),None)
             if result['status']=='interrupted' and node is not None and (node.detached or not node.enabled):
                 result['cost_incomplete']=True
@@ -1787,6 +1799,7 @@ class Coordinator:
             if job["result"]["status"] not in TERMINAL:
                 raise Conflict("Cancel and wait before deleting the job")
             client = self._client(job)
+            if job['result'].get('rejected_before_submit'):client=None
             result_lock=job.setdefault('artifact_lock',threading.RLock())
         with result_lock:
             with self.condition:

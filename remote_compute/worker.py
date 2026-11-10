@@ -56,6 +56,19 @@ class Conflict(ValueError):
     pass
 
 
+def missing_task_assets(task):
+    """Find undeclared assets in fields the worker resolves before admission."""
+    def strings(value):
+        if isinstance(value,str):yield value
+        elif isinstance(value,dict):
+            for item in value.values():yield from strings(item)
+        elif isinstance(value,(list,tuple)):
+            for item in value:yield from strings(item)
+    fields=[task.get('cwd',''),task.get('steps',[]),task.get('env',{}),task.get('execution',{})]
+    return sorted({match[1][6:] for value in strings(fields)for match in _VAR.finditer(value)
+                   if match[1].startswith('asset:')and match[1][6:]not in task.get('assets',{})})
+
+
 def asset_handoff(service, identity, assets=None):
     """Hold an original request's inputs across a slow resynchronization."""
     if not _ID.fullmatch(identity):
