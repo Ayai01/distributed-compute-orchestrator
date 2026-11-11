@@ -22,7 +22,7 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize, elastic_cpus
-from .memory import plan_memory, startup_memory
+from .memory import plan_memory, startup_memory, same_phase
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
 from .cleanup import AssetCache, remove_owned
@@ -1503,10 +1503,11 @@ class Coordinator:
                 if active_cpus is not None and (active_cpus>old or active_cpus>desired):
                     raise ValueError('active_cpus must count threads within the existing grant and requested width')
                 model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
+                requested_model={k:v for k,v in model.items()if v is not None}
+                sample=next((j for j in node.health.get('active_jobs',())if j['id']==job.get('worker_id',identity)),{})
+                phase_calibrated=bool(sample.get('memory_calibrated')and same_phase(requested_model,sample.get('memory_phase')or sample.get('memory_phase_model')))
                 model=node.resize_memory_model(job.get('worker_id',identity),model)
                 planner=(lambda width,available,**values:plan_memory(width,available,floor=active_floor,**values))if 'adaptive_memory'in node.health.get('capabilities',())else lambda width,available,**values:plan_resize(width,available_mb=available,**values)
-                desired,_=planner(desired,node.memory_capacity,**model)
-                if desired<active_floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
                 previous_desired=job.get('desired_cpus')
                 previous_memory=job.get('phase_memory')
                 job['desired_cpus']=desired
@@ -1530,6 +1531,7 @@ class Coordinator:
                 # The report describes work already in flight. Return only
                 # unoccupied slots, then let the owner refill from the grant.
                 granted=max(active_floor,granted)
+                cpu_ready_limit=granted
                 changes_memory=(memory_mb is not None and memory_mb!=old_memory) or modeled
                 credit=node.memory_credit(job.get('worker_id',identity),old_memory) if changes_memory else old_memory
                 granted,memory=planner(granted,min(node.memory_capacity,credit+max(0,min(node.memory_free,self.pool._host_memory_free(node)))),**model)
@@ -1547,7 +1549,8 @@ class Coordinator:
                 previous_phase=previous_memory or job['task'].get('memory_model') or dict(memory_mb=old_memory)
                 phase_changed=({key:value for key,value in previous_phase.items() if value is not None} !=
                                {key:value for key,value in job['phase_memory'].items() if value is not None})
-                if granted==old and memory==old_memory and not phase_changed and not job.get('resize_uncertain') and not active_changed:
+                if (granted==old and memory==old_memory and not phase_changed and not job.get('resize_uncertain') and not active_changed
+                        and not(granted<cpu_ready_limit and not phase_calibrated)):
                     self._publish(job)
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
                 # Reserve increases before the RPC; return decreases after its ack.
@@ -1609,8 +1612,22 @@ class Coordinator:
                 result=dict(id=identity,cpus=observed['cpus'],memory_mb=observed['memory_mb'])
                 if isinstance(observed.get('memory_phase'),dict):result['memory_phase']=observed['memory_phase']
             with self.condition:job.pop('resize_uncertain',None)
+            quote=result.get('memory_calibration')
+            if quote and same_phase(quote['phase'],job.get('phase_memory')):
+                # The resize acknowledgement owns fresher calibration than
+                # the periodic device snapshot. Use it at this same boundary.
+                with self.pool.condition:
+                    sample=next((j for j in node.health.get('active_jobs',())if j['id']==worker_id),None)
+                    if sample is not None:
+                        sample.update(memory_phase=quote['phase'],memory_adaptive_model=quote['model'],memory_calibrated=True,
+                                      memory_reservation_mb=quote['physical_mb'],memory_commit_reservation_mb=quote['commit_mb'],
+                                      memory_sample_cpus=quote['sample_cpus'])
             commit(result['cpus'],result.get('memory_mb',old_memory),result.get('memory_phase'))
-            return dict(result,id=identity,node=node.name,requested_cpus=cpus)
+            cpu_ready_limit=min(cpu_ready_limit,result.get('cpu_available',cpu_ready_limit))
+            calibrating=(result['cpus']<cpu_ready_limit and not result.get('memory_guard_limited')
+                         and (not phase_calibrated or not result.get('memory_calibrated',phase_calibrated)))
+            return dict(result,id=identity,node=node.name,requested_cpus=cpus,cpu_ready_limit=cpu_ready_limit,
+                        memory_calibrating=bool(result.get('memory_calibrating')or calibrating))
 
     def _client(self, job):
         if job.get("node"):

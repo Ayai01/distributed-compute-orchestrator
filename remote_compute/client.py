@@ -941,7 +941,8 @@ class Node:
         from .memory import calibrated_model
         row=next((j for j in self.health.get('active_jobs',())if j['id']==identity),{})
         return calibrated_model(model,row.get('memory_phase')or row.get('memory_phase_model'),row.get('memory_sample_cpus')or row.get('active_cpus',0),
-            row.get('memory_reservation_mb',0),row.get('memory_commit_reservation_mb',0),row.get('memory_calibrated',False),row.get('memory_adaptive_model'),row.get('memory_width_samples'))
+            row.get('memory_reservation_mb',0),row.get('memory_commit_reservation_mb',0),row.get('memory_calibrated',False),row.get('memory_adaptive_model'),row.get('memory_width_samples'),
+            cold_probe=row.get('cpus')==1 and not(row.get('memory_sample_cpus')or row.get('active_cpus')))
 
     @property
     def memory_accounted(self):
@@ -1340,7 +1341,7 @@ class Pool:
                  "active_jobs": n.health.get("active_jobs") or [],
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
-                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version','memory_pressure_state')},
+                 **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version','memory_pressure_state','work_reclaim','temp_reclaim')},
                  "weight": n.weight, "limit": n.limit, "completed": n.completed, "failed": n.failed,
                   "timing_labels": len(n.durations), "error": n.error} for n in self.nodes]}
 

@@ -27,6 +27,7 @@ class CpuLease:
         self.demand = self.active_cpus = None
         self.confirmed = None
         self.phase_pending = False
+        self.memory_calibrating = False
 
     def refresh(self, *, active_cpus=0, ready_cpus=None):
         """Report in-flight threads and immediately runnable demand; return CPUs.
@@ -46,7 +47,7 @@ class CpuLease:
         if unchanged and not self.phase_pending and self.cpus == desired == max(1, active_cpus):
             return self.cpus
         if (desired != self.demand or active_cpus != self.active_cpus
-                or time.monotonic() - self.updated >= 1):
+                or time.monotonic() - self.updated >= (.1 if self.memory_calibrating else 1)):
             try:
                 grant = self.client.resize(self.identity, desired, active_cpus=active_cpus, **self.memory)
             except Exception as error:
@@ -105,6 +106,7 @@ class CpuLease:
                 else:grant={**grant,'cpus':funded}
             self.cpus = grant['cpus']
             self.phase_pending = bool(grant.get('_phase_pending'))
+            self.memory_calibrating = bool(grant.get('memory_calibrating'))
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
             self.demand, self.active_cpus = desired, active_cpus
             # Only a successfully negotiated or validated usable grant can

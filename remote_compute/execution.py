@@ -561,8 +561,18 @@ def run_call(function,*,limits=None,**kwargs):
             # Confirm the still-ready width once before freezing the kernel;
             # busy hosts may retain the smaller grant without waiting for peers.
             check_deadline()
-            actual=lease.refresh(active_cpus=actual,ready_cpus=maximum-actual)
-        lease.refresh(active_cpus=actual,ready_cpus=0)
+            if lease.memory_calibrating:
+                from remote_compute.deadline import resource_window
+                try:
+                    with resource_window(3):
+                        while actual<maximum and lease.memory_calibrating:
+                            time.sleep(.1);check_deadline()
+                            actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
+                except TimeoutError:
+                    check_deadline()
+                    actual=lease.cpus
+            else:actual=lease.refresh(active_cpus=actual,ready_cpus=maximum-actual)
+        actual=lease.refresh(active_cpus=actual,ready_cpus=0)
     try:
         _local.kernel=True
         target=_function(function);_kernel_threads(actual)

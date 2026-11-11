@@ -14,27 +14,25 @@ from .bundle import native_path
 
 def remove_owned(path, *, cancel=None):
     """Remove an owned entry without traversing symlinks or Windows junctions."""
-    if cancel and cancel():raise InterruptedError('Job cleanup cancelled')
-    path=native_path(path,force=True)
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISDIR(info.st_mode):
-        linked = stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 1024)
-        if not linked:
-            for child in path.iterdir():
-                if cancel:remove_owned(child, cancel=cancel)
-                else:remove_owned(child)
-        path.rmdir()
-    else:
-        path.unlink()
+    def remove(entry):
+        if cancel and cancel():raise InterruptedError('Job cleanup cancelled')
+        try:info=os.lstat(entry)
+        except FileNotFoundError:return
+        if stat.S_ISDIR(info.st_mode):
+            linked=stat.S_ISLNK(info.st_mode)or bool(getattr(info,'st_file_attributes',0)&1024)
+            if not linked:
+                with os.scandir(entry)as children:
+                    for child in children:remove(child.path)
+            os.rmdir(entry)
+        else:os.unlink(entry)
+    remove(os.fspath(native_path(path,force=True)))
 
 
 class Reclaimer:
     """Retire owned names atomically; reclaim their bytes outside control locks."""
-    def __init__(self, root):
+    def __init__(self, root, *, source_root=None):
         self.root=Path(root)
+        self.source_root=Path(source_root)if source_root is not None else self.root.parent
         self.root.mkdir(exist_ok=True)
         if self.root.is_symlink() or getattr(self.root.lstat(),'st_file_attributes',0)&1024:
             raise ValueError('Cleanup namespace must be an owned directory')
@@ -47,15 +45,23 @@ class Reclaimer:
             self.thread=threading.Thread(target=self._run,name='dco-reclaim',daemon=True)
             self.thread.start()
 
-    def defer(self, path):
-        path=Path(path).absolute()
-        if path.parent!=self.root.absolute().parent:
+    def defer(self, path, *, after_move=None):
+        path=native_path(path,force=True)
+        scope=native_path(self.source_root,force=True)
+        root=native_path(self.root,force=True)
+        if (not scope in path.parents or path==root or root in path.parents):
             raise ValueError('Cleanup source must belong to its managed namespace')
-        target=self.root/uuid.uuid4().hex
+        target=root/uuid.uuid4().hex
         try:path.rename(target)
         except FileNotFoundError:return
+        if after_move is not None:
+            try:after_move()
+            except BaseException:
+                target.rename(path)
+                raise
         with self.lock:
             self.pending.append(target);self._start()
+        return target
 
     def _run(self):
         while True:

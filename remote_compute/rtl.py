@@ -24,6 +24,16 @@ def msys_workspace(path):
 
 def main(arguments=None):
     arguments = list(sys.argv[1:] if arguments is None else arguments)
+    building='--binary'in arguments or '--build'in arguments
+    if building and os.environ.get('REMOTE_COMPUTE_WORKER')=='1':
+        grant=max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1')))
+        if '-j'in arguments:
+            index=arguments.index('-j')+1;requested=int(arguments[index])
+            arguments[index]=str(grant if requested==0 else max(1,min(requested,grant)))
+        elif '--build-jobs'in arguments:
+            index=arguments.index('--build-jobs')+1;requested=int(arguments[index])
+            arguments[index]=str(grant if requested==0 else max(1,min(requested,grant)))
+        else:arguments.extend(('-j',str(grant)))
     if os.name != "nt":
         return subprocess.call([os.environ.get("VERILATOR", "verilator"), *arguments])
     configured = os.environ.get("MSYS2_ROOT")
@@ -43,11 +53,11 @@ def main(arguments=None):
     # Scope the label to the private job workspace and job temporary directory.
     owned = os.environ.get("REMOTE_COMPUTE_JOB_DIR")
     if owned:
-        directory_root = Path(owned).resolve()
-        try:
-            Path.cwd().resolve().relative_to(directory_root)
-        except ValueError:
-            raise ValueError("RTL workspace must be inside its job directory") from None
+        roots=[Path(owned).resolve()]
+        if os.environ.get('REMOTE_COMPUTE_JOB_TEMP'):roots.append(Path(os.environ['REMOTE_COMPUTE_JOB_TEMP']).resolve())
+        cwd=Path.cwd().resolve()
+        directory_root=next((root for root in roots if cwd==root or root in cwd.parents),None)
+        if directory_root is None:raise ValueError("RTL workspace must be inside its job directory or temporary directory")
         msys_workspace(directory_root)
     def option(name, default):
         return arguments[arguments.index(name) + 1] if name in arguments else default

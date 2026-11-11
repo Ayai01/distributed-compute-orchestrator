@@ -1,6 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.25**；各服务实际运行版本见维护入口。
+- 当前源码版本：**0.11.26**；各服务实际运行版本见维护入口。
+- 冷内存探测保留真实CPU需求；固定内核在仅估计阻塞时等待当前阶段标定，再确定启动宽度。逐项进程仅加载执行所需模块；声明成果通过同卷硬链接保留，输入及scratch原子退役后后台回收，终态、CPU释放和领取不等待递归删除。源码、五台原生部署、扩核与工具缓存实测见`.local/maintenance/stability-20261111/current.json`。
 - 强制终止直接通知任务进程树，取消打断目录清理；终端后台发送终止请求，原取消意图持久恢复。隔离进程、阻塞轮询、清理及键盘验证和统一上线记录见`.local/maintenance/force-kill-20261111/current.json`。
 - 节点加权分配在同一次固定容量计算中复用已确认不可满足的候选结论，避免饱和节点上的大量候选反复占用中心锁；整数分配及设备位置保持。600组精确对照、500候选实测、37项定向检查及上线状态见`.local/maintenance/artifact-wait-20261111/current.json`。
 - 中心恢复未确认送达的派发记录时先查询原worker ID；已受理或已完成的原任务直接接回，明确404的未确认提交沿原ID、冻结输入及既有重试预算接续派发。边界检查与实际维护状态见`.local/maintenance/pending-submission-20261111/current.json`。
@@ -10,7 +11,7 @@
 - SDK收集保持每工程2线程；本地状态记录排队、ZIP获取/解包、发布及删除分项，原回执保持。ZIP准备轮询间隔最多0.5秒。已有批次积压审计、隔离验证及SDK源码部署见`.local/maintenance/collection-latency-20261109/current.json`，新调用进程读取当前SDK。
 - worker在准备命令与正文的切换处，容量调整被明确拒绝并保留原授权时，继续使用原CPU/RAM槽位，不将资源暂时不足记为业务失败。源码、隔离三步入口回归及实际生效状态见`.local/maintenance/automatic-grant-ram-20261109/current.json`。
 - SDK提供`python_map/map_items(item_max_cpus=...)`与子项`run_call`阶段授权；父租约保证完整lane优先及长尾内核扩展。按SDK签名及源码revision识别该接口；交付、隔离保存输入0FE验证和五台源码部署入口为`.local/maintenance/nested-item-cpu-20261109/current.json`，服务引擎无需重载。
-- 固定数值核入口在首次授权不足时，保留未满足需求并在启动前有界复核一次；冷内存单槽探测后可取得空闲核心，忙设备仍按实际授权执行。隔离复现、回归和SDK实际分发状态见`.local/maintenance/kernel-entry-grant-20261110/current.json`；在途固定线程原生核继续原宽度。
+- 固定数值核按当前阶段实测标定、CPU余量和真实就绪需求确定启动宽度；在途固定线程原生核继续原宽度。当前验证与部署入口为`.local/maintenance/stability-20261111/current.json`。
 - 确定性执行前资产引用拒绝的零CPU回执机制、历史原ID独立结清证明及维护生效状态见`.local/maintenance/pre-execution-accounting-20261110/current.json`；原历史回执及科学输入保持。
 - lease转发TLS意外EOF的已确认授权保留、未知空槽限制、隔离HTTP注入验证及SDK分发状态见`.local/maintenance/forwarded-lease-eof-20261110/current.json`。原已完成子项与累计CPU费用保留；在途进程继续使用其已导入SDK。
 - 已校准准备阶段切换到较大内存阶段时，SDK在启动正文前有界等待首槽授权；验证、原ID费用审计及实际分发状态见`.local/maintenance/phase-admission-20261110/current.json`。

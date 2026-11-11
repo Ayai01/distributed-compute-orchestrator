@@ -89,13 +89,21 @@ def same_phase(model,previous):
     return clean(model)==clean(previous)
 
 
-def calibrated_model(model,previous,active_cpus,physical,commit,calibrated,learned=None,points=None):
+def calibrated_model(model,previous,active_cpus,physical,commit,calibrated,learned=None,points=None,*,cold_probe=False):
     """Separate the shared working set from observed width-dependent growth."""
     fixed=model.get('memory_mb')is not None
     if not same_phase(model,previous)or not(fixed or model.get('base_memory_mb')is not None):return model
-    if not calibrated or not fixed and not active_cpus:return dict(learned)if learned is not None else model
+    if not calibrated:return dict(learned)if learned is not None else model
     memory=math.ceil(max(physical,commit))
-    if not active_cpus:return dict(learned)if learned is not None else dict(memory_mb=memory)
+    if not active_cpus:
+        if learned is not None:return dict(learned)
+        if fixed:return dict(memory_mb=memory)
+        if not cold_probe:return model
+        # A stable cold slot funds an unseen lane conservatively with its
+        # entire measured envelope, without reporting fictitious active work.
+        return dict(base_memory_mb=memory if not model.get('memory_per_cpu_mb')else 0,
+                    memory_per_cpu_mb=memory if model.get('memory_per_cpu_mb')else 0,
+                    **({'memory_limit_mb':model['memory_limit_mb']}if model.get('memory_limit_mb')is not None else {}))
     samples=dict(points or ());samples[active_cpus]=memory
     samples=sorted((width,value)for width,value in samples.items()if width>0)
     if fixed and len(samples)<2 and (learned is None or learned.get('memory_per_cpu_mb')is None):return dict(memory_mb=memory)

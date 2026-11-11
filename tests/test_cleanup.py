@@ -18,6 +18,39 @@ from remote_compute.cleanup import AssetCache
 
 
 class CleanupTests(unittest.TestCase):
+    def test_slow_physical_reclaim_releases_cpu_and_allows_collection_and_next_job(self):
+        from remote_compute.cleanup import remove_owned
+        entered,release=threading.Event(),threading.Event()
+        def slow(path,*args,**kwargs):
+            if '.trash'in Path(path).parts:
+                entered.set();release.wait(8)
+            return remove_owned(path,*args,**kwargs)
+        with scratch()as folder,provider(Path(folder)/'worker')as(worker,client):
+            with patch('remote_compute.cleanup.remove_owned',side_effect=slow):
+                i=client.submit(python('from pathlib import Path;Path("raw.bin").write_bytes(b"x"*1048576);Path("metrics.json").write_text("42")',outputs=['metrics.json']))['id']
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual(client.wait(i,wait_timeout=2)['status'],'succeeded')
+                    self.assertEqual(worker.used,0)
+                    self.assertEqual(client.fetch(i)['files']['metrics.json'],b'42')
+                    j=client.submit(python('print("next")'))['id']
+                    self.assertEqual(client.wait(j,wait_timeout=3)['status'],'succeeded')
+                    client.fetch(j)
+                finally:release.set()
+            until(lambda:worker.work_reclaimer.snapshot()['pending']==0)
+
+    def test_failed_result_promotion_rolls_back_the_retired_input(self):
+        from remote_compute.cleanup import Reclaimer
+        with scratch()as folder:
+            root=Path(folder);source=root/'input';source.mkdir();(source/'paid').write_bytes(b'kept')
+            reclaimer=Reclaimer(root/'.trash')
+            try:
+                def fail():raise OSError('promotion refused')
+                with self.assertRaisesRegex(OSError,'promotion refused'):reclaimer.defer(source,after_move=fail)
+                self.assertEqual((source/'paid').read_bytes(),b'kept')
+                self.assertEqual(reclaimer.snapshot()['pending'],0)
+            finally:reclaimer.close()
+
     @unittest.skipUnless(os.name=='nt','Windows extended asset namespace')
     def test_deep_asset_is_indexed_admitted_and_reclaimed_without_startup_failure(self):
         from remote_compute.bundle import pack,native_path

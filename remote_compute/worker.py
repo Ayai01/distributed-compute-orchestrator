@@ -18,6 +18,7 @@ import select
 import ssl
 import sys
 import threading
+import tempfile
 import time
 import weakref
 import zipfile
@@ -319,6 +320,7 @@ class Worker:
         self.stopping = False
         self.threads = set()
         self.cleanup_pending = set()
+        self.work_reclaimer = Reclaimer(self.root/'jobs'/'.trash',source_root=self.root/'jobs')
         self.asset_handoffs = {}
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
@@ -390,6 +392,7 @@ class Worker:
                     "startup_recoveries": self.startup_recoveries,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
                     "startup":self.startup,"temp_reclaim":self.temp_reclaimer.snapshot()if self.temp_reclaimer else None,
+                    "work_reclaim":self.work_reclaimer.snapshot(),
                     "service": service_usage(),
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
@@ -686,6 +689,7 @@ class Worker:
             cpus=max(cpus,floor)
             granted=max(floor,min(cpus,max(0,capacity-self.used+old)))
             if self.pressure_guard.state['limited']:granted=min(granted,floor)
+            cpu_ready_limit=granted
             changes_memory=(memory_mb is not None and memory_mb!=old_memory) or base_memory_mb is not None or memory_per_cpu_mb is not None
             credit=min(reservation(job)) if changes_memory else old_memory
             model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
@@ -695,7 +699,7 @@ class Worker:
             physical,commit=reservation(job)
             observation=job.get('memory_observation')
             observed_cpus=getattr(observation,'active_cpus',0)or result.get('active_cpus',0)
-            calibrated=bool(observation and observation.envelope is not None and (memory_mb is not None or observed_cpus))
+            calibrated=bool(observation and observation.envelope is not None)
             samples=job.get('memory_width_samples',[])
             sampled_at=job.get('memory_width_sampled_at',time.monotonic())
             if time.monotonic()-sampled_at>=10:samples=[];sampled_at=time.monotonic()
@@ -704,7 +708,7 @@ class Worker:
                 points.pop(width,None);points[width]=max(physical,commit)
                 samples=list(points.items())[-8:]
             model=calibrated_model(model,previous_memory,observed_cpus,physical,commit,
-                                   calibrated,job.get('memory_adaptive_model'),samples)
+                                   calibrated,job.get('memory_adaptive_model'),samples,cold_probe=old==1 and not observed_cpus)
             adaptive_model=model
             available=min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb']))
             if memory_budget_mb is not None:available=min(available,memory_budget_mb)
@@ -745,7 +749,13 @@ class Worker:
                 result['resize_count']=result.get('resize_count',0)+1
                 self._save(job)
                 self.condition.notify_all()
-            return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus,memory_phase=requested_memory)
+            memory_limited=granted<cpu_ready_limit
+            return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus,memory_phase=requested_memory,
+                        cpu_ready_limit=cpu_ready_limit,cpu_available=max(floor,capacity-self.used+granted),
+                        memory_calibrated=calibrated and not phase_changed,memory_guard_limited=self.pressure_guard.state['limited'],
+                        memory_calibrating=memory_limited and not(calibrated and not phase_changed)and not self.pressure_guard.state['limited'],
+                        memory_calibration=(dict(phase=requested_memory,model=adaptive_model,physical_mb=physical,commit_mb=commit,sample_cpus=observed_cpus)
+                                            if calibrated and not phase_changed else None))
 
     def lease(self, identity, request):
         """A task asks locally; the center answers through its existing poll."""
@@ -976,6 +986,8 @@ class Worker:
                     [str(path) for path in msys_paths if path.is_dir()] + ([inherited] if inherited else []))
             environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
             environment = cache_environment(environment, self.cache_root)
+            from .paths import build_environment
+            environment = build_environment(environment,self.tools)
             # Default libraries to the grant; callers with outer parallelism
             # can explicitly keep each numerical kernel single-threaded.
             for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS"):
@@ -986,6 +998,7 @@ class Worker:
             low_integrity_directory(temporary)
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
+                               REMOTE_COMPUTE_JOB_TEMP=str(temporary),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'],
                                REMOTE_COMPUTE_DEADLINE=str(deadline))
             callback=job.get('callback',{})
@@ -1195,22 +1208,19 @@ class Worker:
             task = job.get('task') or json.loads((job['directory']/'task.json').read_text(encoding='utf-8'))
             if not task['outputs'] and not discard:
                 return  # Generic job-file callers collect arbitrary files by name.
-            keep = set(tree(work, task['outputs'], cancel=cancelled).values())
-            parents = set()
-            for path in keep:
-                if cancelled():return
-                parents.update(parent for parent in path.parents if work in parent.parents or parent == work)
-            def reclaim(directory):
-                for path in directory.iterdir():
-                    if cancelled():raise InterruptedError('Job cleanup cancelled')
-                    if path in keep:
-                        continue
-                    if path in parents:
-                        reclaim(path)
-                    else:
-                        remove_owned(path, cancel=cancelled)
             if work.is_dir():
-                reclaim(work)
+                with self.condition:lock=job.setdefault('artifact_lock',threading.RLock())
+                with lock:
+                    keep=tree(work,task['outputs'],cancel=cancelled)
+                    with tempfile.TemporaryDirectory(prefix='.dco-output-',dir=native_path(job['directory'],force=True))as folder:
+                        mirror=Path(folder)
+                        for name,path in keep.items():
+                            if cancelled():raise InterruptedError('Job cleanup cancelled')
+                            target=mirror/name;target.parent.mkdir(parents=True,exist_ok=True)
+                            try:os.link(path,target)
+                            except OSError:shutil.copy2(path,target)
+                        if cancelled():raise InterruptedError('Job cleanup cancelled')
+                        self.work_reclaimer.defer(work,after_move=lambda:mirror.rename(work))
         except InterruptedError:
             return
         except (OSError, ValueError) as error:
@@ -1247,15 +1257,10 @@ class Worker:
         issue=None
         for temporary in {self._temporary(job),job['directory']/'tmp'}:
             try:
-                if job['cancel'].is_set():
-                    # Scratch has no scientific outputs. Its namespace already
-                    # has an asynchronous reclaimer; finalization never waits.
-                    if self.temp_reclaimer and temporary.parent == self.temp_root:
-                        self.temp_reclaimer.defer(temporary)
-                    else:
-                        self.cleanup_pending.add(job['result']['id'])
-                    continue
-                remove_owned(temporary, cancel=job['cancel'].is_set)
+                # Scratch has no declared scientific outputs. Retire its name
+                # before finalizing; physical deletion never holds CPU slots.
+                reclaimer=self.temp_reclaimer if self.temp_reclaimer and temporary.parent==self.temp_root else self.work_reclaimer
+                reclaimer.defer(temporary)
             except InterruptedError:
                 self.cleanup_pending.add(job['result']['id'])
                 continue
@@ -1387,7 +1392,7 @@ class Worker:
             with self.condition:
                 if self.jobs.get(identity) is not job:
                     return {"deleted": identity}
-            remove_owned(job["directory"])
+            self.work_reclaimer.defer(job['directory'])
             with self.condition:
                 del self.jobs[identity]
                 self.cleanup_pending.discard(identity)
@@ -1469,6 +1474,7 @@ class Worker:
         self.asset_handoffs.clear()
         self._prune_assets(recent=False)
         self.asset_cache.reclaimer.close()
+        self.work_reclaimer.close()
         if self.temp_reclaimer:self.temp_reclaimer.close()
         unlink(self.memory_wait_file)
         if self.temp_root:

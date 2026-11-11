@@ -20,6 +20,33 @@ def entry():return run_call(kernel,limits=dict(max_cpus=4,memory_mb=768))
 
 
 class KernelEntryTests(unittest.TestCase):
+    def test_direct_worker_recalibrates_a_new_phase_after_a_stable_parent(self):
+        source=SOURCE+'''\ndef cold_sequence():
+    import time
+    time.sleep(2.2)
+    return [run_call(kernel,limits=dict(max_cpus=4,**model)) for model in
+            [dict(memory_mb=1048576),dict(base_memory_mb=4096,memory_per_cpu_mb=4096)]]
+'''
+        with scratch()as folder,provider(Path(folder)/'worker',cpus=4,memory_mb=4096,memory_headroom_mb=0)as(_,client):
+            result=client.run(python_task('business:cold_sequence',max_cpus=4,memory_mb=128,timeout=20,retries=0),files={'business.py':source})
+            self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+            value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
+            self.assertEqual(value,[dict(cpus=4,calls=1),dict(cpus=4,calls=2)])
+
+    def test_large_cold_estimate_waits_for_actual_memory_before_freezing_kernel_width(self):
+        source=SOURCE+'''\ndef cold_entry(linear=False):
+    limits=dict(max_cpus=4)
+    limits.update(dict(base_memory_mb=4096,memory_per_cpu_mb=4096)if linear else dict(memory_mb=1048576))
+    return run_call(kernel,limits=limits)
+'''
+        for linear in (False,True):
+            with self.subTest(linear=linear),scratch()as folder,provider(Path(folder)/'worker',cpus=4,memory_mb=4096,memory_headroom_mb=0)as(_,remote):
+                with Pool([remote])as pool,center(pool,Path(folder)/'center')as(_,client):
+                    result=client.run(python_task('business:cold_entry',kwargs=dict(linear=linear),max_cpus=4,memory_mb=128,timeout=15,retries=0),files={'business.py':source})
+                    self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+                    value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
+                    self.assertEqual(value,dict(cpus=4,calls=1))
+
     def run_entry(self,cpus=4,cold=False):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=cpus,memory_mb=4096,memory_headroom_mb=0)as(worker,remote):
             with Pool([remote])as pool,center(pool,Path(folder)/'center')as(_,client):

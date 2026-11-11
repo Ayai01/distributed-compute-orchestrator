@@ -38,6 +38,21 @@ def cache_environment(environment, root):
     return environment
 
 
+def build_environment(environment, tools):
+    """Expose registered build helpers without changing compiler argv or ABI."""
+    environment=dict(environment);bins=[]
+    for name in ('ccache','ninja'):
+        argv=tools.get(name,())
+        if len(argv)==1:bins.append(str(Path(argv[0]).parent))
+    if bins:environment['PATH']=os.pathsep.join(dict.fromkeys(bins+[environment.get('PATH','')]))
+    cache=tools.get('ccache',())
+    if len(cache)==1:
+        environment.setdefault('OBJCACHE','ccache')
+        for key in ('CMAKE_C_COMPILER_LAUNCHER','CMAKE_CXX_COMPILER_LAUNCHER'):
+            environment.setdefault(key,Path(cache[0]).as_posix())
+    return environment
+
+
 def migrate_worker_state(source, destination, workspace):
     """Move an explicitly configured, stopped worker on the same filesystem."""
     from .worker import lock_root
