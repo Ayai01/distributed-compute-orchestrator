@@ -115,8 +115,13 @@ class Coordinator:
                 task['priority']=value['dispatch_priority']
             self._restore_accelerator(task, value)
             job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
+            if value.get('cancel_requested'):job['cancel'].set()
             value.setdefault('max_retries',task.get('retries',2))
             if value['status']=='queued' or not value.get('worker_url'):
+                if job['cancel'].is_set():
+                    value.update(status='cancelled',finished=time.time())
+                    self._save(job);archive_job(self.jobs,job,startup=True)
+                    return
                 if value.get('worker_id'):job['worker_id']=value['worker_id']
                 value.update(status='queued')
                 self.queue.append(value['id'])
@@ -1672,9 +1677,11 @@ class Coordinator:
 
     def cancel(self, identity):
         job = load_job(self.jobs, self.condition, identity)
+        client = None
         with self.condition:
             if job["result"]["status"] not in TERMINAL:
                 job["cancel"].set()
+                job['result']['cancel_requested'] = True
                 if identity in self.queue:
                     self.queue.remove(identity)
                     job["result"].update(status="cancelled", finished=time.time())
@@ -1688,8 +1695,28 @@ class Coordinator:
                         remote_cancel_pending=True,cost_incomplete=True)
                     self._save(job)
                     archive_job(self.jobs,job)
+                else:
+                    client = self._client(job)
+                self._save(job)
                 self.condition.notify_all()
-            return self.get(identity)
+        # Do not wait for the execution poller, which may be inside a resource
+        # handshake. Client.cancel owns an independent short control transport.
+        if client is not None:
+            try:
+                remote = client.cancel(job.get('worker_id',identity))
+            except (RemoteError,OSError) as error:
+                with self.condition:
+                    job['result']['remote_cancel_pending'] = True
+                    job['result']['cancel_error'] = str(error)
+                    self._save(job)
+            else:
+                with self.condition:
+                    job['result'].pop('cancel_error',None)
+                    job['result'].pop('remote_cancel_pending',None)
+                    job['result']['cancel_acknowledged'] = True
+                    if remote.get('kill_signal_sent'):job['result']['kill_signal_sent'] = True
+                    self._save(job)
+        return self.get(identity)
 
     def prepare_artifacts(self, identity):
         """Acknowledge slow remote preparation without tying it to an HTTP wait."""

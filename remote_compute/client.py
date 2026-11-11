@@ -604,7 +604,11 @@ class Client:
             _pause(delay, check)
 
     def cancel(self, identity):
-        return self.request("/jobs/" + identity + "/cancel", {})
+        # A force control must not queue behind this client's long resource
+        # handshakes or artifact transfers. Keep the same auth/TLS identity.
+        control = Client(self.url, self.token, timeout=min(self.timeout, 3), ca_file=self.ca_file,
+                         operator=self.operator, operator_token=self.operator_token, pool_timeout=.5)
+        return control.request("/jobs/" + identity + "/cancel", {})
 
     def clean(self):
         """Operator cleanup of queued tasks; active and finished receipts remain."""

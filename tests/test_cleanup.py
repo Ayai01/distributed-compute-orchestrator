@@ -265,14 +265,15 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(client.fetch(identity)['files']['metrics.json'],b'{"value":7}')
                 self.assertFalse(work.parent.exists())
 
-    def test_queue_cancellation_reclaims_inputs_without_waiting_for_fetch(self):
+    def test_queue_cancellation_returns_without_scanning_inputs_and_delete_reclaims_them(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (worker, client):
             first=client.submit(python('import time;time.sleep(10)'))['id']
             until(lambda:client.status(first)['status']=='running')
             second=client.submit(python('print("must not run")'),files={'raw.bin':b'x'*1048576})['id']
             self.assertEqual(client.cancel(second)['status'],'cancelled')
-            self.assertEqual(list((worker.root/'jobs'/second/'input').iterdir()),[])
+            self.assertTrue((worker.root/'jobs'/second/'input'/'raw.bin').is_file())
             client.fetch(second)
+            self.assertFalse((worker.root/'jobs'/second).exists())
             client.cancel(first);client.wait(first);client.fetch(first)
 
     def test_worker_lru_protects_uncollected_result_assets_and_center_restores_evicted_source(self):

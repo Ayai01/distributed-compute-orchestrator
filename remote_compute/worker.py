@@ -334,11 +334,12 @@ class Worker:
                 atomic_json(path, saved)
             interrupted = saved["status"] not in TERMINAL
             if interrupted:
-                saved.update(status="interrupted", finished=time.time(), cost_incomplete=True,
+                saved.update(status="cancelled" if saved.get('cancel_requested') else "interrupted", finished=time.time(), cost_incomplete=True,
                              error="Worker stopped before completion")
                 atomic_json(path, saved)
             identity = saved["id"]
             job = Job(result=saved, cancel=threading.Event(), directory=path.parent)
+            if saved.get('cancel_requested'):job['cancel'].set()
             self.jobs.active[identity] = job
             if saved.get('receipt_recovery'):
                 self.startup_recoveries.append(identity)
@@ -1053,6 +1054,10 @@ class Worker:
                     if process is None:
                         state = 'cancelled'
                         break
+                    with self.condition:
+                        job['process'] = process
+                        # Cancellation may arrive between Popen and registration.
+                        if job['cancel'].is_set():process.kill()
                     try:
                         while process.child.poll() is None:
                             usage = process_usage(process)
@@ -1095,6 +1100,8 @@ class Worker:
                             if measured:
                                 result.update(measured)
                     finally:
+                        with self.condition:
+                            job.pop('process', None)
                         process.close()
                     if state != "succeeded":
                         break
@@ -1116,7 +1123,7 @@ class Worker:
             while True:
                 if job.get('memory_pressure'):
                     state,error='failed',result['error']
-                if job["cancel"].is_set() and state == "succeeded":
+                if job["cancel"].is_set() and not job.get('memory_pressure'):
                     state = "cancelled"
                 if 'execution'in task:
                     try:
@@ -1180,24 +1187,32 @@ class Worker:
         """Keep declared results; consumed input decks/builds are no longer artifacts."""
         work = job['directory']/'input'
         try:
+            cancelled = job['cancel'].is_set
+            if cancelled():return  # Retain all partial files until collection/delete.
             if work.resolve() != work:
                 raise ValueError('Job input directory became a link')
             work=native_path(work,force=True)
             task = job.get('task') or json.loads((job['directory']/'task.json').read_text(encoding='utf-8'))
             if not task['outputs'] and not discard:
                 return  # Generic job-file callers collect arbitrary files by name.
-            keep = set(tree(work, task['outputs']).values())
-            parents = {parent for path in keep for parent in path.parents if work in parent.parents or parent == work}
+            keep = set(tree(work, task['outputs'], cancel=cancelled).values())
+            parents = set()
+            for path in keep:
+                if cancelled():return
+                parents.update(parent for parent in path.parents if work in parent.parents or parent == work)
             def reclaim(directory):
                 for path in directory.iterdir():
+                    if cancelled():raise InterruptedError('Job cleanup cancelled')
                     if path in keep:
                         continue
                     if path in parents:
                         reclaim(path)
                     else:
-                        remove_owned(path)
+                        remove_owned(path, cancel=cancelled)
             if work.is_dir():
                 reclaim(work)
+        except InterruptedError:
+            return
         except (OSError, ValueError) as error:
             job['result']['input_cleanup_error'] = str(error)
             self.cleanup_pending.add(job['result']['id'])
@@ -1232,7 +1247,18 @@ class Worker:
         issue=None
         for temporary in {self._temporary(job),job['directory']/'tmp'}:
             try:
-                remove_owned(temporary)
+                if job['cancel'].is_set():
+                    # Scratch has no scientific outputs. Its namespace already
+                    # has an asynchronous reclaimer; finalization never waits.
+                    if self.temp_reclaimer and temporary.parent == self.temp_root:
+                        self.temp_reclaimer.defer(temporary)
+                    else:
+                        self.cleanup_pending.add(job['result']['id'])
+                    continue
+                remove_owned(temporary, cancel=job['cancel'].is_set)
+            except InterruptedError:
+                self.cleanup_pending.add(job['result']['id'])
+                continue
             except FileNotFoundError:
                 pass
             except OSError as error:
@@ -1309,12 +1335,17 @@ class Worker:
         with self.condition:
             if job["result"]["status"] not in TERMINAL:
                 job["cancel"].set()
+                job['result']['cancel_requested'] = True
+                process = job.get('process')
+                if process is not None:
+                    process.kill()
+                    job['result']['kill_signal_sent'] = True
                 if job["result"]["status"] == "queued" and identity in self.queue:
                     self.queue.remove(identity)
                     queued = True
+                self._save(job)
                 self.condition.notify_all()
         if queued:
-            self._clean_work(job, discard=True)
             with self.condition:
                 job["result"].update(status="cancelled", finished=time.time())
                 self._save(job)

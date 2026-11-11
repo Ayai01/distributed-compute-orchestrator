@@ -291,7 +291,7 @@ def active_job_identity(client, prefix):
     return job_identity(active_job_rows(client).values(),prefix)
 
 
-def kill_all(client, *, wait_timeout=30):
+def kill_all(client):
     """Cancel only the original IDs in this endpoint's invocation snapshot."""
     identities=list(active_job_rows(client))
     if not identities:
@@ -325,37 +325,36 @@ def kill_all(client, *, wait_timeout=30):
             else:states[identity]=result
     def confirmed(state):
         return state['status'] in TERMINAL and not state.get('remote_cancel_pending')
-    deadline=time.monotonic()+wait_timeout
-    while True:
-        pending=[identity for identity in targets if states[identity]['status'] not in TERMINAL
-                 and states[identity]['status']!='unknown']
-        if not pending or time.monotonic()>=deadline:break
-        try:states.update(read(pending))
+    # Reconcile a lost acknowledgement once; force control never waits for
+    # receipt finalization, artifact enumeration, or a scientific drain.
+    uncertain=[identity for identity in targets if identity in errors]
+    if uncertain:
+        try:states.update(read(uncertain))
         except (RemoteError,OSError) as error:
-            errors.update((identity,str(error))for identity in pending)
-            break
-        if any(not confirmed(states[identity])for identity in pending):
-            time.sleep(min(.15,max(0,deadline-time.monotonic())))
+            errors.update((identity,str(error))for identity in uncertain)
     pending=[identity for identity in identities if not confirmed(states[identity])]
     for identity in identities:
         if confirmed(states[identity]):errors.pop(identity,None)
         elif states[identity]['status']=='unknown':
             errors[identity]='原ID在此端点未找到；请核对归属或原ID领取状态'
-    return dict(status='incomplete' if pending else 'completed',matched=len(identities),
+    unconfirmed=any(identity in errors or states[identity].get('remote_cancel_pending') for identity in pending)
+    return dict(status='incomplete' if unconfirmed else 'accepted' if pending else 'completed',matched=len(identities),
                 finished=len(identities)-len(pending),pending=pending,errors=errors,
-                jobs=[{key:states[identity][key]for key in ('id','status','remote_cancel_pending','cost_incomplete')
+                jobs=[{key:states[identity][key]for key in ('id','status','cancel_requested','kill_signal_sent','remote_cancel_pending','cost_incomplete')
                        if key in states[identity]}for identity in identities])
 
 
 def kill_job(client, prefix):
     if prefix=='all':return kill_all(client)
     identity=active_job_identity(client,prefix)
-    client.cancel(identity)
-    try:result=client.wait(identity,wait_timeout=30)
+    try:result=client.cancel(identity)
     except (RemoteError,OSError) as error:
         return dict(status='incomplete',pending=[identity],errors={identity:str(error)})
     if result.get('remote_cancel_pending'):
         return dict(status='incomplete',pending=[identity],jobs=[result])
+    if result['status'] not in TERMINAL:
+        return dict(id=identity,status='accepted',job_status=result['status'],cancel_requested=True,
+                    kill_signal_sent=result.get('kill_signal_sent',False),pending=[identity])
     return result
 
 
@@ -931,7 +930,7 @@ class SchedulerShell(Shell):
         self.pool.refresh()
 
     def do_kill(self, line):
-        """kill 任务ID|all：终止指定任务或当前全部排队/运行任务，保留结果及费用。"""
+        """kill 任务ID|all：立即强制终止任务树，保留结果及费用，不等待清理。"""
         if self.center:
             display(kill_job(self.center,line.strip()))
         else:
@@ -1049,7 +1048,7 @@ class WorkerShell(Shell):
         self.worker.control({"paused": False})
 
     def do_kill(self, line):
-        """kill 任务ID|all：终止本设备指定任务或当前全部排队/运行任务，保留回执。"""
+        """kill 任务ID|all：立即强制终止本设备任务树，保留回执，不等待清理。"""
         from .local import LocalClient
         client=self.worker.client if isinstance(self.worker,RemoteWorker)else LocalClient(self.worker)
         display(kill_job(client,line.strip()))

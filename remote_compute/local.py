@@ -15,6 +15,9 @@ class LocalClient(Client):
         super().__init__('local://' + worker.health()['node'])
         self.worker = worker
 
+    def cancel(self, identity):
+        return self.worker.cancel(identity)
+
     def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
         _check_cancelled(cancel)
         worker = self.worker

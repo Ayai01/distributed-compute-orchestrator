@@ -12,8 +12,9 @@ import uuid
 from .bundle import native_path
 
 
-def remove_owned(path):
+def remove_owned(path, *, cancel=None):
     """Remove an owned entry without traversing symlinks or Windows junctions."""
+    if cancel and cancel():raise InterruptedError('Job cleanup cancelled')
     path=native_path(path,force=True)
     try:
         info = path.lstat()
@@ -23,7 +24,8 @@ def remove_owned(path):
         linked = stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 1024)
         if not linked:
             for child in path.iterdir():
-                remove_owned(child)
+                if cancel:remove_owned(child, cancel=cancel)
+                else:remove_owned(child)
         path.rmdir()
     else:
         path.unlink()

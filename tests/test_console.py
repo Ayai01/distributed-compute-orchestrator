@@ -66,6 +66,25 @@ class ConsoleTests(unittest.TestCase):
         keyboard=patch('remote_compute.console._PosixKeyboard',side_effect=lambda:sys.modules['msvcrt'])
         keyboard.start();self.addCleanup(keyboard.stop)
 
+    def test_force_kill_network_wait_does_not_block_keyboard_or_rendering(self):
+        entered,release=threading.Event(),threading.Event()
+        class ForceShell(OperatorShell):
+            def do_kill(self,_line):entered.set();release.wait(5)
+            def do_ping(self,_line):
+                self.assertion=entered.wait(1)
+                super().do_ping(_line);release.set()
+        shell=ForceShell()
+        with redirect_stdout(io.StringIO()),patch.dict(sys.modules,msvcrt=Keyboard([*'kill abcd\rping\rquit\r'])), \
+                patch('remote_compute.console._enable_ansi',return_value=lambda:None), \
+                patch('remote_compute.console.time.sleep'):
+            dashboard=Dashboard(shell,lambda:dict(role='worker',cpus=1))
+            try:dashboard.run()
+            finally:
+                release.set()
+                if dashboard.kill_thread:dashboard.kill_thread.join(1)
+        self.assertTrue(shell.assertion)
+        self.assertEqual(shell.completed,1)
+
     def test_cpu_budget_stays_stable_while_admission_ceiling_changes(self):
         for capacity in (20,16,20):
             with self.subTest(capacity=capacity):

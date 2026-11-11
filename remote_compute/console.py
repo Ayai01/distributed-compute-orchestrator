@@ -457,6 +457,18 @@ class Dashboard:
         self.output_revision = 0
         self.stream = sys.stdout
         self.encoding = getattr(self.stream, 'encoding', 'utf-8')
+        self.kill_thread = None
+
+    def _kill_command(self, line):
+        """Network acknowledgement never owns the keyboard/rendering thread."""
+        if self.kill_thread is not None and self.kill_thread.is_alive():
+            self.write('终止请求正在发送；终端继续可用。\n')
+            return
+        def send():
+            try:self.shell.onecmd(line)
+            except Exception as error:self.write('终止请求失败: '+str(error)+'\n')
+        self.kill_thread = threading.Thread(target=send,name='console-force-kill',daemon=True)
+        self.kill_thread.start()
 
     def write(self, text):
         with self.output_lock:
@@ -631,7 +643,9 @@ class Dashboard:
                                 history.append(line)
                                 history = history[-50:]
                                 selected = len(history)
-                                if self.shell.onecmd(line):
+                                if line.split(None,1)[0] == 'kill':
+                                    self._kill_command(line)
+                                elif self.shell.onecmd(line):
                                     return True
                             line, cursor, last, offset = '', 0, 0, 0
                         elif key in ('\x03', '\x1b'):

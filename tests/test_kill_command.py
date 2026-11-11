@@ -16,10 +16,11 @@ class KillCommandTests(unittest.TestCase):
     def test_single_unconfirmed_or_timed_out_cancellation_is_incomplete(self):
         from remote_compute import RemoteError
         client=Mock();identity='a'*32;client.status.return_value=dict(id=identity,status='running')
-        client.wait.return_value=dict(id=identity,status='interrupted',remote_cancel_pending=True)
+        client.cancel.return_value=dict(id=identity,status='interrupted',remote_cancel_pending=True)
         self.assertEqual(kill_job(client,identity)['pending'],[identity])
-        client.wait.side_effect=RemoteError('wait timeout')
+        client.cancel.side_effect=RemoteError('control unavailable')
         self.assertEqual(kill_job(client,identity)['status'],'incomplete')
+        client.wait.assert_not_called()
 
     def test_all_initial_status_failure_returns_original_ids_without_cancelling(self):
         from remote_compute import RemoteError
@@ -78,7 +79,8 @@ class KillCommandTests(unittest.TestCase):
         identity='a'*32;client.health.return_value=dict(active_jobs=[dict(id=identity)])
         client.statuses.return_value={identity:dict(id=identity,status='running')}
         client.cancel.return_value=dict(id=identity,status='running')
-        self.assertEqual(kill_all(client,wait_timeout=0)['pending'],[identity])
+        self.assertEqual(kill_all(client)['pending'],[identity])
+        client.wait.assert_not_called()
 
     def test_cli_all_cancels_running_and_queued_tasks_and_keeps_original_outputs(self):
         with scratch()as root,provider(Path(root)/'worker')as(_,worker):
@@ -96,8 +98,10 @@ class KillCommandTests(unittest.TestCase):
                     self.assertEqual(main(['--url',client.url,'kill','all']),0)
                 import json
                 result=json.loads(output.getvalue())
-                self.assertEqual((result['matched'],result['finished']),(2,2))
+                self.assertEqual(result['matched'],2)
+                self.assertIn(result['status'],('accepted','completed'))
                 for identity in(running,queued):
+                    client.wait(identity,wait_timeout=5)
                     receipt=client.fetch(identity,delete=False)
                     self.assertEqual(receipt['id'],identity)
                     self.assertEqual(receipt['status'],'cancelled')
@@ -155,7 +159,7 @@ class KillCommandTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO())as output,patch.dict('os.environ',REMOTE_COMPUTE_OPERATOR_TOKEN=state.operator_token):
                     code=main(['--url',client.url,'kill',identity[:8]])
                 self.assertEqual(code,0)
-                self.assertIn('cancelled',output.getvalue())
+                self.assertTrue('cancelled' in output.getvalue() or 'cancel_requested' in output.getvalue())
                 result=client.wait(identity,wait_timeout=8)
                 self.assertEqual(result['status'],'cancelled',result)
                 self.assertEqual(result['request_sha256'],original['request_sha256'])
@@ -173,7 +177,7 @@ class KillCommandTests(unittest.TestCase):
             identity=worker.submit(python('import time;time.sleep(30)'))['id']
             until(lambda:worker.status(identity)['status']=='running')
             with redirect_stdout(io.StringIO()):WorkerShell(state).do_kill(identity[:8])
-            self.assertEqual(worker.status(identity)['status'],'cancelled')
+            self.assertEqual(worker.wait(identity,wait_timeout=5)['status'],'cancelled')
 
     def test_cli_kill_of_an_explicit_worker_url_needs_no_device_name(self):
         with scratch()as root,provider(root)as(_,worker):
@@ -183,7 +187,7 @@ class KillCommandTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()),patch('remote_compute.cli.socket',wraps=socket)as net:
                 net.gethostname.return_value='operator-computer'
                 self.assertEqual(main(['--url',worker.url,'kill',identity[:8]]),0)
-            self.assertEqual(worker.status(identity)['status'],'cancelled')
+            self.assertEqual(worker.wait(identity,wait_timeout=5)['status'],'cancelled')
 
 
 if __name__=='__main__':unittest.main()

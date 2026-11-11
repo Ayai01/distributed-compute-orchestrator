@@ -99,12 +99,14 @@ def pack(files):
     return buffer.getvalue()
 
 
-def tree(root, patterns=("**/*",)):
+def tree(root, patterns=("**/*",), *, cancel=None):
     root = native_path(Path(root).resolve(),force=True)
     files = {}
     for pattern in patterns:
         inside(root, pattern)
-        for path in sorted(root.glob(pattern)):
+        paths = root.glob(pattern)
+        for path in paths if cancel else sorted(paths):
+            if cancel and cancel():raise InterruptedError('Job cleanup cancelled')
             if path.is_file():
                 if path.is_symlink() or not is_relative_to(path.resolve(), root):
                     raise ValueError("Bundle requires regular files: " + str(path))

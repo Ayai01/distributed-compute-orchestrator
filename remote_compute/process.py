@@ -132,6 +132,7 @@ def low_integrity_directory(path):
 class Process:
     def __init__(self, argv, cwd, env, stdout, stderr, *, stdin=None):
         self.job = None
+        self.lifecycle_lock = threading.RLock()
         options = {"start_new_session": True} if os.name != "nt" else {
             "creationflags": subprocess.CREATE_NO_WINDOW | 4,  # CREATE_SUSPENDED
         }
@@ -225,6 +226,21 @@ class Process:
             if time.monotonic()>=deadline:raise RuntimeError('Cancelled child process did not finish exiting')
             time.sleep(.01)
 
+    def kill(self):
+        """Signal the owned tree immediately; the executor owns reaping/accounting."""
+        with self.lifecycle_lock:
+            if os.name == 'nt':
+                if self.job and not self.kernel.TerminateJobObject(self.job, 1):
+                    import ctypes
+                    raise ctypes.WinError(ctypes.get_last_error())
+            else:
+                # Signal the group before scanning escaped descendants.
+                try:os.killpg(self.child.pid, signal.SIGKILL)
+                except ProcessLookupError:pass
+                for pid in self._posix_members():
+                    try:os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:pass
+
     def stop(self):
         handles=self._process_handles() if os.name=='nt' and self.job else []
         try:
@@ -261,8 +277,9 @@ class Process:
                 time.sleep(.01)
 
     def close(self):
-        if self.job:
-            self.kernel.CloseHandle(self.job)
-            self.job = None
-        elif os.name != "nt":
-            self._stop_posix()
+        with self.lifecycle_lock:
+            if self.job:
+                self.kernel.CloseHandle(self.job)
+                self.job = None
+            elif os.name != "nt":
+                self._stop_posix()
