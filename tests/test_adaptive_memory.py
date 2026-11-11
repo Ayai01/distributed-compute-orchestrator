@@ -280,6 +280,8 @@ class AdaptiveMemoryTests(unittest.TestCase):
         self.assertEqual(plan_memory(8,4800,**learned),(8,4800))
         row['active_cpus']=0
         self.assertEqual(node.resize_memory_model('one',model),model)
+        row['memory_sample_cpus']=0
+        self.assertEqual(node.resize_memory_model('one',model),dict(base_memory_mb=0,memory_per_cpu_mb=1200))
 
     def test_estimate_exceeding_ram_gets_one_funded_probe(self):
         self.assertEqual(plan_memory(8,512,memory_mb=8192),(1,256))

@@ -708,7 +708,7 @@ class Worker:
                 points.pop(width,None);points[width]=max(physical,commit)
                 samples=list(points.items())[-8:]
             model=calibrated_model(model,previous_memory,observed_cpus,physical,commit,
-                                   calibrated,job.get('memory_adaptive_model'),samples,cold_probe=old==1 and not observed_cpus)
+                                   calibrated,job.get('memory_adaptive_model'),samples,cold_probe=not observed_cpus)
             adaptive_model=model
             available=min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb']))
             if memory_budget_mb is not None:available=min(available,memory_budget_mb)
