@@ -205,7 +205,7 @@ GPU任务声明`requires=['ml']`及`accelerator={'kind':'cuda', ...}`。默认�
 
 任务进程树CPU费用与服务准备开销分开。中心在向worker提交前检查任务描述中未声明的资产引用；确定性拒绝以`failed / error_kind=pre_execution`结束，回执给出`rejected_before_submit=true`、`task_process_started=false`及`cpu_seconds=0`。原ID可正常领取、持久发布和删除，原请求保持。已有尝试的费用继续累计，未知已付前缀保持未知；失联、回复丢失或普通404不据此写成零费用。
 
-SDK在`GET /jobs/<id>/artifacts`携带`X-DCO-Artifact-Poll:1`，中心按原ID准备远端ZIP，未就绪时立即返回`202 {id,status:"preparing"}`。同一原ID共用一次准备，同一提供者串行传输；ZIP验证身份后原子缓存。SDK准备轮询从0.2秒开始，间隔最多0.5秒，每次有效准备确认续接观察；网络故障仍使用独立的有界重连。准备失败以409结束本次领取，保留原结果供下一次原ID恢复。准备线程参与服务收尾，原ID锁同时保护准备、领取和删除；控制及资源RPC不等待远端大包。中心及worker本地结果直接领取，完整ZIP仍支持ETag及断点传输。
+SDK在`GET /jobs/<id>/artifacts`携带`X-DCO-Artifact-Poll:1`，中心按原ID准备远端ZIP，未就绪时立即返回`202 {id,status:"preparing"}`。同一原ID共用一次准备，不同原ID沿既有有界HTTP连接池并发领取；单个耗时结果保留自己的准备位置，其他结果继续传输。ZIP验证身份后原子缓存。SDK准备轮询从0.2秒开始，间隔最多0.5秒，每次有效准备确认续接观察；网络故障仍使用独立的有界重连。准备失败以409结束本次领取，保留原结果供下一次原ID恢复。准备线程参与服务收尾，原ID锁同时保护准备、领取和删除；控制及资源RPC使用独立连接。中心及worker本地结果直接领取，完整ZIP仍支持ETag及断点传输。
 
 `kill <id|all>`是终端唯一的任务终止命令；SDK和HTTP使用既有cancel接口。单任务支持完整ID或唯一的至少4位活动任务前缀。`all`固定执行时所连接端点的活动快照，沿原ID取消排队及运行任务，不枚举冷历史、不追杀后续提交、不改变受理或暂停设置。中心按原ID确认归属；worker只终止本设备任务。最多8个取消请求并行，统一等待最多30秒确认终态；远端取消未确认、原ID缺失或请求失败明确列入待确认结果，一次性CLI返回非零。原ID、输入身份、声明输出、日志及累计CPU费用保留。运维端重启使用`restart --wait`或`Client.restart(wait=True)`，在排空边界重载同版源码并保留原终端及状态根。
 

@@ -1296,7 +1296,7 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(result['stdout'].strip(),'once')
             client.fetch(identity)
 
-    def test_node_downloads_are_serial_and_same_job_is_cached_until_collection(self):
+    def test_distinct_node_results_overlap_and_same_job_is_cached_until_collection(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=2) as (_,node):
             with Pool([node]) as pool,center(pool,Path(root)/'center') as (state,client):
                 identities=[client.submit(python('pass'))['id'] for _ in range(2)]
@@ -1314,7 +1314,7 @@ class TransportTests(unittest.TestCase):
                         with mutex:active-=1
                 with patch.object(pool.nodes[0].client,'artifacts',side_effect=artifacts),ThreadPoolExecutor(max_workers=4) as transfers:
                     results=list(transfers.map(state.artifacts,identities*2))
-                self.assertEqual(peak,1)
+                self.assertEqual(peak,2)
                 self.assertEqual(len(calls),2)
                 self.assertEqual(results[0],results[2])
                 self.assertEqual(results[1],results[3])
@@ -1323,6 +1323,32 @@ class TransportTests(unittest.TestCase):
                     self.assertTrue((directory/'worker-artifacts.zip').exists())
                     client.delete(identity)
                     self.assertFalse(directory.exists())
+
+    def test_slow_provider_result_does_not_hold_other_finished_ids_in_preparing(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,node):
+            with Pool([node])as pool,center(pool,Path(root)/'center')as(state,client):
+                slow=client.submit(python("print('slow-original')"))['id']
+                fast=client.submit(python("print('fast-original')"))['id']
+                paid={identity:client.wait(identity)['cpu_seconds']for identity in (slow,fast)}
+                entered,release=threading.Event(),threading.Event();original=worker.artifacts
+                def artifact(identity,**options):
+                    if identity==slow:
+                        entered.set()
+                        if not release.wait(8):raise AssertionError('slow result was not released')
+                    return original(identity,**options)
+                with patch.object(worker,'artifacts',side_effect=artifact),ThreadPoolExecutor(2)as transfers:
+                    waiting=transfers.submit(client.fetch,slow)
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        ready=transfers.submit(client.fetch,fast).result(timeout=3)
+                        self.assertEqual(ready['id'],fast)
+                        self.assertEqual(ready['cpu_seconds'],paid[fast])
+                        self.assertFalse(waiting.done())
+                        self.assertFalse(release.is_set())
+                    finally:release.set()
+                    result=waiting.result(timeout=5)
+                    self.assertEqual(result['id'],slow)
+                    self.assertEqual(result['cpu_seconds'],paid[slow])
 
     def test_disconnected_queued_download_does_not_fetch_or_remove_the_original(self):
         with scratch() as root,provider(Path(root)/'worker') as (worker,node):

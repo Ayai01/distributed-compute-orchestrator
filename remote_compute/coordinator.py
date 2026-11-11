@@ -1768,8 +1768,6 @@ class Coordinator:
                 client=None
             worker_id=job.get('worker_id',result.get('worker_id',identity))
             result_lock=job.setdefault('artifact_lock',threading.RLock())
-            transfers=self.__dict__.setdefault('_artifact_transfers',{})
-            transfer_lock=transfers.setdefault(client.url,threading.Lock()) if client else None
         with result_lock:
             with self.condition:
                 if self.jobs.get(identity) is not job:
@@ -1786,15 +1784,10 @@ class Coordinator:
                     if cached.is_file():
                         raw=cached.read_bytes()
                     else:
-                        while not transfer_lock.acquire(timeout=.2):
-                            if is_connected and not is_connected():
-                                raise ConnectionAbortedError('Result download caller disconnected while queued')
-                        try:
-                            if is_connected and not is_connected():
-                                raise ConnectionAbortedError('Result download caller disconnected while queued')
-                            raw=client.artifacts(worker_id)
-                        finally:
-                            transfer_lock.release()
+                        # The original-ID lock coalesces duplicate reads. The
+                        # existing bounded HTTP pool handles distinct results;
+                        # a slow provider ZIP must not serialize every ID.
+                        raw=client.artifacts(worker_id)
                         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                             if json.loads(archive.read('result.json'))['id']!=worker_id:
                                 raise ValueError('Artifact task identity mismatch')

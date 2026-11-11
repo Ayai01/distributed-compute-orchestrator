@@ -3,6 +3,7 @@
 - 当前源码版本：**0.11.24**；各服务实际运行版本及空闲重载状态见维护入口。
 - 节点加权分配在同一次固定容量计算中复用已确认不可满足的候选结论，避免饱和节点上的大量候选反复占用中心锁；整数分配及设备位置保持。600组精确对照、500候选实测、37项定向检查及上线状态见`.local/maintenance/artifact-wait-20261111/current.json`。
 - 中心恢复未确认送达的派发记录时先查询原worker ID；已受理或已完成的原任务直接接回，明确404的未确认提交沿原ID、冻结输入及既有重试预算接续派发。边界检查与实际维护状态见`.local/maintenance/pending-submission-20261111/current.json`。
+- 不同原ID的结果准备与领取共用既有有界HTTP连接池并发；原ID锁保留重复领取合并、身份校验、缓存及删除互斥。慢结果与同节点短结果的真实HTTP复现、原结果领取和实际加载记录见`.local/maintenance/artifact-stall-20261111/current.json`。
 - 资产缓存首次统计及恢复索引统一使用Windows扩展路径，深层输入解包后可正常登记大小并进入执行；原资产字节、请求及科学输入保持。复现、42项定向检查和原生空闲上线状态见`.local/maintenance/deep-asset-startup-20261111/current.json`。
 - 内存警戒先限制新增并发并在安全边界等待，持续真实临界或耗尽才保护性终止；可重入SDK计算的资源恢复独立于retries，沿原ID有界退避并保留已成功map项。验证、连续中断及部署状态见`.local/maintenance/resource-recovery-20261109/current.json`。
 - SDK收集保持每工程2线程；本地状态记录排队、ZIP获取/解包、发布及删除分项，原回执保持。ZIP准备轮询间隔最多0.5秒。已有批次积压审计、隔离验证及SDK源码部署见`.local/maintenance/collection-latency-20261109/current.json`，新调用进程读取当前SDK。
