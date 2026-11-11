@@ -121,6 +121,7 @@ class Coordinator:
                 value.update(status='queued')
                 self.queue.append(value['id'])
             else:
+                job['recover_submission']=value['status']=='dispatching' and value.get('started')is None
                 value.update(status='dispatching')
                 job['recover']=True
             value.pop('error',None)
@@ -945,7 +946,17 @@ class Coordinator:
         node, identity, task = job["node"], job.get('worker_id',job['result']['id']), job["task"]
         result = None;retry=False
         try:
-            if not job.pop('reattach',False):
+            reattach=job.pop('reattach',False)
+            if reattach and job.pop('recover_submission',False):
+                # A center can stop between reserving a provider and finishing
+                # its POST. Observe the same ID before replaying that pending
+                # submission; an already accepted/finished body is never rerun.
+                try:node.client._read_reconnecting(lambda:node.client.status(identity,brief=True))
+                except RemoteError as error:
+                    if getattr(error,'status_code',None)!=404:raise
+                    reattach=False
+                    job['result']['submission_recovered']=True
+            if not reattach:
                 payload = (job['directory'] / 'request.zip').read_bytes()
                 missing=missing_task_assets(task)
                 if missing:
