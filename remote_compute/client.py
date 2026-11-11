@@ -229,6 +229,14 @@ class Client:
         request_digest=None
         for attempt in range(attempts):
             _check_cancelled(cancel)
+            # A fixed-width kernel may wait only briefly before preserving its
+            # paid preparation. Bound each HTTP attempt by that same window.
+            from . import deadline
+            remaining=getattr(deadline,'resource_remaining_time',lambda:None)()
+            if remaining is not None:remaining=deadline.remaining_time()
+            if remaining is not None and remaining<=0:
+                raise TimeoutError('DCO kernel startup wait expired')
+            attempt_timeout=min(network_timeout,remaining)if remaining is not None else network_timeout
             if attempt and asset_upload:
                 # A lost reply can follow a fully validated upload. Probe within
                 # this pool slot before sending the same content again.
@@ -247,12 +255,12 @@ class Client:
                 options={'context':getattr(self,'ssl_context',None)} if self.endpoint.scheme=='https' else {}
                 # The 8 KiB default repeatedly yields the GIL to a busy
                 # scheduler. Keep uploads bounded without one send per 8 KiB.
-                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=network_timeout,
+                connection = factory(self.endpoint.hostname, self.endpoint.port, timeout=attempt_timeout,
                                      blocksize=64*1024,**options)
                 self.connections.connection = connection
-            connection.timeout = network_timeout
+            connection.timeout = attempt_timeout
             if connection.sock is not None:
-                connection.sock.settimeout(network_timeout)
+                connection.sock.settimeout(attempt_timeout)
             try:
                 if partial and etag:
                     headers.update(Range='bytes='+str(len(partial))+'-', **{'If-Range':etag})

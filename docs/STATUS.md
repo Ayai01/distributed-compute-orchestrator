@@ -10,6 +10,7 @@
 - lease转发TLS意外EOF的已确认授权保留、未知空槽限制、隔离HTTP注入验证及SDK分发状态见`.local/maintenance/forwarded-lease-eof-20261110/current.json`。原已完成子项与累计CPU费用保留；在途进程继续使用其已导入SDK。
 - 已校准准备阶段切换到较大内存阶段时，SDK在启动正文前有界等待首槽授权；验证、原ID费用审计及实际分发状态见`.local/maintenance/phase-admission-20261110/current.json`。
 - SDK阶段降需求保留原单槽探测，资源等待服从原期限，实际标定沿已确认阶段记录；MAC八个原失败ID、费用审计、HTTP复现及SDK分发见`.local/maintenance/phase-downshift-20261110/current.json`。
+- 固定线程的顶层`run_call`可用阶段`exact_cpus`及`start_timeout`等待完整真实授权，再启动一次正文；等待与HTTP协商共用启动窗口，原执行期限保持。隔离检查及SDK分发状态见`.local/maintenance/exact-kernel-start-20261110/current.json`。
 - CPU U/B按已授权/基础预算（系统逻辑线程）显示；动态准入容量单独保留在API、nodes明细及cpus回执。源码验证和各窗口实际重载状态见`.local/maintenance/cpu-budget-label-20261109/current.json`。
 - 终端统一使用`kill <id|all>`，补全ID统一青色；`clean`删除未启动排队任务及其记录、临时物和独占缓存。源码验证、部署及窗口实际重载状态见`.local/maintenance/kill-all-20261109/current.json`。
 - hybrid同时提供调度中心和进程内本机计算，看板标题为“混合模式”；API逻辑角色为scheduler，操作员明细另给出mode。进程内worker不另开服务端口。

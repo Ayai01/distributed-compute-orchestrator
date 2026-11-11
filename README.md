@@ -16,6 +16,7 @@ DCO 统一管理能力匹配、CPU/RAM/加速器授权、任务队列、执行�
 - 默认窗口超过128并覆盖兼容线程。只提供已授权且真实就绪的工作；`after`等待前序持久发布，`Deferred/Skipped`表达业务门，准备和领取互不阻塞。
 - 外层进程与内层数值库共用一份实际授权。内存可声明固定值或基础值加每实际核需求，DCO按CPU/RAM共同限制真实并行宽度。
 - 冷准备峰值由父任务首槽容纳；`map_items`、`iter_items`和`run_call`用`limits`分别声明阶段CPU上限与内存模型。并行阶段按实测单项工作集声明，避免沿用冷编译的每核预留。
+- 固定线程的顶层数值核使用`run_call(kernel, limits={'exact_cpus':4, 'start_timeout':30, ...})`：取得并确认4核后才启动一次正文；等待期间保留真实就绪需求，超时在正文前抛出`TimeoutError`。任务仍从1核受理，父任务的`max_cpus`覆盖该宽度；`exact_cpus`替代本阶段的`max_cpus`，不是任务最低核心数。
 - 长任务在评价/记账边界调用`check_deadline(reserve_seconds=...)`，为既有异常收尾留出落盘时间；`remaining_time()`返回任务剩余秒数。原`timeout`硬时限保持，映射结果记录各输入的完成、中断与未启动状态，已付前缀由业务持久发布。
 - 操作员用`client.control(job=原ID, priority=整数)`调整排队任务的有效调度优先级；原请求包、请求SHA及科学输入保持，运行中任务沿原授权执行。
 - 操作员确认输入已关闭后，用`client.control(retire_asset=摘要)`回收指定中心资产，或`client.control(node=名称, worker={"retire_asset":摘要})`回收指定worker副本。活跃、未领取及恢复任务、有效生产者交接和在途上传继续保护；其他资产保持。回执返回退役字节数，目录递归回收在控制锁外执行。

@@ -1,6 +1,7 @@
 """DCO-owned execution of business functions and independent input items."""
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -454,15 +455,72 @@ def _kernel_threads(count,*,reset=False):
     _kernel_thread_count=count
 
 
+def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
+    """Start one fixed-width body only after its actual grant is committed."""
+    from remote_compute import Client
+    from remote_compute.client import RemoteError
+    from remote_compute.deadline import check_deadline,resource_window
+    from remote_compute.memory import memory_boundary
+    if not os.environ.get('REMOTE_COMPUTE_URL')or os.environ.get('REMOTE_COMPUTE_RESIZE')!='1':
+        raise RuntimeError('exact_cpus requires a DCO CPU lease')
+    client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
+    lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=maximum,
+        cpus=min(maximum,max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1')))),**model)
+    # No kernel is active during admission. Keep the complete ready demand
+    # visible until the provider can fund this indivisible numerical stage.
+    actual=0
+    try:
+        try:
+            with resource_window(start_timeout):
+                check_deadline();memory_boundary()
+                while True:
+                    check_deadline()
+                    actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
+                    if actual>=maximum and lease.confirmed is not None and not lease.phase_pending:
+                        actual=lease.refresh(active_cpus=maximum,ready_cpus=0)
+                        if actual>=maximum and lease.confirmed is not None and not lease.phase_pending:break
+                    time.sleep(min(.1,check_deadline()or .1))
+                _kernel_threads(maximum);check_deadline()
+        except TimeoutError as error:
+            raise TimeoutError('Fixed kernel needs %d CPUs; obtained %d; startup wait expired before execution'%(maximum,actual))from error
+        check_deadline()
+        _local.kernel=True
+        return _function(function)(**kwargs)
+    finally:
+        _local.kernel=False
+        try:_kernel_threads(1,reset=True)
+        finally:
+            # A late release reply must not replace a paid result or its
+            # primary startup error. Final task cleanup also returns the grant.
+            try:
+                with resource_window(1):lease.refresh(active_cpus=0,ready_cpus=0)
+            except (RemoteError,TimeoutError):pass
+
+
 def run_call(function,*,limits=None,**kwargs):
-    """Execute a numerical kernel using the grant prepared by the DCO worker."""
+    """Run a flexible kernel, or wait for limits.exact_cpus before starting."""
     from remote_compute.deadline import check_deadline
     check_deadline()
     if os.environ.get('REMOTE_COMPUTE_WORKER')!='1':
         raise RuntimeError('Submit python_call to DCO before executing its kernel')
+    limits=dict(limits or {})
+    exact=limits.pop('exact_cpus',None)
+    start_timeout=limits.pop('start_timeout',None)
+    if exact is not None:
+        if type(exact)is not int or exact<1:raise ValueError('exact_cpus requires a positive integer')
+        if 'max_cpus'in limits:raise ValueError('Use exact_cpus or max_cpus for a kernel stage')
+        if exact>int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS','1')):raise ValueError('exact_cpus exceeds task max_cpus')
+        if (getattr(_local,'kernel',False)or getattr(_local,'item_channel',None)is not None
+                or os.environ.get('DCO_ITEM_PROCESS')=='1'or getattr(_local,'item',False)):
+            raise ValueError('exact_cpus belongs on a top-level run_call stage')
+        if start_timeout is not None:
+            start_timeout=float(start_timeout)
+            if not math.isfinite(start_timeout)or start_timeout<=0:raise ValueError('start_timeout requires a finite positive number')
+        limits['max_cpus']=exact
+    elif start_timeout is not None:raise ValueError('start_timeout requires exact_cpus')
     if getattr(_local,'kernel',False):return _function(function)(**kwargs)
     from remote_compute.memory import memory_boundary
-    memory_boundary()
+    if exact is None:memory_boundary()
     channel=getattr(_local,'item_channel',None)
     if channel is not None:
         if set(limits or {})-{'max_cpus'}:
@@ -491,6 +549,7 @@ def run_call(function,*,limits=None,**kwargs):
     lease=None;actual=max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1')))
     maximum=max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',actual)))
     maximum,model=_phase_resources(maximum,limits)
+    if exact is not None:return _run_exact_kernel(function,kwargs,maximum,model,start_timeout)
     actual=min(actual,maximum)
     if os.environ.get('REMOTE_COMPUTE_URL')and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
         from remote_compute import Client

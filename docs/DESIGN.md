@@ -78,6 +78,8 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 串行业务编排使用`python_task`；在原有排空边界进入训练时，`run_call`先等该原ID的SDK stream完成资源归还并检查错误，再取得数值阶段授权。仍有未启动输入的活跃流应先收齐或停止并排空，避免等待消费者自身而死锁。`run_call(..., limits={"max_cpus":8, ...})`声明阶段有用上限和可选内存需求，不改变父任务上限。
 
+不可拆分的固定线程内核使用顶层`run_call(kernel, limits={'exact_cpus':4, 'start_timeout':30, ...})`。`exact_cpus`为正整数且不超过父任务`max_cpus`，与阶段`max_cpus`互斥；`start_timeout`为可选的有限正秒数，省略时沿原任务剩余期限。启动等待持续报告active=0、ready=exact_cpus，确认完整CPU/RAM授权并承诺该活跃宽度后只调用一次正文；已取得的部分宽度不启动固定模型。等待与HTTP资源协商共同遵守启动窗口及原任务期限，窗口结束不改变正文原期限。超时在正文前抛出`TimeoutError`，已完成准备、原ID和累计费用保留，由工程沿原证据决定后续阶段。映射子项继续使用父级lane授权和`item_max_cpus`，不接受独立`exact_cpus`租约。
+
 固定数值核首次协商未取得完整阶段宽度时，SDK在启动前保留剩余就绪需求并有界复核一次，避免将冷内存探测的单槽授权直接冻结为整段宽度。随后按已确认授权启动，资源不足仍允许1核，不等待其他任务结束，不引入最低核数字段；运行中的原生核保持已选宽度，下一资源边界重新协商。已取得完整宽度及单核阶段保持原握手开销。
 
 `map_items`、`iter_items`和`run_call`均接受阶段`limits`：`max_cpus`取父任务上限内的有用宽度；内存使用固定`memory_mb`或`base_memory_mb + memory_per_cpu_mb × 实际授权CPU`模型，线性模型可加`memory_limit_mb`。省略内存字段时继承父任务模型，显式内存字段替换本阶段模型；父任务声明和后续阶段默认值保持。映射在第一项启动前完成该阶段资源协商，随后按真实在途与就绪项扩缩；尾项结束归还空槽及对应RAM。已知冷编译峰值须由父任务首槽容纳，数值阶段按实测工作集声明，避免把编译预留沿用到每个并行数值项。
