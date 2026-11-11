@@ -4,6 +4,16 @@ from remote_compute.allocation import weighted_node_threads
 
 
 class AllocationTests(unittest.TestCase):
+    def test_saturated_pinned_waiters_do_not_block_other_nodes(self):
+        shares={f'p{i:04d}':1 for i in range(500)}
+        shares['spare']=1
+        demands={name:1024 for name in shares}
+        rooms={name:dict(full=4)for name in shares}
+        rooms['spare']=dict(other=96)
+        expected={name:(1 if name in ('p0000','p0001','p0002','p0003')else 0)for name in shares}
+        expected['spare']=96
+        self.check(dict(full=4,other=96),shares,demands,rooms,expected)
+
     def check(self,capacities,shares,demands,rooms,expected):
         grants=weighted_node_threads(capacities,shares,demands,rooms)
         self.assertEqual({p:sum(row.values()) for p,row in grants.items()},expected)

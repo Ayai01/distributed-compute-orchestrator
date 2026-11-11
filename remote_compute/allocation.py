@@ -69,6 +69,7 @@ def weighted_node_threads(capacities, shares, demands, rooms):
     placed={name:{node:0 for node in rooms.get(name,{})} for name in shares}
     used={node:0 for node in capacities}
     total={name:0 for name in shares}
+    blocked=set()
     degree={node:sum(node in edges for edges in rooms.values()) for node in capacities}
     def place(name,seen):
         nodes=[node for node in placed[name] if node in capacities and node not in seen
@@ -87,12 +88,15 @@ def weighted_node_threads(capacities, shares, demands, rooms):
                     return True
         return False
     for _ in range(sum(capacities.values())):
-        candidates=sorted((name for name in shares if total[name]<demands[name]),
+        candidates=sorted((name for name in shares if name not in blocked and total[name]<demands[name]),
                           key=lambda name:((total[name]+1)/shares[name],name))
         for name in candidates:
             if place(name,set()):
                 total[name]+=1
                 break
+            # Capacities and usable edges stay fixed during this flow. Adding
+            # another claim cannot make an already infeasible claim feasible.
+            blocked.add(name)
         else:
             break
     return placed
