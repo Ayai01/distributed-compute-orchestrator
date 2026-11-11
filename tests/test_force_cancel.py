@@ -1,5 +1,7 @@
 """Force control bypasses blocked polling and interrupts finalization work."""
 from pathlib import Path
+import os
+import sys
 import threading
 import time
 import unittest
@@ -12,6 +14,30 @@ from test_compute import provider, python, scratch, until
 
 
 class ForceCancelTests(unittest.TestCase):
+    @unittest.skipIf(os.name=='nt','POSIX escaped session ownership')
+    def test_force_kill_captures_escaped_descendant_before_parent_reaping(self):
+        from remote_compute.process import Process
+        with scratch() as directory:
+            root=Path(directory)
+            child='import os,time;os.setsid();open("escaped.pid","w").write(str(os.getpid()));time.sleep(60)'
+            parent='import subprocess,sys,time;subprocess.Popen([sys.executable,"-c",'+repr(child)+']);time.sleep(60)'
+            with (root/'out').open('wb') as output:
+                process=Process([sys.executable,'-c',parent],root,dict(os.environ),output,output)
+                try:
+                    until(lambda:(root/'escaped.pid').is_file())
+                    pid=int((root/'escaped.pid').read_text())
+                    self.assertFalse(process.__dict__.get('_posix_known'))
+                    process.kill();process.child.wait(timeout=1)
+                    def stopped():
+                        try:return Path('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split()[0]=='Z'
+                        except FileNotFoundError:return True
+                    until(stopped,seconds=1)
+                finally:
+                    if (root/'escaped.pid').is_file():
+                        try:os.kill(int((root/'escaped.pid').read_text()),9)
+                        except ProcessLookupError:pass
+                    process.stop();process.close()
+
     def test_kill_does_not_wait_for_directory_enumeration_and_preserves_paid_output(self):
         enumerating, release = threading.Event(), threading.Event()
         from remote_compute.bundle import tree

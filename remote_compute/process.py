@@ -234,10 +234,11 @@ class Process:
                     import ctypes
                     raise ctypes.WinError(ctypes.get_last_error())
             else:
-                # Signal the group before scanning escaped descendants.
+                # Retain escaped descendants before killing their ancestry.
+                members = self._posix_members()
                 try:os.killpg(self.child.pid, signal.SIGKILL)
                 except ProcessLookupError:pass
-                for pid in self._posix_members():
+                for pid in members:
                     try:os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:pass
 
