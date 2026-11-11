@@ -26,6 +26,7 @@ class CpuLease:
         self.updated = float('-inf')
         self.demand = self.active_cpus = None
         self.confirmed = None
+        self.phase_pending = False
 
     def refresh(self, *, active_cpus=0, ready_cpus=None):
         """Report in-flight threads and immediately runnable demand; return CPUs.
@@ -42,7 +43,7 @@ class CpuLease:
         unchanged = desired == self.demand and active_cpus == self.active_cpus
         # No slot can grow or be returned in a stable fully occupied phase.
         # Other phases still poll: the same demand can borrow a peer's release.
-        if unchanged and self.cpus == desired == max(1, active_cpus):
+        if unchanged and not self.phase_pending and self.cpus == desired == max(1, active_cpus):
             return self.cpus
         if (desired != self.demand or active_cpus != self.active_cpus
                 or time.monotonic() - self.updated >= 1):
@@ -90,7 +91,10 @@ class CpuLease:
                     and grant.get('status')in('queued','dispatching'))
                 if (not executing or funded<max(1,active_cpus) or
                         required is not None and required>available):
-                    if (inherited and executing and not active_cpus
+                    probe=(self._retained_downshift(grant,active_cpus) if inherited
+                        and os.environ.get('REMOTE_COMPUTE_WORKER')=='1' else None)
+                    if probe is not None:grant=probe
+                    elif (inherited and executing and not active_cpus
                             and os.environ.get('REMOTE_COMPUTE_WORKER')=='1'
                             and grant.get('cpus',0)>=1 and available>0):
                         # A paid preparation phase can end below the next
@@ -100,22 +104,52 @@ class CpuLease:
                     else:raise error
                 else:grant={**grant,'cpus':funded}
             self.cpus = grant['cpus']
+            self.phase_pending = bool(grant.get('_phase_pending'))
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
             self.demand, self.active_cpus = desired, active_cpus
             # Only a successfully negotiated or validated usable grant can
             # survive a read outage. The constructor's CPU seed is not one.
             self.confirmed = (dict(cpus=self.cpus,memory_mb=self.memory_mb,
-                memory_phase=dict(self.memory)) if grant.get('supported') is not False
+                memory_phase=dict(grant['memory_phase'] if self.phase_pending else self.memory)) if grant.get('supported') is not False
                 and self.cpus>0 and (not self.memory or self.memory_mb is not None
                 and self.memory_mb>0) else None)
             self.updated = time.monotonic()
         return self.cpus
+
+    def _retained_downshift(self,grant,active):
+        """Keep one already paid slot when the next estimate decreases."""
+        previous=grant.get('memory_phase')
+        if (grant.get('status')!='running' or active>1 or grant.get('cpus',0)<1
+                or grant.get('memory_mb',0)<=0 or not isinstance(previous,dict)):
+            return None
+        def first(model):
+            return model.get('memory_mb') or ((model.get('base_memory_mb',0)or 0)
+                +(model.get('memory_per_cpu_mb',0)or 0))
+        needed,prior=first(self.memory),first(previous)
+        if not 0<needed<prior or self.memory.get('memory_limit_mb',needed)<needed:
+            return None
+        if grant['cpus']>1:
+            # Return idle slots under the acknowledged phase before starting
+            # the single-slot probe. This does not borrow any new CPU or RAM.
+            try:reduced=self.client.resize(self.identity,1,active_cpus=active,**previous)
+            except Exception as error:
+                if (getattr(error,'status_code',None)!=409 or not any(message in str(error)for message in (
+                        'Insufficient memory for resource resize; existing grant retained',
+                        'Insufficient RAM for active workers; existing grant retained',
+                        'Center resource reply timed out; existing grant retained',RESOURCE_TRANSPORT_RETAINED))):raise
+                # The original grant still contains this one slot; retry its
+                # idle-slot return at the next executor boundary.
+            else:
+                if reduced.get('cpus')!=1:return None
+                grant=reduced
+        return dict(grant,cpus=1,memory_phase=dict(previous),_phase_pending=True)
 
     def _wait_for_phase(self,target):
         from .client import RemoteError
         def waiting():
             error=RemoteError('Waiting for the first funded slot of the new memory phase')
             error.transport_retryable=True
+            error.phase_waiting=True
             return error
         def settle():
             current=self.client.status(target)
@@ -137,10 +171,17 @@ class CpuLease:
                         RESOURCE_TRANSPORT_RETAINED)):
                     raise waiting() from error
                 raise
-        remaining=remaining_time()
-        return self.client._read_reconnecting(settle,
-            deadline=time.monotonic()+remaining if remaining is not None else None,
-            check=check_deadline)
+        while True:
+            remaining=remaining_time()
+            try:
+                return self.client._read_reconnecting(settle,
+                    deadline=time.monotonic()+remaining if remaining is not None else None,
+                    check=check_deadline)
+            except RemoteError as error:
+                # Resource admission has the task's original deadline. A
+                # transport reconnect window must not end that task early.
+                if not getattr(error,'phase_waiting',False)or remaining is None:raise
+                check_deadline()
 
     def _retained_status(self,target,desired,active,error,inherited):
         uncertain=any(message in str(error)for message in (
