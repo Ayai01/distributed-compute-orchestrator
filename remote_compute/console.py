@@ -461,9 +461,8 @@ class Dashboard:
 
     def _kill_command(self, line):
         """Network acknowledgement never owns the keyboard/rendering thread."""
-        if self.kill_thread is not None and self.kill_thread.is_alive():
-            self.write('终止请求正在发送；终端继续可用。\n')
-            return
+        # A second target, including kill all, must reach force control even
+        # while the first endpoint's acknowledgement is still outstanding.
         def send():
             try:self.shell.onecmd(line)
             except Exception as error:self.write('终止请求失败: '+str(error)+'\n')

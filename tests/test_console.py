@@ -85,6 +85,22 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(shell.assertion)
         self.assertEqual(shell.completed,1)
 
+    def test_kill_all_is_not_dropped_behind_an_outstanding_single_kill(self):
+        entered,release,all_sent=threading.Event(),threading.Event(),threading.Event()
+        shell=OperatorShell()
+        def command(line):
+            if line=='kill abcd':entered.set();release.wait(5)
+            elif line=='kill all':all_sent.set()
+        shell.onecmd=command
+        dashboard=Dashboard(shell,lambda:{})
+        dashboard._kill_command('kill abcd');first=dashboard.kill_thread
+        try:
+            self.assertTrue(entered.wait(1))
+            dashboard._kill_command('kill all')
+            self.assertTrue(all_sent.wait(1))
+        finally:
+            release.set();first.join(1);dashboard.kill_thread.join(1)
+
     def test_cpu_budget_stays_stable_while_admission_ceiling_changes(self):
         for capacity in (20,16,20):
             with self.subTest(capacity=capacity):
