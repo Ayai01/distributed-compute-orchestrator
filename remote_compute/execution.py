@@ -6,14 +6,10 @@ import os
 from pathlib import Path
 import re
 import pickle
-import subprocess
 import sys
 import threading
-import tempfile
-from collections import deque,namedtuple
-from queue import Queue,Empty
+from collections import namedtuple
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 if __package__ in (None, ''):
     sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
@@ -76,6 +72,8 @@ def _thread_item(function,item,kwargs):
 def _process_item(function,item,kwargs,channel=None):
     # One process lifetime per business item returns its allocator/model RAM
     # when that item completes, including a map's long tail.
+    import subprocess,tempfile
+    from collections import deque
     with tempfile.TemporaryDirectory(prefix='dco-item-')as folder:
         root=Path(folder);request=root/'request.pkl';result=root/'result.pkl'
         request.write_bytes(pickle.dumps((function,item,kwargs,channel),protocol=4))
@@ -227,6 +225,8 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
     if item_max_cpus>1:
         from remote_compute.item_resources import ItemResources
         resources=ItemResources(grants,item_max_cpus,len(items))
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue,Empty
     position=0;active={};values=[None]*len(items)if collect else None;failures=[];completed=Queue()
     if backend=='thread':
         _single_threaded(False);function=_function(function)
@@ -314,6 +314,7 @@ class StreamResultsPending(RuntimeError):
 class ItemStream:
     """SDK-owned completion stream; stop new work and drain accepted items."""
     def __init__(self,function,items,kwargs,backend,stop_when,limits=None):
+        from queue import Queue
         items=list(items)
         ceiling=min(max(1,len(items)),max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',os.cpu_count()or 1))))
         limits=dict(limits or {});ceiling,_=_phase_resources(ceiling,limits)

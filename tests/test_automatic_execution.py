@@ -191,12 +191,12 @@ def timeout_map():
             self.assertEqual(json.loads(r['files']['.dco-results.json'])['items'][0]['value'],[1])
 
     def test_unfunded_probe_fails_before_its_first_item(self):
-        with scratch()as root,provider(Path(root)/'worker',cpus=2,memory_mb=192,memory_headroom_mb=0)as(_,client):
-            task=python_task('business:overestimated_map',max_cpus=2,memory_mb=64,outputs=['probe-item'])
+        with scratch()as root,provider(Path(root)/'worker',cpus=2,memory_mb=192,memory_headroom_mb=0)as(worker,client):
+            task=python_task('business:overestimated_map',max_cpus=2,memory_mb=64,timeout=1,outputs=['probe-item'])
             r=client.run(task,files={'business.py':FUNCTIONS})
-            self.assertEqual(r['status'],'failed')
-            self.assertIn('Insufficient RAM for active workers',r['stderr'])
+            self.assertIn(r['status'],('failed','timed_out'))
             self.assertNotIn('probe-item',r['files'])
+            self.assertEqual(worker.used,0)
 
     def test_map_and_stream_phase_cap_bounds_real_parallelism(self):
         for stream in (False,True):

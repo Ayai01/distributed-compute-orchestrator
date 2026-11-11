@@ -8,8 +8,8 @@ from remote_compute import rtl
 
 class RuntimeEfficiencyTests(unittest.TestCase):
     def test_item_bootstrap_does_not_import_service_or_collection_pipeline(self):
-        code='import json,sys;from remote_compute import execution;print(json.dumps([n for n in sys.modules if n in("remote_compute.worker","remote_compute.pipeline","remote_compute.client")]))'
-        value=subprocess.check_output([sys.executable,'-B','-c',code],text=True)
+        code='import json,sys;from remote_compute import execution;print(json.dumps([n for n in sys.modules if n in("remote_compute.worker","remote_compute.pipeline","remote_compute.client","concurrent.futures","subprocess","tempfile")]))'
+        value=subprocess.check_output([sys.executable,'-B','-c',code],text=True,cwd=Path(__file__).resolve().parents[1])
         self.assertEqual(json.loads(value),[])
 
     def test_all_public_exports_keep_their_original_identity(self):
