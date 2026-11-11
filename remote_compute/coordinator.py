@@ -110,6 +110,7 @@ class Coordinator:
             with zipfile.ZipFile(path.parent/'request.zip') as archive:
                 task=json.loads(archive.read('task.json'))
             task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+            task=self._cache_placement(task)
             if 'dispatch_priority'in value:
                 task['priority']=value['dispatch_priority']
             self._restore_accelerator(task, value)
@@ -305,7 +306,7 @@ class Coordinator:
     def health(self, *, brief=False, sample=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []))
         with self.condition, self.pool.condition:
             return self._health()
 
@@ -449,7 +450,7 @@ class Coordinator:
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs)),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cpu_accounting']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -622,6 +623,38 @@ class Coordinator:
             result.update(accelerator=None, accelerator_fallback=dict(reason=reason, at=now))
             self._save(job)
 
+    def _cache_placement(self,task):
+        if task.get('cache_ref')is None:return task
+        from .cache_refs import read
+        reference=read(self.root,task['cache_ref'])
+        if reference['project']!=task.get('project'):
+            raise ValueError('Cache reference belongs to another project')
+        if task.get('node')not in (None,reference['provider']):
+            raise ValueError('Cache reference conflicts with explicit placement')
+        return dict(task,node=reference['provider'])
+
+    def cache_reference(self,identity,request=None):
+        from .cache_refs import read,register,public,reference_id
+        reference_id(identity)
+        if request is None:return public(read(self.root,identity))
+        if not isinstance(request,dict)or set(request)-{'content_id'}:
+            raise ValueError('Cache registration accepts content_id only')
+        with self.submission_lock.hold(identity):
+            try:previous=read(self.root,identity)
+            except ValueError:previous=None
+            if previous is not None:
+                if request.get('content_id')not in (None,previous.get('content_id')):
+                    raise ValueError('A producer cache reference is immutable')
+                return public(previous)
+            job=load_job(self.jobs,self.condition,identity)
+            result=dict(job['result'])
+            if result.get('status')!='succeeded':
+                raise ValueError('Cache registration requires a successful producer')
+            provider=result.get('assigned_node')or getattr(job.get('node'),'name',None)
+            record=register(self.root,identity,project=result.get('project'),provider=provider,
+                content_id=request.get('content_id'))
+            return public(record)
+
     def submit(self, identity, payload, *, operator=False):
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
@@ -645,6 +678,7 @@ class Coordinator:
                 validate_operator_fields(raw_task,operator)
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
+                task=self._cache_placement(task)
             with self.asset_cache.lock:
                 for asset in set(task['assets'].values()):
                     if not (self.root/'assets'/(asset+'.zip')).is_file():
@@ -672,6 +706,7 @@ class Coordinator:
                                   "total_steps": len(task["steps"]), "assets": task["assets"]}})
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
+                if task.get('cache_ref'):job['result']['cache_ref']=task['cache_ref']
                 admission = {
                     key: job['result'][key] for key in ('id', 'status', 'request_sha256', 'assets', 'label',
                         'project', 'cpus', 'memory_mb', 'submitted', 'total_steps')}
@@ -820,7 +855,8 @@ class Coordinator:
                                 node_headroom=headroom,memory_floor=job['result'].get('resource_recovery_memory_mb',0),
                                 resource_recovery=bool(job['result'].get('resource_recovery_count')))
                         except (RuntimeError, ValueError) as error:
-                            job["result"].update(status="failed", error=str(error), finished=time.time())
+                            message=('Cache-reference provider is unavailable or incompatible'if job['task'].get('cache_ref')else str(error))
+                            job["result"].update(status="failed", error=message, finished=time.time())
                             self._save(job)
                             self.queue.remove(identity)
                             archive_job(self.jobs, job)
@@ -870,6 +906,7 @@ class Coordinator:
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
                 task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+                task=self._cache_placement(task)
                 if 'dispatch_priority'in job['result']:
                     task['priority']=job['result']['dispatch_priority']
                 self._restore_accelerator(task, job['result'])
@@ -930,6 +967,7 @@ class Coordinator:
                     worker_task = dict(task)
                     # Placement hints belong to the dispatcher, not the executable.
                     worker_task.pop('node',None)
+                    worker_task.pop('cache_ref',None)
                     worker_task.pop('single_thread_weight',None)
                     worker_task.pop('retries',None)
                     if worker_task.get('accelerator') is not None:
@@ -1191,6 +1229,7 @@ class Coordinator:
         with zipfile.ZipFile(job['directory']/'request.zip') as archive:
             task=json.loads(archive.read('task.json'))
         task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
+        task=self._cache_placement(task)
         self._restore_accelerator(task, job['result'])
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
         job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task),node=None,worker_id=worker_id)

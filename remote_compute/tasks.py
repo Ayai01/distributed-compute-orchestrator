@@ -31,7 +31,7 @@ def python_task(function, *, kwargs=None, **options):
 def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
-            accelerator=None, platform=None):
+            accelerator=None, platform=None, cache_ref=None):
     platform = validate_platform(platform)
     model=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
     if model:
@@ -53,6 +53,9 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
         task["accelerator"] = accelerator
     if platform is not None:
         task['platform'] = platform
+    if cache_ref is not None:
+        from .cache_refs import reference_id
+        task['cache_ref']=reference_id(cache_ref)
     if single_thread_weight != 1.0 or isinstance(single_thread_weight, bool):
         task['single_thread_weight'] = single_thread_weight
     if cwd is not None:

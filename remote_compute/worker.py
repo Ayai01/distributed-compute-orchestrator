@@ -142,7 +142,7 @@ def cpu_budget(value=0):
 def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
-    unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator", "platform"}
+    unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "accelerator", "platform", "cache_ref"}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     maximum=task.get('max_cpus',task.get('cpus') or 1024)
@@ -150,6 +150,9 @@ def validate_task(task, capacity, *, allow_auto=False):
             "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256,
             "accelerator": None, **task}
     cpus, timeout = task["cpus"], task["timeout"]
+    if task.get('cache_ref')is not None:
+        from .cache_refs import reference_id
+        reference_id(task['cache_ref'])
     if 'execution' in task:
         from .execution import validate_execution
         validate_execution(task['execution'])
@@ -792,6 +795,8 @@ class Worker:
                     return dict(result)
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 task = validate_task(json.loads(archive.read("task.json")), int(self.capacity*self.cpu_overcommit_factor))
+                if task.get('cache_ref'):
+                    raise ValueError('cache_ref requires the scheduling center')
                 if task.get('platform') is not None and task['platform'] != sys.platform:
                     raise ValueError('Task platform differs from worker sys.platform')
                 with self.condition:
@@ -1627,6 +1632,9 @@ class Handler(BaseHTTPRequestHandler):
                     value = worker.restart_node(request['node'])
                 else:
                     raise ValueError("Restart requires a supervised service")
+            elif len(parts)==2 and parts[0]=='cache-references' and scheduler and self.command in ('GET','POST'):
+                request=json.loads(body)if self.command=='POST'else None
+                value=worker.cache_reference(parts[1],request)
             elif parts == ['jobs','status'] and self.command == 'POST':
                 request = json.loads(body)
                 identities = validate_status_ids(request.get('ids') if isinstance(request, dict) else None)

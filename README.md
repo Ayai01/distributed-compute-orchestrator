@@ -368,3 +368,21 @@ New-NetFirewallRule -Name RemoteCompute-Control-26133 -DisplayName "DCO 26133" -
 ## 文档分工
 
 [AGENTS](AGENTS.md) 管协作；[DESIGN](docs/DESIGN.md) 管协议、调度和内部机制；[STATUS](docs/STATUS.md) 管当前事实及验证；[ROADMAP](docs/ROADMAP.md) 管已确认后续。README 集中实际使用入口，示例和配置另见 [examples](examples/)、[worker.example.json](worker.example.json)、[nodes.example.json](nodes.example.json)。
+
+
+### 已完成构建的本地缓存引用
+
+支持`cache_references`协议能力的调度中心允许普通工程登记成功生产任务，并让后续任务消费该提供者的本地缓存。节点和平台仍由DCO决定，不放入`requires`。
+
+```python
+built = client.run(build_task, output_dir="results/build", keep=True)
+reference = client.cache_ref(built["id"], content_id=model_key)
+# 持久发布原回执、构建证据和reference后，再删除运输记录。
+client.delete(built["id"])
+consume = python_task("business:consume", cache_ref=reference["id"],
+                      requires=["rtl", "shared:arh"], max_cpus=4, project=built["project"])
+```
+
+引用登记要求生产任务已成功且具有工程名；消费者的project必须相同。引用及可选content_id持久保留，原运输记录删除后仍有效。工程在自己的正常publish回调中登记并保存引用，即可继续沿`Client.execute`领取、发布和删除；不需要操作员代提交。普通响应只含引用、生产任务、工程与内容身份，不返回设备清单或设备名。
+
+`content_id`记录工程已有的内容或模型身份；实际缓存的校验、兼容性和回收由工程cache-only协议负责。引用限定到生产提供者，DCO不向其他设备回退或据此重编译。新接口在中心`cache_references`能力启用后受理；SDK在未激活中心直接给出维护提示。

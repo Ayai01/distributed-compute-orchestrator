@@ -367,6 +367,16 @@ class Client:
                     raise RemoteError('Restart wait limit reached; current jobs continue') from None
                 time.sleep(.25)
 
+    def cache_ref(self,identity,*,content_id=None):
+        """Register a successful producer's project cache before its receipt is deleted."""
+        from .cache_refs import reference_id
+        reference_id(identity)
+        if 'cache_references'not in self.health(brief=True).get('capabilities',()):
+            raise RemoteError('Cache references require scheduling-center maintenance activation')
+        # Registration is idempotent on this producer ID; a lost reply must
+        # not strand an otherwise successful build during publication.
+        return self._read_reconnecting(lambda:self.request('/cache-references/'+identity,dict(content_id=content_id)))
+
     def submit(self, task, *, inputs=None, files=None, job_id=None):
         from .policy import validate_operator_fields
         try:validate_operator_fields(task,self.operator)

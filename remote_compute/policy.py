@@ -244,6 +244,7 @@ def aggregate_accelerators(profiles):
 def public_capabilities():
     """Names of the stable project-facing capability concepts."""
     return [
+        "cache_references",
         "admission",
         "admission_ready_tasks",
         "batch_status",
