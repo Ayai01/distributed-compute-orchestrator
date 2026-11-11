@@ -2,7 +2,7 @@
 
 PROJECT_NAME = "Distributed Compute Orchestrator"
 ABBREVIATION = "DCO"
-__version__ = "0.11.22"
+__version__ = "0.11.23"
 
 from .client import Client, Pool, RemoteError, RequestCancelled
 from .tasks import command, ngspice, verilator, python_map, python_call, python_task

@@ -1,6 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.22**；各服务实际运行版本及空闲重载状态见维护入口。
+- 当前源码版本：**0.11.23**；各服务实际运行版本及空闲重载状态见维护入口。
+- 资产缓存首次统计及恢复索引统一使用Windows扩展路径，深层输入解包后可正常登记大小并进入执行；原资产字节、请求及科学输入保持。复现、42项定向检查和原生空闲上线状态见`.local/maintenance/deep-asset-startup-20261111/current.json`。
 - 内存警戒先限制新增并发并在安全边界等待，持续真实临界或耗尽才保护性终止；可重入SDK计算的资源恢复独立于retries，沿原ID有界退避并保留已成功map项。验证、连续中断及部署状态见`.local/maintenance/resource-recovery-20261109/current.json`。
 - SDK收集保持每工程2线程；本地状态记录排队、ZIP获取/解包、发布及删除分项，原回执保持。ZIP准备轮询间隔最多0.5秒。已有批次积压审计、隔离验证及SDK源码部署见`.local/maintenance/collection-latency-20261109/current.json`，新调用进程读取当前SDK。
 - worker在准备命令与正文的切换处，容量调整被明确拒绝并保留原授权时，继续使用原CPU/RAM槽位，不将资源暂时不足记为业务失败。源码、隔离三步入口回归及实际生效状态见`.local/maintenance/automatic-grant-ram-20261109/current.json`。

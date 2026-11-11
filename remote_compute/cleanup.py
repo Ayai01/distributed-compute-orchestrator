@@ -108,6 +108,9 @@ class AssetCache:
         self._compact_sizes()
 
     def _add(self, path, known_size=None):
+        # Assets can unpack successfully into the extended namespace while
+        # their deep children still exceed Win32 paths during cache indexing.
+        path = native_path(path,force=True)
         size = path.stat().st_size if self.archives else known_size or 0
         if not self.archives and known_size is None:
             for folder, directories, files in os.walk(path, followlinks=False):

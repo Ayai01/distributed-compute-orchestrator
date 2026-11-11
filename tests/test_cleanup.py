@@ -18,6 +18,37 @@ from remote_compute.cleanup import AssetCache
 
 
 class CleanupTests(unittest.TestCase):
+    @unittest.skipUnless(os.name=='nt','Windows extended asset namespace')
+    def test_deep_asset_is_indexed_admitted_and_reclaimed_without_startup_failure(self):
+        from remote_compute.bundle import pack,native_path
+        from remote_compute.cleanup import remove_owned
+        with scratch()as directory,provider(Path(directory)/'worker')as(worker,client):
+            identity='a'*64;asset=worker.root/'assets'/identity
+            segment='d'*max(1,240-len(str(asset))-1)
+            name=segment+'/panda-bookshelf_small-0001/request.yaml'
+            payload=pack({name:b'original-input','shallow':b'kept'})
+            identity=hashlib.sha256(payload).hexdigest();asset=worker.root/'assets'/identity
+            try:
+                self.assertGreater(len(str(asset/name)),260)
+                self.assertTrue(client.request('/assets/'+identity,payload)['exists'])
+                self.assertEqual(worker.asset_cache.snapshot()['bytes'],len(b'original-inputkept'))
+                # A second task's presence check must reuse the same asset.
+                self.assertTrue(client.request('/assets/'+identity)['exists'])
+                self.assertEqual((native_path(asset,force=True)/name).read_bytes(),b'original-input')
+                task=python("print('startup-ok')",assets={'snapshot':identity},outputs=[])
+                result=client.run(task)
+                self.assertEqual(result['status'],'succeeded',result.get('error'))
+                self.assertEqual(len(result['steps']),1)
+                with patch('remote_compute.cleanup.os.walk',side_effect=AssertionError('known size was rescanned')):
+                    again=AssetCache(worker.root/'assets')
+                self.assertEqual(again.snapshot()['bytes'],len(b'original-inputkept'))
+                worker.asset_cache.retire(identity)
+                until(lambda:worker.asset_cache.reclaimer.snapshot()['pending']==0)
+                self.assertFalse(asset.exists())
+                again.reclaimer.close()
+            finally:
+                remove_owned(asset)
+
     def test_failed_retirement_is_reclaimed_on_the_next_start(self):
         with scratch()as directory:
             root=Path(directory)/'assets';root.mkdir();asset=root/('f'*64);asset.mkdir()
