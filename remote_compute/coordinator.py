@@ -243,7 +243,7 @@ class Coordinator:
                 advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
                                   node.capacity-node.reserved-node.external+old))
                 if _elastic_job(job):
-                    advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,{project:resource}))
+                    advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,resources))
                 advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
                             current_cpus=old,current_memory_mb=old_memory,
                             available_memory_mb=old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
@@ -739,25 +739,24 @@ class Coordinator:
                     self.accepting_assets.clear()
 
     def _queued_candidates(self,budgets):
-        """Priority, fewer occupied project threads, then small startup widths."""
+        """Least occupied weighted project first; priority orders its own work."""
         from collections import deque
         matching=_matching_pass(self.pool)
         ready=[key for key in self.queue if self.jobs[key]['result'].get('resource_retry_after',0)<=time.time()]
         counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
                         for node in matching(self.jobs[key]['task'])) for key in ready}
-        for priority in sorted({self.jobs[key]['task']['priority'] for key in ready},reverse=True):
-            groups={}
-            for key in sorted(ready,key=lambda key:(self.jobs[key]['task'].get('cpus',1)or 1,counts[key])):
-                task=self.jobs[key]['task']
-                if task['priority']==priority:groups.setdefault(task.get('project')or'default',deque()).append(key)
-            while groups:
-                group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'],
-                    self.jobs[groups[group][0]]['task'].get('cpus',1)or 1,counts[groups[group][0]]))
-                key=groups[group].popleft()
-                if not groups[group]:del groups[group]
-                yield key
+        groups={}
+        for key in sorted(ready,key=lambda key:(-self.jobs[key]['task']['priority'],self.jobs[key]['task'].get('cpus',1)or 1,counts[key])):
+            task=self.jobs[key]['task']
+            groups.setdefault(task.get('project')or'default',deque()).append(key)
+        while groups:
+            group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'],
+                self.jobs[groups[group][0]]['task'].get('cpus',1)or 1,counts[groups[group][0]],group))
+            key=groups[group].popleft()
+            if not groups[group]:del groups[group]
+            yield key
 
-    def _growth_headroom(self, resources):
+    def _growth_headroom(self, resources, *, candidate=None):
         """Give existing elastic work its first four useful threads.
 
         This holds no worker lease and never changes an active pool. Its owner
@@ -765,26 +764,46 @@ class Coordinator:
         finishing makes them available to queued work immediately.
         """
         protected={}
-        warm_cache={}
+        warm_cache={'projects':self._project_cpu_plan(resources)}
+        remaining={}
+        occupied={}
+        for _key,peer in active_items(self.jobs):
+            node=peer.get('node')
+            if node is not None and peer['result']['status']not in TERMINAL:
+                key=(peer['task'].get('project')or'default',node.name)
+                occupied[key]=occupied.get(key,0)+peer['task']['cpus']
         for identity,job in sorted(active_items(self.jobs),key=lambda row:(row[1]['result'].get('submitted',0),row[0])):
             held=job.get('node');current=job.get('task',{})
+            group=current.get('project')or'default'
+            if group not in resources:continue
+            other=(candidate.get('project')or'default')if candidate is not None else group
+            lower=(candidate is not None and other in resources and group!=other and
+                   resources[group]['used']/resources[group]['resource_share']<resources[other]['used']/resources[other]['resource_share'])
             startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
-            desired=min(4,job.get('desired_cpus',startup));old=current.get('cpus',0)
+            desired=job.get('desired_cpus',startup)
+            if not lower:desired=min(4,desired)
+            old=current.get('cpus',0)
             if (held is None or desired<=old
                     or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
                     or held.error or not held.enabled or held.health.get('paused')):
                 continue
             free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
             if not free:continue
-            target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=warm_cache)
+            target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=None if lower else warm_cache)
+            key=(group,held.name)
+            if key not in remaining:
+                remaining[key]=(max(0,warm_cache['projects'].get(group,{}).get(held.name,0)-occupied.get(key,0))
+                                if len(warm_cache['projects'])>1 else math.inf)
             available_memory=held.memory_credit(job.get('worker_id',identity),current['memory_mb'])+max(0,min(held.memory_free,self.pool._host_memory_free(held)))
             model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
             model.update(job.get('phase_memory',dict(memory_mb=current['memory_mb'])))
-            model=held.resize_memory_model(job.get('worker_id',identity),model)
+            calibrated=held.resize_memory_model(job.get('worker_id',identity),model)
+            model={key:calibrated.get(key)for key in model}
             target,memory=plan_memory(target,available_memory,**model)if 'adaptive_memory'in held.health.get('capabilities',())else plan_resize(target,available_mb=available_memory,**model)
             if memory is not None and memory>available_memory:continue
-            count=max(0,min(target-old,free))
+            count=max(0,min(target-old,free,remaining[key]))
             if count:
+                remaining[key]-=count
                 protected[held.name]=protected.get(held.name,0)+count
         return protected
 
@@ -794,7 +813,7 @@ class Coordinator:
         def order(identity):
             task = self.jobs[identity]['task']
             group = task.get('project') or 'default'
-            return (-task['priority'], resources[group]['used']/resources[group]['resource_share'])
+            return (resources[group]['used']/resources[group]['resource_share'], group, -task['priority'])
         with self.pool.condition:
             for identity in sorted(self.queue, key=order):
                 job = self.jobs[identity]; task = job['task']
@@ -822,9 +841,7 @@ class Coordinator:
         protected = {}
         for name, (node, waiting) in claims.items():
             owner = waiting.get('project') or 'default'; resource = resources[owner]
-            if (owner != group and (waiting['priority'] > task['priority'] or
-                    waiting['priority'] == task['priority'] and
-                    resource['used']/resource['resource_share'] <= current['used']/current['resource_share'])):
+            if (owner != group and resource['used']/resource['resource_share'] <= current['used']/current['resource_share']):
                 protected[name] = max(0, min(waiting['cpus'], node.capacity-node.reserved-node.external))
         return protected
 
@@ -836,7 +853,7 @@ class Coordinator:
                     for identity in self.queue:
                         self._fallback_accelerator(self.jobs[identity])
                     budgets = self.project_resources()
-                    growth = None
+                    growth = {}
                     fixed = None
                     # Within the same priority and CPU mode, place constrained
                     # work first so flexible jobs retain the other devices.
@@ -848,11 +865,11 @@ class Coordinator:
                         group = job['task'].get('project') or 'default'
                         budget = budgets[group]
                         try:
-                            if growth is None:
-                                growth=self._growth_headroom(budgets)
+                            if group not in growth:
+                                growth[group]=self._growth_headroom(budgets,candidate=job['task'])
                             if fixed is None:
                                 fixed = self._fixed_queue_claims(budgets)
-                            headroom = dict(growth)
+                            headroom = dict(growth[group])
                             for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
                                 headroom[name] = max(headroom.get(name, 0), count)
                             node = self.pool._acquire(job["task"], block=False,
@@ -873,7 +890,7 @@ class Coordinator:
                         job["node"] = node
                         job['cpu_overcommit']=node.reserved+node.external>node.base_capacity
                         budget['used'] += job['task']['cpus']
-                        growth = None
+                        growth = {}
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              cpus=job['task']['cpus'])
@@ -1360,11 +1377,66 @@ class Coordinator:
         host='127.0.0.1' if host=='0.0.0.0' else host
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
-    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None):
-        """Share a project's node budget at a drained elastic phase boundary.
+    def _project_cpu_plan(self, resources, *, demand_override=None, memory_exempt=()):
+        """Lend compatible capacity by current, usable weighted demand.
+
+        These are opportunities at safe boundaries, not revocable live grants.
+        A project unable to use RAM, an accelerator or a node contributes no
+        hypothetical claim there; the other projects can borrow that capacity.
+        """
+        nodes={n.name:n for n in self.pool.nodes if n.enabled and not n.error and not n.health.get('paused')}
+        capacities={name:max(0,n.capacity-n.external)for name,n in nodes.items()}
+        matching=_matching_pass(self.pool);demands={};rooms={};memory={};fixed={}
+        now=time.time()
+        for key,job in active_items(self.jobs):
+            if (job['result']['status']in TERMINAL or job['cancel'].is_set()or job.get('recover')
+                    or job['result'].get('resource_retry_after',0)>now):continue
+            task=job['task'];group=task.get('project')or'default';held=job.get('node')
+            if group not in resources:continue
+            if held is not None and held.name not in nodes:
+                if held.enabled and not held.error and held.health.get('paused'):
+                    fixed[group]=fixed.get(group,0)+task['cpus']
+                continue
+            elastic=_elastic_job(job)
+            demand=job.get('desired_cpus',max(4,task.get('cpus',1))if held is not None and elastic else task.get('cpus',1)or 1)
+            if demand_override is not None:demand=demand_override.get(key,demand)
+            demand=min(demand,task.get('max_cpus',demand))
+            eligible=[]
+            for node in matching({**task,'cpus':0}if elastic else task):
+                if node.name not in nodes or held is not None and held is not node:continue
+                if node.name not in memory:memory[node.name]=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
+                if held is None:
+                    if node.startup_memory(task)>memory[node.name]:continue
+                    if task.get('accelerator')and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
+                eligible.append(node.name)
+            if not eligible:continue
+            if held is not None and elastic:
+                model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
+                model.update(job.get('phase_memory')or task.get('memory_model')or dict(memory_mb=task['memory_mb']))
+                sample=next((j for j in held.health.get('active_jobs',())if j['id']==job.get('worker_id',key)),{})
+                # Unknown estimates must not erase CPU opportunity before the
+                # caller can wait for cold calibration. Its new phase is fitted
+                # separately by resize, after the fair CPU target is known.
+                if (key not in memory_exempt and sample.get('memory_calibrated')and
+                        same_phase(model,sample.get('memory_phase')or sample.get('memory_phase_model'))):
+                    calibrated=held.resize_memory_model(job.get('worker_id',key),model)
+                    model={field:calibrated.get(field)for field in model}
+                    available=min(held.memory_capacity,held.memory_credit(job.get('worker_id',key),task['memory_mb'])+memory[held.name])
+                    width,_=plan_memory(demand,available,**model)if 'adaptive_memory'in held.health.get('capabilities',())else plan_resize(demand,available_mb=available,**model)
+                    demand=max(1,min(demand,width))
+            demands[group]=demands.get(group,0)+demand
+            edges=rooms.setdefault(group,{})
+            for name in eligible:edges[name]=edges.get(name,0)+min(demand,capacities[name])
+        shares={group:resources[group]['resource_share']for group in demands}
+        if len(shares)<=1:
+            return {group:{name:min(capacities[name],room)for name,room in rooms[group].items()}for group in shares}
+        return weighted_node_threads(capacities,shares,demands,rooms,current_used={group:resources[group]['used']for group in shares},fixed_used=fixed)
+
+    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, phase_model=None):
+        """Apply the project share, then its task order at a drained boundary.
 
         Running peers keep their grants until their own boundary. Within the
-        free compatible capacity, existing work gets up to four useful threads, ready work
+        project's usable compatible capacity, existing work gets up to four useful threads, ready work
         enters at its startup width, then idle slots widen running work. Explicit
         fixed-width requests retain their indivisible admission contract.
         """
@@ -1373,30 +1445,33 @@ class Coordinator:
             # The plan grants at most the requested width and at least one.
             # A one-thread phase therefore has the exact target without a plan.
             return 1
-        if warm_cache is not None and group in warm_cache:
-            return max(1,warm_cache[group].get(identity,{}).get(current['node'].name,0))
+        if warm_cache is not None:
+            if 'projects'not in warm_cache:warm_cache['projects']=self._project_cpu_plan(resources)
+            projects=warm_cache['projects']
+        else:
+            previous=current.get('phase_memory')or current['task'].get('memory_model')or dict(memory_mb=current['task']['memory_mb'])
+            exempt=(identity,)if phase_model is not None and not same_phase(phase_model,previous)else()
+            projects=self._project_cpu_plan(resources,demand_override={identity:max(desired,current.get('desired_cpus',desired))},memory_exempt=exempt)
+        # Other jobs retain their real grants until their own boundaries.
+        # An ideal lower share must never be treated as if those peers had
+        # already returned CPUs, or hundreds of one-core jobs can warm again.
+        held_here=sum(peer['task']['cpus']for _key,peer in active_items(self.jobs)
+                      if peer.get('node')is current['node']and peer['result']['status']not in TERMINAL
+                      and(peer['task'].get('project')or'default')==group)
+        share_room=(max(1,projects.get(group,{}).get(current['node'].name,0)-max(0,held_here-current['task']['cpus']))
+                    if len(projects)>1 else desired)
+        if warm_cache is not None and group in warm_cache.get('warm',{}):
+            return min(share_room,max(1,warm_cache['warm'][group].get(identity,{}).get(current['node'].name,0)))
         members={key:job for key,job in active_items(self.jobs)
                  if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
                  and job['result'].get('resource_retry_after',0)<=time.time()
                  and (job['task'].get('project') or 'default')==group}
         nodes={node.name:node for node in self.pool.nodes
                if node.enabled and not node.error and not node.health.get('paused')}
-        # A wider phase may use spare slots only after every older running
-        # project has its first four useful threads funded on that node.
-        free={name:max(0,node.capacity-node.external-node.reserved)for name,node in nodes.items()}
-        peer_warm={name:0 for name in nodes}
-        for key,peer in sorted(active_items(self.jobs),key=lambda row:(row[1]['result'].get('submitted',0),row[0])):
-            held=peer.get('node');task=peer.get('task',{})
-            if (held is None or held.name not in free or not _elastic_job(peer)
-                    or peer['result']['status']not in ('running','dispatching') or peer['cancel'].is_set()):continue
-            wanted=desired if key==identity else peer.get('desired_cpus',4)
-            gap=max(0,min(4,wanted,task.get('max_cpus',wanted))-task.get('cpus',0))
-            count=min(gap,free[held.name]);free[held.name]-=count
-            if (task.get('project')or'default')!=group:peer_warm[held.name]+=count
         capacities={}
         for name,node in nodes.items():
             held=sum(job['task']['cpus'] for job in members.values() if job.get('node') is node)
-            capacities[name]=max(0,node.capacity-node.external-node.reserved+held-peer_warm[name])
+            capacities[name]=max(0,min(node.capacity-node.external-node.reserved+held,projects.get(group,{}).get(name,0)))
         matching=_matching_pass(self.pool)
         fixed=[];demands={};rooms={};waiting={};memory_available={}
         for key,job in members.items():
@@ -1449,26 +1524,18 @@ class Coordinator:
             # One growth pass asks each elastic peer for its first four useful
             # threads. The same group has one unchanged warm plan;
             # wider idle growth is handled separately at the phase boundary.
-            warm_cache[group]=warm
-            return max(1,warm.get(identity,{}).get(current['node'].name,0))
+            warm_cache.setdefault('warm',{})[group]=warm
+            return min(share_room,max(1,warm.get(identity,{}).get(current['node'].name,0)))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
         entrants=weighted_node_threads(spare,{key:1. for key in waiting},waiting,rooms)
         # A ready entrant owns this opportunity until the scheduler admits it.
         # Wider running phases may still use other nodes with no ready entrant.
         for name in spare:
             if any(row.get(name,0) for row in entrants.values()):spare[name]=0
-        for key in self.queue:
-            queued=self.jobs[key]
-            if queued['cancel'].is_set()or queued['result'].get('resource_retry_after',0)>time.time():continue
-            task=queued['task'];startup=task.get('cpus',1)or 1
-            for node in matching(task):
-                if (spare.get(node.name,0)>=startup and not node.health.get('paused')
-                        and node.startup_memory(task)<=max(0,min(node.memory_free,self.pool._host_memory_free(node)))):
-                    spare[node.name]=0
         extra={key:max(0,value-sum(warm[key].values())) for key,value in running.items()}
         wide=weighted_node_threads(spare,shares,extra,rooms)
         name=current['node'].name
-        return max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0))
+        return min(share_room,max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0)))
 
     def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:
@@ -1527,7 +1594,7 @@ class Coordinator:
                     floor=1 if cooperative else old
                     granted=max(floor,min(desired,available)) if node.enabled and not node.health.get('paused') else old
                     if cooperative and node.enabled and not node.health.get('paused'):
-                        granted=min(granted,self._cooperative_cpu_target(identity,desired,resources))
+                        granted=min(granted,self._cooperative_cpu_target(identity,desired,resources,phase_model=requested_model))
                 # The report describes work already in flight. Return only
                 # unoccupied slots, then let the owner refill from the grant.
                 granted=max(active_floor,granted)

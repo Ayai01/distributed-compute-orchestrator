@@ -2,7 +2,7 @@
 
 PROJECT_NAME = "Distributed Compute Orchestrator"
 ABBREVIATION = "DCO"
-__version__ = "0.11.27"
+__version__ = "0.11.28"
 
 __all__ = ["Client", "Pool", "RemoteError", "RequestCancelled", "command", "ngspice", "verilator", "python_map", "python_call", "python_task", "map_items", "run_call", "iter_items", "StreamResultsPending", "remaining_time", "check_deadline", "Deferred", "Skipped", "ExecutionFailure", "ExecutionPaused"]
 

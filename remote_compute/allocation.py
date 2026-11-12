@@ -60,9 +60,9 @@ def weighted_threads(capacity, shares, demands):
     return allocated
 
 
-def weighted_node_threads(capacities, shares, demands, rooms):
+def weighted_node_threads(capacities, shares, demands, rooms, *, current_used=None, fixed_used=None):
     """Integer weighted max-min shares, with only usable node edges in the flow."""
-    if len(capacities)==1:
+    if len(capacities)==1 and current_used is None and fixed_used is None:
         node,capacity=next(iter(capacities.items()))
         grants=weighted_threads(capacity,shares,{p:min(demands[p],rooms.get(p,{}).get(node,0)) for p in shares})
         return {p:({node:grants[p]} if node in rooms.get(p,{}) else {}) for p in shares}
@@ -87,9 +87,10 @@ def weighted_node_threads(capacities, shares, demands, rooms):
                     placed[name][node]+=1
                     return True
         return False
+    # Project opportunity uses current occupancy to break integer share ties.
+    rank=(lambda name:((total[name]+(fixed_used or {}).get(name,0))/shares[name],current_used.get(name,0)/shares[name],name))if current_used is not None else lambda name:((total[name]+1)/shares[name],name)
     for _ in range(sum(capacities.values())):
-        candidates=sorted((name for name in shares if name not in blocked and total[name]<demands[name]),
-                          key=lambda name:((total[name]+1)/shares[name],name))
+        candidates=sorted((name for name in shares if name not in blocked and total[name]<demands[name]),key=rank)
         for name in candidates:
             if place(name,set()):
                 total[name]+=1

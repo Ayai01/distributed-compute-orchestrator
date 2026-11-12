@@ -34,9 +34,9 @@ class AdmissionPlanningTests(unittest.TestCase):
         }
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['capacity'],4)
-        self.assertEqual(state._growth_headroom(budgets),{'0':3})
+        self.assertEqual(state._growth_headroom(budgets),{'0':2})
 
-    def test_running_warmup_precedes_another_projects_new_task(self):
+    def test_running_warmup_leaves_another_projects_fair_startup_slot(self):
         state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
         state.jobs={
             'active':dict(task=dict(steps=[['echo']],cpus=1,max_cpus=8,memory_mb=64,project='A',priority=0),
@@ -47,20 +47,20 @@ class AdmissionPlanningTests(unittest.TestCase):
         }
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['capacity'],4)
-        self.assertEqual(state._growth_headroom(budgets),{'0':3})
+        self.assertEqual(state._growth_headroom(budgets),{'0':2})
         # A truly serial phase returns its standing demand as well as its
         # lease; it must not hold three unusable slots against new work.
         state.jobs['active']['desired_cpus']=1
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['capacity'],1)
         self.assertEqual(state._growth_headroom(budgets),{})
-        # Queue priority does not bypass the first four useful threads.
+        # Priority within the other project does not change its share.
         state.jobs['active']['desired_cpus']=8
         state.jobs['waiting']['task']['priority']=1
         budgets=state.project_resources()
         self.assertEqual(budgets['A']['capacity'],4)
         self.assertEqual(budgets['B']['capacity'],1)
-        self.assertEqual(state._growth_headroom(budgets),{'0':3})
+        self.assertEqual(state._growth_headroom(budgets),{'0':2})
 
     def test_small_start_elastic_jobs_spread_across_idle_devices(self):
         state=self.center([20,30,52,16,16]);pool=state.pool
@@ -321,11 +321,11 @@ class AdmissionPlanningTests(unittest.TestCase):
                                 result=dict(status='queued'))
         budgets={'A':dict(used=0,resource_share=1.),'B':dict(used=2,resource_share=1.),'u':dict(used=8,resource_share=1.)}
         iterator=state._queued_candidates(budgets)
-        self.assertEqual(next(iterator),'urgent')
         self.assertEqual(next(iterator),'A1')
         budgets['A']['used']=4
         self.assertEqual(next(iterator),'B1')
         self.assertEqual(next(iterator),'A2')
+        self.assertEqual(next(iterator),'urgent')
 
 
 @contextmanager
@@ -388,20 +388,16 @@ class CenterTests(unittest.TestCase):
                 with self.assertRaisesRegex(RemoteError,'404'):client.status(first)
                 client.delete(second)
 
-    def test_cross_project_four_thread_lease_precedes_new_dispatch(self):
+    def test_low_share_entrant_gets_a_slot_at_the_running_jobs_boundary(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=4,cpu_limit=4) as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
                 first=client.submit(python('import time;time.sleep(30)',max_cpus=8,project='A'))['id']
                 try:
-                    until(lambda:client.status(first)['status']=='running')
+                    until(lambda:client.status(first)['status']=='running'and worker.status(first)['cpus']==4)
                     second=client.submit(python('print("new-project")',max_cpus=1,project='B'))['id']
                     self.assertEqual(client.status(second)['status'],'queued')
-                    self.assertEqual(client.resize(first,4)['cpus'],4)
-                    self.assertEqual(worker.status(first)['cpus'],4)
-                    self.assertEqual(client.status(second)['status'],'queued')
-                    # An explicit drained serial phase releases the protected
-                    # slots and allows the other project's original ID in.
-                    self.assertEqual(client.resize(first,1)['cpus'],1)
+                    self.assertEqual(client.resize(first,4)['cpus'],3)
+                    self.assertEqual(worker.status(first)['cpus'],3)
                     result=client.wait(second)
                     self.assertEqual(result['status'],'succeeded',result)
                     self.assertEqual(result['stdout'].strip(),'new-project')
@@ -750,10 +746,12 @@ class CenterTests(unittest.TestCase):
                     until(lambda:pool.nodes[0].reserved==0)
 
     def test_late_lease_answer_preserves_the_original_failed_outcome(self):
-        code=("import os,sys\nsys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\n"
+        code=("import os,sys,threading,time\nsys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])\n"
               "from remote_compute import Client\n"
-              "Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],timeout=.1,lease_timeout=.1).resize("
-              "os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n")
+              "def pending():\n"
+              " try:Client(os.environ['REMOTE_COMPUTE_URL'],os.environ['REMOTE_COMPUTE_TOKEN'],timeout=.1,lease_timeout=.1).resize(os.environ['REMOTE_COMPUTE_JOB_ID'],1,memory_mb=128)\n"
+              " except Exception:pass\n"
+              "threading.Thread(target=pending,daemon=True).start()\ntime.sleep(.3)\nraise RuntimeError('original business failure')\n")
         with scratch() as root,provider(Path(root)/'worker',memory_mb=1024) as (worker,remote), \
                 Pool([remote]) as pool,center(pool,Path(root)/'center') as (state,client):
             original=state.resize
@@ -771,7 +769,7 @@ class CenterTests(unittest.TestCase):
             self.assertEqual(remote.status(identity)['cpus'],1)
             result=client.fetch(identity)
             self.assertEqual(result['steps'][0]['returncode'],1)
-            self.assertIn('timed out',result['stderr'])
+            self.assertIn('original business failure',result['stderr'])
             until(lambda:pool.nodes[0].reserved==0 and worker.used==0)
 
     def test_local_lease_can_release_grant_during_host_health_failure(self):
@@ -865,8 +863,9 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.resize(first,0)['cpus'],4)
                 second=client.submit(python(hold,project='B',max_cpus=1024,memory_mb=64))['id']
                 self.assertEqual(client.status(first)['cpus'],4)
-                # The first four useful threads precede a queued entrant.
-                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],4)
+                # At its own boundary the dominant project leaves a funded
+                # startup slot for the less occupied project.
+                self.assertEqual(client.resize(first,4,memory_mb=64)['cpus'],3)
                 self.assertEqual(client.resize(first,1,memory_mb=64)['cpus'],1)
                 until(lambda:client.status(second)['status']=='running')
                 self.assertEqual(client.status(second)['cpus'],1)
@@ -1363,18 +1362,16 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(client.admission('A',max_cpus=1024,queue_ratio=0)['capable_cpus'],12)
                 self.assertEqual(client.admission('B',max_cpus=1024,queue_ratio=0)['capable_cpus'],12)
                 client.control(paused=False)
-                until(lambda:all(client.status(i)['status']=='running'for i in (other,queued)))
+                until(lambda:client.status(other)['status']=='running')
                 client.resize(other,0)
-                self.assertEqual(client.status(other)['cpus'],8)
-                self.assertEqual(client.status(queued)['cpus'],1)
-                self.assertEqual(client.resize(queued,0)['cpus'],4)
-                resources=client.health()['projects']
-                self.assertEqual({name:(row['capacity'],row['used']) for name,row in resources.items()},
-                                 {'A':(24,16),'B':(12,8)})
-                for identity in (existing,other):
-                    client.write_job_file(identity,'release','done');client.wait(identity);client.fetch(identity)
+                self.assertGreaterEqual(client.status(other)['cpus'],11)
+                self.assertGreaterEqual(client.health()['projects']['A']['used'],12)
+                client.write_job_file(existing,'release','done');client.wait(existing);client.fetch(existing)
+                self.assertEqual(client.resize(other,0)['cpus'],6)
                 until(lambda:client.status(queued)['status']=='running')
                 self.assertEqual(client.status(queued)['assigned_node'],'node2')
+                self.assertEqual(client.resize(queued,0)['cpus'],6)
+                client.write_job_file(other,'release','done');client.wait(other);client.fetch(other)
                 client.write_job_file(queued,'release','done');client.wait(queued);client.fetch(queued)
 
     def test_capped_auto_window_starts_every_device_without_prefetch(self):
@@ -1443,10 +1440,10 @@ class CenterTests(unittest.TestCase):
                 identity=client.submit(python('import time;time.sleep(30)',max_cpus=1024,project='other'))['id']
                 until(lambda:client.status(identity)['status']=='running')
                 window=client.admission('newcomer',max_cpus=1024,queue_ratio=0)
-                self.assertEqual((window['running_tasks'],window['in_flight']),(2,2))
+                self.assertEqual((window['running_tasks'],window['in_flight']),(4,4))
                 client.cancel(identity);client.wait(identity);client.fetch(identity)
 
-    def test_cancellation_is_sent_once_and_terminal_polling_stays_bounded(self):
+    def test_direct_cancellation_and_polling_fallback_stay_bounded(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,worker):
             with Pool([worker]) as pool, center(pool,Path(root)/'center') as (_,client):
                 identity=client.submit(python('import time;time.sleep(30)'))['id']
@@ -1458,7 +1455,7 @@ class CenterTests(unittest.TestCase):
                     return result
                 with patch.object(backend,'cancel',wraps=backend.cancel) as cancel,patch.object(backend,'status',side_effect=delayed_terminal) as status:
                     client.cancel(identity);client.wait(identity)
-                    self.assertEqual(cancel.call_count,1)
+                    self.assertIn(cancel.call_count,(1,2))
                     self.assertLessEqual(status.call_count,9)
                 client.fetch(identity)
 
@@ -1953,21 +1950,24 @@ class CenterTests(unittest.TestCase):
         self.assertEqual(weighted_threads(58, dict(A=1,B=1,C=1), dict(A=1,B=100,C=100)),dict(A=1,B=29,C=28))
 
     def test_three_projects_share_all_threads_and_auto_job_obeys_share(self):
+        hold="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.02)"
         with scratch() as root, provider(Path(root)/'worker', cpus=7) as (_, node):
             with Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
                 client.control(paused=True)
                 identities=[]
-                identities.append(client.submit(python('import time; time.sleep(1)',max_cpus=1024,project='A'))['id'])
+                identities.append(client.submit(python(hold,max_cpus=1024,project='A'))['id'])
                 for project in ('B','C'):
                     for _ in range(2):
-                        identities.append(client.submit(python('import time; time.sleep(1)',project=project))['id'])
+                        identities.append(client.submit(python(hold,project=project))['id'])
                 client.control(paused=False)
                 until(lambda:client.status(identities[0])['status']=='running')
                 client.resize(identities[0],0)
                 until(lambda: sum(p['used'] for p in client.health()['projects'].values()) == 7)
+                until(lambda:all(client.status(identity)['status']=='running'for identity in identities))
                 allocations=client.health()['projects']
-                self.assertEqual({k:v['used'] for k,v in allocations.items()},dict(A=4,B=2,C=1))
+                self.assertEqual({k:v['used'] for k,v in allocations.items()},dict(A=3,B=2,C=2))
                 for identity in identities:
+                    client.write_job_file(identity,'release','done')
                     client.wait(identity);client.fetch(identity)
 
     def test_automatic_cpu_grant_starts_with_one_thread(self):
