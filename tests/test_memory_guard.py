@@ -14,19 +14,19 @@ class MemoryGuardTests(unittest.TestCase):
         return dict(memory_total_mb=48907,host_memory_available_mb=physical,host_commit_available_mb=commit)
 
     def test_spare_physical_ram_and_low_commit_warn_then_continue_without_a_kill(self):
-        guard=PressureGuard();host=self.host(commit=380)
+        guard=PressureGuard();host=self.host(commit=1280)
         first=guard.update(host,0);self.assertTrue(first['limited']);self.assertTrue(first['waiting'])
         settled=guard.update(host,3)
-        self.assertTrue(settled['limited']);self.assertFalse(settled['waiting']);self.assertFalse(settled['terminate'])
+        self.assertTrue(settled['limited']);self.assertTrue(settled['waiting']);self.assertFalse(settled['terminate'])
         self.assertIsNone(pressure_victim([],host))
         recovered=guard.update(self.host(),4);self.assertTrue(recovered['waiting'])
         self.assertFalse(guard.update(self.host(),6)['limited'])
 
     def test_transient_emergency_does_not_kill_but_sustained_or_exhausted_does(self):
         guard=PressureGuard()
-        self.assertFalse(guard.update(self.host(commit=64),0)['terminate'])
+        self.assertTrue(guard.update(self.host(commit=64),0)['terminate'])
         self.assertFalse(guard.update(self.host(),.1)['terminate'])
-        self.assertFalse(guard.update(self.host(commit=64),1)['terminate'])
+        self.assertTrue(guard.update(self.host(commit=64),1)['terminate'])
         self.assertTrue(guard.update(self.host(commit=64),3)['terminate'])
         self.assertTrue(PressureGuard().update(self.host(commit=16),0)['terminate'])
         self.assertTrue(guard.update(self.host(physical=64),6)['terminate'])
@@ -46,13 +46,13 @@ class MemoryGuardTests(unittest.TestCase):
 
     def test_soft_commit_warning_stops_new_admission_without_terminating_running_work(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2,memory_headroom_mb=0)as(worker,client):
-            host=self.host();worker.host.sample=Mock(side_effect=lambda:dict(host))
+            host=self.host();worker.host.sample=Mock(side_effect=lambda:dict(host));worker._pressure_sample=lambda:dict(host)
             task=python_task('work:one',max_cpus=2,retries=0,timeout=15)
             code="from pathlib import Path;import time\ndef one():\n Path('started').write_text('yes')\n while not Path('release').exists():time.sleep(.02)\n return 1\n"
             identity=client.submit(task,files={'work.py':code})['id']
             try:
                 until(lambda:(worker.jobs[identity]['directory']/'input/started').exists())
-                host['host_commit_available_mb']=380
+                host['host_commit_available_mb']=1280
                 until(lambda:worker.pressure_guard.state['limited'])
                 second=client.submit(task,files={'work.py':code})['id']
                 time.sleep(2.2)
@@ -191,7 +191,7 @@ def one(i,counts):
         with scratch()as root:
             root=Path(root);counts=root/'counts';counts.mkdir()
             with provider(root/'worker',shared={'counts':counts},memory_headroom_mb=0)as(worker,remote),Pool([remote])as pool,center(pool,root/'center')as(_,client),patch('remote_compute.coordinator.RESOURCE_RECOVERY_DELAYS',(.1,.2)):
-                host=self.host();worker.host.sample=Mock(side_effect=lambda:dict(host))
+                host=self.host();worker.host.sample=Mock(side_effect=lambda:dict(host));worker._pressure_sample=lambda:dict(host)
                 code="from pathlib import Path;import time\ndef one(counts):\n p=Path(counts)/'calls';n=int(p.read_text())+1 if p.exists()else 1;p.write_text(str(n))\n if n==1:time.sleep(20)\n return n\n"
                 identity=client.submit(python_task('work:one',kwargs={'counts':'${shared:counts}'},max_cpus=1,retries=0,timeout=25),files={'work.py':code})['id']
                 until(lambda:(counts/'calls').exists())
@@ -210,7 +210,7 @@ def one(i,counts):
     def test_command_wait_deadline_does_not_start_another_resource_rpc(self):
         from test_compute import python
         with scratch()as root,provider(Path(root)/'worker',memory_headroom_mb=0)as(worker,client):
-            host=self.host();worker.host.sample=Mock(side_effect=lambda:dict(host))
+            host=self.host();worker.host.sample=Mock(side_effect=lambda:dict(host));worker._pressure_sample=lambda:dict(host)
             task=python("from pathlib import Path;import time;Path('ready').touch()\nwhile not Path('release').exists():time.sleep(.01)",timeout=1.5,retries=0)
             task['steps'].append(['${tool:python}','-c',"raise AssertionError('past deadline')"])
             calls=[];original=worker._automatic_grant

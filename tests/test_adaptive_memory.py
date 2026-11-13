@@ -288,16 +288,16 @@ class AdaptiveMemoryTests(unittest.TestCase):
         self.assertEqual(plan_memory(8,512,base_memory_mb=4096,memory_per_cpu_mb=768),(1,256))
         self.assertEqual(plan_memory(8,128,memory_mb=8192)[0],0)
 
-    def test_pressure_targets_low_priority_largest_tree_in_the_scarce_resource(self):
-        def job(priority,rss,private):
-            return dict(task=dict(priority=priority),result=dict(status='running'),cancel=threading.Event(),rss_mb=rss,private_mb=private)
-        high=job(2,2000,2000);physical=job(0,1000,100);commit=job(0,100,1000)
+    def test_pressure_targets_the_newest_started_tree(self):
+        def job(start,rss,private):
+            return dict(task=dict(priority=0),result=dict(status='running',started=start),process=Mock(),cancel=threading.Event(),rss_mb=rss,private_mb=private)
+        old=job(1,2000,2000);new=job(3,1000,100);middle=job(2,100,1000)
         host=dict(memory_total_mb=4096,host_memory_available_mb=64,host_commit_available_mb=2048)
-        self.assertIs(pressure_victim([high,physical,commit],host),physical)
+        self.assertIs(pressure_victim([old,new,middle],host),new)
         host.update(host_memory_available_mb=2048,host_commit_available_mb=64)
-        self.assertIs(pressure_victim([high,physical,commit],host),commit)
+        self.assertIs(pressure_victim([old,new,middle],host),new)
         host['host_commit_available_mb']=2048
-        self.assertIsNone(pressure_victim([high,physical,commit],host))
+        self.assertIsNone(pressure_victim([old,new,middle],host))
 
     def test_oversized_request_runs_without_changing_frozen_input(self):
         with scratch()as root,provider(root+'/worker',cpus=1,memory_mb=512,memory_headroom_mb=0)as(_,node):

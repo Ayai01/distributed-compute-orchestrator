@@ -1,6 +1,7 @@
 """The unified Python entry point and its operator consoles."""
 
 import argparse
+import json
 from contextlib import ExitStack
 import ipaddress
 import os
@@ -264,14 +265,32 @@ def supervise(argv):
 
 def _supervise(argv):
     while True:
-        process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv])
+        process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv],
+                                   env=dict(os.environ,DCO_SUPERVISOR_REVISION='memory31'))
         while True:
             try:
                 code = process.wait()
                 break
             except KeyboardInterrupt:
                 continue  # the child receives the same console signal
-        if code != 75:
+        if code in (76,-9,0xC0000017,0xC000009A,-1073741801,-1073741670):
+            from .memory import PressureGuard
+            from .resources import memory,commit_memory
+            config=json.loads((ROOT/'worker.local.json').read_text(encoding='utf-8-sig'))if(ROOT/'worker.local.json').is_file()else{}
+            guard=PressureGuard()
+            print('内存中断：等待实际RAM和提交余量恢复后自动重启。',flush=True)
+            stable=None
+            while True:
+                total,free=memory();commit=commit_memory()
+                host=dict(memory_total_mb=total,host_memory_available_mb=free,memory_headroom_mb=config.get('memory_headroom_mb',0))
+                if commit is not None:host.update(host_commit_available_mb=commit[1])
+                state=guard.update(host)
+                if not state['limited']:
+                    if stable is None:stable=time.monotonic()
+                    if time.monotonic()-stable>=2:break
+                else:stable=None
+                time.sleep(.5)
+        elif code != 75:
             return code
         # Live controls are saved to the device config. Replaying the original
         # launch override would silently undo the operator's latest selection.
@@ -291,7 +310,7 @@ def handoff_python(invocation):
     """Let a reloaded child replace its old supervisor through a normal exit."""
     from .setup_tools import preferred_python
     executable=preferred_python()
-    if executable.resolve()==Path(sys.executable).resolve():
+    if executable.resolve()==Path(sys.executable).resolve() and os.environ.get('DCO_SUPERVISOR_REVISION')=='memory31':
         return False
     environment=dict(os.environ,PYTHONUTF8='1',PYTHONDONTWRITEBYTECODE='1',
                      DCO_SERVICE_HANDOFF='1')

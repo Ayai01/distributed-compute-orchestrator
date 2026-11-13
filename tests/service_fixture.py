@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 
 
-ENTRY = '''import sys
+ENTRY = '''import sys,os
+os.environ['DCO_SUPERVISOR_REVISION']='memory31'
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path

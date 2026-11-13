@@ -8,26 +8,39 @@ import time
 
 PRESSURE_GRACE_SECONDS=2.0
 PRESSURE_RECOVERY_SECONDS=2.0
-COMMIT_EMERGENCY_MB=128
+COMMIT_EMERGENCY_MB=1024
 
 
 def pressure_threshold(host):
-    return max(128,min(1024,int(host.get('memory_total_mb',0)*.02)))
+    return max(host.get('memory_headroom_mb',0),512,min(2048,int(host.get('memory_total_mb',0)*.02)))
 
 
 class PressureGuard:
-    """Warn and drain at boundaries before an actual sustained emergency."""
+    """Actual and one-second projected headroom; immediate kills, stable recovery."""
     def __init__(self):
         self.warning_since=None;self.critical_since=None;self.recovered_since=None
         self.state=dict(limited=False,waiting=False,terminate=False)
+        self.previous=None
+        self.fall_rates=(0,0)
 
     def update(self,host,now=None):
         now=time.monotonic()if now is None else now
         threshold=pressure_threshold(host)
         physical=host.get('host_memory_available_mb',threshold)
-        commit=host.get('host_commit_available_mb',threshold)
-        warning=physical<threshold or commit<threshold
+        commit=host.get('host_commit_available_mb',math.inf)
+        warning=physical<threshold+512 or commit<COMMIT_EMERGENCY_MB+512
         critical=physical<threshold or commit<COMMIT_EMERGENCY_MB
+        predicted=False
+        if self.previous is not None:
+            at,old_physical,old_commit=self.previous;span=max(.05,now-at)
+            if span<=2:
+                rates=(max(0,(old_physical-physical)/span),max(0,(old_commit-commit)/span))
+                predicted=(physical-min(rates[0],self.fall_rates[0])<threshold or
+                           commit-min(rates[1],self.fall_rates[1])<COMMIT_EMERGENCY_MB)
+                self.fall_rates=rates
+            else:self.fall_rates=(0,0)
+        self.previous=(now,physical,commit)
+        warning=warning or predicted
         if warning:
             if self.warning_since is None:self.warning_since=now
             self.recovered_since=None
@@ -38,10 +51,10 @@ class PressureGuard:
             if self.critical_since is None:self.critical_since=now
         else:self.critical_since=None
         settling=not warning and self.warning_since is not None
-        waiting=settling or critical or warning and now-self.warning_since<PRESSURE_GRACE_SECONDS
-        terminate=critical and (min(physical,commit)<32 or now-self.critical_since>=PRESSURE_GRACE_SECONDS)
+        waiting=settling or warning
+        terminate=critical or predicted
         self.state=dict(limited=warning or settling,waiting=bool(waiting),terminate=bool(terminate),
-            warning=warning,physical_threshold_mb=threshold,commit_emergency_mb=COMMIT_EMERGENCY_MB,
+            warning=warning,predicted=predicted,physical_threshold_mb=threshold,commit_emergency_mb=COMMIT_EMERGENCY_MB,
             warning_seconds=0 if self.warning_since is None else round(now-self.warning_since,3))
         return self.state
 
@@ -140,17 +153,15 @@ def plan_memory(cpus,available_mb,*,floor=1,**model):
     return 0,memory
 
 
-def pressure_victim(jobs,host):
-    """Choose one low-priority consumer when real RAM or commit is critical."""
+def pressure_victim(jobs,host,*,emergency=False):
+    """Newest admitted task first, including children not yet memory-sampled."""
     threshold=pressure_threshold(host)
     physical=host.get('host_memory_available_mb',threshold)
-    commit=host.get('host_commit_available_mb',threshold)
-    if physical>=threshold and commit>=COMMIT_EMERGENCY_MB:return None
-    private=commit<physical
+    commit=host.get('host_commit_available_mb',math.inf)
+    if not emergency and physical>=threshold and commit>=COMMIT_EMERGENCY_MB:return None
     candidates=[j for j in jobs if j['result']['status']=='running'and not j['cancel'].is_set()
-                and j.get('private_mb'if private else 'rss_mb',j.get('rss_mb',0))>0]
-    return min(candidates,key=lambda j:(j['task'].get('priority',0),
-        -j.get('private_mb'if private else 'rss_mb',j.get('rss_mb',0))),default=None)
+                and j.get('process') is not None]
+    return max(candidates,key=lambda j:(j['result'].get('started',0),j['result'].get('submitted',0),j['result'].get('id','')),default=None)
 
 
 class MemoryObservation:

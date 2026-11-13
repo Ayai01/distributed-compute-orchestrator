@@ -9,4 +9,8 @@ for stream in (sys.stdout, sys.stderr):
 from remote_compute.cli import main
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except MemoryError:
+        import os
+        os._exit(76)  # Native supervisor waits for real memory recovery.

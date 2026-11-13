@@ -259,6 +259,11 @@ class Worker:
         self.paused = False
         self.host = Host()
         self.pressure_guard=PressureGuard()
+        self.pressure_processes={}
+        self.pressure_process_lock=threading.Lock()
+        self.pressure_stop=threading.Event()
+        self.pressure_kills=0
+        self.last_memory_victim=None
         self.memory_wait_file=self.root/'memory-pressure.wait'
         unlink(self.memory_wait_file)
         self.memory_wait_signaled=False
@@ -368,6 +373,8 @@ class Worker:
                             seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
         atomic_json(self.root/'startup-current.json',self.startup)
         self.scheduler = threading.Thread(target=self._schedule, name="compute-scheduler", daemon=True)
+        self.memory_watchdog=threading.Thread(target=self._memory_watchdog,name='memory-emergency',daemon=True)
+        self.memory_watchdog.start()
         self.scheduler.start()
 
     def health(self, *, brief=False, sample=False):
@@ -387,7 +394,8 @@ class Worker:
                     "accelerator_used": len({unit[:2] for items in self.accelerator_reservations.values() for unit in items}),
                     "accelerator_jobs": sum(bool(items) for items in self.accelerator_reservations.values()),
                     "pid": os.getpid(), "version": __version__, "home": Path.home().as_posix(),
-                    "memory_pressure_state":dict(self.pressure_guard.state),
+                    "supervisor_revision":os.environ.get('DCO_SUPERVISOR_REVISION'),
+                    "memory_pressure_state":dict(self.pressure_guard.state,kills=self.pressure_kills,last_victim=self.last_memory_victim,watchdog_alive=self.memory_watchdog.is_alive()),
                     "memory_wait_signal_error":getattr(self,'memory_wait_signal_error',None),
                     "configuration_revision": self.configuration_revision,
                     "startup_recoveries": self.startup_recoveries,
@@ -605,6 +613,7 @@ class Worker:
         if 'host_commit_available_mb'in host:
             limits.append(host['host_commit_available_mb']-COMMIT_EMERGENCY_MB-commit_unallocated)
         available=max(0,min(limits))
+        if self.pressure_guard.state['limited']:available=0
         return {**host, "memory_capacity_mb": self.memory_capacity, "memory_reserved_mb": round(reserved, 2),
                 "memory_available_mb": int(available), "memory_reserve_mb": self.memory_reserve,
                 "memory_headroom_mb": self.memory_headroom, "memory_commit_headroom_mb":COMMIT_EMERGENCY_MB,
@@ -902,11 +911,50 @@ class Worker:
                 raise
             return dict(result)
 
+    def _pressure_sample(self):
+        from .resources import memory,commit_memory
+        total,free=memory();commit=commit_memory()
+        host=dict(memory_total_mb=total,host_memory_available_mb=free,memory_headroom_mb=self.memory_headroom)
+        if commit is not None:host.update(host_commit_limit_mb=commit[0],host_commit_available_mb=commit[1])
+        return host
+
+    def _memory_watchdog(self):
+        # Never acquire the scheduler condition, enumerate receipts, or save to
+        # disk before the OS kill. A blocked control/RPC/cleanup cannot delay it.
+        if os.name=='nt':
+            import ctypes
+            kernel=ctypes.windll.kernel32
+            kernel.GetCurrentThread.restype=ctypes.c_void_p
+            kernel.SetThreadPriority.argtypes=[ctypes.c_void_p,ctypes.c_int]
+            kernel.SetThreadPriority(kernel.GetCurrentThread(),2)
+        while not self.pressure_stop.is_set():
+            try:
+                self._memory_emergency(self._pressure_sample())
+            except Exception as error:
+                self.pressure_guard.state.update(limited=True,waiting=True,sample_error=type(error).__name__)
+            self.pressure_stop.wait(.1)
+
+    def _memory_emergency(self,host):
+        pressure=self.pressure_guard.update(host)
+        if not pressure['terminate']:return
+        with self.pressure_process_lock:jobs=tuple(self.pressure_processes.values())
+        victim=pressure_victim(jobs,host,emergency=True)
+        if victim is None:return
+        process=victim.get('process')
+        if process is None:return
+        victim['result'].update(error_kind='memory_pressure',error='Newest task forcibly killed to restore actual host memory headroom',
+                               memory_pressure={**host,'guard':dict(pressure)})
+        victim['memory_pressure']=True;victim['cancel'].set()
+        process.kill()
+        self.pressure_kills+=1
+        self.last_memory_victim=victim['result']['id']
+        self.pressure_guard.state.update(last_victim=self.last_memory_victim,kills=self.pressure_kills)
+
     def _schedule(self):
         with self.condition:
             while not self.stopping:
                 host=self.host.sample()
-                pressure=self.pressure_guard.update(host)
+                pressure=self.pressure_guard.state
                 if pressure['waiting']!=self.memory_wait_signaled:
                     try:
                         if pressure['waiting']:self.memory_wait_file.touch()
@@ -917,13 +965,6 @@ class Worker:
                         self.memory_wait_signaled=pressure['waiting']
                         self.memory_wait_signal_error=None
                 if pressure['limited']:
-                    if pressure['terminate']and time.monotonic()>=getattr(self,'next_memory_pressure',0):
-                        victim=pressure_victim(active_values(self.jobs),host)
-                        if victim is not None:
-                            victim['result'].update(error_kind='memory_pressure',error='Task terminated under critical host RAM/commit pressure',
-                                memory_pressure={**host,'guard':dict(pressure),'victim_priority':victim['task'].get('priority',0)})
-                            victim['memory_pressure']=True;victim['cancel'].set()
-                            self.next_memory_pressure=time.monotonic()+2
                     self.condition.wait(.25);continue
                 # FIFO prevents a continuous stream of small jobs starving a larger one.
                 if self.queue and not self.paused:
@@ -948,6 +989,16 @@ class Worker:
         # Serialize only initial OS process creation, outside the scheduler
         # condition. Cancellation wakes the pacing wait without starting it.
         with self.start_lock:
+            # Only one unmeasured process tree may cold-start at a time.
+            # Once measured, its independent memory envelope funds admission.
+            while not self.stopping and not job['cancel'].is_set():
+                with self.pressure_process_lock:
+                    cold=any(j is not job and not j['cancel'].is_set() and
+                             getattr(j.get('memory_observation'),'envelope',None)is None
+                             for j in self.pressure_processes.values())
+                if not cold and not self.pressure_guard.state['limited']:break
+                if time.time()>=job['result'].get('deadline',float('inf')):return None
+                job['cancel'].wait(.05)
             interval=1. if job.get('cpu_overcommit')else .5
             deadline=self.next_start+max(0,interval-self.start_interval)
             if self.stopping or job['cancel'].wait(max(0,deadline-time.monotonic())):
@@ -955,7 +1006,11 @@ class Worker:
             if self.stopping or job['cancel'].is_set():
                 return None
             try:
-                return Process(*args, **kwargs)
+                process=Process(*args, **kwargs)
+                with self.pressure_process_lock:
+                    job['process']=process
+                    self.pressure_processes[job['result']['id']]=job
+                return process
             finally:
                 self.next_start = time.monotonic() + interval
                 self.start_interval=interval
@@ -1069,6 +1124,9 @@ class Worker:
                     if process is None:
                         state = 'cancelled'
                         break
+                    with self.pressure_process_lock:
+                        job['process']=process
+                        self.pressure_processes[result['id']]=job
                     with self.condition:
                         job['process'] = process
                         # Cancellation may arrive between Popen and registration.
@@ -1120,6 +1178,7 @@ class Worker:
                             if measured:
                                 result.update(measured)
                     finally:
+                        with self.pressure_process_lock:self.pressure_processes.pop(result['id'],None)
                         with self.condition:
                             job.pop('process', None)
                         process.close()
@@ -1469,6 +1528,8 @@ class Worker:
         for identity, _job in pending:
             self.cancel(identity)
         self.scheduler.join()
+        self.pressure_stop.set()
+        self.memory_watchdog.join()
         for thread in list(self.threads):
             thread.join()
         # Calibration runs in a daemon thread and observes ``stopping`` while
