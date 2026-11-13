@@ -911,12 +911,25 @@ class Node:
 
     @property
     def memory_free(self):
+        pressure=self.health.get('memory_pressure_state') or {}
+        # A stale worker-side budget sample must not turn healthy host RAM into
+        # zero admission. The watchdog's physical/commit guard remains the
+        # hard authority; use the fresh host sample while it is healthy.
+        reported=self.health.get('memory_available_mb',0)
+        if (reported<=0 and not pressure.get('limited') and
+                self.health.get('host_memory_available_mb') is not None):
+            physical=self.health.get('host_memory_available_mb',0)-self.health.get('memory_headroom_mb',0)
+            commit=self.health.get('host_commit_available_mb')
+            if commit is None:reported=max(0,physical)
+            else:
+                from .memory import COMMIT_EMERGENCY_MB
+                reported=max(0,min(physical,commit-COMMIT_EMERGENCY_MB))
         if self.health.get('memory_accounting')=='rss':
             return min(self.memory_capacity-self.health.get('memory_reserved_mb',0)-self.memory_unreported,
-                       self.health.get('memory_available_mb',0)-self.memory_unreported)
+                       reported-self.memory_unreported)
         unreported = max(0, self.reserved_memory_mb - self.health.get("memory_reserved_mb", 0))
         return min(self.memory_capacity - self.reserved_memory_mb - self.external_memory_mb,
-                   self.health.get("memory_available_mb", 0) - unreported)
+                   reported - unreported)
 
     @property
     def memory_unreported(self):

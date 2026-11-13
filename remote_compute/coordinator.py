@@ -1053,6 +1053,11 @@ class Coordinator:
                         node.client.cancel(identity)
                         cancel_sent=True
                     remote = node.client.status(identity, brief=True)
+                    if (remote.get('status') in ('running','dispatching') and
+                            remote.get('runtime',{}).get('process_alive') is False):
+                        remote=dict(remote,status='interrupted',finished=time.time(),
+                                    error='Worker process disappeared; preserving original ID for resource recovery',
+                                    error_kind='process_lost',cost_incomplete=True)
                     request=remote.get('resource_request')
                     if request and job.get('lease_answered')!=request['request_id']:
                         options={k:v for k,v in request.items() if k!='request_id'}
@@ -1073,6 +1078,10 @@ class Coordinator:
                         job['lease_answered']=request['request_id']
                     if remote['status'] in TERMINAL:
                         remote = node.client.status(identity)
+                        if remote.get('runtime',{}).get('process_alive') is False and remote.get('status') not in TERMINAL:
+                            remote=dict(remote,status='interrupted',finished=time.time(),
+                                        error='Worker process disappeared; preserving original ID for resource recovery',
+                                        error_kind='process_lost',cost_incomplete=True)
                 except RemoteError as error:
                     if getattr(error,'status_code',None)==404:
                         retry=True
