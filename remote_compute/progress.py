@@ -160,6 +160,9 @@ def diagnose(job, *, now=None, offline=False):
     elif state in ('queued','pending'):code = 'queued'
     elif offline:code,level = 'worker_unreachable','warning'
     elif state=='dispatching':code = 'preparing'
+    elif runtime.get('process_alive') is False and (job.get('resource_request') or
+            runtime.get('cpu_seconds',0)<=0 or job.get('active_cpus',job.get('cpus',0))==0):
+        code = 'resource_wait' if job.get('resource_request') else 'preparing'
     elif runtime.get('process_alive') is False:code,level = 'process_lost','warning'
     elif job.get('progress_error'):code,level = 'progress_invalid','warning'
     elif _number(runtime.get('sampled_at')) and now-runtime['sampled_at']>max(15,threshold):code,level = 'worker_sample_stale','warning'

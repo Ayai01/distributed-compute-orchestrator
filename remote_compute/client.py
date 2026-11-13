@@ -916,6 +916,7 @@ class Node:
         # zero admission. The watchdog's physical/commit guard remains the
         # hard authority; use the fresh host sample while it is healthy.
         reported=self.health.get('memory_available_mb',0)
+        host_fallback=False
         if (reported<=0 and not pressure.get('limited') and
                 self.health.get('host_memory_available_mb') is not None):
             physical=self.health.get('host_memory_available_mb',0)-self.health.get('memory_headroom_mb',0)
@@ -924,12 +925,18 @@ class Node:
             else:
                 from .memory import COMMIT_EMERGENCY_MB
                 reported=max(0,min(physical,commit-COMMIT_EMERGENCY_MB))
+            host_fallback=True
         if self.health.get('memory_accounting')=='rss':
             return min(self.memory_capacity-self.health.get('memory_reserved_mb',0)-self.memory_unreported,
                        reported-self.memory_unreported)
-        unreported = max(0, self.reserved_memory_mb - self.health.get("memory_reserved_mb", 0))
-        return min(self.memory_capacity - self.reserved_memory_mb - self.external_memory_mb,
-                   reported - unreported)
+        worker_reserved=self.health.get("memory_reserved_mb",0)
+        if host_fallback:
+            # Worker health is the fresh physical/commit sample. A center-side
+            # grant left by a lost process must not permanently consume Admit.
+            return min(self.memory_capacity-worker_reserved-self.external_memory_mb,reported)
+        unreported = max(0, self.reserved_memory_mb-worker_reserved)
+        return min(self.memory_capacity-self.reserved_memory_mb-self.external_memory_mb,
+                   reported-unreported)
 
     @property
     def memory_unreported(self):
