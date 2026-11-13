@@ -36,11 +36,11 @@ class PressureRetryTests(unittest.TestCase):
 
     def test_actual_host_measurements_alone_trigger_protection(self):
         job=dict(task=dict(priority=0,memory_mb=1024**3),result=dict(status='running'),
-                 rss_mb=96,private_mb=95,cancel=threading.Event())
+                 rss_mb=96,private_mb=95,process=object(),cancel=threading.Event())
         host=dict(memory_total_mb=48907,host_memory_available_mb=11786,host_commit_available_mb=8192)
         self.assertIsNone(pressure_victim([job],host))
         host['host_commit_available_mb']=908
-        self.assertIsNone(pressure_victim([job],host))
+        self.assertIs(pressure_victim([job],host),job)
         host['host_commit_available_mb']=64
         self.assertIs(pressure_victim([job],host),job)
 
