@@ -33,6 +33,7 @@ from .process import Process, low_integrity_directory
 from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, service_usage,
                         DEFAULT_MEMORY_RESERVE_MB, DEFAULT_MEMORY_HEADROOM_MB)
 from .telemetry import Activity
+from .progress import sample as sample_progress, diagnose
 from .client import RemoteError
 from .cleanup import AssetCache, Reclaimer, remove_owned
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
@@ -371,7 +372,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                      capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory']+(['restart'] if self.restart_available else []))
+                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress']+(['restart'] if self.restart_available else []))
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -1076,7 +1077,9 @@ class Worker:
                             usage = process_usage(process)
                             total_cpu = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
                             measured = accounting.update(total_cpu) if accounting else None
+                            progress_update = sample_progress(job,total_cpu)
                             with self.condition:
+                                result.update(progress_update)
                                 # A cached process scan may predate this child.
                                 if usage['rss_mb'] > 0:
                                     job['rss_mb'] = usage['rss_mb']
@@ -1108,7 +1111,10 @@ class Worker:
                         usage = process_usage(process)
                         cpu_seconds = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
                         measured = accounting.update(cpu_seconds) if accounting else None
+                        progress_update = sample_progress(job,cpu_seconds,force=True)
                         with self.condition:
+                            result.update(progress_update)
+                            result['runtime']['process_alive'] = False
                             result["cpu_seconds"] = cpu_seconds
                             if measured:
                                 result.update(measured)
@@ -1281,7 +1287,7 @@ class Worker:
     def get(self, identity):
         job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            return json.loads(json_bytes(job["result"]))
+            return json.loads(json_bytes({**job["result"], 'diagnostic':diagnose(job['result'])}))
 
     def job_file(self, identity, name, data=None):
         job = load_job(self.jobs, self.condition, identity)

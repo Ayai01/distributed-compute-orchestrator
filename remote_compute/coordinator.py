@@ -424,6 +424,7 @@ class Coordinator:
                 known_ids.add(job.get('worker_id', result.get('worker_id', result['id'])))
                 if result['status'] not in TERMINAL and result.get('assigned_node'):
                     item = {k: result.get(k) for k in ('id','label','status','cpus','max_cpus','memory_mb','started')}
+                    item['identity_scope'] = 'task'
                     item['memory_phase']=(result.get('memory_phase')or job['task'].get('memory_model')
                                           or dict(memory_mb=job['task'].get('memory_mb')))
                     item.update(progress_fields(result))
@@ -440,6 +441,7 @@ class Coordinator:
                     job=self.jobs[item['id']]
                     worker_id=job.get('worker_id',job['result'].get('worker_id',item['id']))
                     item['rss_mb']=sampled.get(worker_id,{}).get('rss_mb')
+                    item.update(progress_fields(sampled.get(worker_id,{})))
                 for item in node.get('active_jobs',[]):
                     known = item['id'] in known_ids or item['id'] in self.jobs
                     if isinstance(self.jobs, JobRecords):
@@ -473,6 +475,12 @@ class Coordinator:
                         **{key:self.jobs[identity]['task'].get(key,default) for key,default in
                            (('project','default'),('priority',0),('resource_share',1.0))}}
                         for identity in self.queue],
+                    'recent_failures':[{**{key:job['result'].get(key)for key in
+                        ('id','label','status','cpus','max_cpus','started','finished','elapsed','assigned_node')},
+                        'project':job.get('task',{}).get('project',job['result'].get('project','')),
+                        'identity_scope':'task',**progress_fields(job['result'])}
+                        for job in list(getattr(self.jobs,'recent',{}).values())
+                        if job['result']['status'] in ('failed','timed_out','interrupted')][-8:],
                     'projects': self.project_resources(), **self.activity.snapshot()}
 
     def project_resources(self):
@@ -1350,6 +1358,9 @@ class Coordinator:
             for key in ('completed', 'total'):
                 if key not in remote:
                     job['result'].pop(key, None)
+        if isinstance(remote.get('progress'),dict) and remote['progress'].get('schema')=='dco.progress.v1':
+            for key in ('completed','total','phase','unit'):
+                if key not in remote['progress']:job['result'].pop(key,None)
         if 'resource_request' not in remote:job['result'].pop('resource_request',None)
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ('id',"assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}

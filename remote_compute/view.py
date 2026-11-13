@@ -64,6 +64,12 @@ def _short(text, width):
 def _progress_label(job):
     """Format an explicit task ratio without estimating from wall time."""
     progress = job.get('progress')
+    if isinstance(progress,dict) and progress.get('schema')=='dco.progress.v1':
+        done,total=progress.get('completed'),progress.get('total')
+        if isinstance(done,(int,float)) and isinstance(total,(int,float)) and total>0:
+            return f'{done/total*100:.0f}%'
+        if isinstance(done,(int,float)):return f"{done:g}{progress.get('unit','')}"
+        return progress.get('phase')or '—'
     if isinstance(progress, dict):
         for key in ('ratio', 'fraction', 'percent'):
             value = progress.get(key)
@@ -402,9 +408,12 @@ class StatusRows(list):
         self.records=[]
         for name,job in self.jobs:
             state=job.get('status','running')
+            from .progress import diagnose, LABELS
+            diagnostic=job.get('diagnostic') or diagnose(job)
+            state_label=LABELS.get(diagnostic['code'],{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state))
             started=job.get('started')
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
-                                 _task_memory(job),{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state),compact_tag(job,preferred=_label(job),measure=_width),
+                                 _task_memory(job),state_label,compact_tag(job,preferred=_label(job),measure=_width),
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
                                  _progress_label(job)])
@@ -506,6 +515,7 @@ class StatusRows(list):
         records=self.records[self.task_page*size:(self.task_page+1)*size]
         records=[r if len(r)>7 else [*r,'-'] for r in records]
         ram_width=max([9]+[_width(r[4])for r in records])
+        state_width=max([4]+[_width(r[5])for r in records])
         def tag(record):
             return record[6] if record[9] in ('—','0/1','1/1') else f'{record[9]} {record[6]}'
         # The full progress column appears only when the task panel has room
@@ -515,19 +525,19 @@ class StatusRows(list):
         if width>=110 and not show_progress:
             table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,4,None],width,right=(3,4,5))
+                         [4,self.node_width,6,9,ram_width,6,state_width,None],width,right=(3,4,5))
         elif width>=110:
             table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Prog','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,4,6,None],width,right=(3,4,5,6))
+                         [4,self.node_width,6,9,ram_width,6,state_width,6,None],width,right=(3,4,5,6))
         elif width>=100:
             table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Tag'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,4,None],width,right=(3,4,5))
+                         [4,self.node_width,6,9,ram_width,6,state_width,None],width,right=(3,4,5))
         elif width>=80:
             table=_table(['ID','Node','CPU/max','RAM实/报','Sec','St','Tag'],
                          [[r[i]for i in (0,1,3,4,7,5)]+[tag(r)]for r in records],
-                         [4,self.node_width,9,ram_width,6,4,None],width,right=(2,3,4))
+                         [4,self.node_width,9,ram_width,6,state_width,None],width,right=(2,3,4))
         elif width>=54:
             table=_table(['ID','Node','CPU/max','Sec','Tag'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
                          [4,self.node_width,9,6,None],width,right=(2,3))

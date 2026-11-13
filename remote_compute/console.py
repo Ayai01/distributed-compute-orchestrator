@@ -37,13 +37,15 @@ def _paint_row(row, device_names=()):
     title_pattern = re.compile(r'\+ .+?(?:-+(?=\+)|(?=\+$))')
     hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
     number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?)(?![\w.])')
-    state_pattern = re.compile(r'运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
+    state_pattern = re.compile(r'CPU活跃|进度停滞|心跳丢失|进程丢失|连接中断|采样陈旧|进度无效|等资源|推进|准备|运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
     names = sorted(set(device_names) - {'', '-'}, key=lambda name: (-len(name), name))
     device_pattern = (re.compile(r'(?<![\w])(?:' + '|'.join(re.escape(name) for name in names) + r')(?![\w])')
                       if names else None)
     state_colors = {
         '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
         '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
+        'CPU活跃':'\x1b[32m', '推进':'\x1b[32m', '准备':'\x1b[36m', '等资源':'\x1b[33m',
+        **{key:'\x1b[33m'for key in ('进度停滞','心跳丢失','进程丢失','连接中断','采样陈旧','进度无效')},
         '派发':'\x1b[36m', '校准中':'\x1b[36m',
         '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
         'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}

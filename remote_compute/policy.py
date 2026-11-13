@@ -248,6 +248,7 @@ def public_capabilities():
         "admission",
         "admission_ready_tasks",
         "batch_status",
+        "task_progress",
         "artifact_fetch",
         "max_cpus",
         "resize",

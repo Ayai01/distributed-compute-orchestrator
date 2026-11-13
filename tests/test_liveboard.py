@@ -118,18 +118,18 @@ class LiveboardTests(unittest.TestCase):
         self.assertTrue(live.due(signature,None,1,0))
         self.assertEqual([live.backoff(n)for n in (1,2,3,99)],[5,10,20,300])
 
-    def test_collector_uses_only_two_cached_read_endpoints_and_operator_header_locally(self):
+    def test_collector_uses_one_cached_operator_snapshot_locally(self):
         with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:
             token=Path(folder)/'operator.token';token.write_text('private')
             requests=[]
             def read(opener,request,timeout,limit):
                 requests.append(request)
-                return self.health()if request.full_url.endswith('/health')else dict(nodes=[self.node()])
+                return dict(self.health(),nodes=[self.node()])
             with patch.object(live,'read_json',side_effect=read):
                 _,metrics=live.collect(dict(operator_token_file=str(token)))
-            self.assertEqual([x.full_url for x in requests],['http://127.0.0.1:26133/health','http://127.0.0.1:26133/nodes'])
-            self.assertIsNone(requests[0].get_header('Authorization'))
-            self.assertEqual(requests[1].get_header('Authorization'),'Bearer private')
+            self.assertEqual([x.full_url for x in requests],['http://127.0.0.1:26133/health'])
+            self.assertEqual(requests[0].get_header('Authorization'),'Bearer private')
+            self.assertEqual(metrics['source_queries'],1)
             self.assertGreater(metrics['source_bytes'],0)
             with self.assertRaises(ValueError):live.collect(dict(source_url='http://remote:26133',operator_token_file=str(token)))
 
@@ -224,7 +224,7 @@ class LiveboardTests(unittest.TestCase):
     def test_loaded_health_can_wait_for_planning_without_triggering_retry(self):
         import threading,time
         from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
-        health=self.health()
+        health=dict(self.health(),nodes=[])
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*_):pass
             def do_GET(self):

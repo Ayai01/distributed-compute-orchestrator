@@ -32,7 +32,12 @@ def progress_fields(value):
     """Return cheap progress fields already present in a task snapshot."""
     fields = {}
     progress = value.get('progress')
-    if isinstance(progress, (int, float)) and math.isfinite(float(progress)):
+    from .progress import SCHEMA, normalize, diagnose
+    business = isinstance(progress,dict) and progress.get('schema')==SCHEMA
+    if business:
+        fields['progress'] = normalize(progress)
+        fields.update({key:progress[key]for key in ('phase','completed','total','unit')if key in progress})
+    elif isinstance(progress, (int, float)) and math.isfinite(float(progress)):
         fields['progress'] = progress
     elif isinstance(progress, dict):
         compact = {key: progress[key] for key in ('ratio', 'fraction', 'percent')
@@ -41,9 +46,11 @@ def progress_fields(value):
         if compact:
             fields['progress'] = compact
     for key in ('phase', 'stage'):
+        if business:continue
         if isinstance(value.get(key), str) and value[key]:
             fields[key] = value[key][:64]
     for key in ('completed', 'total', 'current', 'target', 'nfe', 'budget'):
+        if business:continue
         candidate = value.get(key)
         if isinstance(candidate, (int, float)) and math.isfinite(float(candidate)):
             fields[key] = candidate
@@ -56,6 +63,11 @@ def progress_fields(value):
                             and (step.get('finished') is not None
                                  or step.get('returncode') is not None))
             fields.update(completed=min(completed, total), total=total)
+    if isinstance(value.get('runtime'),dict):
+        fields['runtime'] = {key:value['runtime'][key]for key in
+            ('sampled_at','process_alive','cpu_seconds','last_cpu_advanced')if key in value['runtime']}
+    if business or 'runtime' in fields or value.get('resource_request'):
+        fields['diagnostic'] = diagnose(value)
     return fields
 
 

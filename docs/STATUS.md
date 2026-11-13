@@ -1,6 +1,7 @@
 # DCO 当前事实
 
-- 当前源码版本：**0.11.28**；各服务实际运行版本见维护入口。
+- 当前源码版本：**0.11.29**；各服务实际运行版本见维护入口。
+- 任务进度入口为`report_progress`，按真实固定总量或未知终点的工作计数报告；业务心跳、最后推进、等待和检查点摘要随现有worker采样进入状态API、终端和私有Web。映射任务自动报告实际完成项数，业务报告优先。诊断只提醒，完整检查点归业务工程。验证、接入和自然空闲上线事实见`.local/maintenance/task-progress-20261112/current.json`。
 - 跨工程准入及扩核按CPU/Share优先补齐低占用工程；同工程保留已有任务到4核、新任务1核、余核扩展。暂停节点的在途授权继续计账，规划扣除同工程在同节点真实持有的其他授权，低占用工程的有用宽扩展优先于高占用工程新任务。原ID、活跃底线及原生中心更换恢复验证、源码与现场上线入口见`.local/maintenance/share-fairness-20261111/current.json`。
 - 独立计算子项按需加载执行层；父进程创建执行池、流或子进程时才导入对应标准库。逐项进程隔离、结果次序、期限和授权保持。8轮配对冷启动、相关回归及单次Claude审查裁定见`.local/maintenance/stability-20261111/performance-current.json`。
 - 冷内存探测保留真实CPU需求；固定内核在仅估计阻塞时等待当前阶段标定，再确定启动宽度。逐项进程仅加载执行所需模块；声明成果通过同卷硬链接保留，输入及scratch原子退役后后台回收，终态、CPU释放和领取不等待递归删除。源码、五台原生部署、扩核与工具缓存实测见`.local/maintenance/stability-20261111/current.json`。
@@ -22,7 +23,7 @@
 - CPU U/B按已授权/基础预算（系统逻辑线程）显示；动态准入容量单独保留在API、nodes明细及cpus回执。源码验证和各窗口实际重载状态见`.local/maintenance/cpu-budget-label-20261109/current.json`。
 - 终端统一使用`kill <id|all>`，补全ID统一青色；`clean`删除未启动排队任务及其记录、临时物和独占缓存。源码验证、部署及窗口实际重载状态见`.local/maintenance/kill-all-20261109/current.json`。
 - hybrid同时提供调度中心和进程内本机计算，看板标题为“混合模式”；API逻辑角色为scheduler，操作员明细另给出mode。进程内worker不另开服务端口。
-- 私有远程展示的独立发布器源码为1.0.3；`cpu_total`为固定逻辑线程总量，`cpu_base`为基础预算，`cpu_capacity`为动态准入，`cpu_max_capacity`为按实际倍率计算的最大超发容量。节点内存提供整机物理已用、任务树RSS、原阶段申报、校准预留、预算保留及实际物理警戒线。CBOR+gzip传输、语义合同、验证及实际发布状态见`.local/maintenance/display-transport-20261109/current.json`和`contract.md`。原展示归属和入口见`.local/maintenance/liveboard-20261108/`。任务比例只使用显式进度，缺失的历史完成数及中心uptime为null。
+- 私有远程展示的独立发布器源码为1.0.4；`cpu_total`为固定逻辑线程总量，`cpu_base`为基础预算，`cpu_capacity`为动态准入，`cpu_max_capacity`为按实际倍率计算的最大超发容量。节点内存提供整机物理已用、任务树RSS、原阶段申报、校准预留、预算保留及实际物理警戒线。CBOR+gzip传输、语义合同、验证及实际发布状态见`.local/maintenance/display-transport-20261109/current.json`和`contract.md`。原展示归属和入口见`.local/maintenance/liveboard-20261108/`。任务比例只使用显式进度，缺失的历史完成数及中心uptime为null。
 - 当前操作员`01a1a83d-ce20-78e2-bc01-13eba8bca9d6`；维护及放行状态：`.local/maintenance/automatic-contract-20261104/current.json`，与实际health交叉核对。维护入口保存实际运行版本、源码部署、原状态恢复及受理/派发状态；兼容更新按设备自然空闲重载，原ID继续执行和领取。
 - 普通客户端生产缓存引用入口为`Client.cache_ref`和任务`cache_ref`；运行中心已公开`cache_references`协议能力，普通客户端可取回已迁入的C910成功生产引用，node/platform权限保持。隔离验证、原ID领取及费用核对、worker进程保持和实际生效证据见`.local/maintenance/cache-reference-api-20261110/current.json`。
 - 使用规范：[README](../README.md)；接口及机制：[DESIGN](DESIGN.md)；协作要求：[AGENTS](../AGENTS.md)。

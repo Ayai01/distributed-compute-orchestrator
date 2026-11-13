@@ -625,6 +625,9 @@ def main(path):
     def save(status='running'):
         atomic_json(output,dict(completed=len(records),total=total,status=status,
             items=[records[i]for i in sorted(records)],item_states=states,error=str(error)if error else None))
+        if spec['mode']=='map':
+            from remote_compute.progress import report_items
+            report_items(len(records),total)
     def started(index):
         states[index].update(status='running',started=time.time());save()
     def publish(index,value,failure):

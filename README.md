@@ -279,6 +279,22 @@ Python和C++是基础环境，不出现在运行能力列表。科学计算的�
 
 工程CPU目标数不参与准入、派发或扩核；跨工程按已授权CPU除以`resource_share`优先补齐低占用者，准入和扩核共用动态份额。同工程按已有任务到4核、新任务1核、余核扩展的顺序运行，`priority`用于同工程排队顺序。没有就绪工作或无法使用的份额由其他工程借用。设备配额、超发倍率、真实内存和已授权活跃线程继续约束分配。准备窗口仍按运输中的原ID计数，默认保有真实排队工作。业务代码在执行进程中读取到的环境和自行写入的输出保持原内容。
 
+任务内使用唯一普通进度入口`report_progress`。它只原子更新本任务的小型快照，由worker现有采样和中心状态链路汇总，不发RPC、不启动监视线程。映射任务自动报告真实完成项数；业务报告优先于映射项数。终端、状态API和私有Web使用同一份数据。
+
+```python
+from remote_compute import report_progress
+
+report_progress(phase="native replay", completed=through_cycle, total=None, unit="cycles",
+                counters={"layer": layer, "source_edges": source_edges,
+                          "replayed_MAC_steps": mac_steps},
+                metrics={"inference_cpu_seconds": cpu_seconds},
+                checkpoint={"interval_seconds": 1500, "saved_at": saved_at,
+                            "available": True, "resume": "next-segment"}, stale_after=120)
+report_progress()  # 心跳，保留已有计数
+```
+
+仅在最终工作总量真实固定时填写`total`；未知终点使用`total=None`，单遍名义周期可以另放`counters`。计数为当前阶段绝对值；CPU用时等观测量放metrics，单独增长不算业务推进。省略字段保留原值，`waiting=None`清除等待；`waiting={"kind":"resource","reason":"等待完整CPU授权"}`报告明确的资源等待。检查点字段只传已发布状态的摘要与简短恢复标识，业务负责完整状态持久化。状态中的`progress.last_heartbeat`、`progress.last_advanced`与`diagnostic`区分排队、准备、等待资源、CPU活跃、停滞、心跳/进程丢失及已有失败。`stale_after`只影响诊断提醒，不取消、重算或修改任务期限。推荐沿业务已有的约5秒报告边界更新；无新增计数时也可发送心跳。DCO之外调用返回False。
+
 | 能力 | 就绪条件及独立安装理由 |
 | --- | --- |
 | `ng47` | ngspice 47仿真器及其运行依赖；独立电路仿真工具。 |

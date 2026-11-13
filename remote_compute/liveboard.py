@@ -22,12 +22,13 @@ from .bundle import atomic_json
 from .runtimes import EXECUTION_CAPABILITIES
 from .startup import Cancelled, single_instance
 from .liveboard_wire import encode as encode_cbor
+from .progress import SCHEMA, normalize as normalize_progress, diagnose
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0.3'
+PUBLISHER_VERSION = '1.0.4'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -99,18 +100,31 @@ def snapshot(health, nodes, *, now=None):
                                                    cpu_used=0, completed=None, failed=None))
             p['running'] += int(j.get('status') == 'running')
             p['cpu_used'] += number(j.get('cpus')) or 0
-            done, count = number(j.get('completed')), number(j.get('total'))
-            progress = (dict(completed=done, total=count, ratio=done/count)
-                        if done is not None and count is not None and 0 <= done <= count and count > 0 else None)
+            progress = display_progress(j)
             started = number(j.get('started'))
-            jobs.append(dict(id=text(j.get('id'), 64), identity_scope='worker_attempt',
+            jobs.append(dict(id=text(j.get('id'), 64), identity_scope=j.get('identity_scope','worker_attempt'),
                              tag=text(j.get('label'), 96), project=project, node=name,
                              status=text(j.get('status'), 16), cpus=number(j.get('cpus')),
                              max_cpus=number(j.get('max_cpus')), rss_mb=number(j.get('rss_mb')),
                              memory_reported_mb=reported_memory(j),
                              memory_reserved_mb=number(j.get('memory_reservation_mb')),
                              elapsed_seconds=int(max(0, now-started)) if started is not None else None,
-                             progress=progress))
+                             progress=progress,diagnostic=diagnose(j,now=now,offline=status=='offline')))
+    for j in health.get('queued_jobs')or():
+        project=text(j.get('project')or'default',80)
+        projects.setdefault(project,dict(name=project,running=0,queued=None,cpu_used=0,completed=None,failed=None))
+        jobs.append(dict(id=text(j.get('id'),64),identity_scope='task',tag=text(j.get('label'),96),
+            project=project,node=None,status='queued',cpus=0,max_cpus=number(j.get('max_cpus')),
+            progress=None,diagnostic=diagnose(dict(j,status='queued'),now=now)))
+    for j in health.get('recent_failures')or():
+        jobs.append(dict(id=text(j.get('id'),64),identity_scope='task',tag=text(j.get('label'),96),
+            project=text(j.get('project')or'default',80),node=text(j.get('assigned_node'),48),status=text(j.get('status'),16),
+            cpus=0,max_cpus=number(j.get('max_cpus')),elapsed_seconds=number(j.get('elapsed')),
+            progress=display_progress(j),diagnostic=diagnose(j,now=now)))
+    for name,p in projects.items():
+        resource=(health.get('projects')or{}).get(name,{})
+        p['queued']=number(resource.get('queued'))
+        p['resource_share']=number(resource.get('resource_share'))
     if health.get('paused'):
         alerts.append(dict(code='dispatch_paused', level='info', text='新派发已暂停'))
     if not health.get('accepting', True):
@@ -127,6 +141,15 @@ def snapshot(health, nodes, *, now=None):
     total, free = memory_sum('memory_total_mb'), memory_sum('host_memory_available_mb')
     mode = 'hybrid' if any(str(n.get('url', '')).startswith('local://') for n in nodes) else 'scheduler'
     all_jobs = len(jobs)
+    running=sorted((j for j in jobs if j['status']in('running','dispatching')),key=lambda j:(-(j['cpus']or 0),j['id']))
+    queued=[j for j in jobs if j['status']=='queued'];failed=[j for j in jobs if j['status']in('failed','timed_out','interrupted')]
+    display_jobs=running[:max(16,32-min(8,len(queued))-min(8,len(failed)))]+failed[:8]+queued[:8]
+    from .progress import LABELS
+    for job in jobs:
+        d=job.get('diagnostic',{})
+        if d.get('level') in ('warning','error'):
+            alerts.append(dict(code=d['code'],level=d['level'],job_id=job['id'],
+                               text=LABELS.get(d['code'],d['code'])+' · '+job['id'][:8]))
     result = dict(schema='dco.live.v1', sampled_at=stamp(),
                   source=dict(name='DCO', version=text(health.get('version'), 24), mode=mode,
                               uptime_seconds=None, status='online'),
@@ -146,10 +169,10 @@ def snapshot(health, nodes, *, now=None):
                                memory_reserve_mb=display_memory_sum('memory_reserve_mb'),
                                host_memory_floor_mb=display_memory_sum('host_memory_floor_mb')),
                   nodes=rows[:16], projects=sorted(projects.values(), key=lambda p: (-p['cpu_used'], p['name']))[:16],
-                  jobs=sorted(jobs, key=lambda j: (j['status'] != 'running', -(j['cpus'] or 0), j['id']))[:32],
+                  jobs=display_jobs[:32],
                   alerts=alerts[:8],
                   coverage=dict(nodes_total=len(rows), projects_active_total=len(projects), jobs_active_total=all_jobs,
-                                queued_job_details=False, history=False))
+                                queued_job_details=bool(queued), recent_failure_limit=8,history=False))
     # Bound the complete upload, including its JSON envelope and UTF-8 labels.
     for field in ('jobs', 'projects', 'nodes'):
         while len(encode(dict(data=result))) > MAX_BYTES and result[field]:
@@ -157,6 +180,16 @@ def snapshot(health, nodes, *, now=None):
     if len(encode(dict(data=result))) > MAX_BYTES:
         raise ValueError('Display snapshot exceeds size budget')
     return result
+
+
+def display_progress(job):
+    p=job.get('progress')
+    if isinstance(p,dict)and p.get('schema')==SCHEMA:
+        try:return normalize_progress(p)
+        except ValueError:return None
+    done,count=number(job.get('completed')),number(job.get('total'))
+    return (dict(completed=done,total=count,ratio=done/count)
+            if done is not None and count is not None and 0<=done<=count and count>0 else None)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -221,16 +254,15 @@ def collect(config):
     started = time.perf_counter()
     # This existing endpoint waits behind scheduler planning. Allow the normal
     # loaded response while keeping the wait isolated in this bounded sidecar.
-    health = read_json(opener, Request(url+'/health'), 5, MAX_SOURCE_BYTES)
-    nodes = read_json(opener, Request(url+'/nodes', headers={
-        'Authorization':'Bearer '+token, 'X-DCO-Role':'operator'}), 2, MAX_SOURCE_BYTES)
-    if not isinstance(health, dict) or not isinstance(nodes, dict) or not isinstance(nodes.get('nodes'), list):
+    health = read_json(opener, Request(url+'/health',headers={
+        'Authorization':'Bearer '+token,'X-DCO-Role':'operator'}), 5, MAX_SOURCE_BYTES)
+    if not isinstance(health, dict) or not isinstance(health.get('nodes'), list):
         raise ValueError('Invalid display source response')
-    if not all(isinstance(n, dict) for n in nodes['nodes']):
+    if not all(isinstance(n, dict) for n in health['nodes']):
         raise ValueError('Invalid display source nodes')
-    value = snapshot(health, nodes['nodes'])
+    value = snapshot(health, health['nodes'])
     return value, dict(collect_ms=round((time.perf_counter()-started)*1000, 3),
-                       source_bytes=len(encode(health))+len(encode(nodes)))
+                       source_bytes=len(encode(health)),source_queries=1)
 
 
 def fingerprint(value):
