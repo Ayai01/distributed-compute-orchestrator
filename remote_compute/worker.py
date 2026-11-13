@@ -41,7 +41,7 @@ from .compat import unlink
 from .receipts import read_receipt
 from .paths import cache_environment
 from .allocation import plan_resize,cpu_capacity,validate_cpu_overcommit
-from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard
+from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
@@ -603,11 +603,12 @@ class Worker:
                                for j,quote in zip(running,quotes))
         limits=[self.memory_capacity-reserved,host['host_memory_available_mb']-self.memory_headroom-unallocated]
         if 'host_commit_available_mb'in host:
-            limits.append(host['host_commit_available_mb']-self.memory_headroom-commit_unallocated)
+            limits.append(host['host_commit_available_mb']-COMMIT_EMERGENCY_MB-commit_unallocated)
         available=max(0,min(limits))
         return {**host, "memory_capacity_mb": self.memory_capacity, "memory_reserved_mb": round(reserved, 2),
                 "memory_available_mb": int(available), "memory_reserve_mb": self.memory_reserve,
-                "memory_headroom_mb": self.memory_headroom, "memory_budget_mb":self.memory_budget,
+                "memory_headroom_mb": self.memory_headroom, "memory_commit_headroom_mb":COMMIT_EMERGENCY_MB,
+                "memory_budget_mb":self.memory_budget,
                 "memory_effective_mb":int(min(self.memory_capacity,reserved+available)),
                 'private_mb':round(private,2),'memory_unallocated_mb':round(unallocated,2),
                 'commit_unallocated_mb':round(commit_unallocated,2),

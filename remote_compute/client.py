@@ -1502,7 +1502,9 @@ class Pool:
         available=physical-unallocated
         committed=[n for n in sampled if n.health.get('host_commit_available_mb')is not None]
         if committed:
-            commit=min(n.health['host_commit_available_mb']-n.health.get('memory_headroom_mb',n.health.get('memory_reserve_mb',0))for n in committed)
+            from .memory import COMMIT_EMERGENCY_MB
+            # Physical reserve and commit availability are separate resources.
+            commit=min(n.health['host_commit_available_mb']-n.health.get('memory_commit_headroom_mb',COMMIT_EMERGENCY_MB)for n in committed)
             unallocated_commit=sum(n.memory_unreported+n.health.get('commit_unallocated_mb',
                 max(0,n.health.get('memory_reserved_mb',0)-n.health.get('private_mb',n.health.get('rss_mb',0))))for n in siblings)
             available=min(available,commit-unallocated_commit)
