@@ -3,6 +3,7 @@
 ## 当前入口与负责人
 
 - 当前发布源码：**0.11.35**。实际运行版本、PID、状态根、设备验收和维护放行以 `.local/maintenance/takeover-20261114/current.json` 为入口。
+- 资产接口有限检查入口：`.local/maintenance/asset-interface-20261114/current.json`。大队列调度锁分片及旧中心请求身份读取修复已通过97项定向检查，等待自然维护边界加载；五台常驻进程仍运行已发布0.11.35。YOLO原ID `ab7f99f7aa9b421092b14f09b5aca2a2` 已完成经原包、受理记录及真实worker回执核对的数据纠正，中心原请求与worker运输包摘要分别保留，1514.94 CPU秒及成果保持。
 - DCO由2026-11-14接管会话 `01a1dabc-384b-7830-8015-1f0bee6c57ac` 统一负责；旧操作员会话仅作为历史参考，不再唤醒。
 - 调度中心与worker通过 `main.py` 原生监督器运行；本机提供者使用设备配置中的原状态根。配置、凭据、工具、输入、原ID、检查点和未领取结果保留在各设备的忽略目录。
 - 使用与部署见[README](../README.md)，机制见[DESIGN](DESIGN.md)，协作要求见[AGENTS](../AGENTS.md)，持续职责见[ROADMAP](ROADMAP.md)。

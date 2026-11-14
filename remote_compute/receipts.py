@@ -23,6 +23,27 @@ def _receipt(path, identity):
     return value
 
 
+def read_center_receipt(path, *, assets=()):
+    """Expose the accepted request identity, retaining a legacy worker envelope.
+
+    Older center receipts could copy the worker's rewritten dispatch ZIP hash.
+    Qualify that repair against both the immutable admission and original ZIP;
+    the retained execution receipt and its paid work stay untouched on disk.
+    """
+    value=read_receipt(path,assets=assets)
+    admission_path=Path(path).parent/'admission.json'
+    if not admission_path.is_file():return value
+    admission=_object(admission_path)
+    original=admission.get('request_sha256')
+    if admission.get('id')!=value['id'] or not original or original==value.get('request_sha256'):
+        return value
+    archive=Path(path).parent/'request.zip'
+    if hashlib.sha256(archive.read_bytes()).hexdigest()!=original:
+        raise ValueError('Original center request differs from its admission identity')
+    return dict(value,request_sha256=original,worker_request_sha256=value.get('request_sha256'),
+                request_identity_recovery=dict(source='admission.json+request.zip',original_verified=True))
+
+
 def read_receipt(path, *, assets=()):
     """Return an original receipt or a durable, explicitly incomplete failure.
 

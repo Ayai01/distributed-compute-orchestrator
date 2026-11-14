@@ -28,7 +28,7 @@ from .compat import unlink
 from .cleanup import AssetCache, remove_owned
 from .acceptance import SubmissionAssets, SubmissionLocks
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
-from .receipts import read_receipt
+from .receipts import read_center_receipt as read_receipt
 import socket
 import math
 import os
@@ -83,7 +83,7 @@ class Coordinator:
         self.accepting_assets = SubmissionAssets()
         self.asset_writes = weakref.WeakValueDictionary()
         self.jobs, self.queue, self.threads = JobRecords(
-            self.root / 'jobs', index_path=self.root / 'history.index.jsonl'), [], set()
+            self.root / 'jobs', index_path=self.root / 'history.index.jsonl',receipt_reader=read_receipt), [], set()
         self.asset_handoffs = {}
         self.legacy_assets = set()
         self.stopping = False
@@ -753,13 +753,14 @@ class Coordinator:
         ready=[key for key in self.queue if self.jobs[key]['result'].get('resource_retry_after',0)<=time.time()]
         counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
                         for node in matching(self.jobs[key]['task'])) for key in ready}
+        modes={key:self.jobs[key]['task'].get('cpus',1)or 1 for key in ready}
         groups={}
         for key in sorted(ready,key=lambda key:(-self.jobs[key]['task']['priority'],self.jobs[key]['task'].get('cpus',1)or 1,counts[key])):
             task=self.jobs[key]['task']
             groups.setdefault(task.get('project')or'default',deque()).append(key)
         while groups:
-            group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'],
-                self.jobs[groups[group][0]]['task'].get('cpus',1)or 1,counts[groups[group][0]],group))
+            group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'] if group in budgets else math.inf,
+                modes[groups[group][0]],counts[groups[group][0]],group))
             key=groups[group].popleft()
             if not groups[group]:del groups[group]
             yield key
@@ -863,10 +864,19 @@ class Coordinator:
                     budgets = self.project_resources()
                     growth = {}
                     fixed = None
+                    slice_started=time.monotonic()
                     # Within the same priority and CPU mode, place constrained
                     # work first so flexible jobs retain the other devices.
                     # Free compatible slots are not fenced by project quotas.
                     for identity in self._queued_candidates(budgets):
+                        # A full campaign can have thousands of ready originals.
+                        # Let asset handoffs, status and grants acquire the same
+                        # condition between bounded stretches of placement work.
+                        if time.monotonic()-slice_started>=.02:
+                            self.condition.wait(.001)
+                            if self.stopping or self.paused:break
+                            budgets.clear();budgets.update(self.project_resources())
+                            growth={};fixed=None;slice_started=time.monotonic()
                         if identity not in self.queue:
                             continue
                         job = self.jobs[identity]
@@ -1364,6 +1374,8 @@ class Coordinator:
         if 'resource_request' not in remote:job['result'].pop('resource_request',None)
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ('id',"assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
+        if remote.get('request_sha256') and remote['request_sha256']!=assigned.get('request_sha256'):
+            assigned['worker_request_sha256']=remote['request_sha256']
         assigned.pop('resource_request',None)
         if job.get('task'):
             assigned['cpus']=job['task']['cpus']

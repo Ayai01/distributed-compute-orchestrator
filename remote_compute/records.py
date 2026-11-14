@@ -18,8 +18,9 @@ class Job(dict):
 
 
 class JobRecords(MutableMapping):
-    def __init__(self, root, cache_size=64, *, index_path=None):
+    def __init__(self, root, cache_size=64, *, index_path=None, receipt_reader=read_receipt):
         self.root = Path(root)
+        self.receipt_reader=receipt_reader
         self.active = {}
         self.history = {}
         self.recent = OrderedDict()
@@ -151,7 +152,7 @@ class JobRecords(MutableMapping):
         path = directory / 'result.json'
         if known is None and not path.is_file():
             raise KeyError(identity)
-        result = read_receipt(path, assets=known[0] if known is not None else ())
+        result = self.receipt_reader(path, assets=known[0] if known is not None else ())
         if known is None and result.get('status') not in TERMINAL:
             raise KeyError(identity)
         return Job(result=result, read_result=deepcopy(result), directory=directory,
@@ -166,7 +167,7 @@ class JobRecords(MutableMapping):
         with self.record_lock(identity):
             if identity in self.deleted or identity not in self.history:
                 raise KeyError(identity)
-            return read_receipt(self.root / identity / 'result.json',
+            return self.receipt_reader(self.root / identity / 'result.json',
                                 assets=self.history[identity][0])
 
     def _remember(self, identity, job):
