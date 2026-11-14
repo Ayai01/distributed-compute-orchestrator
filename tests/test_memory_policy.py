@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from remote_compute.worker import Worker
 from remote_compute.client import Node, Pool
-from remote_compute.memory import MemoryObservation
+from remote_compute.memory import MemoryObservation,PressureGuard
 from test_compute import provider, python, scratch, until
 from test_center import center
 
@@ -32,7 +32,8 @@ class MemoryPolicyTests(unittest.TestCase):
 
     def test_materialized_private_commit_is_not_reserved_again_from_rss(self):
         worker=Worker.__new__(Worker);worker.host=Mock()
-        worker.host.sample.return_value=dict(memory_total_mb=4000,host_memory_available_mb=1200,host_commit_available_mb=600)
+        worker.pressure_guard=PressureGuard()
+        worker.host.sample.return_value=dict(memory_total_mb=4000,host_memory_available_mb=1200,host_commit_available_mb=1524)
         worker.memory_capacity=2000;worker.memory_reserve=0;worker.memory_headroom=100;worker.memory_budget=2000
         worker.jobs={'job':dict(result=dict(status='running'),task=dict(memory_mb=1000,memory_model=True),
                                rss_mb=400,private_mb=900,rss_sampled=True)}
@@ -57,6 +58,7 @@ class MemoryPolicyTests(unittest.TestCase):
 
     def test_live_headroom_uses_sampled_rss_instead_of_overestimated_requests(self):
         worker=Worker.__new__(Worker)
+        worker.pressure_guard=PressureGuard()
         worker.host=Mock();worker.host.sample.return_value=dict(memory_total_mb=48*GIB,host_memory_available_mb=24*GIB)
         worker.memory_capacity=32*GIB;worker.memory_reserve=16*GIB
         worker.memory_headroom=8*GIB;worker.memory_budget=0
@@ -83,6 +85,7 @@ class MemoryPolicyTests(unittest.TestCase):
 
     def test_unsampled_process_keeps_initial_reservation(self):
         worker=Worker.__new__(Worker)
+        worker.pressure_guard=PressureGuard()
         worker.host=Mock();worker.host.sample.return_value=dict(memory_total_mb=48*GIB,host_memory_available_mb=24*GIB)
         worker.memory_capacity=32*GIB;worker.memory_reserve=16*GIB
         worker.memory_headroom=8*GIB;worker.memory_budget=0
@@ -110,10 +113,10 @@ class MemoryPolicyTests(unittest.TestCase):
             host_memory_available_mb=40*GIB,host_commit_available_mb=8*GIB,
             memory_headroom_mb=2*GIB,commit_unallocated_mb=5*GIB)
         pool=Pool.__new__(Pool);pool.nodes=[node]
-        self.assertEqual(pool._host_memory_free(node),GIB)
+        self.assertEqual(pool._host_memory_free(node),2*GIB)
         # A fresh dispatch has no sample yet and retains its full reservation.
         node.reserved_memory_mb=2*GIB
-        self.assertEqual(pool._host_memory_free(node),-GIB)
+        self.assertEqual(pool._host_memory_free(node),0)
 
     def test_real_process_with_high_estimate_does_not_block_another_job(self):
         with scratch() as root,provider(root+'/worker',cpus=2,memory_mb=512,memory_headroom_mb=0) as (_,node):

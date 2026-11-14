@@ -56,11 +56,10 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
         state.jobs['waiting']=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=24,
             memory_mb=64,project='B'),node=None,cancel=threading.Event(),result=dict(status='queued'))
         self.assertEqual(state.resize('0',24,active_cpus=4)['cpus'],4)
-        # A new task's priority does not dilute the first four useful slots.
-        # A real tail can return its unused slot while siblings keep computing.
+        # Cross-project fairness returns an empty slot at this owner's boundary;
+        # the three active children and other owners' grants keep computing.
         state.jobs['waiting']['task']['priority']=1
-        self.assertEqual(state.resize('0',24,active_cpus=3)['cpus'],4)
-        # Only a real reduction in useful demand frees a warmup slot.
+        self.assertEqual(state.resize('0',24,active_cpus=3)['cpus'],3)
         self.assertEqual(state.resize('0',3,active_cpus=3)['cpus'],3)
         self.assertEqual(node.reserved,23)
         del state.jobs['waiting']
@@ -96,14 +95,14 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
                 first=client.submit(python(hold,max_cpus=8,project='A',memory_mb=64))['id']
                 second=None
                 try:
-                    until(lambda:client.status(first)['status']=='running')
+                    until(lambda:client.status(first).get('runtime',{}).get('process_alive') is True)
                     self.assertEqual(client.resize(first,4,active_cpus=1)['cpus'],4)
                     second=client.submit(python(hold,max_cpus=8,project='B',priority=1,memory_mb=64))['id']
                     self.assertEqual(client.resize(first,4,active_cpus=4)['cpus'],4)
                     self.assertEqual(worker.status(first)['cpus'],4)
                     self.assertEqual(client.status(second)['status'],'queued')
                     probe=client.resize(first,4,active_cpus=4,base_memory_mb=128,memory_per_cpu_mb=512)
-                    self.assertEqual((probe['cpus'],probe['memory_mb']),(4,640))
+                    self.assertEqual((probe['cpus'],probe['memory_mb']),(4,1024))
                     self.assertEqual(worker.status(first)['cpus'],4)
                     self.assertEqual(client.resize(first,4,active_cpus=3)['cpus'],3)
                     until(lambda:client.status(second)['status']=='running')
@@ -111,7 +110,9 @@ print(json.dumps(dict(cpus=g['cpus'],lease=os.environ.get('REMOTE_COMPUTE_LEASE'
                     with self.assertRaises(RemoteError):client.resize(first,4,active_cpus=3)
                 finally:
                     for identity in (first,second):
-                        if identity:client.write_job_file(identity,'release','done')
+                        if identity:
+                            if client.status(identity)['status']=='running':client.write_job_file(identity,'release','done')
+                            else:client.cancel(identity)
                     for identity in (first,second):
                         if identity:client.wait(identity);client.fetch(identity)
 

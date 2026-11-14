@@ -90,6 +90,7 @@ class ServicePowerTests(unittest.TestCase):
                         return 0
 
                     with patch('remote_compute.cli.require_visible'), \
+                            patch('remote_compute.cli.handoff_python',return_value=False), \
                             patch('remote_compute.cli.keep_awake', awake), \
                             patch('remote_compute.cli.supervise', side_effect=running), \
                             patch('remote_compute.cli.run_scheduler', side_effect=running), \
@@ -457,6 +458,20 @@ class ControlLifecycleTests(unittest.TestCase):
                     result=client.fetch(pending)
                     self.assertEqual(result['status'],'succeeded')
                     self.assertIn('retained output',result['stdout'])
+                    client.control(paused=True)
+                    queued=client.submit(python("print('queued original after reload')"))
+                    before=client.health()['pid']
+                    self.assertEqual(client.status(queued['id'])['status'],'queued')
+                    self.assertTrue(client.restart(wait=True,wait_timeout=5)['restarting'])
+                    def queued_reloaded():
+                        try:return client.health()['pid']!=before
+                        except RemoteError:return False
+                    until(queued_reloaded,seconds=15)
+                    client.wait(queued['id'],wait_timeout=10)
+                    retained=client.fetch(queued['id'])
+                    self.assertEqual(retained['request_sha256'],queued['request_sha256'])
+                    self.assertEqual(retained['status'],'succeeded',retained)
+                    self.assertEqual(retained['stdout'].strip(),'queued original after reload')
                     self.assertEqual(client.run(python("print('after center reload')"))['status'],'succeeded')
                 finally:
                     process.stop();process.close()

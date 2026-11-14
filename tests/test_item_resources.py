@@ -215,7 +215,11 @@ class ItemResourcesTests(unittest.TestCase):
             self.assertEqual(result['status'],'succeeded',result.get('stderr'))
             values=[row['value']for row in json.loads(result['files']['.dco-results.json'])['items']]
             self.assertEqual(len(values),10)
-            self.assertTrue(all(row['rows'][0]['width']==1 for row in values[:8]),values)
+            # Finished peers can lend slots before every earlier index returns.
+            # The first lane starts narrow; the long tail uses the whole grant.
+            self.assertEqual(values[0]['rows'][0]['width'],1,values[0])
+            self.assertTrue(all(1<=row['width']<=8 for value in values for row in value['rows']))
+            self.assertEqual(result['peak_cpus'],8)
             self.assertEqual(max(row['width']for row in values[-1]['rows']),8,values[-1])
             self.assertEqual(client.health()['used_cpus'],0)
 

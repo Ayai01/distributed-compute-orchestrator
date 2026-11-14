@@ -75,7 +75,7 @@ class CpuLeaseTests(unittest.TestCase):
                                 def started():
                                     try:return client.read_job_file(identity,'started')==b'yes'
                                     except RemoteError as error:
-                                        if error.status_code==404:return False
+                                        if error.status_code in (404,409):return False
                                         raise
                                 until(started,seconds=8)
                                 self.assertEqual(client.status(identity)['status'],'running')
@@ -206,7 +206,7 @@ class CpuLeaseTests(unittest.TestCase):
                 def started(identity):
                     try:return client.read_job_file(identity,'lease-started')==b'yes'
                     except RemoteError as error:
-                        if error.status_code==404:return False
+                        if error.status_code in (404,409):return False
                         raise
                 first = client.submit(python(ready_hold, project='A',  max_cpus=1024, memory_mb=64))['id']
                 remaining = {first}

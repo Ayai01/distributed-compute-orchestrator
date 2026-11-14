@@ -65,7 +65,7 @@ def progress_fields(value):
             fields.update(completed=min(completed, total), total=total)
     if isinstance(value.get('runtime'),dict):
         fields['runtime'] = {key:value['runtime'][key]for key in
-            ('sampled_at','process_alive','cpu_seconds','last_cpu_advanced')if key in value['runtime']}
+            ('sampled_at','process_alive','returncode','cpu_seconds','last_cpu_advanced')if key in value['runtime']}
     if business or 'runtime' in fields or value.get('resource_request'):
         fields['diagnostic'] = diagnose(value)
     return fields

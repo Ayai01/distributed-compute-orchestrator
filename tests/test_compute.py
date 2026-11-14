@@ -222,7 +222,9 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["files"]["answer.txt"], b"42")
         self.assertIn("hello", result["stdout"])
         self.assertEqual(self.client.status(), [])
-        self.assertEqual(list((self.worker.root / "jobs").iterdir()), [])
+        self.assertEqual([p for p in (self.worker.root/'jobs').iterdir() if p.name!='.trash'], [])
+        until(lambda:self.worker.work_reclaimer.snapshot()['pending']==0)
+        self.assertEqual(list((self.worker.root/'jobs/.trash').iterdir()),[])
 
     def test_output_directory_contains_full_logs_and_result(self):
         result = self.client.run(python("print('saved')"), output_dir=self.root / "result")

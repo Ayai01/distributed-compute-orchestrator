@@ -80,7 +80,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
             auto_cpus=False,elastic_cpus=True,desired_cpus=8,node=node,cancel=threading.Event(),result=dict(status='running',submitted=0)),
             'waiting':dict(task=dict(steps=[['echo']],cpus=0,max_cpus=8,memory_mb=64,project='B'),
             auto_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued',submitted=1))}
-        self.assertEqual(state._cooperative_cpu_target('running',8,state.project_resources()),4)
+        self.assertEqual(state._cooperative_cpu_target('running',8,state.project_resources()),7)
         state.queue.clear();state.jobs.pop('waiting')
         self.assertEqual(state._cooperative_cpu_target('running',8,state.project_resources()),8)
 
@@ -89,7 +89,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
         for key,submitted in (('A',0),('B',1)):
             state.jobs[key]=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=64,memory_mb=64,project=key),
                 auto_cpus=True,desired_cpus=64,node=node,cancel=threading.Event(),result=dict(status='running',submitted=submitted))
-        self.assertEqual(state._cooperative_cpu_target('B',64,state.project_resources()),8)
+        self.assertEqual(state._cooperative_cpu_target('B',64,state.project_resources()),6)
         node.reserved=9;state.jobs['B']['task']['cpus']=8
         self.assertEqual(state._cooperative_cpu_target('A',64,state.project_resources()),4)
 

@@ -154,7 +154,7 @@ Tab 在空输入时显示根命令候选，有输入时补全；PgUp/PgDn 翻任
 }
 ```
 
-这是示例预算，按设备设置。复制 [worker.example.json](worker.example.json) 为 `worker.local.json` 后默认启动才会读取。`memory_mb=0` 默认使用物理内存减 16GiB，显式数值为设备计算预算；`memory_headroom_mb=8192` 为系统实时保留至少 8GiB 可用 RAM。运行任务首次取得进程树 RSS 后按实际占用准入；尚在派发或启动采样前按申报量预留。任务的阶段需求仍保留在回执中，实际用量增长继续计入设备预算。缺失共享路径标记为 `unavailable_shared`，其他能力继续提供。
+这是示例预算，按设备设置。复制 [worker.example.json](worker.example.json) 为 `worker.local.json` 后默认启动才会读取。`memory_mb=0` 默认使用物理内存减 16GiB，显式数值为设备计算预算；`memory_headroom_mb=8192` 为系统实时保留至少 8GiB 可用 RAM。运行任务完成稳定的进程树 RSS/private 采样后按实测包络准入；尚在派发或冷启动标定中保留已筹资的启动预留。任务的阶段需求仍保留在回执中，实际用量增长继续计入设备预算。缺失共享路径标记为 `unavailable_shared`，其他能力继续提供。
 
 持久任务、输入、资产及未领取结果放在普通磁盘 `.local/state`：中心为 `scheduler/`，hybrid 本机 worker 为 `local/`，独立 worker 按端口隔离。设备 JSON 的 `root` 只指定 worker 状态根；CLI `--root` 同时指定 worker 根和中心的 `scheduler/` 子目录。`temp_root` 缺省或null均使用已可用共享RAM的DCO专属TMP；没有可用共享RAM时回落到工程`.local/tmp`。显式路径优先生效；Linux复用系统运行时目录时显式配置`temp_root`，见下文。
 
@@ -293,7 +293,7 @@ report_progress(phase="native replay", completed=through_cycle, total=None, unit
 report_progress()  # 心跳，保留已有计数
 ```
 
-仅在最终工作总量真实固定时填写`total`；未知终点使用`total=None`，单遍名义周期可以另放`counters`。计数为当前阶段绝对值；CPU用时等观测量放metrics，单独增长不算业务推进。省略字段保留原值，`waiting=None`清除等待；`waiting={"kind":"resource","reason":"等待完整CPU授权"}`报告明确的资源等待。检查点字段只传已发布状态的摘要与简短恢复标识，业务负责完整状态持久化。状态中的`progress.last_heartbeat`、`progress.last_advanced`与`diagnostic`区分排队、准备、等待资源、CPU活跃、停滞、心跳/进程丢失及已有失败。`stale_after`只影响诊断提醒，不取消、重算或修改任务期限。推荐沿业务已有的约5秒报告边界更新；无新增计数时也可发送心跳。DCO之外调用返回False。
+仅在最终工作总量真实固定时填写`total`；未知终点使用`total=None`，单遍名义周期可以另放`counters`。计数为当前阶段绝对值；CPU用时等观测量放metrics，单独增长不算业务推进。省略字段保留原值，`waiting=None`清除等待；`waiting={"kind":"resource","reason":"等待完整CPU授权"}`报告明确的资源等待。检查点字段只传已发布状态的摘要与简短恢复标识，业务负责完整状态持久化。状态中的`progress.last_heartbeat`、`progress.last_advanced`与`diagnostic`区分排队、准备、等待资源、CPU活跃、收尾、停滞、心跳/进程丢失及已有失败。`stale_after`只影响诊断提醒，不取消、重算或修改任务期限。推荐沿业务已有的约5秒报告边界更新；无新增计数时也可发送心跳。DCO之外调用返回False。
 
 | 能力 | 就绪条件及独立安装理由 |
 | --- | --- |

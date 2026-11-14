@@ -5,7 +5,7 @@ import unittest
 
 from remote_compute import Client, Pool, RemoteError
 from remote_compute.client import Node
-from remote_compute.memory import MemoryObservation, reservation
+from remote_compute.memory import MemoryObservation, PressureGuard, reservation
 from remote_compute.worker import Worker
 from test_compute import provider, python, scratch, until
 from test_center import center
@@ -20,8 +20,9 @@ def observed(rss=96,private=95):
 class ObservedMemoryTests(unittest.TestCase):
     def worker(self,jobs):
         worker=Worker.__new__(Worker)
+        worker.pressure_guard=PressureGuard()
         worker.host=Mock();worker.host.sample.return_value=dict(memory_total_mb=4096,
-            host_memory_available_mb=2048,host_commit_available_mb=512)
+            host_memory_available_mb=2048,host_commit_available_mb=1472)
         worker.memory_capacity=2048;worker.memory_reserve=0;worker.memory_headroom=64;worker.memory_budget=2048
         worker.jobs=jobs
         return worker
@@ -95,7 +96,7 @@ class ObservedMemoryTests(unittest.TestCase):
 
     def test_fixed_cpu_growth_keeps_the_calibrated_memory_envelope(self):
         with scratch()as root,provider(root+'/worker',cpus=2,memory_mb=512,memory_headroom_mb=0)as(worker,client):
-            worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=2048,host_commit_available_mb=768))
+            worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=2048,host_commit_available_mb=1728))
             identity=client.submit(python('import time;time.sleep(20)',max_cpus=2,memory_mb=400))['id']
             try:
                 until(lambda:client.status(identity)['status']=='running')
@@ -132,7 +133,7 @@ class ObservedMemoryTests(unittest.TestCase):
 
     def test_actual_high_request_low_usage_unblocks_windows_commit(self):
         with scratch()as root,provider(root+'/worker',cpus=2,memory_mb=512,memory_headroom_mb=0)as(worker,node):
-            worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=2048,host_commit_available_mb=512))
+            worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=2048,host_commit_available_mb=1472))
             with Pool([node])as pool,center(pool,root+'/center')as(_,client):
                 first=client.submit(python("import time;print('ready',flush=True);time.sleep(20)",memory_mb=400))['id']
                 try:
@@ -151,7 +152,7 @@ class ObservedMemoryTests(unittest.TestCase):
 
     def test_real_resize_cannot_spend_the_original_reclaimed_estimate_twice(self):
         with scratch()as root,provider(root+'/worker',cpus=1,memory_mb=512,memory_headroom_mb=0)as(worker,client):
-            worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=2048,host_commit_available_mb=768))
+            worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=2048,host_commit_available_mb=1728))
             identity=client.submit(python('import time;time.sleep(20)',memory_mb=400))['id']
             try:
                 until(lambda:worker.health()['memory_reserved_mb']<100,seconds=6)

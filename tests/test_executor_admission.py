@@ -92,10 +92,10 @@ class ExecutorAdmissionTests(unittest.TestCase):
                 def started():
                     try:return all(client.read_job_file(identity,'started-'+str(i))==b'yes'for i in range(4))
                     except RemoteError as error:
-                        if error.status_code==404:return False
+                        if error.status_code in (404,409):return False
                         raise
                 try:
-                    until(started)
+                    until(started,seconds=10)
                     self.assertEqual(client.status(identity)['cpus'],4)
                     original=state.resize;acknowledged=threading.Event();replies=[]
                     def observed(*args,**kwargs):

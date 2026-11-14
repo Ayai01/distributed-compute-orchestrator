@@ -34,7 +34,8 @@ class PressureGuard:
         if self.previous is not None:
             at,old_physical,old_commit=self.previous;span=max(.05,now-at)
             if span<=2:
-                rates=(max(0,(old_physical-physical)/span),max(0,(old_commit-commit)/span))
+                rates=(max(0,(old_physical-physical)/span),
+                       max(0,(old_commit-commit)/span)if math.isfinite(old_commit)and math.isfinite(commit)else 0)
                 predicted=(physical-min(rates[0],self.fall_rates[0])<threshold or
                            commit-min(rates[1],self.fall_rates[1])<COMMIT_EMERGENCY_MB)
                 self.fall_rates=rates

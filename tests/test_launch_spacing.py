@@ -8,19 +8,27 @@ from unittest.mock import patch
 from remote_compute import Pool
 from remote_compute.client import Node
 from remote_compute.worker import Worker
+from remote_compute.memory import PressureGuard
+from types import SimpleNamespace
 from remote_compute.coordinator import Coordinator
 from test_compute import provider,python,scratch
 from test_center import center
 
 
 class LaunchSpacingTests(unittest.TestCase):
-    def test_concurrent_initial_process_creation_is_spaced(self):
+    def worker(self):
         worker=Worker.__new__(Worker)
+        worker.pressure_process_lock=threading.Lock();worker.pressure_processes={}
+        worker.pressure_guard=PressureGuard()
+        return worker
+
+    def test_concurrent_initial_process_creation_is_spaced(self):
+        worker=self.worker()
         worker.start_lock=threading.Lock();worker.next_start=0.;worker.start_interval=.5;worker.stopping=False
         barrier=threading.Barrier(3);times=[]
         def start(_):
             barrier.wait()
-            return worker._start_process(dict(cancel=threading.Event()),['echo'])
+            return worker._start_process(dict(cancel=threading.Event(),result=dict(id=str(threading.get_ident())),memory_observation=SimpleNamespace(envelope=(1,1))),['echo'])
         def process(*args,**kwargs):
             times.append(time.monotonic());return object()
         with patch('remote_compute.worker.Process',side_effect=process),ThreadPoolExecutor(3)as pool:
@@ -29,7 +37,7 @@ class LaunchSpacingTests(unittest.TestCase):
         self.assertTrue(all(b-a>=.5 for a,b in zip(times,times[1:])),times)
 
     def test_cancelled_start_does_not_launch_or_wait_out_the_interval(self):
-        worker=Worker.__new__(Worker)
+        worker=self.worker()
         worker.start_lock=threading.Lock();worker.next_start=time.monotonic()+10;worker.start_interval=.5;worker.stopping=False
         cancel=threading.Event();cancel.set()
         with patch('remote_compute.worker.Process')as process:
@@ -60,14 +68,14 @@ class LaunchSpacingTests(unittest.TestCase):
             finally:pool.close()
 
     def test_worker_stop_during_spacing_wait_keeps_the_gate_and_skips_creation(self):
-        worker=Worker.__new__(Worker)
+        worker=self.worker()
         worker.start_lock=threading.Lock();worker.next_start=time.monotonic()+.06;worker.start_interval=.5;worker.stopping=False
         previous=worker.next_start
         def stop():
             time.sleep(.01);worker.stopping=True
         with patch('remote_compute.worker.Process')as process,ThreadPoolExecutor(1)as pool:
             stopping=pool.submit(stop)
-            self.assertIsNone(worker._start_process(dict(cancel=threading.Event()),['echo']))
+            self.assertIsNone(worker._start_process(dict(cancel=threading.Event(),result=dict(id=str(threading.get_ident())),memory_observation=SimpleNamespace(envelope=(1,1))),['echo']))
             stopping.result();process.assert_not_called()
         self.assertEqual(worker.next_start,previous)
 
@@ -89,11 +97,11 @@ class LaunchSpacingTests(unittest.TestCase):
             now=10.
             def wait(self,delay):self.now+=delay;return False
             def is_set(self):return False
-        clock=Clock();worker=Worker.__new__(Worker);times=[]
+        clock=Clock();worker=self.worker();times=[]
         worker.start_lock=threading.Lock();worker.next_start=0.;worker.start_interval=.5;worker.stopping=False
         with patch('remote_compute.worker.time.monotonic',side_effect=lambda:clock.now), \
                 patch('remote_compute.worker.Process',side_effect=lambda *args,**kwargs:times.append(clock.now)):
-            for borrowed in (False,True,False):worker._start_process(dict(cancel=clock,cpu_overcommit=borrowed),['echo'])
+            for borrowed in (False,True,False):worker._start_process(dict(cancel=clock,cpu_overcommit=borrowed,result=dict(id='clock'),memory_observation=SimpleNamespace(envelope=(1,1))),['echo'])
         self.assertEqual(times,[10.,11.,12.])
 
     def test_device_dispatch_gates_are_independent_and_borrowed_entry_waits_one_second(self):

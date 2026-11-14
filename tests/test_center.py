@@ -616,7 +616,7 @@ class CenterTests(unittest.TestCase):
             with center(pool,Path(root)/'center') as (state,client):
                 sleep="import time;print('ready',flush=True);time.sleep(30)"
                 borrowers=[client.submit(python(sleep,max_cpus=1,memory_mb=64,project='Bench'))['id'] for _ in range(3)]
-                until(lambda:all(client.status(i)['status']=='running' for i in borrowers))
+                until(lambda:all('ready' in client.logs(i)['stdout'] for i in borrowers),seconds=15)
                 active=client.submit(python(sleep,max_cpus=1024,memory_mb=64,project='ARH'))['id']
                 until(lambda:'ready'in client.logs(active)['stdout'])
                 original=client.status(active)['request_sha256']
@@ -1086,8 +1086,12 @@ class CenterTests(unittest.TestCase):
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client):
                 identity=client.submit(python('import time;time.sleep(30)'))['id']
-                until(lambda:client.status(identity)['status']=='running')
-                with patch.object(pool.nodes[0].client,'resize') as resize:
+                until(lambda:client.status(identity).get('runtime',{}).get('process_alive') is True)
+                # Isolate the unchanged-grant path from adaptive repricing of
+                # a newly observed working set. A real unexpected RPC must not
+                # replace the center's numeric grant with a Mock object.
+                with patch('remote_compute.memory.calibrated_model',side_effect=lambda model,*args,**kwargs:model), \
+                        patch.object(pool.nodes[0].client,'resize',wraps=pool.nodes[0].client.resize) as resize:
                     grant=client.resize(identity,1,memory_mb=256)
                     self.assertEqual((grant['cpus'],grant['memory_mb']),(1,256))
                     resize.assert_not_called()
@@ -1927,14 +1931,15 @@ class CenterTests(unittest.TestCase):
                     Pool([node]) as pool, center(pool, Path(root)/'center') as (_, client):
                 task=python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",project='A')
                 jobs=[client.submit(task)['id'] for _ in range(4)]
-                until(lambda: all(client.status(job)['status']=='running' for job in jobs))
+                until(lambda: all(client.status(job).get('runtime',{}).get('process_alive') is True for job in jobs),seconds=15)
                 parallel=client.submit(python('import time; time.sleep(.4)',max_cpus=1024,project='B'))['id']
                 client.write_job_file(jobs[0],'release','go')
                 client.wait(jobs[0]);client.fetch(jobs[0])
                 until(lambda:client.status(parallel)['status']in('running','succeeded'))
                 self.assertEqual(client.status(parallel)['cpus'],1)
-                # The command chooses its startup grant before creating steps.
-                until(lambda:bool(client.status(parallel).get('steps')))
+                # The grant is fixed before the body starts; cold starts are
+                # serialized until each preceding process tree is calibrated.
+                until(lambda:client.status(parallel).get('runtime',{}).get('process_alive') is True,seconds=15)
                 client.write_job_file(jobs[1],'release','go')
                 client.wait(jobs[1]);client.fetch(jobs[1])
                 until(lambda: client.status(parallel)['status'] in ('running','succeeded'))

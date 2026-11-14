@@ -127,7 +127,8 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
             def restart_center(*, check=False):
                 if check:
                     with coordinator.condition:
-                        if coordinator.stopping or any(j['result']['status'] not in TERMINAL for j in active_values(coordinator.jobs)):
+                        if coordinator.stopping or any(j['result']['status'] not in TERMINAL and
+                                j['result']['status']!='queued' for j in active_values(coordinator.jobs)):
                             raise Conflict('Scheduler has active jobs; wait for them to finish before restarting')
                         coordinator.stopping = True
                         coordinator.condition.notify_all()
@@ -228,7 +229,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
         return 130
     finally:
         if coordinator:
-            coordinator.close()
+            coordinator.close(preserve_queued=restarting.is_set())
         if api:
             api.shutdown()
             api_thread.join()
@@ -619,7 +620,7 @@ def main(argv=None):
             except OSError:
                 pass
         return 0
-    except (ValueError, OSError, RuntimeError, StopIteration, TypeError) as error:
+    except (ValueError, OSError, RuntimeError, StopIteration, TypeError, MemoryError) as error:
         print("操作失败:", error, file=sys.stderr)
         if not args.url and args.action is None and not (args.test or args.test_native or args.check):
             diagnostic = ROOT / '.local/diagnostics/startup-error.log'
@@ -631,6 +632,13 @@ def main(argv=None):
                 pass
         if args.url and ('10061' in str(error) or 'Connection refused' in str(error)):
             print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py；统一连接地址 http://127.0.0.1:26133。', file=sys.stderr)
+        # Python can report Windows commit/resource exhaustion as OSError,
+        # including from a console wait. Keep the native supervisor's memory
+        # recovery path instead of turning a recoverable outage into exit 2.
+        if args.service_child and (isinstance(error,MemoryError) or
+                isinstance(error,OSError) and (getattr(error,'winerror',None) in (8,14,1450,1455)
+                                              or error.errno==12)):
+            return 76
         return 2
     finally:
         try:

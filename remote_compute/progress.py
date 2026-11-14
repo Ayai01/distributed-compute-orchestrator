@@ -160,8 +160,10 @@ def diagnose(job, *, now=None, offline=False):
     elif state in ('queued','pending'):code = 'queued'
     elif offline:code,level = 'worker_unreachable','warning'
     elif state=='dispatching':code = 'preparing'
+    elif runtime.get('process_alive') is False and runtime.get('returncode') is not None:
+        code = 'finishing'
     elif runtime.get('process_alive') is False and (job.get('resource_request') or
-            runtime.get('cpu_seconds',0)<=0 or job.get('active_cpus',job.get('cpus',0))==0):
+            runtime.get('cpu_seconds')==0 or job.get('active_cpus',job.get('cpus'))==0):
         code = 'resource_wait' if job.get('resource_request') else 'preparing'
     elif runtime.get('process_alive') is False:code,level = 'process_lost','warning'
     elif job.get('progress_error'):code,level = 'progress_invalid','warning'
@@ -178,7 +180,7 @@ def diagnose(job, *, now=None, offline=False):
                 reason=p.get('waiting',{}).get('reason'),progress_error=job.get('progress_error'))
 
 
-LABELS = dict(queued='排队',preparing='准备',resource_wait='等资源',waiting='等待',
+LABELS = dict(queued='排队',preparing='准备',finishing='收尾',resource_wait='等资源',waiting='等待',
               running='运行',progressing='推进',cpu_active='CPU活跃',stalled='进度停滞',
               heartbeat_lost='心跳丢失',worker_unreachable='连接中断',worker_sample_stale='采样陈旧',
               process_lost='进程丢失',failed='失败',timed_out='超时',interrupted='中断',

@@ -1174,6 +1174,7 @@ class Worker:
                         with self.condition:
                             result.update(progress_update)
                             result['runtime']['process_alive'] = False
+                            result['runtime']['returncode'] = step['returncode']
                             result["cpu_seconds"] = cpu_seconds
                             if measured:
                                 result.update(measured)

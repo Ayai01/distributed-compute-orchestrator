@@ -33,6 +33,15 @@ def cache_environment(environment, root):
                       ('MPLCONFIGDIR', 'matplotlib'), ('CUDA_CACHE_PATH', 'cuda'),
                       ('CCACHE_DIR', 'ccache')):
         environment.setdefault(key, str(root / name))
+    if os.name=='nt':
+        cache=root/'ccache'
+        if Path(environment['CCACHE_DIR'])==cache:
+            # Native Low-integrity build helpers share the managed cache;
+            # give newly created cache entries the same label as job scratch.
+            # Explicit external caches keep their owner's configuration.
+            cache.mkdir(parents=True,exist_ok=True)
+            from .process import low_integrity_directory
+            low_integrity_directory(cache)
     environment.setdefault('HUGGINGFACE_HUB_CACHE', str(Path(environment['HF_HOME']) / 'hub'))
     environment.setdefault('REMOTE_COMPUTE_CACHE_DIR', str(root))
     return environment

@@ -204,6 +204,7 @@ class RecoveryTests(unittest.TestCase):
                 path = root/'center/jobs'/accepted['id']/'result.json'
                 result = json.loads(path.read_text())
                 result.update(status=status, finished=None)
+                result.pop('cancel_requested',None)  # Simulate a crash, not the fixture's orderly cancel.
                 path.write_text(json.dumps(result))
             # Simulate legacy crash receipts, before the history index existed.
             (root/'center/history.index.jsonl').unlink()
@@ -318,6 +319,7 @@ class RecoveryTests(unittest.TestCase):
                 path=root/'center/jobs'/identity/'result.json'
                 result=json.loads(path.read_text())
                 result.update(status=status,finished=None)
+                result.pop('cancel_requested',None)  # The simulated crash never requested cancellation.
                 result.pop('max_retries',None)  # Upgrade an existing 0.8.2 receipt.
                 path.write_text(json.dumps(result))
             (root/'center/history.index.jsonl').unlink()

@@ -912,28 +912,15 @@ class Node:
     @property
     def memory_free(self):
         pressure=self.health.get('memory_pressure_state') or {}
-        # A stale worker-side budget sample must not turn healthy host RAM into
-        # zero admission. The watchdog's physical/commit guard remains the
-        # hard authority; use the fresh host sample while it is healthy.
+        if pressure.get('limited'):return 0
+        # The worker already deducts funded but not yet materialized memory.
+        # Idle host RAM cannot replace that admission budget: starting work
+        # still owns its reservation until the worker samples or releases it.
         reported=self.health.get('memory_available_mb',0)
-        host_fallback=False
-        if (reported<=0 and not pressure.get('limited') and
-                self.health.get('host_memory_available_mb') is not None):
-            physical=self.health.get('host_memory_available_mb',0)-self.health.get('memory_headroom_mb',0)
-            commit=self.health.get('host_commit_available_mb')
-            if commit is None:reported=max(0,physical)
-            else:
-                from .memory import COMMIT_EMERGENCY_MB
-                reported=max(0,min(physical,commit-COMMIT_EMERGENCY_MB))
-            host_fallback=True
         if self.health.get('memory_accounting')=='rss':
             return min(self.memory_capacity-self.health.get('memory_reserved_mb',0)-self.memory_unreported,
                        reported-self.memory_unreported)
         worker_reserved=self.health.get("memory_reserved_mb",0)
-        if host_fallback:
-            # Worker health is the fresh physical/commit sample. A center-side
-            # grant left by a lost process must not permanently consume Admit.
-            return min(self.memory_capacity-worker_reserved-self.external_memory_mb,reported)
         unreported = max(0, self.reserved_memory_mb-worker_reserved)
         return min(self.memory_capacity-self.reserved_memory_mb-self.external_memory_mb,
                    reported-unreported)

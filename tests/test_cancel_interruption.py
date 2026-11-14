@@ -27,7 +27,7 @@ class CancelInterruptionTests(unittest.TestCase):
                 state.threads={threading.current_thread()};state._save=Mock();state._retry=Mock()
                 state._execute(job)
                 self.assertEqual(job['result']['id'],identity)
-                self.assertEqual(job['result']['status'],'interrupted')
+                self.assertEqual(job['result']['status'],'cancelled')
                 self.assertEqual(job['result']['cpu_seconds'],cpu)
                 self.assertEqual(job['result']['error'],remote['error'])
                 client.cancel.assert_called_once_with(identity)

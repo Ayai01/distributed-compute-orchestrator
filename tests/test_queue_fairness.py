@@ -25,7 +25,7 @@ class AutomaticQueueFairnessTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 busy=[client.submit(python(HOLD,project='serial'))['id']for _ in range(4)]
-                until(lambda:all(client.status(i)['status']=='running'for i in busy))
+                until(lambda:all('ready'in client.logs(i)['stdout']for i in busy),seconds=15)
                 wide=client.submit(python(HOLD,project='parallel',max_cpus=16))['id']
                 self.assertEqual(client.status(wide)['status'],'queued')
                 client.write_job_file(busy[0],'release','done');client.wait(busy[0])
@@ -54,7 +54,7 @@ class AutomaticQueueFairnessTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 busy=[client.submit(python(HOLD,project='serial'))['id']for _ in range(2)]
-                until(lambda:all(client.status(i)['status']=='running'for i in busy))
+                until(lambda:all('ready'in client.logs(i)['stdout']for i in busy),seconds=15)
                 low=client.submit(python(HOLD,max_cpus=4,priority=0,project='low'))['id']
                 high=client.submit(python(HOLD,max_cpus=4,priority=10,project='high'))['id']
                 client.write_job_file(busy[0],'release','done');client.wait(busy[0])
@@ -86,7 +86,8 @@ class AutomaticQueueFairnessTests(unittest.TestCase):
     def test_memory_blocked_work_does_not_hold_an_unused_cpu(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=256,memory_headroom_mb=0)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
-                busy=client.submit(python(HOLD,base_memory_mb=128,memory_per_cpu_mb=64,project='resident'))['id']
+                resident="data=bytearray(128*1024*1024)\nfor i in range(0,len(data),4096):data[i]=1\n"+HOLD
+                busy=client.submit(python(resident,base_memory_mb=128,memory_per_cpu_mb=64,project='resident'))['id']
                 until(lambda:'ready'in client.logs(busy)['stdout'])
                 blocked=client.submit(python(HOLD,max_cpus=4,memory_mb=128,priority=10,project='large'))['id']
                 small=client.submit(python(HOLD,memory_mb=32,project='small'))['id']

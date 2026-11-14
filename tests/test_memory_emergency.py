@@ -6,6 +6,14 @@ from remote_compute.memory import PressureGuard,pressure_victim
 from test_compute import provider,scratch,until,python
 
 class MemoryEmergencyTests(unittest.TestCase):
+    def test_first_commit_observation_does_not_invent_a_falling_trend(self):
+        g=PressureGuard();h=dict(memory_total_mb=32768,host_memory_available_mb=16000)
+        self.assertFalse(g.update(h,0)['terminate'])
+        self.assertFalse(g.update(dict(h,host_commit_available_mb=8192),.1)['terminate'])
+        warning=g.update(dict(h,host_commit_available_mb=1280),.2)
+        self.assertTrue(warning['limited']);self.assertFalse(warning['terminate'])
+        self.assertTrue(g.update(dict(h,host_commit_available_mb=900),.3)['terminate'])
+
     def test_actual_floor_is_immediate_and_recovery_is_stable(self):
         g=PressureGuard();host=dict(memory_total_mb=32768,memory_headroom_mb=4096,host_memory_available_mb=4000,host_commit_available_mb=8000)
         self.assertTrue(g.update(host,0)['terminate'])

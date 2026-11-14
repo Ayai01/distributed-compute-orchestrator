@@ -2067,10 +2067,13 @@ class Coordinator:
         self._prune_assets()
         return value
 
-    def close(self):
+    def close(self, *, preserve_queued=False):
         with self.condition:
             self.stopping = True
             for identity, _job in list(active_items(self.jobs)):
+                # Native reloads preserve accepted, undispatched inputs. The
+                # replacement restores the original queue from durable receipts.
+                if preserve_queued and _job['result']['status']=='queued':continue
                 self.cancel(identity)
             self.condition.notify_all()
         self.scheduler.join()

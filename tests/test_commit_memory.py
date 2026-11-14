@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from remote_compute import resources
 from remote_compute.worker import Worker
+from remote_compute.memory import PressureGuard
 
 GIB=1024
 
@@ -39,6 +40,7 @@ class CommitMemoryTests(unittest.TestCase):
 
     def worker(self,commit):
         worker=Worker.__new__(Worker)
+        worker.pressure_guard=PressureGuard()
         worker.host=Mock();worker.host.sample.return_value=dict(memory_total_mb=48*GIB,
             host_memory_available_mb=40*GIB,host_commit_available_mb=commit)
         worker.memory_capacity=32*GIB;worker.memory_reserve=16*GIB
@@ -58,7 +60,7 @@ class CommitMemoryTests(unittest.TestCase):
     def test_unsampled_reservations_are_counted_before_commit_is_consumed(self):
         worker=self.worker(6*GIB)
         worker.jobs={'starting':dict(result=dict(status='running'),task=dict(memory_mb=3*GIB))}
-        self.assertEqual(worker._memory_state()['memory_available_mb'],GIB)
+        self.assertEqual(worker._memory_state()['memory_available_mb'],2*GIB)
 
     def test_startup_fixed_task_keeps_future_commit_until_calibrated(self):
         worker=self.worker(12*GIB)
@@ -68,17 +70,17 @@ class CommitMemoryTests(unittest.TestCase):
         state=worker._memory_state()
         self.assertEqual(state['memory_reserved_mb'],6*GIB)
         self.assertEqual(state['commit_unallocated_mb'],5*GIB)
-        self.assertEqual(state['memory_available_mb'],5*GIB)
+        self.assertEqual(state['memory_available_mb'],6*GIB)
         job['private_mb']=7*GIB
         state=worker._memory_state()
         self.assertEqual(state['commit_unallocated_mb'],0)
-        self.assertEqual(state['memory_available_mb'],10*GIB)
+        self.assertEqual(state['memory_available_mb'],11*GIB)
 
     def test_exhaustion_recovery_and_missing_optional_field(self):
         worker=self.worker(GIB)
         self.assertEqual(worker._memory_state()['memory_available_mb'],0)
         worker.host.sample.return_value['host_commit_available_mb']=10*GIB
-        self.assertEqual(worker._memory_state()['memory_available_mb'],8*GIB)
+        self.assertEqual(worker._memory_state()['memory_available_mb'],9*GIB)
         del worker.host.sample.return_value['host_commit_available_mb']
         self.assertEqual(worker._memory_state()['memory_available_mb'],32*GIB)
 
