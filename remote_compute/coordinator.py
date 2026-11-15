@@ -1065,6 +1065,9 @@ class Coordinator:
                     result=dict(status='cancelled',finished=time.time(),cancelled_before_submit=True,cpu_seconds=0)
                     with self.condition:self._update(job,result)
                     return
+            # Worker acceptance owns the executable copy. Recovery rereads
+            # the frozen request on disk; polling needs no transport buffers.
+            payload = files = None
             cancel_sent=False
             while True:
                 try:

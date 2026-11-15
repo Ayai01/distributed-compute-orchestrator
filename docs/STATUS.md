@@ -2,7 +2,8 @@
 
 ## 当前入口与负责人
 
-- 当前发布源码：**0.11.39**。中心修复原ID重试的attempt观察隔离，四台远端worker保留0.11.35原进程；中心与Web依据原始采样统一重算展示。源码同步、PID、状态根及当前验收见 `.local/maintenance/yolo-memory-state-20261115/current.json`；阶段需求验收见 `.local/maintenance/queued-idle-20261115/current.json`，进度诊断验收见 `.local/maintenance/progress-semantics-20261115/current.json`，资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
+- 当前发布源码：**0.11.40**。中心在worker确认受理后释放传输ZIP和解包副本；原请求保留在原ID目录，恢复重新读取原件。四台远端worker保留0.11.35原进程。源码、实际加载代码、PID、内存采样及当前验收见 `.local/maintenance/local-start-stall-20261115/current.json`；attempt观察验收见 `.local/maintenance/yolo-memory-state-20261115/current.json`，阶段需求验收见 `.local/maintenance/queued-idle-20261115/current.json`，进度诊断验收见 `.local/maintenance/progress-semantics-20261115/current.json`，资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
+- 传输副本生命周期修复通过23项定向检查：计算运行中不保留中心的传输副本，大输入原件、原SHA、结果和中断恢复费用保持。CPU空槽的准入仍受实际物理余量、未物化预留与提交余量约束；外部控制器占用与DCO任务树分别核对，内存保护线继续沿设备配置。
 - 原ID恢复时，旧进程、业务进度、阶段预留和诊断随费用存入原attempt；新attempt从自己的观察开始，worker采样未含运行/业务字段时同步清除当前旧字段。47项定向检查通过，包含真实内存中断后原ID重派、首次进程创建前等待、原输入摘要及完整attempt费用核对。内存声明与实测预留分别保留；256MiB单核冷探测、冷启动标定栅栏及真实压力保护继续沿既有策略运行。
 - 串行业务入口初始需求为1核；重新接回原worker时恢复其最后实际阶段需求，自动容量请求在提供者确定后解析。真实并行阶段继续取得最多4个有用核的优先机会，串行阶段不占用扩核预留。49项定向检查及3项最终阶段检查通过，包含原生中心退出后原科学进程、输入摘要和排队原ID连续性；最初13个兼容排队任务均已离开队列。
 - 执行采样、进程存活、CPU推进与业务报告/计数分别保留。CPU推进但业务报告静默时显示“计算中，暂未报告新进度”，未知CPU活动保留为未上报；资源等待、实际停滞、采样陈旧、连接或进程异常分别提示。98项定向检查及31项最终进度/看板复测通过，C910原观测回放与浏览器详情、空状态、离线状态验收通过；Web发布器为1.0.6。
