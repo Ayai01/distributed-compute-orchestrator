@@ -43,6 +43,11 @@ from .policy import validate_operator_fields
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
 
+# These observations describe one worker attempt, rather than the frozen job.
+ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
+    'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
+    'memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request')
+
 
 def _matching_pass(pool):
     """Reuse provider matches within one unchanged allocation pass."""
@@ -1282,6 +1287,8 @@ class Coordinator:
                              artifact=('.dco-attempts/%04d.zip'%(len(attempts)+1)) if outcome.get('id') else None,
                              status=outcome['status'],error=outcome.get('error',''),finished=outcome.get('finished'),
                              **measured))
+        attempts[-1].update({key:deepcopy(outcome.get(key,job['result'].get(key)))
+                            for key in ATTEMPT_OBSERVATIONS if key in outcome or key in job['result']})
         if recovering:
             job['result'].update(resource_recovery_count=used+1,
                 resource_retry_after=time.time()+RESOURCE_RECOVERY_DELAYS[used],
@@ -1309,6 +1316,8 @@ class Coordinator:
                     'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency','error_kind','memory_pressure','peak_private_mb'):
             job['result'].pop(key,None)
         job['result'].update(started=None,stdout='',stderr='',steps=[])
+        for key in ATTEMPT_OBSERVATIONS:job['result'].pop(key,None)
+        _restore_phase_demand(job)
         self.queue.append(identity);self.queue.sort(key=lambda key:-self.jobs[key]['task']['priority'])
         self._save(job)
         self.activity.notify('Interrupted; retry original task ['+identity[:4]+']')
@@ -1380,6 +1389,11 @@ class Coordinator:
     def _update(self, job, remote):
         if job.get('retired'):return
         clean_tool_snapshot(remote)
+        # A polling snapshot owns these fields, including their absence before
+        # the replacement attempt has created its first process.
+        for key in ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
+                    'completed','total','current','target','nfe','budget'):
+            if key not in remote:job['result'].pop(key,None)
         if remote.get('status') in TERMINAL and remote['status']!='interrupted':
             job['result'].pop('remote_cancel_pending',None)
             job['result'].pop('cost_incomplete',None)
