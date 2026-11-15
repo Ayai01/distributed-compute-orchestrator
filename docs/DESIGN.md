@@ -78,6 +78,8 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 `python_task(function, kwargs=..., max_cpus=...)`运行串行业务入口：初始只占1核。入口在独立GP、角点或其它真实并行阶段调用`map_items`，DCO按真实需求动态授权，结束后归还至1核再执行串行训练等步骤。它适合一个搜索内部有多个并行阶段的工作流；`python_map`用于相互独立的完整输入，默认单项1核、可声明进程子项内核上限，`python_call`用于一个多线程数值内核。工程只表达业务阶段，不维护租约或进程池。
 
+中心从受理时即登记串行入口的1核阶段需求；重新接回运行中的原ID时恢复最后实际请求，自动容量请求在提供者确定后按其容量解析。排队入口从串行阶段开始，调度扩核预留沿当前真实阶段计算，`max_cpus`继续保留整项任务的理论并行上限。
+
 `iter_items(function, items, backend=..., stop_when=..., limits=...)`提供完成顺序的`index/value/error`流，用`with`管理。在途项与尚未消费的结果合计受实际取得过的并行窗口限制，不按输入总数积压。消费者发布和业务判定不阻塞空槽回收，结果窗口满时停止新增并归还空闲CPU。预算门触发调用`stream.stop()`停止新增，继续迭代收齐已在途结果。
 
 提前离开上下文时，SDK收齐已开始的工作，将未消费记录的原索引、输入、结果和错误保存到声明输出`.dco-streams/`，并抛出`StreamResultsPending`；其`results/recovery_dir`供业务继续发布。正常消费完毕不生成该目录。恢复记录为本任务可信pickle文件，工程持久发布后随运输副本回收。

@@ -2,7 +2,8 @@
 
 ## 当前入口与负责人
 
-- 当前发布源码：**0.11.37**。中心终端与上传Web已加载进度诊断修复，四台远端worker保留0.11.35原进程；中心与Web依据原始采样统一重算展示。源码同步、PID、状态根及当前验收见 `.local/maintenance/progress-semantics-20261115/current.json`；资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
+- 当前发布源码：**0.11.38**。中心已加载阶段需求初始化与原ID恢复修复，四台远端worker保留0.11.35原进程；中心与Web依据原始采样统一重算展示。源码同步、PID、状态根及当前验收见 `.local/maintenance/queued-idle-20261115/current.json`；进度诊断验收见 `.local/maintenance/progress-semantics-20261115/current.json`，资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
+- 串行业务入口初始需求为1核；重新接回原worker时恢复其最后实际阶段需求，自动容量请求在提供者确定后解析。真实并行阶段继续取得最多4个有用核的优先机会，串行阶段不占用扩核预留。49项定向检查及3项最终阶段检查通过，包含原生中心退出后原科学进程、输入摘要和排队原ID连续性；最初13个兼容排队任务均已离开队列。
 - 执行采样、进程存活、CPU推进与业务报告/计数分别保留。CPU推进但业务报告静默时显示“计算中，暂未报告新进度”，未知CPU活动保留为未上报；资源等待、实际停滞、采样陈旧、连接或进程异常分别提示。98项定向检查及31项最终进度/看板复测通过，C910原观测回放与浏览器详情、空状态、离线状态验收通过；Web发布器为1.0.6。
 - 大队列调度锁分片及旧中心请求身份读取修复已通过97项定向检查，实际加载的调度字节码与当前源码一致。沿本机科学进程自然完成边界交接，核对2643个原队列输入及166个远端原任务；四台远端worker PID保持。C910/Rocket资产查询、handoff与释放共21次实测全部成功、无超时，该次负载下延迟中位4.38秒、最长10.82秒。YOLO原ID `ab7f99f7aa9b421092b14f09b5aca2a2` 的中心原请求与worker运输包摘要分别保留，1514.94 CPU秒及成果保持，ARH已按严格原ID领取。
 - DCO由2026-11-14接管会话 `01a1dabc-384b-7830-8015-1f0bee6c57ac` 统一负责；旧操作员会话仅作为历史参考，不再唤醒。
