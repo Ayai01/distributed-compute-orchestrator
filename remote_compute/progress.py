@@ -149,10 +149,15 @@ def diagnose(job, *, now=None, offline=False):
     state = job.get('status','running');p = job.get('progress') or {}
     p = p if isinstance(p,dict) and p.get('schema')==SCHEMA else {}
     runtime = job.get('runtime') or {}
+    progress_error=job.get('progress_error',(job.get('diagnostic') or {}).get('progress_error'))
     age = lambda key: max(0,now-p[key]) if _number(p.get(key)) else None
     heartbeat,advance = age('last_heartbeat'),age('last_advanced')
     if p.get('source')=='executor':heartbeat = None
     threshold = p.get('stale_after',120)
+    sample_age = max(0,now-runtime['sampled_at']) if _number(runtime.get('sampled_at')) else None
+    cpu_age = max(0,now-runtime['last_cpu_advanced']) if _number(runtime.get('last_cpu_advanced')) else None
+    report_stale = heartbeat>threshold if heartbeat is not None else None
+    progress_stale = advance>threshold if advance is not None else None
     cpu = _number(runtime.get('last_cpu_advanced')) and now-runtime['last_cpu_advanced']<=15
     code,level = 'running','info'
     if state in ('failed','timed_out','interrupted'):code,level = state,'error'
@@ -166,23 +171,28 @@ def diagnose(job, *, now=None, offline=False):
             runtime.get('cpu_seconds')==0 or job.get('active_cpus',job.get('cpus'))==0):
         code = 'resource_wait' if job.get('resource_request') else 'preparing'
     elif runtime.get('process_alive') is False:code,level = 'process_lost','warning'
-    elif job.get('progress_error'):code,level = 'progress_invalid','warning'
-    elif _number(runtime.get('sampled_at')) and now-runtime['sampled_at']>max(15,threshold):code,level = 'worker_sample_stale','warning'
-    elif heartbeat is not None and heartbeat>threshold:code,level = 'heartbeat_lost','warning'
+    elif progress_error:code,level = 'progress_invalid','warning'
+    elif sample_age is not None and sample_age>max(15,threshold):code,level = 'worker_sample_stale','warning'
     elif job.get('resource_request') or p.get('waiting',{}).get('kind') in ('resource','cpu','memory'):code = 'resource_wait'
     elif p.get('waiting'):code = 'waiting'
-    elif advance is not None and advance>threshold:
+    elif report_stale or progress_stale:
         code,level = ('cpu_active','info') if cpu else ('stalled','warning')
     elif p:code = 'progressing'
     elif cpu:code = 'cpu_active'
+    reason=p.get('waiting',{}).get('reason')
+    if code=='cpu_active' and (report_stale or progress_stale):reason='暂未报告新进度'
+    elif code=='stalled':reason='CPU与业务进度暂未推进'
+    elif code=='resource_wait' and not reason:reason='等待资源授权'
     return dict(code=code,level=level,heartbeat_age_seconds=heartbeat,advanced_age_seconds=advance,
                 stale_after_seconds=threshold,cpu_active=bool(cpu),
-                reason=p.get('waiting',{}).get('reason'),progress_error=job.get('progress_error'))
+                worker_sample_age_seconds=sample_age,cpu_advanced_age_seconds=cpu_age,
+                process_alive=runtime.get('process_alive'),business_report_stale=report_stale,
+                progress_stale=progress_stale,reason=reason,progress_error=progress_error)
 
 
 LABELS = dict(queued='排队',preparing='准备',finishing='收尾',resource_wait='等资源',waiting='等待',
-              running='运行',progressing='推进',cpu_active='CPU活跃',stalled='进度停滞',
-              heartbeat_lost='心跳丢失',worker_unreachable='连接中断',worker_sample_stale='采样陈旧',
+              running='运行',progressing='推进',cpu_active='计算中',stalled='进度停滞',
+              heartbeat_lost='业务报告静默',worker_unreachable='连接中断',worker_sample_stale='采样陈旧',
               process_lost='进程丢失',failed='失败',timed_out='超时',interrupted='中断',
               progress_invalid='进度无效',
               succeeded='完成',cancelled='取消')

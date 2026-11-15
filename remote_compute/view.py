@@ -405,11 +405,12 @@ class StatusRows(list):
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
         now=time.time()
+        offline_nodes={n.get('name')for n in value.get('nodes',[])if n.get('error')}
         self.records=[]
         for name,job in self.jobs:
             state=job.get('status','running')
             from .progress import diagnose, LABELS
-            diagnostic=job.get('diagnostic') or diagnose(job)
+            diagnostic=diagnose(job,now=now,offline=name in offline_nodes)
             state_label=LABELS.get(diagnostic['code'],{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state))
             started=job.get('started')
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",

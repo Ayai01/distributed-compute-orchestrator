@@ -10,12 +10,53 @@ from remote_compute import Client,Pool,python_call,python_map,report_progress
 from remote_compute.bundle import progress_fields
 from remote_compute.progress import SCHEMA,diagnose,normalize,sample,report_items
 from remote_compute import liveboard
-from remote_compute.view import _progress_label
+from remote_compute.view import _progress_label,StatusRows
 from test_compute import scratch,provider,until
 from test_center import center
 
 
 class ProgressTests(unittest.TestCase):
+    def test_silent_native_stage_keeps_runtime_and_report_clocks_separate(self):
+        p=normalize(dict(source='business',phase='link_model',completed=0,unit='links',
+                         last_heartbeat=100,last_advanced=100))
+        job=dict(id='original',status='running',progress=p,
+                 runtime=dict(sampled_at=400,last_cpu_advanced=399,process_alive=True,cpu_seconds=352))
+        d=diagnose(job,now=400)
+        self.assertEqual((d['code'],d['level'],d['reason']),('cpu_active','info','暂未报告新进度'))
+        self.assertEqual((d['worker_sample_age_seconds'],d['heartbeat_age_seconds'],d['cpu_advanced_age_seconds']),(0,300,1))
+        self.assertTrue(d['process_alive']);self.assertTrue(d['business_report_stale']);self.assertTrue(d['progress_stale'])
+        self.assertNotIn('total',p);self.assertNotIn('ratio',p);self.assertEqual(job['runtime']['cpu_seconds'],352)
+        waiting={**job,'resource_request':dict(cpus=4)}
+        self.assertEqual(diagnose(waiting,now=400)['code'],'resource_wait')
+        stalled={**job,'runtime':dict(job['runtime'],last_cpu_advanced=100)}
+        self.assertEqual(diagnose(stalled,now=400)['code'],'stalled')
+        stale={**job,'runtime':dict(job['runtime'],sampled_at=100)}
+        self.assertEqual(diagnose(stale,now=400)['code'],'worker_sample_stale')
+        self.assertEqual(diagnose(job,now=400,offline=True)['code'],'worker_unreachable')
+
+    def test_compact_transport_preserves_invalid_report_evidence(self):
+        from remote_compute.bundle import progress
+        job=dict(id='original',status='running',progress_error='invalid_or_unreadable_progress',
+                 runtime=dict(sampled_at=400,last_cpu_advanced=399,process_alive=True))
+        compact=progress(job)
+        self.assertEqual(diagnose(compact,now=400)['code'],'progress_invalid')
+        self.assertEqual(diagnose(compact,now=400)['progress_error'],job['progress_error'])
+        self.assertNotEqual(diagnose(dict(compact,progress_error=None),now=400)['code'],'progress_invalid')
+
+    def test_terminal_and_web_reclassify_legacy_worker_diagnostic_from_actual_samples(self):
+        job=dict(id='original',status='running',cpus=1,progress=normalize(dict(source='business',
+            phase='native',completed=7,unit='cycles',last_heartbeat=100,last_advanced=100)),
+            runtime=dict(sampled_at=400,last_cpu_advanced=399,process_alive=True),
+            diagnostic=dict(code='heartbeat_lost',level='warning',cpu_active=True))
+        node=dict(name='worker',capacity=4,base_capacity=4,reserved=1,active_jobs=[job])
+        health=dict(role='scheduler',nodes=[node],queued=0,used_cpus=1)
+        with patch('remote_compute.view.time.time',return_value=400):terminal=StatusRows(health)
+        self.assertEqual(terminal.records[0][5],'计算中')
+        value=liveboard.snapshot(health,[node],now=400)
+        self.assertEqual(value['jobs'][0]['diagnostic']['code'],'cpu_active')
+        self.assertFalse(value['alerts']);self.assertNotIn('total',value['jobs'][0]['progress'])
+        self.assertEqual(value['jobs'][0]['progress']['completed'],7)
+
     def test_report_is_local_atomic_and_heartbeat_keeps_work_counters(self):
         with scratch()as root,patch.dict(os.environ,REMOTE_COMPUTE_JOB_DIR=str(root)):
             with patch('remote_compute.progress.time.time',return_value=100):
@@ -57,7 +98,7 @@ class ProgressTests(unittest.TestCase):
         base=dict(status='running',progress=p,runtime=dict(sampled_at=200,last_cpu_advanced=199,process_alive=True))
         cases=[(base,'cpu_active'),({**base,'runtime':dict(sampled_at=200,last_cpu_advanced=10)},'stalled'),
                ({**base,'status':'queued'},'queued'),({**base,'status':'dispatching'},'preparing'),
-               ({**base,'progress':dict(p,last_heartbeat=10)},'heartbeat_lost'),
+               ({**base,'progress':dict(p,last_heartbeat=10)},'cpu_active'),
                ({**base,'runtime':dict(sampled_at=10)},'worker_sample_stale'),
                ({**base,'runtime':dict(process_alive=False)},'process_lost'),
                ({**base,'resource_request':dict(cpus=4)},'resource_wait'),
