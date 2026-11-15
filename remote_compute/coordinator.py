@@ -61,6 +61,18 @@ def _elastic_job(job):
     return job.get('elastic_cpus',job.get('auto_cpus',False))
 
 
+def _restore_phase_demand(job):
+    """A useful ceiling is not the serial entry's current ready width."""
+    if 'desired_cpus' in job:return
+    requested=job['result'].get('requested_cpus')
+    if job['result'].get('status')!='queued' and type(requested)is int and requested>=0:
+        job['desired_cpus']=min(requested or job['task']['max_cpus'],job['task']['max_cpus'])
+    elif job['task'].get('execution',{}).get('mode')=='entry':
+        # The worker also starts an entry with one CPU; nested map/call
+        # requests publish their actual useful widths at phase boundaries.
+        job['desired_cpus']=1
+
+
 def _infrastructure_interruption(job, outcome):
     # Named-machine operations may change external state and retain their
     # explicit retry allowance. Ordinary frozen jobs run in fresh workdirs.
@@ -115,6 +127,7 @@ class Coordinator:
                 task['priority']=value['dispatch_priority']
             self._restore_accelerator(task, value)
             job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
+            _restore_phase_demand(job)
             if value.get('cancel_requested'):job['cancel'].set()
             value.setdefault('max_retries',task.get('retries',2))
             if value['status']=='queued' or not value.get('worker_url'):
@@ -718,6 +731,7 @@ class Coordinator:
                                   "submitted": time.time(), "started": None, "finished": None,
                                   "stdout": "", "stderr": "", "steps": [],
                                   "total_steps": len(task["steps"]), "assets": task["assets"]}})
+                _restore_phase_demand(job)
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
                 if task.get('cache_ref'):job['result']['cache_ref']=task['cache_ref']
