@@ -18,13 +18,18 @@ def entry():
 class PhaseDemandTests(unittest.TestCase):
     def test_recovery_distinguishes_retained_parallel_phase_from_fresh_queued_entry(self):
         from remote_compute.coordinator import _restore_phase_demand
-        for status,requested,wanted in [('running',1,1),('running',4,4),('running',0,4),('queued',4,1)]:
+        for status,requested,wanted in [('running',1,1),('running',4,4),('queued',4,1)]:
             job=dict(task=dict(cpus=1,max_cpus=4,execution=dict(mode='entry')),
                      result=dict(status=status,requested_cpus=requested))
             _restore_phase_demand(job)
             self.assertEqual(job['desired_cpus'],wanted)
         job['desired_cpus']=3;_restore_phase_demand(job)
         self.assertEqual(job['desired_cpus'],3)
+        from types import SimpleNamespace
+        automatic=dict(task=job['task'],result=dict(status='running',requested_cpus=0))
+        _restore_phase_demand(automatic);self.assertNotIn('desired_cpus',automatic)
+        automatic['node']=SimpleNamespace(capacity=3);_restore_phase_demand(automatic)
+        self.assertEqual(automatic['desired_cpus'],3)
 
     def test_serial_entries_fill_all_slots_before_requesting_parallel_phases(self):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=4)as(_,worker),Pool([worker])as pool,center(pool,Path(folder)/'center')as(state,client):

@@ -66,7 +66,11 @@ def _restore_phase_demand(job):
     if 'desired_cpus' in job:return
     requested=job['result'].get('requested_cpus')
     if job['result'].get('status')!='queued' and type(requested)is int and requested>=0:
-        job['desired_cpus']=min(requested or job['task']['max_cpus'],job['task']['max_cpus'])
+        if requested==0:
+            node=job.get('node')
+            if node is None:return  # Automatic width needs the reattached provider.
+            requested=node.capacity
+        job['desired_cpus']=min(requested,job['task']['max_cpus'])
     elif job['task'].get('execution',{}).get('mode')=='entry':
         # The worker also starts an entry with one CPU; nested map/call
         # requests publish their actual useful widths at phase boundaries.
@@ -969,6 +973,7 @@ class Coordinator:
                 grant=remote or job['result']
                 task.update(cpus=grant['cpus'],memory_mb=grant['memory_mb'])
                 job.update(task=task,auto_cpus=automatic,elastic_cpus=elastic,node=node,reattach=True,worker_id=worker_id)
+                _restore_phase_demand(job)
                 was_known=worker_id in node.known_jobs
                 if remote and not was_known:
                     node.external=max(0,node.external-(task['cpus'] if remote['status']=='running' else 0))
