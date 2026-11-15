@@ -30,6 +30,9 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(diagnose(waiting,now=400)['code'],'resource_wait')
         stalled={**job,'runtime':dict(job['runtime'],last_cpu_advanced=100)}
         self.assertEqual(diagnose(stalled,now=400)['code'],'stalled')
+        unknown={**job,'runtime':dict(sampled_at=400,process_alive=True)}
+        self.assertEqual((diagnose(unknown,now=400)['code'],diagnose(unknown,now=400)['level']),('running','info'))
+        self.assertIsNone(diagnose(unknown,now=400)['cpu_advanced_age_seconds'])
         stale={**job,'runtime':dict(job['runtime'],sampled_at=100)}
         self.assertEqual(diagnose(stale,now=400)['code'],'worker_sample_stale')
         self.assertEqual(diagnose(job,now=400,offline=True)['code'],'worker_unreachable')

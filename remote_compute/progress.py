@@ -176,12 +176,13 @@ def diagnose(job, *, now=None, offline=False):
     elif job.get('resource_request') or p.get('waiting',{}).get('kind') in ('resource','cpu','memory'):code = 'resource_wait'
     elif p.get('waiting'):code = 'waiting'
     elif report_stale or progress_stale:
-        code,level = ('cpu_active','info') if cpu else ('stalled','warning')
+        code,level = ('cpu_active','info') if cpu else ('stalled','warning') if cpu_age is not None else ('running','info')
     elif p:code = 'progressing'
     elif cpu:code = 'cpu_active'
     reason=p.get('waiting',{}).get('reason')
     if code=='cpu_active' and (report_stale or progress_stale):reason='暂未报告新进度'
     elif code=='stalled':reason='CPU与业务进度暂未推进'
+    elif code=='running' and (report_stale or progress_stale):reason='暂未报告新进度，CPU活动未上报'
     elif code=='resource_wait' and not reason:reason='等待资源授权'
     return dict(code=code,level=level,heartbeat_age_seconds=heartbeat,advanced_age_seconds=advance,
                 stale_after_seconds=threshold,cpu_active=bool(cpu),
