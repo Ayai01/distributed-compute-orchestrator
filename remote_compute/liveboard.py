@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0.6'
+PUBLISHER_VERSION = '1.0.7'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -156,7 +156,7 @@ def snapshot(health, nodes, *, now=None):
                   summary=dict(running=sum(j['status'] == 'running' for j in jobs),
                                queued=number(health.get('queued')), completed=None, failed=None,
                                cpu_used=number(health.get('used_cpus')),
-                               cpu_capacity=number((health.get('cpu') or {}).get('capacity')),
+                               cpu_capacity=number(health.get('cpus')),
                                cpu_base=sum(r['cpu_base'] or 0 for r in rows if r['status'] in ('online', 'paused')),
                                cpu_total=memory_sum('logical_cpus'),
                                cpu_max_capacity=sum(r['cpu_max_capacity']or 0 for r in rows if r['status']in('online','paused')),
@@ -303,7 +303,7 @@ def upload(config, value):
     reply = read_json(build_opener(ProxyHandler({}), NoRedirect()), request, 4, 16384)
     if not isinstance(reply, dict) or not isinstance(reply.get('instance'), dict):
         raise ValueError('Invalid display upload response')
-    return len(data), number(reply['instance'].get('sequence'))
+    return len(data), number(reply['instance'].get('sequence')), reply.get('viewer_active') is True
 
 
 class Owner:
@@ -349,6 +349,9 @@ def run(config_path, *, owner_pid=None, once=False, send=True):
                 state_path = Path(config['state_file'])
                 if config.get('enabled') is not True:
                     break
+                # These are current runtime outputs, including on a fresh migration.
+                for key in ('state_file', 'sample_file'):
+                    Path(config[key]).parent.mkdir(parents=True, exist_ok=True)
                 wait = IDLE_SECONDS
                 try:
                     value, metrics = collect(config)
@@ -358,12 +361,14 @@ def run(config_path, *, owner_pid=None, once=False, send=True):
                     signature = fingerprint(value)
                     if not owner.alive() or stopped.is_set():
                         break
-                    wait = ACTIVE_SECONDS if value['summary']['running'] or value['summary']['queued'] else IDLE_SECONDS
+                    wait = ACTIVE_SECONDS if state.get('viewer_active') else IDLE_SECONDS
                     if send and due(signature, previous, time.monotonic(), last):
                         started = time.perf_counter()
-                        size, sequence = upload(config, value)
+                        size, sequence, viewer_active = upload(config, value)
                         state.update(posts=state['posts']+1, last_uploaded_at=stamp(), upload_bytes=size,
-                                     upload_ms=round((time.perf_counter()-started)*1000, 3), server_sequence=sequence)
+                                     upload_ms=round((time.perf_counter()-started)*1000, 3), server_sequence=sequence,
+                                     viewer_active=viewer_active)
+                        wait = ACTIVE_SECONDS if viewer_active else IDLE_SECONDS
                         previous, last = signature, time.monotonic()
                     state.update(status='online', failures=0, error=None)
                 except (OSError, ValueError, KeyError) as error:

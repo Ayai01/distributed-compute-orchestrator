@@ -1,32 +1,42 @@
 # DCO v1 当前状态
 
-2026-11-16（美国太平洋时间）。
+2026-11-16（美国太平洋时间）。五机已统一到v1原生入口；当前分支v1，运行版本1.0.0。架构为强机单中心、直连优先、nurikoi仅认证中转与资源控制。
 
-- 已批准：强机单中心、直连优先、nurikoi仅中转及远程控制；四工程联合适配和迁移后清理。
-- 当前工程：D:/Projects/#4-Arclight/DCO_v1，独立Git克隆，分支v1，1.0.0源码09ec7a7已发布。
-- 本机中心已原生切换：PID52240，supervisor9728，scheduler及worker状态均在新根；19项工具、状态和生产索引同卷迁移，原operator身份保持。ku26s已从标准Linux新根运行1.0.0，PID4078434。
-- 五机已从标准新根运行1.0.0：PC52240、TX16888、ITX4740、126kf5044、ku26s4078434。退出前后目录比较混入正常领取，导致迁移脚本在移动完成后停住；Linux修正边界恢复，三Windows由用户启动新入口后恢复。四远端旧根活跃消费者及当前配置旧路径引用均为0。
-- 六份文档已建立；具体实施和验收见ROADMAP，已生效项目逐项替换本页。
-- 目录合同：Windows有D盘用D:/Projects/#4-Arclight/DCO_v1，否则C盘；Linux用~/Projects/#4-Arclight/DCO_v1。
-- 当前主线接管v1实现与部署；旧维护会话只作来源参考。
-- TX、ITX 于 2026-11-16 03:12:42 PST 完成排空；随后用户重新接回，两机已恢复供给。33个原ID已结清：29取消条件全部从原检查点接续，4成功条件直接复用，17,600.953125 CPU秒完整保留；7个相关控制器已运行。后续迁移沿原生边界，不再为准备目录取消健康计算。
-- 新资源合同已生效：固定宽度整组准入、等待0核、阶段/批尾归还、8项CPU/RAM政策与受限控制API。84个不同合同用例及24项真实任务验证通过，回执 `.local/migration/resources-validation.json`。
-- 四工程SDK路径、实际线程宽度和科研缓存归属适配已完成；通用交换读取 `.local/projects.json`，72项缓存合同及另2项原生产者引用合同通过。ARH已改用DCO_v1 SDK，新独立服务PID44772，5个原run沿原ID恢复。
-- 本次维护自然排空于04:13:58 PST完成，没有取消科学任务。C910两条缓存引用随TX、ITX上线已一次接续；Rocket继续运行。YOLO此前因256MiB控制器声明不足而暂停，正保持原身份修正运行额度并恢复，后继沿原依赖推进。
-- 网站控制已完成真实浏览器验收：Aya1登录、5设备快照、利用率阈值90→89→90保存并恢复。代理补齐X-DCO-Role，对应单测通过；实际中转资源GET 200、约0.04秒。Nginx及FRP保持原进程。
-- 路由、流式传输与CLI生命周期验证已通过。火绒信任范围确认为D:/Projects，安装器已改为官方包校验后直接写固定版本工具目录；Linux二进制已完成部署，服务器frps/site-visitor active，Nginx已有精确WSS路由，未新增公网端口。
-- 真实跨nurikoi任务80dd5e87960143bb99045cef1d8a008f一次提交成功，7个成功RPC全走TX中转，CPU0.046875秒；持久结果/费用后删除原运输任务。ku26s继承桌面http_proxy导致隧道EOF，启动器已修为仅frpc排除该环境变量，单项合同通过；沿当前窗口自然边界应用，直连计算继续。
-- 四远端标准工程根、源码、网络及私有配置已建立；工具、科学缓存和状态沿同卷保留式迁移。四份旧科研缓存模块已按统一流程回收41,448字节，原代码保存在Git。
+## 已交付
 
-## 四工程入口
+| 设备 | 根目录 | 当前原生PID |
+| --- | --- | ---: |
+| Aya1-PC | D:/Projects/#4-Arclight/DCO_v1 | 52240，supervisor 9728 |
+| Aya1-TX | D:/Projects/#4-Arclight/DCO_v1 | 16888 |
+| Aya1-ITX | D:/Projects/#4-Arclight/DCO_v1 | 4740 |
+| 126kf | C:/Projects/#4-Arclight/DCO_v1 | 5044 |
+| ku26s | ~/Projects/#4-Arclight/DCO_v1 | 4082067 |
 
-| 工程 | 当前适配入口 | 迁移责任 |
-| --- | --- | --- |
-| AOP_v2 | compute/center.py | execute/python_call/python_task/iter_items及原始角点缓存 |
-| RGCN-v2 | src/parallelism.py、remote_native.py、remote_research.py | 阶段资源、原生测量与逻辑观察缓存 |
-| ARH-DSE-v3 | arh/dco.py、framework/distributed_tasks.py、remote_execution.py | 原ID、资产、原生阶段与独立服务连续运行 |
-| DCBFS-MO | src/dcbfs/_runtime/parallel.py | map/run_call与完整reference缓存 |
+- SDK、工具、状态、生产索引及原operator身份已迁入标准根，节点和中心路由均恢复。远端磁盘源码68bb462；ku26s已加载该隧道启动修复，Windows健康进程沿现有代码继续，启动专用修复在下次自然启动加载。
+- 无公网IP通路已完成真实TX任务：原ID80dd5e87960143bb99045cef1d8a008f，一次提交、7个成功RPC走nurikoi、结果与0.046875 CPU秒持久后回收。frp 0.71.1固定SHA；服务器两服务总约11MiB，CPU/内存有界，Nginx443精确WSS路径，无新增公网端口。ku26s已移除frpc继承的桌面http_proxy，真实relay健康。
+- 固定宽度整组准入、等待0核、弹性扩缩、批尾归还与跨工程份额已生效。资源84项、缓存72+2项、CLI31项及原网络合同已通过；24项真实资源任务完成。已通过证据直接复用。
+- 网站控制完成实际登录、读取、可恢复写入和最新联动验收。CPU硬限额H=floor(B×F)，H/F双向联动，设备cpu_limit只读约束基础预算。当前PC基础12、倍率1.25；其他基础与倍率保持用户配置。
+- 物理保留及保护线：PC 12GiB，其他四台4GiB；停止扩展的主机利用率：PC80%、其他85%。控制面和展示面已对齐。
+- 展示发布器1.0.7 PID7568归supervisor9728持有；迁移后输出目录缺失问题已修复，当前状态在.local/liveboard。有人观看15秒、无人观看60秒；浏览租约75秒由网站worker共享，gzip+CBOR典型约5KB/次。浏览器实见11秒前采样、PC12.0GiB保留线。
+
+## 科研衔接
+
+AOP、RGCN、ARH-DSE、DCBFS已沿同一SDK、实际线程宽度和内容交换合同接入；科学缓存规则归各工程，DCO通过.local/projects.json统一注册。AOP/RGCN/DCBFS研究暂停保持。ARH独立服务沿原ID、已付窗口和检查点继续；三工程结果与优化状态见ARH-DSE-v3/docs/STATUS.md。
+
+TX/ITX最初排空的33个原ID已结清：29取消条件从原检查点接续、4成功条件直接复用，17,600.953125 CPU秒保留。后续原生迁移采用自然边界；Linux末批保持enabled并短暂停中心新派发，原任务结清后重载再恢复派发。原校准缓存同卷迁入，没有重复校准。
+
+## 退役与证据
+
+本机旧DCO及DCO-arh-integration-fix、三Windows桌面旧根、Linux旧distributed-compute-orchestrator根和旧诊断launcher均已退役。源码历史用独立Git bundle保留；必要原ID、费用、科学参考与私有配置按清单归档到.local/history。
+
+- 本机：17,518文件，逻辑457,882,616B、独立实体457,769,327B；必要历史压缩193,122,019B、Git bundle1,424,773B。
+- 三Windows：8,118载荷文件，逻辑857,513,256B、独立实体857,479,781B；三必要历史压缩共175,083,884B。
+- Linux：210旧文件、4,430,237B；保留32必要文件、220,916B。
+- 迁移用一次性launcher/controller和空客户端账本共5文件、15,509B已统一回收，回执为helper-retirement.json。
+- 原统一脚本的退出码2仅对应受保护批次：本机活动ARH批次、TX两个既有false批次、126kf来源未明docs批次。均已保护，未删除其内容。
+
+部署与回收回执集中在.local/migration：node-migration、windows-retirement、local-retirement-preservation、website-deployment、resource-policy-current；网络真实任务在.local/network/relay-task-validation.json。各费用先持久再删除运输任务，一次性监视器已退出。
 
 ## 后续
 
-收尾YOLO运行额度与原检查点接续，应用Linux隧道启动环境修复；保留必要历史与独有科研成果后，统一退役无消费者旧目录和过期诊断启动器。部署事实保存在 .local/migration/，科研结果由原工程持久账本持有。
+DCO本轮迁移交付完成。后续围绕真实故障或新工程公共合同维护，不新增兼容层；ARH当前有限搜索、独立验证、阶段报告与后继供给继续由其服务持有。阶段结果产出后由用户决定下一轮科研目标。

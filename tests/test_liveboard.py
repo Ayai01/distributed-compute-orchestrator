@@ -57,6 +57,7 @@ class LiveboardTests(unittest.TestCase):
         self.assertEqual(value['summary']['memory_total_mb'],32000)
         self.assertEqual(value['summary']['memory_used_mb'],20000)
         self.assertEqual(value['summary']['queued'],7)
+        self.assertEqual(live.snapshot(dict(self.health(),cpus=170),nodes)['summary']['cpu_capacity'],170)
         self.assertIsNone(value['summary']['completed'])
         self.assertIsNone(value['source']['uptime_seconds'])
         self.assertEqual(value['nodes'][0]['capabilities'],['ng47','ml'])
@@ -139,7 +140,8 @@ class LiveboardTests(unittest.TestCase):
             path.write_text(json.dumps(dict(url='https://example.test/manage/live/id/update/',token='s'*48)))
             value=live.snapshot(self.health(),[])
             with patch.object(live,'read_json',return_value=dict(instance=dict(sequence=3)))as read:
-                size,sequence=live.upload(dict(upload_file=str(path)),value)
+                size,sequence,viewing=live.upload(dict(upload_file=str(path)),value)
+            self.assertFalse(viewing)
             request=read.call_args.args[1]
             self.assertEqual(json.loads(request.data),dict(data=value))
             self.assertNotIn('s'*48,request.data.decode())
@@ -157,8 +159,9 @@ class LiveboardTests(unittest.TestCase):
             path=Path(folder)/'upload.local.json'
             path.write_text(json.dumps(dict(url='https://example.test/manage/live/id/update/',token='s'*48)))
             value=live.snapshot(self.health(),[self.node()])
-            with patch.object(live,'read_json',return_value=dict(instance=dict(sequence=4)))as read:
-                size,sequence=live.upload(dict(upload_file=str(path),transport='cbor-gzip'),value)
+            with patch.object(live,'read_json',return_value=dict(instance=dict(sequence=4),viewer_active=True))as read:
+                size,sequence,viewing=live.upload(dict(upload_file=str(path),transport='cbor-gzip'),value)
+            self.assertTrue(viewing)
             request=read.call_args.args[1]
             self.assertEqual(request.get_header('Content-type'),'application/cbor')
             self.assertEqual(request.get_header('Content-encoding'),'gzip')
@@ -253,6 +256,19 @@ class LiveboardTests(unittest.TestCase):
             self.assertNotIn('SECRET_TOKEN',(folder/'state.json').read_text())
             self.assertEqual(state['posts'],0)
             self.assertEqual(state['next_interval_seconds'],5)
+
+    def test_fresh_output_directories_and_viewer_driven_interval(self):
+        with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:
+            folder=Path(folder);cfg=folder/'liveboard.local.json'
+            cfg.write_text(json.dumps(dict(enabled=True,state_file=str(folder/'current/state.json'),
+                sample_file=str(folder/'current/sample.json'))))
+            for viewing,interval in ((False,60),(True,15)):
+                with patch.object(live,'collect',return_value=(live.snapshot(self.health(),[]),{})), \
+                        patch.object(live,'upload',return_value=(100,7,viewing)):
+                    state=live.run(cfg,once=True)
+                self.assertEqual(state['status'],'online')
+                self.assertEqual(state['next_interval_seconds'],interval)
+                self.assertTrue((folder/'current/sample.json').is_file())
 
     def test_real_readonly_collection_and_failed_upload_preserve_running_original(self):
         from remote_compute import Pool, command
