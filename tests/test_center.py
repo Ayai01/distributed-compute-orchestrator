@@ -330,6 +330,8 @@ class AdmissionPlanningTests(unittest.TestCase):
 
 @contextmanager
 def center(pool, root, **options):
+    import secrets
+    options.setdefault('token', secrets.token_urlsafe(24))
     state = Coordinator(pool, root, **options)
     server = Server(('127.0.0.1', 0), state)
     thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
@@ -337,7 +339,7 @@ def center(pool, root, **options):
     try:
         # The scheduler test harness represents the visible DCO operator
         # console; project-facing redaction is covered with a normal Client.
-        yield state, Client(f'http://127.0.0.1:{server.server_port}', operator=True,
+        yield state, Client(f'http://127.0.0.1:{server.server_port}', state.token, operator=True,
                             operator_token=state.operator_token,state_dir=Path(root)/'client')
     finally:
         state.close()
@@ -1073,7 +1075,7 @@ class CenterTests(unittest.TestCase):
                 shell=SimpleNamespace(pool=pool,center=None)
                 with patch('remote_compute.commands.ROOT',Path(root)):
                     SchedulerShell.do_save(shell,'')
-                saved=json.loads((Path(root)/'nodes.local.json').read_text())
+                saved=json.loads((Path(root)/'.local/nodes.json').read_text())
                 self.assertEqual(saved['nodes'][0]['host_ip'],'203.0.113.43')
 
     def test_callback_timeout_applies_only_to_callback_default_clients(self):
@@ -1214,13 +1216,28 @@ class CenterTests(unittest.TestCase):
             root=Path(directory)
             remote=dict(name='remote',url='https://203.0.113.42:26133',weight=1.0,limit=0,
                         memory_limit_mb=0,enabled=True)
-            (root/'nodes.local.json').write_text(json.dumps({'nodes':[dict(remote,token='private-worker-token')]}))
+            (Path(root)/'.local').mkdir(parents=True,exist_ok=True)
+            (root/'.local/nodes.json').write_text(json.dumps({'nodes':[dict(remote,token='private-worker-token',
+                relay_url='http://127.0.0.1:27101',peer_id='remote')]}))
             shell=SimpleNamespace(pool=SimpleNamespace(nodes=[]),
                                   center=SimpleNamespace(nodes=lambda:dict(policy='adaptive',nodes=[remote]),token=''))
             with patch('remote_compute.commands.ROOT',root),io.StringIO() as output,redirect_stdout(output):
                 SchedulerShell.do_save(shell,'')
-            saved=json.loads((root/'nodes.local.json').read_text())['nodes'][0]
+            saved=json.loads((root/'.local/nodes.json').read_text())['nodes'][0]
             self.assertEqual(saved['token'],'private-worker-token')
+            self.assertEqual(saved['relay_url'],'http://127.0.0.1:27101')
+            self.assertEqual(saved['peer_id'],'remote')
+            remote['url']='https://203.0.113.43:26133'
+            with patch('remote_compute.commands.ROOT',root),redirect_stdout(io.StringIO()):
+                SchedulerShell.do_save(shell,'')
+            changed=json.loads((root/'.local/nodes.json').read_text())['nodes'][0]
+            self.assertEqual(changed['token'],'private-worker-token')
+            self.assertEqual(changed['relay_url'],saved['relay_url'])
+            remote.update(relay_url=None,peer_id=None)
+            with patch('remote_compute.commands.ROOT',root),redirect_stdout(io.StringIO()):
+                SchedulerShell.do_save(shell,'')
+            cleared=json.loads((root/'.local/nodes.json').read_text())['nodes'][0]
+            self.assertNotIn('relay_url',cleared);self.assertNotIn('peer_id',cleared)
 
     def test_offline_worker_keeps_health_and_local_submission_available(self):
         with scratch() as root, provider(Path(root)/'local') as (_,local), provider(Path(root)/'offline') as (_,offline):
@@ -2085,7 +2102,7 @@ class CenterTests(unittest.TestCase):
                         client.control(node='node1', routing={'memory_limit_mb': 128})
                         with patch('remote_compute.commands.ROOT', root):
                             shell.do_save('')
-                        saved = json.loads((root/'nodes.local.json').read_text())
+                        saved = json.loads((root/'.local/nodes.json').read_text())
                         self.assertEqual(saved['nodes'][0]['memory_limit_mb'], 128)
                         client.control(node='node1', routing={'memory_limit_mb': 0})
                         shell.do_batch(f'"{source}" "{root}/results"')

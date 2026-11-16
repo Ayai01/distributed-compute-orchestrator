@@ -36,6 +36,7 @@ def provider(root, cpus=1, *, trusted_networks=None, **options):
     # Host commit pressure from concurrent research belongs to the dedicated
     # capacity regressions, not these isolated HTTP/process fixtures.
     options.setdefault('cpu_overcommit_factor',1.0)
+    options.setdefault('token', uuid.uuid4().hex)
     with patch('remote_compute.resources.memory',return_value=(48*1024,40*1024)), \
             patch('remote_compute.resources.commit_memory',return_value=None):
         if options.get('accelerators') and 'python_runtimes' not in options:

@@ -13,8 +13,11 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import socket
 import ssl
+import stat
+import tempfile
 import threading
 import time
 from urllib.parse import quote, urlencode
@@ -70,14 +73,18 @@ def _pause(seconds, check=None):
         time.sleep(min(.1, remaining))
 
 
-class _UploadBody(io.BytesIO):
+class _UploadBody:
     def __init__(self, data, cancel):
-        super().__init__(data)
+        self.data = memoryview(data)
+        self.offset = 0
         self.cancel = cancel
 
     def read(self, size=-1):
         _check_cancelled(self.cancel)
-        return super().read(size)
+        stop = len(self.data) if size < 0 else min(len(self.data), self.offset + size)
+        block = self.data[self.offset:stop]
+        self.offset = stop
+        return block
 
 
 class _ConnectionPool:
@@ -126,8 +133,25 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None, state_dir=None):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None, state_dir=None, relay_url=None, peer_id=None):
         self.url, self.token, self.operator = url.rstrip("/"), token, bool(operator)
+        if not self.token and urlsplit(self.url).scheme in {'http','https'}:
+            from .auth import loopback_endpoint
+            if loopback_endpoint(urlsplit(self.url).hostname or ''):
+                registration=Path(__file__).resolve().parent.parent/'.local/client.json'
+                try:
+                    registered=json.loads(registration.read_text(encoding='utf-8'))
+                except FileNotFoundError:
+                    registered={}
+                if registered.get('url')==self.url:self.token=registered.get('token','')
+        self.relay_url = relay_url.rstrip('/') if relay_url else None
+        self.peer_id = peer_id
+        self._direct_retry_after = 0.0
+        if self.relay_url:
+            from .auth import node_url
+            self.relay_url = node_url(self.relay_url)
+            if not self.token and not operator_token:
+                raise ValueError('A relay requires the destination device credential')
         # One installed SDK owns its durable client index across caller cwds.
         # Explicit roots let isolated clients share the same ownership domain.
         self.state_dir = native_path(Path(state_dir).expanduser().resolve() if state_dir is not None
@@ -139,7 +163,7 @@ class Client:
         self.timeout = timeout
         self.lease_timeout = max(timeout, 130) if lease_timeout is None else lease_timeout
         self.pool_timeout = pool_timeout
-        self.endpoint = urlsplit(self.url)
+        self._endpoint = urlsplit(self.url)
         self.connections = threading.local()
         self._capabilities = None
         self._asset_ids = OrderedDict()
@@ -148,10 +172,57 @@ class Client:
         self.ca_file=ca_file or (os.environ.get('REMOTE_COMPUTE_CA') if self.url==os.environ.get('REMOTE_COMPUTE_URL','').rstrip('/') else None)
         self.ssl_context=ssl.create_default_context(cafile=self.ca_file) if self.ca_file else None
 
-    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
-        pool=self.__dict__.get('_transport')
-        if pool is None:
-            pool=self.__dict__.setdefault('_transport',_ConnectionPool())
+    @property
+    def endpoint(self):
+        return getattr(self.connections, 'route', self._endpoint)
+
+    def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
+        options=dict(method=method,binary=binary,brief=brief,extra_headers=extra_headers,cancel=cancel,_output=_output)
+        verb=method or ('POST' if data is not None else 'GET')
+        job_upload=verb=='POST' and isinstance(data,bytes) and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
+        replayable=(verb=='GET' or verb=='DELETE' or job_upload or verb=='POST' and (
+            path in ('/admission','/jobs/status') or bool(re.fullmatch(r'/assets/[0-9a-f]{64}|/jobs/[0-9a-f]{32}/cancel',path))))
+        previous=getattr(self.connections,'route',None)
+        errors=[]
+        try:
+            routes=(self.relay_url,) if self.relay_url and time.monotonic()<self._direct_retry_after else (self.url,self.relay_url)
+            for route in routes:
+                if not route:continue
+                self.connections.route=urlsplit(route)
+                try:
+                    if errors and job_upload:
+                        try:saved=self._routed_request(path,cancel=cancel)
+                        except RemoteError as observed:
+                            if observed.status_code!=404:raise
+                        else:
+                            if saved.get('id')!=path.rsplit('/',1)[-1] or saved.get('request_sha256')!=hashlib.sha256(data).hexdigest():
+                                conflict=RemoteError('Original job request differs: '+path.rsplit('/',1)[-1]);conflict.status_code=409
+                                raise conflict
+                            return json_bytes(saved) if binary else saved
+                    return self._routed_request(path,data,**options)
+                except RemoteError as error:
+                    if not error.transport_retryable or (not replayable and getattr(error,'request_may_have_been_sent',True)):
+                        raise
+                    if route==self.url and self.relay_url:self._direct_retry_after=time.monotonic()+15
+                    errors.append(error)
+            error=errors[-1]
+            error.route_errors=tuple(errors)
+            raise error
+        finally:
+            if previous is None:self.connections.__dict__.pop('route',None)
+            else:self.connections.route=previous
+
+    def download(self, path, destination, *, cancel=None):
+        """Stream a binary GET to an owned file, retaining ETag/range recovery."""
+        destination=Path(destination)
+        with destination.open('w+b') as output:
+            self.request(path,binary=True,cancel=cancel,_output=output)
+        return destination
+
+    def _routed_request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
+        pools=self.__dict__.setdefault('_transports',{})
+        pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if self.endpoint.geturl()==self.url
+              else pools.setdefault(self.endpoint.geturl(),_ConnectionPool()))
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
         # Cache lookups/handoffs and collection cleanup may wait behind disk I/O,
@@ -173,7 +244,7 @@ class Client:
             except (OSError,ValueError):connection.close()
         self.connections.connection=connection
         try:
-            return self._request(path,data,method=method,binary=binary,brief=brief,extra_headers=extra_headers,cancel=cancel)
+            return self._request(path,data,method=method,binary=binary,brief=brief,extra_headers=extra_headers,cancel=cancel,_output=_output)
         except RequestCancelled:
             connection=getattr(self.connections,'connection',None)
             if connection is not None:connection.close()
@@ -186,13 +257,12 @@ class Client:
                 with pool.lock:pool.idle.append(connection)
             pool.release(bulk=bulk)
 
-    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
+    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
-        if self.endpoint.scheme == 'http' and not getattr(self, '_lan_http_checked', False):
+        if self.endpoint.scheme == 'http':
             if not lan_endpoint(self.endpoint.hostname):
                 raise RemoteError('Non-LAN endpoints require HTTPS with certificate verification')
-            self._lan_http_checked = True
         # Both resource routes can wait for the center/worker handshake. A
         # direct hybrid resize needs the same deadline as a worker-side lease;
         # replies and ordinary requests keep their normal network deadline.
@@ -201,7 +271,7 @@ class Client:
             or 'request_id' not in data and re.fullmatch(r'/jobs/[0-9a-f]{32}/lease', path)))
         network_timeout = getattr(self, 'lease_timeout', max(self.timeout, 130)) if resource_wait else self.timeout
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
-                   'Accept-Encoding': 'gzip','X-DCO-Keepalive':'1'}
+                   'Accept-Encoding': 'identity' if binary else 'gzip','X-DCO-Keepalive':'1'}
         auth_token = (self.operator_token or self.token) if self.operator else self.token
         if auth_token:
             headers["Authorization"] = "Bearer " + auth_token
@@ -224,7 +294,8 @@ class Client:
         if data is not None and len(data)>MAX_BODY:
             raise ValueError('Request body has %d bytes; protocol limit is %d bytes. Use separate content assets for large inputs.'%(len(data),MAX_BODY))
         method = method or ('POST' if data is not None else 'GET')
-        partial, etag = bytearray(), None
+        partial, etag = _output if _output is not None else io.BytesIO(), None
+        partial.seek(0);partial.truncate()
         attempts = 4 if binary and method == 'GET' else 2
         retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status') or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
@@ -265,27 +336,34 @@ class Client:
             connection.timeout = attempt_timeout
             if connection.sock is not None:
                 connection.sock.settimeout(attempt_timeout)
+            sent=False
             try:
-                if partial and etag:
-                    headers.update(Range='bytes='+str(len(partial))+'-', **{'If-Range':etag})
+                if partial.tell() and etag:
+                    headers.update(Range='bytes='+str(partial.tell())+'-', **{'If-Range':etag})
                 else:
                     headers.pop('Range',None);headers.pop('If-Range',None)
                 # A bytes body uses one sendall with a whole-body deadline.
                 # The reader loop sends bounded blocks, so active uploads can
                 # outlast the socket timeout. Each retry starts at byte zero.
                 body=_UploadBody(data,cancel) if stream_body else data
+                if connection.sock is None:connection.connect()
+                sent=True
                 connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
                 response = connection.getresponse()
+                if self.peer_id and response.getheader('X-DCO-Node') != self.peer_id:
+                    connection.close();self.connections.connection=None
+                    error=RemoteError('Destination device identity differs: '+str(self.peer_id));error.status_code=409
+                    raise error
                 self.connections.response_status=response.status
                 self.connections.etag=response.getheader("ETag")
                 if binary and response.status < 400:
-                    continued=(partial and response.status==206 and response.getheader('ETag')==etag
-                               and response.getheader('Content-Range','').startswith('bytes '+str(len(partial))+'-'))
+                    continued=(partial.tell() and response.status==206 and response.getheader('ETag')==etag
+                               and response.getheader('Content-Range','').startswith('bytes '+str(partial.tell())+'-'))
                     if response.status==206 and not continued:
-                        partial.clear();etag=None
+                        partial.seek(0);partial.truncate();etag=None
                         raise http.client.HTTPException('Invalid artifact resume range')
                     if not continued:
-                        partial.clear()
+                        partial.seek(0);partial.truncate()
                     etag=response.getheader('ETag') if response.getheader('Accept-Ranges')=='bytes' else None
                     while True:
                         chunk=response.read1(128*1024)
@@ -293,8 +371,9 @@ class Client:
                             if response.length not in (None,0):
                                 raise http.client.IncompleteRead(b'',response.length)
                             break
-                        partial.extend(chunk)
-                    raw=bytes(partial)
+                        _check_cancelled(cancel)
+                        partial.write(chunk)
+                    raw=partial.getvalue() if _output is None else b''
                 else:
                     raw = response.read()
                 if response.getheader('Content-Encoding') == 'gzip':
@@ -311,7 +390,7 @@ class Client:
                 connection.close()
                 self.connections.connection = None
                 if not etag:
-                    partial.clear()
+                    partial.seek(0);partial.truncate()
                 if job_upload:
                     # Acceptance can finish before its HTTP reply is lost, or
                     # an old service's post-acceptance notice can return 404.
@@ -321,8 +400,9 @@ class Client:
                         saved=self._request(path,method='GET',cancel=cancel)
                     except RequestCancelled:
                         raise
-                    except RemoteError:
-                        pass
+                    except RemoteError as observed:
+                        if observed.status_code!=404 and not isinstance(exc,RemoteError):
+                            raise
                     else:
                         if request_digest is None:
                             request_digest=hashlib.sha256(data).hexdigest()
@@ -334,7 +414,8 @@ class Client:
                 if not retryable or attempt==attempts-1:
                     error=RemoteError(f'{self.url}{path}: {exc}')
                     error.transport_code=getattr(exc,'winerror',None) or getattr(exc,'errno',None)
-                    error.transport_retryable=isinstance(exc,(ConnectionError,TimeoutError,http.client.HTTPException,ssl.SSLEOFError))
+                    error.transport_retryable=isinstance(exc,(ConnectionError,TimeoutError,http.client.HTTPException,ssl.SSLEOFError,socket.gaierror))
+                    error.request_may_have_been_sent=sent
                     raise error from None
                 time.sleep(min(1,.1*2**attempt))
         return raw if binary else json.loads(raw)
@@ -428,14 +509,16 @@ class Client:
         from .leases import CpuLease
         return CpuLease(self, identity, **options)
 
-    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None, _memory_budget_mb=None):
+    def resize(self, identity, cpus, *, active_cpus=None, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None, _memory_budget_mb=None):
         """Borrow idle slots or return them; active_cpus counts in-flight threads."""
         if type(cpus) is not int or cpus < 0:
             raise ValueError('resize cpus must be a nonnegative integer')
         if active_cpus is not None and (type(active_cpus) is not int or active_cpus < 0):
             raise ValueError('active_cpus must count nonnegative in-flight threads')
+        if min_cpus is not None and (type(min_cpus) is not int or not 0<=min_cpus<=cpus):
+            raise ValueError('min_cpus must be an integer between zero and cpus')
         request = dict(cpus=cpus)
-        for key, value in dict(active_cpus=active_cpus, memory_mb=memory_mb,
+        for key, value in dict(active_cpus=active_cpus, min_cpus=min_cpus, memory_mb=memory_mb,
                               base_memory_mb=base_memory_mb, memory_per_cpu_mb=memory_per_cpu_mb,
                               memory_limit_mb=memory_limit_mb,memory_budget_mb=_memory_budget_mb).items():
             if value is not None:request[key] = value
@@ -611,7 +694,8 @@ class Client:
         # A force control must not queue behind this client's long resource
         # handshakes or artifact transfers. Keep the same auth/TLS identity.
         control = Client(self.url, self.token, timeout=min(self.timeout, 3), ca_file=self.ca_file,
-                         operator=self.operator, operator_token=self.operator_token, pool_timeout=.5)
+                         operator=self.operator, operator_token=self.operator_token, pool_timeout=.5,
+                         relay_url=self.relay_url,peer_id=self.peer_id)
         return control.request("/jobs/" + identity + "/cancel", {})
 
     def clean(self):
@@ -704,7 +788,7 @@ class Client:
             if deadline is not None:delay=min(delay,deadline-now)
             _pause(delay,check)
 
-    def artifacts(self, identity):
+    def artifacts(self, identity, *, destination=None):
         # A center may first need to retrieve the complete remote ZIP. Keep
         # that header wait and its connections separate from status/control.
         if self.endpoint.scheme not in {'http', 'https'}:
@@ -713,14 +797,21 @@ class Client:
         if self.endpoint.scheme in {'http','https'}:
             backend=self.__dict__.get('_result_client')
             if backend is None:
-                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None)))
+                backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None),relay_url=self.relay_url,peer_id=self.peer_id))
             backend.timeout=max(120,self.timeout)
         metrics=self.__dict__.setdefault('_artifact_timing',threading.local())
         stats=dict(requests=0,request_seconds=0.0,preparing_responses=0,prepare_sleep_seconds=0.0)
         metrics.value=stats
         def read():
             started=time.monotonic()
-            try:return backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers={'X-DCO-Artifact-Poll':'1'})
+            try:
+                if destination is None:
+                    return backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers={'X-DCO-Artifact-Poll':'1'})
+                with Path(destination).open('w+b') as output:
+                    backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers={'X-DCO-Artifact-Poll':'1'},_output=output)
+                    if getattr(backend.connections,'response_status',200)==202:
+                        output.seek(0);return output.read()
+                return Path(destination)
             finally:
                 stats['requests']+=1;stats['request_seconds']+=time.monotonic()-started
         delay = .2
@@ -740,15 +831,24 @@ class Client:
             delay = min(.5, delay*2)
 
     def fetch(self, identity, output_dir=None, *, delete=True):
+        if output_dir is None:
+            return self._fetch(identity,output_dir,delete=delete)
+        temporary_root=Path(os.environ['LOCALAPPDATA'])/'Temp' if os.name=='nt' else None
+        with tempfile.TemporaryDirectory(prefix='dco-artifact-',dir=temporary_root) as folder:
+            return self._fetch(identity,output_dir,delete=delete,artifact_path=Path(folder)/'result.zip')
+
+    def _fetch(self, identity, output_dir=None, *, delete=True, artifact_path=None):
         started=time.monotonic()
         metrics=self.__dict__.setdefault('_artifact_timing',threading.local());metrics.value=None
         fetched=self.__dict__.setdefault('_fetch_timing',threading.local());fetched.value=dict(id=identity)
-        try:raw = self.artifacts(identity)
+        try:raw = self.artifacts(identity,**({'destination':artifact_path} if artifact_path is not None else {}))
         except BaseException:
             fetched.value=dict(id=identity,stage='artifacts',artifacts_seconds=time.monotonic()-started,**(metrics.value or {}))
             raise
         received=time.monotonic()
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        source=raw if isinstance(raw,Path) else io.BytesIO(raw)
+        archive_bytes=raw.stat().st_size if isinstance(raw,Path) else len(raw)
+        with zipfile.ZipFile(source) as archive:
             result = json.loads(archive.read("result.json"))
             expanded=sum(item.file_size for item in archive.infolist())
             names = [name for name in archive.namelist() if name.startswith("files/")]
@@ -757,15 +857,27 @@ class Client:
         decoded=time.monotonic()
         if output_dir is not None:
             directory=Path(output_dir).resolve()
-            with zipfile.ZipFile(io.BytesIO(raw))as archive:
+            if not isinstance(source,Path):source.seek(0)
+            with zipfile.ZipFile(source)as archive:
                 long=any(len(str(directory/name))>=248 for name in archive.namelist())
             directory=native_path(directory,force=long)
-            unpack(raw,directory)
+            if not isinstance(source,Path):source.seek(0)
+            from .bundle import inside
+            with zipfile.ZipFile(source) as archive:
+                if expanded>2*1024**3:raise ValueError('Expanded bundle exceeds 2 GiB; predeploy large assets with shared roots')
+                for item in archive.infolist():
+                    target=inside(directory,item.filename);mode=item.external_attr>>16
+                    if stat.S_ISLNK(mode):raise ValueError('Bundle requires regular files')
+                    if item.is_dir():target.mkdir(parents=True,exist_ok=True);continue
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    with archive.open(item) as input_file,target.open('wb') as output:
+                        shutil.copyfileobj(input_file,output,128*1024)
+                    if os.name!='nt':target.chmod(stat.S_IMODE(mode) or 0o644)
             result["output_dir"] = str(directory)
         unpacked=time.monotonic()
         fetched.value=dict(id=identity,artifacts_seconds=received-started,decode_seconds=decoded-received,
             unpack_seconds=unpacked-decoded,total_seconds=unpacked-started,
-            archive_bytes=len(raw),expanded_bytes=expanded,**(metrics.value or {}))
+            archive_bytes=archive_bytes,expanded_bytes=expanded,**(metrics.value or {}))
         result["url"] = self.url
         retired=time.monotonic()
         if delete:
@@ -906,7 +1018,8 @@ class Node:
         # Transport reservations waiting for startup do not prove a full worker.
         used=min(self.reserved+self.external,self.health.get('used_cpus',self.reserved+self.external))
         return cpu_capacity(self.base_capacity,used,self.health.get('cpu_percent'),
-                            self.health.get('cpu_overcommit_factor',1.0))
+                            self.health.get('cpu_overcommit_factor',1.0),
+                            self.health.get('cpu_overcommit_utilization',90))
 
     @property
     def memory_capacity(self):
@@ -1056,7 +1169,7 @@ class Pool:
                 node = Node(f"node{index + 1}", entry)
             else:
                 node = Node(entry.get("name", f"node{index + 1}"),
-                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10),ca_file=entry.get('ca_file'),operator=True),
+                            entry.get('client') or Client(entry["url"], entry.get("token", ""),timeout=entry.get('timeout',10),ca_file=entry.get('ca_file'),operator=True,relay_url=entry.get('relay_url'),peer_id=entry.get('peer_id')),
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
@@ -1263,7 +1376,7 @@ class Pool:
             self.refresh(monitor=True)
 
     def configure(self, name=None, *, policy=None, **changes):
-        connection_change=bool(set(changes)&{'enabled','url','ca_file'})
+        connection_change=bool(set(changes)&{'enabled','url','ca_file','relay_url','peer_id'})
         with self.condition:
             if policy is not None:
                 if policy not in self.POLICIES:
@@ -1271,8 +1384,8 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "timeout", "host_ip", "url", "ca_file", "aliases"}:
-                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, timeout, host_ip, url, ca_file, aliases")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "timeout", "host_ip", "url", "ca_file", "aliases", "relay_url", "peer_id"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, timeout, host_ip, url, ca_file, aliases, relay_url, peer_id")
                 timeout=changes.pop('timeout',None)
                 if timeout is not None and (isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not 0<timeout<float('inf')):
                     raise ValueError('Node timeout must be positive and finite')
@@ -1283,12 +1396,15 @@ class Pool:
                 self._validate_node(proposed)
                 address=changes.pop('url',node.client.url)
                 ca_file=changes.pop('ca_file',getattr(node.client,'ca_file',None))
+                relay_url=changes.pop('relay_url',getattr(node.client,'relay_url',None))
+                peer_id=changes.pop('peer_id',getattr(node.client,'peer_id',None))
                 if not isinstance(address,str) or urlsplit(address).scheme not in {'http','https','local'}:
                     raise ValueError('Node URL must use HTTP(S) or the private local endpoint')
                 if any(other is not node and other.client.url==address.rstrip('/') for other in self.nodes):
                     raise ValueError('Configure each worker URL once')
-                if address.rstrip('/')!=node.client.url or ca_file!=getattr(node.client,'ca_file',None):
-                    node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file,operator=True)
+                if (address.rstrip('/')!=node.client.url or ca_file!=getattr(node.client,'ca_file',None)
+                        or relay_url!=getattr(node.client,'relay_url',None) or peer_id!=getattr(node.client,'peer_id',None)):
+                    node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file,operator=True,relay_url=relay_url,peer_id=peer_id)
                     node.connection_generation+=1
                     node.error='Node address changed; checking worker'
                 for key, value in changes.items():
@@ -1303,8 +1419,8 @@ class Pool:
             self.condition.notify_all()
         if name is not None and connection_change:self._save_reconnect(node)
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None):
-        node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file,operator=True), weight=weight, limit=limit)
+    def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None, relay_url=None, peer_id=None):
+        node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file,operator=True,relay_url=relay_url,peer_id=peer_id), weight=weight, limit=limit)
         node.host_ip = host_ip
         node.aliases=[] if aliases is None else aliases
         self._validate_node(node)
@@ -1324,8 +1440,12 @@ class Pool:
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
                  "timeout": getattr(n.client,'timeout',10),
                  "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),
+                 "relay_url":getattr(n.client,'relay_url',None),"peer_id":getattr(n.client,'peer_id',None),
                  "capacity": n.capacity, "base_capacity":n.base_capacity,
                  "cpu_overcommit_factor":n.health.get('cpu_overcommit_factor',1.0),
+                 "cpu_overcommit_utilization":n.health.get('cpu_overcommit_utilization',90),
+                 "memory_commit_headroom_mb":n.health.get('memory_commit_headroom_mb'),
+                 "configured":n.health.get('configured',{}),
                  "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),

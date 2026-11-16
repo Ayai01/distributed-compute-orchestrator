@@ -15,8 +15,8 @@ class CpuLease:
 
     def __init__(self, client, identity, *, max_cpus=1024, cpus=1, memory_mb=None,
                  base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
-        if type(cpus) is not int or type(max_cpus) is not int or not 1 <= cpus <= max_cpus:
-            raise ValueError('cpus and max_cpus require 1 <= cpus <= max_cpus')
+        if type(cpus) is not int or type(max_cpus) is not int or max_cpus<1 or not 0 <= cpus <= max_cpus:
+            raise ValueError('cpus and max_cpus require 0 <= cpus <= max_cpus and max_cpus >= 1')
         self.client, self.identity = client, identity
         self.max_cpus, self.cpus = max_cpus, cpus
         self.memory = {key: value for key, value in dict(memory_mb=memory_mb,
@@ -25,11 +25,12 @@ class CpuLease:
         self.memory_mb = memory_mb
         self.updated = float('-inf')
         self.demand = self.active_cpus = None
+        self.min_cpus = None
         self.confirmed = None
         self.phase_pending = False
         self.memory_calibrating = False
 
-    def refresh(self, *, active_cpus=0, ready_cpus=None):
+    def refresh(self, *, active_cpus=0, ready_cpus=None, min_cpus=0):
         """Report in-flight threads and immediately runnable demand; return CPUs.
 
         Active threads retain their existing authorization. Only idle slots can
@@ -40,16 +41,18 @@ class CpuLease:
             raise ValueError('active_cpus must count threads within the existing grant')
         if ready_cpus is not None and (type(ready_cpus) is not int or ready_cpus < 0):
             raise ValueError('ready_cpus must be a nonnegative thread demand or None')
-        desired = self.max_cpus if ready_cpus is None else min(self.max_cpus, max(1, active_cpus + ready_cpus))
-        unchanged = desired == self.demand and active_cpus == self.active_cpus
+        desired = self.max_cpus if ready_cpus is None else min(self.max_cpus, active_cpus + ready_cpus)
+        if type(min_cpus)is not int or not 0<=min_cpus<=desired:
+            raise ValueError('min_cpus must be an integer within this phase demand')
+        unchanged = desired == self.demand and active_cpus == self.active_cpus and min_cpus==self.min_cpus
         # No slot can grow or be returned in a stable fully occupied phase.
         # Other phases still poll: the same demand can borrow a peer's release.
-        if unchanged and not self.phase_pending and self.cpus == desired == max(1, active_cpus):
+        if unchanged and not self.phase_pending and self.cpus == desired == active_cpus:
             return self.cpus
-        if (desired != self.demand or active_cpus != self.active_cpus
+        if (not unchanged
                 or time.monotonic() - self.updated >= (.1 if self.memory_calibrating else 1)):
             try:
-                grant = self.client.resize(self.identity, desired, active_cpus=active_cpus, **self.memory)
+                grant = self.client.resize(self.identity, desired, active_cpus=active_cpus,min_cpus=min_cpus, **self.memory)
             except Exception as error:
                 if (getattr(error,'status_code',None)!=409 or
                         not any(message in str(error)for message in (
@@ -65,6 +68,10 @@ class CpuLease:
                 target=(os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID',self.identity)
                     if inherited and os.environ.get('REMOTE_COMPUTE_LEASE')=='1' else self.identity)
                 grant=self._retained_status(target,desired,active_cpus,error,inherited)
+                if not desired:
+                    self.cpus=0;self.demand=0;self.active_cpus=0;self.min_cpus=0
+                    self.confirmed=None;self.updated=time.monotonic()
+                    return 0
                 available=grant.get('memory_mb',0)
                 if isinstance(grant.get('memory_phase'),dict)and same_phase(self.memory,grant['memory_phase']):
                     # The provider already funded this phase using its actual
@@ -95,9 +102,13 @@ class CpuLease:
                     probe=(self._retained_downshift(grant,active_cpus) if inherited
                         and os.environ.get('REMOTE_COMPUTE_WORKER')=='1' else None)
                     if probe is not None:grant=probe
+                    elif executing and not active_cpus and grant.get('cpus',0)==0:
+                        # A drained or uncertain phase has no authorized start.
+                        # Keep its ready demand and retry at the next boundary.
+                        grant=dict(grant,cpus=0)
                     elif (inherited and executing and not active_cpus
                             and os.environ.get('REMOTE_COMPUTE_WORKER')=='1'
-                            and grant.get('cpus',0)>=1 and available>0):
+                            and grant.get('cpus',0)>=0 and available>0):
                         # A paid preparation phase can end below the next
                         # phase's first-slot estimate. Negotiate that slot at
                         # this safe boundary before starting any new body.
@@ -108,7 +119,7 @@ class CpuLease:
             self.phase_pending = bool(grant.get('_phase_pending'))
             self.memory_calibrating = bool(grant.get('memory_calibrating'))
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
-            self.demand, self.active_cpus = desired, active_cpus
+            self.demand, self.active_cpus, self.min_cpus = desired, active_cpus, min_cpus
             # Only a successfully negotiated or validated usable grant can
             # survive a read outage. The constructor's CPU seed is not one.
             self.confirmed = (dict(cpus=self.cpus,memory_mb=self.memory_mb,
@@ -119,9 +130,9 @@ class CpuLease:
         return self.cpus
 
     def _retained_downshift(self,grant,active):
-        """Keep one already paid slot when the next estimate decreases."""
+        """Fund a probe under the acknowledged phase when its estimate falls."""
         previous=grant.get('memory_phase')
-        if (grant.get('status')!='running' or active>1 or grant.get('cpus',0)<1
+        if (grant.get('status')!='running' or active>1 or grant.get('cpus',0)<0
                 or grant.get('memory_mb',0)<=0 or not isinstance(previous,dict)):
             return None
         def first(model):
@@ -130,15 +141,16 @@ class CpuLease:
         needed,prior=first(self.memory),first(previous)
         if not 0<needed<prior or self.memory.get('memory_limit_mb',needed)<needed:
             return None
-        if grant['cpus']>1:
-            # Return idle slots under the acknowledged phase before starting
-            # the single-slot probe. This does not borrow any new CPU or RAM.
+        if grant['cpus']!=1:
+            # Negotiate the probe under the acknowledged phase. A drained
+            # executor may need to reacquire its first slot here.
             try:reduced=self.client.resize(self.identity,1,active_cpus=active,**previous)
             except Exception as error:
                 if (getattr(error,'status_code',None)!=409 or not any(message in str(error)for message in (
                         'Insufficient memory for resource resize; existing grant retained',
                         'Insufficient RAM for active workers; existing grant retained',
                         'Center resource reply timed out; existing grant retained',RESOURCE_TRANSPORT_RETAINED))):raise
+                if grant['cpus']==0:return None
                 # The original grant still contains this one slot; retry its
                 # idle-slot return at the next executor boundary.
             else:
@@ -193,7 +205,7 @@ class CpuLease:
             if uncertain:
                 # A late resize may still return idle slots after this read.
                 # Preserve the reported active floor, not those unsettled slots.
-                grant=dict(grant,cpus=min(grant.get('cpus',0),max(1,active)))
+                grant=dict(grant,cpus=min(grant.get('cpus',0),active))
             return grant
         try:
             return observe()
@@ -208,7 +220,7 @@ class CpuLease:
             if uncertain:
                 # The unanswered resize could have returned idle slots. Keep
                 # its active floor until an authoritative observation arrives.
-                width=min(width,max(1,active))
+                width=min(width,active)
             return dict(cached,status='running',cpus=width)
         # No new work starts from an unverified seed or a different phase.
         # Retry only observation, within the original execution deadline.

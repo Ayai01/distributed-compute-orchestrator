@@ -7,7 +7,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from remote_compute.bundle import pack
-from remote_compute.cache_assets import groups
+from remote_compute.cache_assets import groups, load_projects
+from test_cache_aop_rgcn import cache_aop, cache_rgcn
+from test_cache_arh_bench import arh, dcbfs
 from test_compute import scratch
 
 
@@ -36,8 +38,8 @@ class CacheAssetTests(unittest.TestCase):
                 'analog.simulators':SimpleNamespace(simulation_jobs=jobs),
                 'compute.models':SimpleNamespace(model_bundle=bundle),
             }
-            with patch('remote_compute.cache_assets.importlib.import_module', side_effect=modules.__getitem__):
-                result = groups(root, 'aop')
+            with patch('importlib.import_module', side_effect=modules.__getitem__):
+                result = groups(root, cache_aop)
             self.assertEqual(set(result['aop_code']['files']), set(names[:4]))
             self.assertTrue(all(isinstance(value,Path) for value in result['aop_code']['files'].values()))
             models = [value for name,value in result.items() if name!='aop_code']
@@ -71,8 +73,8 @@ class CacheAssetTests(unittest.TestCase):
                                    native_models=Mock(return_value=pdk_files))
             eda=SimpleNamespace(resolve_tools=Mock(return_value={'pdk_root':'selected-pdk'}))
             modules={'src.remote_native':native,'src.eda':eda}
-            with patch('remote_compute.cache_assets.importlib.import_module',side_effect=modules.__getitem__):
-                result=groups(root,'rgcn')
+            with patch('importlib.import_module',side_effect=modules.__getitem__):
+                result=groups(root,cache_rgcn)
             native.native_code.assert_called_once_with(root.resolve())
             native.native_models.assert_called_once_with('selected-pdk')
             self.assertEqual(result['rgcn_native']['files'], native_files)
@@ -85,36 +87,40 @@ class CacheAssetTests(unittest.TestCase):
             self.assertEqual(result['rgcn_research']['requires'], ['ml'])
             self.assertNotIn('configs/live.json', native_files)
 
-    def test_bench_captures_original_named_source_and_static_groups(self):
-        source={'bench/entry.py':b'source','pyproject.toml':b'project'}
-        static={'bench/problems/data/model.npz':b'model bytes'}
-        def builder(client):
-            data=client.sync_files(static)
-            code=client.sync_files(source)
-            return dict(bench=code,bench_data=data)
-        module=SimpleNamespace(_source_assets=Mock(side_effect=builder))
-        with patch('remote_compute.cache_assets.importlib.import_module',return_value=module):
-            result=groups(Path.cwd(),'bench')
-        self.assertEqual(set(result), {'bench','bench_data'})
-        self.assertEqual(pack(result['bench']['files']),pack(source))
-        self.assertEqual(pack(result['bench_data']['files']),pack(static))
-        self.assertEqual(result['bench']['requires'], [])
-        module._source_assets.assert_called_once()
+    def test_dcbfs_reuses_its_actual_compute_file_manifest(self):
+        with scratch() as directory:
+            root = Path(directory)
+            (root/'tools').mkdir()
+            (root/'tools/compute.py').write_text(
+                "def files():\n    return {'src/dcbfs/entry.py':b'source','data/reference/front.npz':b'original'}\n")
+            result = groups(root, dcbfs)
+            self.assertEqual(result['dcbfs_source']['files'], {
+                'src/dcbfs/entry.py':b'source','data/reference/front.npz':b'original'})
 
     def test_arh_uses_existing_source_snapshot_without_copying_shared_tools(self):
         files={'main.py':b'entry','framework/runtime.py':b'runtime'}
         module=SimpleNamespace(files=Mock(return_value=files))
-        with patch('remote_compute.cache_assets.importlib.import_module',return_value=module):
-            result=groups(Path.cwd(),'arh')
+        with patch('importlib.import_module',return_value=module):
+            result=groups(Path.cwd(),arh)
         module.files.assert_called_once_with(Path.cwd().resolve())
         self.assertEqual(result,{'arh_source':{
             'files':files,'requires':['shared:arh']}})
 
-    def test_unknown_project_does_not_import_or_scan_a_project(self):
-        with patch('remote_compute.cache_assets.importlib.import_module') as imported:
-            with self.assertRaisesRegex(ValueError,'Unknown cache project'):
-                groups(Path.cwd(),'unknown')
-        imported.assert_not_called()
+    def test_registry_accepts_new_project_without_core_branch(self):
+        with scratch() as directory:
+            root = Path(directory)
+            (root/'adapter.py').write_text('def manifest(root): return {}\n')
+            path = root/'projects.json'
+            path.write_text(json.dumps({'projects':{'custom':{'root':str(root),
+                'adapter':'adapter.py','requires':['ngspice47']}}}))
+            registered = load_projects(path)
+            self.assertEqual(registered['custom']['requires'], ['ng47'])
+            self.assertEqual(load_projects(root/'absent.json'), {})
+            data = json.loads(path.read_text())
+            data['projects']['custom']['adapter'] = '../escape.py'
+            path.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                load_projects(path)
 
 
 if __name__=='__main__':

@@ -20,6 +20,22 @@ from test_compute import provider, scratch
 
 
 class OfflineTests(unittest.TestCase):
+    def test_detached_profile_retains_the_device_route_and_saved_credential(self):
+        with scratch() as directory:
+            path=Path(directory)/'.local/nodes.json';path.parent.mkdir()
+            row=dict(name='device',url='http://192.168.1.11:26133',token='previous',limit=8)
+            path.write_text(json.dumps({'nodes':[row]}))
+            client=Client(row['url'],'current',relay_url='http://127.0.0.1:27101',peer_id='device',state_dir=Path(directory)/'client')
+            node=Node('device',client,enabled=False,detached=True,reconnect_attempts=2,reconnect_after=60)
+            save_detached_node(path,node)
+            saved=json.loads(path.read_text())['nodes'][0]
+            self.assertEqual((saved['token'],saved['limit']),('previous',8))
+            self.assertEqual((saved['relay_url'],saved['peer_id']),(client.relay_url,'device'))
+            client.relay_url=None;client.peer_id=None
+            save_detached_node(path,node)
+            saved=json.loads(path.read_text())['nodes'][0]
+            self.assertNotIn('relay_url',saved);self.assertNotIn('peer_id',saved)
+
     def test_one_minute_expiry_keeps_original_references_and_skips_ordinary_probes(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=2) as (_,client):
             removed=[]
@@ -66,7 +82,8 @@ class OfflineTests(unittest.TestCase):
 
     def test_disabled_configuration_keeps_budget_credentials_and_skips_startup_probe(self):
         with scratch() as root:
-            path=Path(root)/'nodes.local.json'
+            path=Path(root)/'.local/nodes.json'
+            path.parent.mkdir(parents=True,exist_ok=True)
             original=dict(name='device',url='http://192.168.1.11:26133',limit=8,token='saved-secret',enabled=True)
             path.write_text(json.dumps({'policy':'adaptive','nodes':[original,dict(name='other',url='http://192.168.1.12:26133',enabled=False)]}))
             node=Node('device',Client(original['url']),enabled=False,detached=True)
@@ -131,7 +148,8 @@ class OfflineTests(unittest.TestCase):
 
     def test_renamed_same_machine_reconnects_without_changing_original_references(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, client):
-            path=Path(root)/'nodes.local.json'
+            path=Path(root)/'.local/nodes.json'
+            path.parent.mkdir(parents=True,exist_ok=True)
             path.write_text(json.dumps({'nodes':[dict(name='original-route',url=client.url,token='retained',limit=1)]}))
             with Pool([dict(name='original-route',client=client,limit=1)],refresh=1000,
                       on_reconnect=lambda n:save_detached_node(path,n)) as pool:
@@ -164,8 +182,9 @@ class OfflineTests(unittest.TestCase):
 
     def test_startup_retains_the_previous_name_as_an_alias_for_the_same_endpoint(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
-            path=Path(root)/'nodes.local.json'
-            path.write_text(json.dumps({'nodes':[dict(name='old-name',url=client.url,aliases=['older-name'])]}))
+            path=Path(root)/'.local/nodes.json'
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(json.dumps({'nodes':[dict(name='old-name',url=client.url,token=client.token,aliases=['older-name'])]}))
             loaded=load_nodes(path)['nodes'][0]
             self.assertEqual(loaded['name'],client.health()['node'])
             self.assertEqual(loaded['aliases'],['older-name','old-name'])
@@ -185,7 +204,8 @@ class OfflineTests(unittest.TestCase):
                     self.assertEqual(health.call_count,1)
                     self.assertEqual(pool._retry_detached(future+600),[])
                 self.assertEqual(lost.reconnect_attempts,5)
-                path=Path(root)/'nodes.local.json'
+                path=Path(root)/'.local/nodes.json'
+                path.parent.mkdir(parents=True,exist_ok=True)
                 path.write_text(json.dumps({'nodes':[dict(name='lost',url=client.url,enabled=False)]}))
                 save_detached_node(path,lost)
                 row=json.loads(path.read_text())['nodes'][0]
@@ -198,7 +218,8 @@ class OfflineTests(unittest.TestCase):
     def test_manual_api_disable_is_saved_before_restart(self):
         from test_center import center
         with scratch() as root,provider(Path(root)/'worker') as (_,remote):
-            path=Path(root)/'nodes.local.json'
+            path=Path(root)/'.local/nodes.json'
+            path.parent.mkdir(parents=True,exist_ok=True)
             row=dict(name='device',url=remote.url,enabled=True,limit=1,token='preserved')
             path.write_text(json.dumps(dict(nodes=[row])))
             with Pool([dict(row,client=remote)],refresh=1000,
@@ -213,7 +234,8 @@ class OfflineTests(unittest.TestCase):
 
     def test_cli_save_and_automatic_retry_merge_under_one_configuration_lock(self):
         with scratch() as root:
-            path=Path(root)/'nodes.local.json'
+            path=Path(root)/'.local/nodes.json'
+            path.parent.mkdir(parents=True,exist_ok=True)
             row=dict(name='device',url='http://127.0.0.1:26133',enabled=True,
                      weight=1,limit=52,memory_limit_mb=0,token='preserved')
             path.write_text(json.dumps(dict(nodes=[row])))
@@ -223,7 +245,7 @@ class OfflineTests(unittest.TestCase):
                 inside.set();self.assertTrue(release.wait(3))
                 return dict(policy='adaptive',nodes=[{k:v for k,v in row.items() if k!='token'}])
             shell=SimpleNamespace(center=None,pool=SimpleNamespace(nodes=[],snapshot=snapshot))
-            lost=Node('device',Client(row['url']),enabled=False,detached=True,
+            lost=Node('device',Client(row['url'],row['token']),enabled=False,detached=True,
                       reconnect_attempts=4,reconnect_after=time.time()+60)
             def run(call):
                 try:call()

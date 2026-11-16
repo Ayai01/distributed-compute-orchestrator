@@ -89,7 +89,7 @@ def configure(root, address, port=26133, *, config_path=None, restart=True):
     if type(port) is not int or not 0 < port < 65536:
         raise ValueError('Worker port must be between 1 and 65535')
     root = Path(root).resolve()
-    path = Path(config_path).resolve() if config_path else root / 'worker.local.json'
+    path = Path(config_path).resolve() if config_path else root / '.local/worker.json'
     previous = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
     token = os.environ.get('REMOTE_COMPUTE_TOKEN') or previous.get('token') or secrets.token_urlsafe(32)
     health = None

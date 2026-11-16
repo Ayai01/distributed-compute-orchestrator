@@ -117,7 +117,7 @@ class ExecutorAdmissionTests(unittest.TestCase):
                 self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                 values=json.loads(result['files']['.dco-results.json'])['items']
                 self.assertEqual([row['value']for row in values],list(range(5)))
-                self.assertEqual(result['cpus'],1)
+                self.assertEqual(result['cpus'],0)
 
     def test_shrink_after_snapshot_preserves_all_inputs_and_grant_for_both_backends(self):
       for scenario in ('snapshot','entry','pending'):

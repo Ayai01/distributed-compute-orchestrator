@@ -18,15 +18,21 @@ Windows 安装根为 D:/Projects/#4-Arclight/DCO_v1，无 D 盘时使用 C 盘�
 
 弹性阶段从可用的有效宽度工作，按就绪项扩核，尾项完成及时归还空槽。固定线程内核必须整组取得所需核数后执行；等待完整组的任务不占用计算槽。所有活跃线程保持授予直至安全归还。跨工程按 resource_share 与实际可执行需求分配，暂时用不上的份额供其他工程使用。
 
+固定内核用 `run_call(limits={'exact_cpus': N, ...})` 声明真实线程宽度，任务 `max_cpus` 至少为N。支持 `resize_min_cpus` 的节点通过 `min_cpus` 整组准入；等待时0核但保留驻留内存。弹性 map/iter 的上限来自真实就绪工作，不由某台机器瞬时空闲量决定。迁移中的旧节点沿原资源语义执行已冻结请求。
+
 内存调度区分解释器与共享输入基线、每项增量、冷准备峰值及后处理。声明用于准入，完整进程树实测用于校准；实际物理余量和 Windows 私有提交余量决定压力处理。资源预算减少只影响后续准入和可归还空槽，不杀健康任务。
 
 CPU预算、硬上限、超发倍率、超发停止利用率、内存预算与物理/提交保留线通过同一受限控制 API 调整，持久保存到所属设备配置。界面同时显示配置值、有效值和实际占用。维护更新沿原生重载边界进行。
+
+控制入口为 operator 专用 `GET/POST /control/resources`，写入 `{node, changes}`；八字段为 `cpus`、`cpu_limit`、`cpu_overcommit_factor`、`cpu_overcommit_utilization`、`memory_mb`、`memory_reserve_mb`、`memory_headroom_mb`、`memory_commit_headroom_mb`。`cpu_limit` 限基础预算，超发上限为基础预算乘倍率（1–1.5）；利用率阈值取1–100。下调预算保留健康活跃授权，新增准入按新值执行。
 
 ## 传输、结果与生命周期
 
 源码、模型和数据按不可变摘要分开复用。大包流式传输、支持已有续传合同；控制请求与大包分开背压，状态按有界批次读取，稳定状态降低采样频率。网页只传紧凑当前快照，页面隐藏时降低刷新；已压缩大包不重复压缩。
 
 fetch(delete=False) → 工程持久发布结果/费用/恢复引用 → delete。任务与 attempt 费用累积，未知费用保留为未知。科学缓存键和合并规则由工程持有，DCO只提供内容与清单交换。
+
+`.local/projects.json` 注册 `projects:{id:{root,adapter,requires,producer_group?}}`；root为本机工程源码，adapter为其中相对路径。工程提供manifest/export/merge/groups，DCO按不可变内容发送adapter和必要helper，远端共享根只需缓存。源代码/模型分组在本机工程构建，按摘要复用；ARH的独立producer资产通过可选producer_group声明。DCBFS使用dcbfs身份及实际reference协议，旧Bench数据保留原身份。
 
 ## 迁移
 

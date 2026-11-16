@@ -104,7 +104,7 @@ def _mark_shared(root, size):
 
 def ensure_shared(size_gib=None, *, create=False):
     """Reuse/extend the marked volume; never create a second disk after a failed resize."""
-    settings=json.loads((ROOT/'worker.local.json').read_text(encoding='utf-8-sig')) if (ROOT/'worker.local.json').is_file() else {}
+    settings=json.loads((ROOT/'.local/worker.json').read_text(encoding='utf-8-sig')) if (ROOT/'.local/worker.json').is_file() else {}
     # Capacity belongs to this host's operator, including for older callers passing 8.
     size_gib=settings.get('ramdisk_gib',8 if size_gib is None else size_gib)
     if type(size_gib) is not int or size_gib not in (4,8,16):

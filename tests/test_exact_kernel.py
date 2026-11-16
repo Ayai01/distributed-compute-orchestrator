@@ -32,15 +32,16 @@ def entry(wait=5):
 
 
 class ExactKernelTests(unittest.TestCase):
-    def test_partial_grants_remain_ready_until_exact_width_is_committed(self):
+    def test_waiting_fixed_width_returns_all_idle_cpus_until_the_group_is_funded(self):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=4,memory_mb=4096,memory_headroom_mb=0)as(worker,remote):
             with Pool([remote])as pool,center(pool,Path(folder)/'center')as(_,client):
                 original=worker.resize;requests=[];partial=0
                 def resize(identity,cpus,**options):
                     nonlocal partial
-                    if options.get('memory_mb')==768 and partial<2:
-                        partial+=1;cpus=min(cpus,partial)
-                    result=original(identity,cpus,**options)
+                    if options.get('min_cpus')==4 and not options.get('active_cpus')and partial<2:
+                        partial+=1;worker.capacity=partial
+                    try:result=original(identity,cpus,**options)
+                    finally:worker.capacity=4
                     requests.append(dict(active=options.get('active_cpus'),cpus=cpus,grant=result['cpus']))
                     return result
                 with patch.object(worker,'resize',side_effect=resize):
@@ -48,7 +49,7 @@ class ExactKernelTests(unittest.TestCase):
                 self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                 value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
                 self.assertEqual((value['cpus'],value['calls']),(4,1));self.assertTrue(value['deadline_preserved'])
-                self.assertEqual([r['grant']for r in requests[:2]],[1,2])
+                self.assertEqual([r['grant']for r in requests[:2]],[0,0])
                 self.assertTrue(all(r['active']==0 for r in requests[:3]),requests)
                 self.assertTrue(any(r['active']==4 and r['grant']==4 for r in requests),requests)
                 self.assertEqual(worker.used,0)
@@ -56,9 +57,15 @@ class ExactKernelTests(unittest.TestCase):
     def test_waits_for_peer_release_without_preempting_or_resubmitting_it(self):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=4,memory_mb=4096,memory_headroom_mb=0)as(worker,remote):
             with Pool([remote])as pool,center(pool,Path(folder)/'center')as(_,client):
-                peer=client.submit(python("import time;time.sleep(2)",max_cpus=3,project='peer',timeout=10))['id']
+                peer=client.submit(python("from pathlib import Path\nimport time\nwhile not Path('release').exists():time.sleep(.02)",max_cpus=3,project='peer',timeout=15))['id']
                 until(lambda:worker.health()['used_cpus']==3)
-                result=client.run(python_task('business:entry',max_cpus=4,memory_mb=512,timeout=12,retries=0),files={'business.py':SOURCE})
+                identity=client.submit(python_task('business:entry',max_cpus=4,memory_mb=512,timeout=12,retries=0),files={'business.py':SOURCE})['id']
+                try:
+                    until(lambda:client.status(identity).get('min_cpus')==4 and client.status(identity)['cpus']==0)
+                    self.assertEqual(worker.used,3)
+                    self.assertEqual(client.status(peer)['status'],'running')
+                finally:client.write_job_file(peer,'release','yes')
+                client.wait(identity,wait_timeout=12);result=client.fetch(identity)
                 self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                 value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
                 self.assertEqual((value['cpus'],value['calls']),(4,1))
@@ -73,7 +80,7 @@ class ExactKernelTests(unittest.TestCase):
             self.assertEqual(result['status'],'succeeded',result.get('stderr'))
             value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
             self.assertEqual(value['calls'],0);self.assertEqual(value['next_stage'],1)
-            self.assertIn('needs 4 CPUs; obtained 1',value['error'])
+            self.assertIn('needs 4 CPUs; obtained 0',value['error'])
             self.assertTrue(value['deadline_preserved']);self.assertLess(value['waited'],2)
             self.assertEqual(result['files']['paid-preparation'],b'retained')
             self.assertEqual(worker.used,0)

@@ -36,7 +36,7 @@ class LeaseStatusOutageTests(unittest.TestCase):
                 clock.return_value=12;self.assertEqual(lease.refresh(active_cpus=active,ready_cpus=8-active),8)
 
     def test_unanswered_resize_keeps_only_its_active_floor_during_read_outage(self):
-        for active,expected in ((0,1),(2,2)):
+        for active,expected in ((0,0),(2,2)):
             client=Client()
             with self.subTest(active=active),patch.object(client,'resize',side_effect=[dict(cpus=4,memory_mb=128),self.refused(timeout=True)]), \
                     patch.object(client,'status',side_effect=self.unavailable()),patch('remote_compute.leases.time.monotonic',return_value=10)as clock:

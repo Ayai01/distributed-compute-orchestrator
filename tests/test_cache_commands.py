@@ -19,14 +19,14 @@ from test_compute import scratch, until
 class CacheCommandTests(unittest.TestCase):
     def test_parser_accepts_simple_project_names_and_kind(self):
         for name, expected in [('all', 'all'), ('AOP', 'aop'), ('RGCN', 'rgcn'),
-                               ('ARH-DSE', 'arh'), ('Bench', 'bench')]:
+                               ('ARH', 'arh'), ('DCBFS', 'dcbfs'), ('Custom-ID', 'custom-id')]:
             with self.subTest(project=name):
                 args = cache_parser().parse_args([name])
                 self.assertEqual((args.project, args.kind), (expected, 'all'))
-        args = cache_parser().parse_args(['ARH-DSE-v2', '--kind', 'research'])
+        args = cache_parser().parse_args(['ARH', '--kind', 'research'])
         self.assertEqual((args.project, args.kind), ('arh', 'research'))
         with redirect_stderr(io.StringIO()):
-            for argv in ([], ['missing'], ['all', '--kind', 'automatic']):
+            for argv in ([], ['all', '--kind', 'automatic']):
                 with self.subTest(argv=argv), self.assertRaises(SystemExit):
                     cache_parser().parse_args(argv)
 
@@ -36,7 +36,8 @@ class CacheCommandTests(unittest.TestCase):
         shell.stdout = output
         sync = Mock()
         try:
-            with patch.dict(sys.modules, {'remote_compute.cache_sync': SimpleNamespace(sync_cache=sync)}), redirect_stdout(output):
+            with patch.dict(sys.modules, {'remote_compute.cache_sync': SimpleNamespace(sync_cache=sync)}), \
+                 patch('remote_compute.cache_assets.load_projects',return_value={'arh':{},'dcbfs':{}}),redirect_stdout(output):
                 shell.onecmd('help')
                 shell.onecmd('help sync_cache')
                 def suggest(line):
@@ -44,8 +45,11 @@ class CacheCommandTests(unittest.TestCase):
                 self.assertEqual(suggest('sync_ca')['matches'], ['sync_cache'])
                 self.assertIn('all', suggest('sync_cache ')['matches'])
                 self.assertEqual(suggest('sync_cache ar')['matches'], ['arh'])
+                self.assertEqual(suggest('sync_cache dc')['matches'], ['dcbfs'])
                 self.assertEqual(suggest('sync_cache all --ki')['matches'], ['--kind'])
                 self.assertEqual(suggest('sync_cache all --kind ')['matches'], ['all', 'assets', 'research'])
+                with patch('remote_compute.cache_assets.load_projects',return_value={}):
+                    self.assertEqual([name for name in suggest('sync_cache ')['matches'] if not name.startswith('-')],['all'])
             self.assertIn('sync_cache all', output.getvalue())
             self.assertIn('--kind', output.getvalue())
             sync.assert_not_called()
@@ -69,7 +73,7 @@ class CacheCommandTests(unittest.TestCase):
         try:
             with patch.dict(sys.modules, {'remote_compute.cache_sync': SimpleNamespace(sync_cache=synchronize)}), redirect_stdout(io.StringIO()) as output:
                 shell.stdout = output
-                shell.onecmd('sync_cache ARH-DSE --kind research')
+                shell.onecmd('sync_cache ARH --kind research')
                 self.assertTrue(entered.wait(2))
                 self.assertIn(identity, shell.handles)
                 self.assertTrue(shell.futures)
@@ -193,11 +197,11 @@ class CacheCommandTests(unittest.TestCase):
         for status in ('partial', 'failed'):
             with self.subTest(status=status):
                 code, client, clients, sync = self._invoke_cli(
-                    ['--url', 'http://example.test:26133', 'sync_cache', 'Bench', '--kind', 'assets'],
+                    ['--url', 'http://example.test:26133', 'sync_cache', 'DCBFS', '--kind', 'assets'],
                     status=status)
                 self.assertEqual(code, 1)
                 self.assertTrue(all(call.args[0]=='http://example.test:26133' for call in clients.call_args_list))
-                self.assertEqual(sync.call_args.args, (client, 'bench'))
+                self.assertEqual(sync.call_args.args, (client, 'dcbfs'))
                 self.assertEqual(sync.call_args.kwargs['kind'], 'assets')
 
     def test_cli_does_not_sync_when_viewing_nodes_or_pointed_at_worker(self):

@@ -73,7 +73,7 @@ def progress_fields(value):
 
 def progress(value):
     """Small polling view; full provenance remains in the final result."""
-    result = {key: value[key] for key in ('id','status','label','cpus','memory_mb','memory_phase','submitted','started',
+    result = {key: value[key] for key in ('id','status','label','cpus', 'active_cpus', 'min_cpus', 'requested_cpus','memory_mb','memory_phase','submitted','started',
              'finished','elapsed','assigned_node','worker_url','center_submitted','dispatched','resource_request') if key in value}
     result.update(progress_fields(value))
     return result

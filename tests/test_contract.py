@@ -381,7 +381,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
         client=Client();identity='e'*32
         raw=pack({'result.json':json.dumps(dict(id=identity,status='succeeded')).encode(),
                   'files/large.bin':b'x'*10000,'stdout.log':b'finished'})
-        reads=[];read=zipfile.ZipFile.read
+        reads=[];read=zipfile.ZipFile.open
         def read_once(archive,name,*args,**kwargs):
             reads.append(name.filename if isinstance(name,zipfile.ZipInfo) else name)
             return read(archive,name,*args,**kwargs)
@@ -391,7 +391,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                 self.assertEqual(value,identity)
                 self.assertEqual((root/'files/large.bin').read_bytes(),b'x'*10000)
             with patch.object(client,'artifacts',return_value=raw),patch.object(client,'delete',side_effect=delete), \
-                    patch.object(zipfile.ZipFile,'read',read_once):
+                    patch.object(zipfile.ZipFile,'open',read_once):
                 result=client.fetch(identity,root)
             self.assertEqual(result['files'],['large.bin'])
             self.assertEqual(reads.count('files/large.bin'),1)

@@ -73,12 +73,13 @@ class StandaloneTests(unittest.TestCase):
             write_entry(copied)
             shutil.copytree(ROOT/'remote_compute', copied/'remote_compute', ignore=shutil.ignore_patterns('__pycache__'))
             config = {'shared': {'old-project': str(root/'missing')}, 'cpus': 1, 'memory_mb': 512,
-                      'memory_reserve_mb': 0, 'memory_headroom_mb': 0}
-            (copied/'worker.local.json').write_text(json.dumps(config), encoding='utf-8')
+                      'memory_reserve_mb': 0, 'memory_headroom_mb': 0,'token':'isolated-service-token'}
+            (copied/'.local').mkdir(parents=True,exist_ok=True)
+            (copied/'.local/worker.json').write_text(json.dumps(config), encoding='utf-8')
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1', 0))
                 port = probe.getsockname()[1]
-            client = Client(f'http://127.0.0.1:{port}', timeout=1)
+            client = Client(f'http://127.0.0.1:{port}', 'isolated-service-token', timeout=1)
             with (root/'worker.log').open('wb') as log:
                 process = Process([sys.executable, '-B', str(copied/'main.py'), '--mode', 'worker', '--no-dashboard',
                                    '--port', str(port)], copied,

@@ -10,7 +10,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 URL = 'https://github.com/Ayai01/distributed-compute-orchestrator.git'
-ARCHIVE_URL = 'https://codeload.github.com/Ayai01/distributed-compute-orchestrator/zip/refs/heads/main'
+ARCHIVE_URL = 'https://codeload.github.com/Ayai01/distributed-compute-orchestrator/zip/refs/heads/v1'
 
 
 def _archive_update(check=False):
@@ -72,15 +72,15 @@ def update(*, check=False):
     remote = git('remote', 'get-url', 'origin')
     if remote.rstrip('/') != URL:
         raise ValueError('origin must point to ' + URL)
-    git('fetch', 'origin', 'main')
-    target = git('rev-parse', 'origin/main')
+    git('fetch', 'origin', 'v1')
+    target = git('rev-parse', 'origin/v1')
     if not check and before != target:
         if git('status', '--porcelain', '--untracked-files=no'):
             raise ValueError('Commit local source changes before updating')
         if git('merge-base', before, target) != before:
-            raise ValueError('Local commits are ahead of or diverge from origin/main; '
+            raise ValueError('Local commits are ahead of or diverge from origin/v1; '
                              'push them or reconcile the branch before updating')
-        git('merge', '--ff-only', 'origin/main')
+        git('merge', '--ff-only', 'origin/v1')
     current = git('rev-parse', 'HEAD')
     return dict(repository=URL, current=current, available=target,
                 updated=current != before, restart_required=current != before)

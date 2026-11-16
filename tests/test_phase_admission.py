@@ -101,6 +101,7 @@ def entry():
             self.assertEqual(result['status'],'succeeded',result.get('stderr'))
             self.assertEqual(json.loads(result['files']['.dco-results.json'])['items'][0]['value'],1)
             self.assertEqual(len(refused),2)
-            self.assertTrue(all(n==1 for n in requests))
+            self.assertTrue(all(n in(0,1)for n in requests))
+            self.assertIn(0,requests)
             self.assertGreater(result['cpu_seconds'],.1)
             self.assertEqual(worker.used,0)

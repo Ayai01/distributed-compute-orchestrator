@@ -12,6 +12,9 @@
     {
       "name": "Aya1-TX",
       "url": "http://192.168.1.10:26133",
+      "relay_url": "http://127.0.0.1:27101",
+      "peer_id": "Aya1-TX",
+      "token": "replace-with-device-credential",
       "weight": 1,
       "limit": 0,
       "memory_limit_mb": 0,

@@ -8,11 +8,18 @@ def validate_cpu_overcommit(value):
     return float(value)
 
 
-def cpu_capacity(base,used,percent,factor):
-    """Lend bounded slots only after the base grant fills below 90% host CPU."""
-    if used>=base and percent is not None and math.isfinite(percent)and 0<=percent<90:
-        return int(base*factor)
-    return base
+def validate_cpu_utilization(value):
+    if isinstance(value,bool)or not isinstance(value,(int,float))or not math.isfinite(value)or not 1<=value<=100:
+        raise ValueError('cpu_overcommit_utilization must be a finite percentage in 1..100')
+    return float(value)
+
+
+def cpu_capacity(base,used,percent,factor,utilization=90):
+    """Lend bounded slots below the configured host utilization threshold."""
+    capacity=base
+    if used>=base and percent is not None and math.isfinite(percent)and 0<=percent<utilization:
+        capacity=int(base*factor)
+    return capacity
 
 
 def elastic_cpus(task):

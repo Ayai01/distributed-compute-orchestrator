@@ -131,7 +131,7 @@ class _Grants:
         while True:
             with self.condition:
                 if self.stopping:return
-                if not self.active and not self.ready and self.cpus==1 and not self.fenced:
+                if not self.active and not self.ready and self.cpus==0 and not self.fenced:
                     self.condition.wait(.1);continue
                 active,ready=self.active,self.ready
                 self.pending=True;self.pending_floor=active
@@ -476,9 +476,9 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
                 check_deadline();memory_boundary()
                 while True:
                     check_deadline()
-                    actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
+                    actual=lease.refresh(active_cpus=0,ready_cpus=maximum,min_cpus=maximum)
                     if actual>=maximum and lease.confirmed is not None and not lease.phase_pending:
-                        actual=lease.refresh(active_cpus=maximum,ready_cpus=0)
+                        actual=lease.refresh(active_cpus=maximum,ready_cpus=0,min_cpus=maximum)
                         if actual>=maximum and lease.confirmed is not None and not lease.phase_pending:break
                     time.sleep(min(.1,check_deadline()or .1))
                 _kernel_threads(maximum);check_deadline()
@@ -557,6 +557,9 @@ def run_call(function,*,limits=None,**kwargs):
         client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
         lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=max(maximum,actual),cpus=actual,**model)
         actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
+        while actual<1:
+            time.sleep(.1);check_deadline();memory_boundary()
+            actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
         if actual<maximum:
             # A cold RAM probe can fund one slot before the phase is known.
             # Confirm the still-ready width once before freezing the kernel;

@@ -41,15 +41,16 @@ class TLSSetupTests(unittest.TestCase):
                      env={'USER_SETTING': 'retained'}, token='this-node-secret',
                      certfile=str(self.cert), keyfile=str(self.key))
         value.update(changes)
-        (root / 'worker.local.json').write_text(json.dumps(value), encoding='utf-8')
+        (root / '.local').mkdir(parents=True,exist_ok=True)
+        (root / '.local/worker.json').write_text(json.dumps(value), encoding='utf-8')
         return value
 
     def test_generated_certificate_authenticates_external_tls_and_reuses_device_configuration(self):
         with scratch() as temporary, patch.dict(os.environ, {'REMOTE_COMPUTE_TOKEN': ''}):
             root = Path(temporary); previous = self.settings(root)
-            (root / '.local').mkdir()
+            (root / '.local').mkdir(exist_ok=True)
             result = configure(root, '203.0.113.42', 26143, restart=False)
-            config = json.loads((root / 'worker.local.json').read_text())
+            config = json.loads((root / '.local/worker.json').read_text())
             for key, value in previous.items():
                 if key != 'port':self.assertEqual(config[key], value)
             self.assertEqual(config['port'], 26143)
@@ -76,7 +77,7 @@ class TLSSetupTests(unittest.TestCase):
 
     def test_active_work_keeps_original_console_and_waits_for_idle(self):
         with scratch() as temporary, patch.dict(os.environ, {'REMOTE_COMPUTE_TOKEN': ''}):
-            root = Path(temporary); self.settings(root); (root / '.local').mkdir()
+            root = Path(temporary); self.settings(root); (root / '.local').mkdir(exist_ok=True)
             live = Mock()
             live.health.return_value = dict(role='worker', tool_root=str(root), used_cpus=1,
                                             queued=0, active_jobs=[dict(id='original-id')])
@@ -84,11 +85,11 @@ class TLSSetupTests(unittest.TestCase):
                 result = configure(root, '203.0.113.42', 26143)
             self.assertEqual(result['status'], 'configured_waiting_for_idle')
             live.restart.assert_not_called()
-            self.assertEqual(json.loads((root / 'worker.local.json').read_text())['cpus'], 3)
+            self.assertEqual(json.loads((root / '.local/worker.json').read_text())['cpus'], 3)
 
     def test_idle_reload_verifies_tls_in_the_original_console(self):
         with scratch() as temporary, patch.dict(os.environ, {'REMOTE_COMPUTE_TOKEN': ''}):
-            root = Path(temporary); self.settings(root); (root / '.local').mkdir()
+            root = Path(temporary); self.settings(root); (root / '.local').mkdir(exist_ok=True)
             live, secure = Mock(), Mock()
             live.health.return_value = dict(role='worker', tool_root=str(root), used_cpus=0, queued=0, active_jobs=[])
             secure.health.return_value = dict(role='worker', node='actual-device', version='test')
@@ -102,12 +103,12 @@ class TLSSetupTests(unittest.TestCase):
     def test_other_service_on_port_is_not_modified_or_restarted(self):
         with scratch() as temporary, patch.dict(os.environ, {'REMOTE_COMPUTE_TOKEN': ''}):
             root = Path(temporary); self.settings(root)
-            before = (root / 'worker.local.json').read_bytes()
+            before = (root / '.local/worker.json').read_bytes()
             live = Mock(); live.health.return_value = dict(role='worker', tool_root=str(root / 'other'))
             with patch('remote_compute.tls_setup.Client', return_value=live), \
                     self.assertRaisesRegex(ValueError, 'another DCO service'):
                 configure(root, '203.0.113.42', 26143)
-            self.assertEqual((root / 'worker.local.json').read_bytes(), before)
+            self.assertEqual((root / '.local/worker.json').read_bytes(), before)
             live.restart.assert_not_called()
 
     def test_cli_runs_setup_without_starting_another_service(self):

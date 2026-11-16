@@ -66,7 +66,7 @@ class TakeoverRegressions(unittest.TestCase):
 
     def test_service_os_memory_errors_reach_the_native_recovery_exit(self):
         with scratch()as root:
-            root=Path(root);config=root/'worker.local.json';config.write_text('{}')
+            root=Path(root);config=root/'.local/worker.json';config.parent.mkdir(parents=True);config.write_text('{}')
             errors=[MemoryError('allocation'),OSError(12,'allocation')]
             for number in (8,14,1450,1455,5):
                 error=OSError('native error');error.winerror=number;errors.append(error)

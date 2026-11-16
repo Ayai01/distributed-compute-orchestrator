@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from remote_compute import cache_arh as arh, cache_bench as bench
+from test_cache_arh_bench import arh, dcbfs, PROJECTS
 from remote_compute import cache_sync as sync
 from remote_compute.client import RemoteError
 from test_cache_arh_bench import local_producer, seed, snapshot
@@ -28,12 +28,25 @@ def local_calls(log, before=None):
             if response is not None:
                 return response
         arguments.pop('_assets', None)
-        adapter = {'arh': arh, 'bench': bench}[project]
+        adapter = {'arh': arh, 'dcbfs': dcbfs}[project]
         return getattr(adapter, action)(target['shared_paths'][project], **arguments)
     return call
 
 
+def registrations():
+    return {
+        'arh':dict(root=str(PROJECTS/'ARH-DSE-v3'), adapter='framework/cache_exchange.py',
+                   requires=['python'], producer_group='arh_source', _adapter_asset='fixture'),
+        'dcbfs':dict(root=str(PROJECTS/'DCBFS-MO'), adapter='src/dcbfs/_runtime/cache_exchange.py',
+                    requires=['python'], _adapter_asset='fixture')}
+
+
 class ResearchSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.registration = patch.object(sync, 'load_projects', side_effect=registrations)
+        self.registration.start()
+        self.addCleanup(self.registration.stop)
+
     def test_arh_union_and_deeper_prefix_converge_then_transfer_zero_records(self):
         with scratch() as directory:
             roots = [Path(directory)/name for name in ('A', 'B', 'C')]
@@ -65,44 +78,44 @@ class ResearchSyncTests(unittest.TestCase):
             self.assertEqual([action for unused, action, args in calls], ['manifest']*3)
             client.machine.assert_not_called()
 
-    def test_bench_complete_snapshots_union_then_no_duplicate_data(self):
+    def test_dcbfs_complete_snapshots_union_then_no_duplicate_data(self):
         with scratch() as directory:
             roots = [Path(directory)/name for name in ('A', 'B')]
             keys = [snapshot(roots[0], 'class-ab.npz', b'measured-A'),
                     snapshot(roots[1], 'ldo.npz', b'measured-B')]
             client = Mock()
-            client.nodes.return_value = dict(nodes=[node(root.name, root, 'bench') for root in roots])
+            client.nodes.return_value = dict(nodes=[node(root.name, root, 'dcbfs') for root in roots])
             calls = []
             with patch.object(sync._RPC, 'call', new=local_calls(calls)):
-                first = sync.sync_cache(client, 'bench', kind='research')
+                first = sync.sync_cache(client, 'dcbfs', kind='research')
                 self.assertEqual(first['status'], 'succeeded')
-                self.assertEqual(set(bench.manifest(roots[0])), set(keys))
-                self.assertEqual(bench.manifest(roots[0]), bench.manifest(roots[1]))
+                self.assertEqual(set(dcbfs.manifest(roots[0])), set(keys))
+                self.assertEqual(dcbfs.manifest(roots[0]), dcbfs.manifest(roots[1]))
                 calls.clear()
-                second = sync.sync_cache(client, 'bench', kind='research')
-            self.assertEqual(second['projects']['bench']['research']['exported_records'], 0)
+                second = sync.sync_cache(client, 'dcbfs', kind='research')
+            self.assertEqual(second['projects']['dcbfs']['research']['exported_records'], 0)
             self.assertTrue(all(action == 'manifest' for unused, action, args in calls))
 
     def test_one_registered_consumer_skips_before_any_export(self):
         client = Mock()
-        client.nodes.return_value = dict(nodes=[node('only', Path('single'), 'bench')])
+        client.nodes.return_value = dict(nodes=[node('only', Path('single'), 'dcbfs')])
         with patch.object(sync._RPC, 'call') as rpc:
-            report = sync.sync_cache(client, 'bench', kind='research')
+            report = sync.sync_cache(client, 'dcbfs', kind='research')
         rpc.assert_not_called()
-        self.assertEqual(report['projects']['bench']['research']['status'], 'skipped')
+        self.assertEqual(report['projects']['dcbfs']['research']['status'], 'skipped')
 
     def test_offline_consumer_does_not_prevent_other_two_merging(self):
         with scratch() as directory:
             roots = [Path(directory)/name for name in ('A', 'B', 'offline')]
             key = snapshot(roots[0], 'class-ab.npz', b'measurement')
-            nodes = [node(root.name, root, 'bench') for root in roots]
+            nodes = [node(root.name, root, 'dcbfs') for root in roots]
             nodes[-1]['error'] = 'connection timed out'
             client, calls = Mock(), []
             client.nodes.return_value = dict(nodes=nodes)
             with patch.object(sync._RPC, 'call', new=local_calls(calls)):
-                report = sync.sync_cache(client, 'bench', kind='research')
+                report = sync.sync_cache(client, 'dcbfs', kind='research')
             self.assertEqual(report['status'], 'partial')
-            self.assertEqual(report['projects']['bench']['research']['status'], 'succeeded')
+            self.assertEqual(report['projects']['dcbfs']['research']['status'], 'succeeded')
             self.assertEqual(report['unavailable'][0]['node'], 'offline')
             self.assertEqual((roots[1]/key).read_bytes(), (roots[0]/key).read_bytes())
             self.assertNotIn('offline', [name for name, action, args in calls])
@@ -112,13 +125,13 @@ class ResearchSyncTests(unittest.TestCase):
             roots = [Path(directory)/name for name in ('A', 'B', 'C')]
             key = snapshot(roots[0], 'class-ab.npz', b'measurement')
             client = Mock()
-            client.nodes.return_value = dict(nodes=[node(root.name, root, 'bench') for root in roots])
+            client.nodes.return_value = dict(nodes=[node(root.name, root, 'dcbfs') for root in roots])
             def before(target, action, arguments):
                 if target['name'] == 'B':
                     raise RemoteError('temporarily offline')
             with patch.object(sync._RPC, 'call', new=local_calls([], before)):
-                report = sync.sync_cache(client, 'bench', kind='research')
-            research = report['projects']['bench']['research']
+                report = sync.sync_cache(client, 'dcbfs', kind='research')
+            research = report['projects']['dcbfs']['research']
             self.assertEqual(research['status'], 'partial')
             self.assertEqual(research['errors'][0]['action'], 'manifest')
             self.assertEqual(research['errors'][0]['node'], 'B')
@@ -131,49 +144,49 @@ class ResearchSyncTests(unittest.TestCase):
             for index in range(4):
                 snapshot(roots[0], 'snapshot-'+str(index)+'.npz', bytes([index])*600000)
             client, calls = Mock(), []
-            client.nodes.return_value = dict(nodes=[node(root.name, root, 'bench') for root in roots])
+            client.nodes.return_value = dict(nodes=[node(root.name, root, 'dcbfs') for root in roots])
             def before(target, action, arguments):
                 if target['name'] == 'B' and action == 'merge':
                     raise RemoteError('receiver producer is incompatible')
             with patch.object(sync._RPC, 'call', new=local_calls(calls, before)):
-                report = sync.sync_cache(client, 'bench', kind='research')
+                report = sync.sync_cache(client, 'dcbfs', kind='research')
             self.assertEqual(report['status'], 'partial')
             self.assertEqual(sum(name == 'B' and action == 'merge' for name, action, args in calls), 1)
             self.assertEqual(sum(action == 'export' for name, action, args in calls), 4)
-            self.assertEqual(bench.manifest(roots[0]), bench.manifest(roots[2]))
+            self.assertEqual(dcbfs.manifest(roots[0]), dcbfs.manifest(roots[2]))
 
     def test_export_digest_supersedes_inventory_when_source_publishes(self):
         with scratch() as directory:
             roots = [Path(directory)/name for name in ('A', 'B')]
-            key = snapshot(roots[0], 'class-ab.npz', b'old-measurement')
-            original = bench.manifest(roots[0])[key]['digest']
+            key = seed(roots[0], 'conv-prefix', ('sampling',), '{"trials":4}', trials=4)
+            old = arh.manifest(roots[0])[key]['digest']
             client, calls = Mock(), []
-            client.nodes.return_value = dict(nodes=[node(root.name, root, 'bench') for root in roots])
+            client.nodes.return_value = dict(nodes=[node(root.name, root) for root in roots])
             def before(target, action, arguments):
                 if target['name'] == 'A' and action == 'export':
-                    snapshot(roots[0], 'class-ab.npz', b'new-measurement')
-            with patch.object(sync._RPC, 'call', new=local_calls(calls, before)):
-                report = sync.sync_cache(client, 'bench', kind='research')
+                    seed(roots[0], 'conv-prefix', ('sampling',), '{"trials":8}', trials=8)
+            with patch.object(sync._RPC, 'call', new=local_calls(calls, before)), \
+                    patch.object(sync, '_assets', return_value=dict(status='succeeded', identities={'arh_source':'fixture'})), \
+                    patch.object(arh, '_open_store', side_effect=local_producer):
+                report = sync.sync_cache(client, 'arh', kind='research')
             self.assertEqual(report['status'], 'succeeded')
-            current = bench.manifest(roots[0])[key]['digest']
-            self.assertNotEqual(original, current)
-            self.assertEqual(bench.manifest(roots[1])[key]['digest'], current)
-            merges = [args for unused, action, args in calls if action == 'merge']
-            self.assertEqual(len(merges), 1)
-            self.assertEqual(merges[0]['records'][key]['digest'], current)
+            current = arh.manifest(roots[0])[key]['digest']
+            self.assertNotEqual(old, current)
+            self.assertEqual(arh.manifest(roots[1])[key]['digest'], current)
+            self.assertEqual(sum(action == 'merge' for _, action, _ in calls), 1)
 
     def test_disappeared_export_reports_partial_without_inventing_record(self):
         with scratch() as directory:
             roots = [Path(directory)/name for name in ('A', 'B')]
             snapshot(roots[0], 'class-ab.npz', b'old-measurement')
             client, calls = Mock(), []
-            client.nodes.return_value = dict(nodes=[node(root.name, root, 'bench') for root in roots])
+            client.nodes.return_value = dict(nodes=[node(root.name, root, 'dcbfs') for root in roots])
             def before(target, action, arguments):
                 return {} if action == 'export' else None
             with patch.object(sync._RPC, 'call', new=local_calls(calls, before)):
-                report = sync.sync_cache(client, 'bench', kind='research')
+                report = sync.sync_cache(client, 'dcbfs', kind='research')
             self.assertEqual(report['status'], 'partial')
-            self.assertEqual(report['projects']['bench']['research']['exported_records'], 0)
+            self.assertEqual(report['projects']['dcbfs']['research']['exported_records'], 0)
             self.assertFalse(any(action == 'merge' for unused, action, args in calls))
             self.assertFalse(roots[1].exists())
 
@@ -190,7 +203,7 @@ class CacheRpcTests(unittest.TestCase):
             client.fetch.side_effect = fetch_error
         stop = threading.Event()
         stop.wait = Mock(return_value=False)
-        return client, accepted, sync._RPC(client, None, stop)
+        return client, accepted, sync._RPC(client, None, stop, registrations())
 
     def test_success_fetches_and_deletes_only_own_accepted_id(self):
         client, accepted, rpc = self.fixture()

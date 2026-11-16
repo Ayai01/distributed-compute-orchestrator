@@ -105,6 +105,22 @@ class ProjectShareTests(unittest.TestCase):
         self.assertEqual(s.resize('b',64,active_cpus=1)['cpus'],8)
         self.assertEqual(node.reserved,16)
 
+    def test_fixed_stages_take_one_weighted_indivisible_opportunity(self):
+        s=self.state(4);node=s.pool.nodes[0]
+        node.health['capabilities']=['resize','resize_active_cpus','resize_min_cpus']
+        node.client.resize=lambda identity,cpus,**options:dict(cpus=cpus,memory_mb=64)
+        s.stopping=False;s._publish=lambda job:None;s._save=lambda job:None
+        for key,project in(('a','A'),('b','B')):
+            job=self.job(s,key,project,cpus=0,maximum=4,desired=4)
+            job['result'].update(min_cpus=4,active_cpus=0)
+        self.assertEqual(s.resize('b',4,active_cpus=0,min_cpus=4)['cpus'],0)
+        self.assertEqual(s.resize('a',4,active_cpus=0,min_cpus=4)['cpus'],4)
+        self.assertEqual(s.resize('a',4,active_cpus=4,min_cpus=4)['cpus'],4)
+        self.assertEqual(s.resize('b',4,active_cpus=0,min_cpus=4)['cpus'],0)
+        self.assertEqual(s.resize('a',0,active_cpus=0,min_cpus=0)['cpus'],0)
+        self.assertEqual(s.resize('b',4,active_cpus=0,min_cpus=4)['cpus'],4)
+        self.assertEqual(node.reserved,4)
+
     def test_hundreds_of_old_one_core_jobs_cannot_reserve_low_share_projects_free_slots(self):
         s=self.state(208)
         for i in range(182):self.job(s,'a'+str(i),'ARH',desired=64,priority=1000)

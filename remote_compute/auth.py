@@ -1,4 +1,5 @@
-"""LAN admission and the transport boundary for remote worker credentials."""
+"""Device credential and transport boundaries, independent of tunnel addresses."""
+import hmac
 import ipaddress
 import socket
 from urllib.parse import urlsplit, urlunsplit
@@ -30,6 +31,17 @@ def lan_endpoint(host):
     return in_networks(host)
 
 
+def loopback_endpoint(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        try:
+            addresses=socket.getaddrinfo(host,None,type=socket.SOCK_STREAM)
+        except OSError:
+            return False
+        return bool(addresses) and all(ipaddress.ip_address(item[4][0]).is_loopback for item in addresses)
+
+
 def node_url(address):
     """Expand an operator's host shorthand without downgrading public TLS."""
     address = address.strip()
@@ -57,7 +69,12 @@ def node_url(address):
 
 def trusted_networks(values):
     if values is None:
-        return LAN_NETWORKS
+        return ()
     if not isinstance(values, (list, tuple)):
         raise ValueError('trusted_networks must be a list of LAN CIDR networks')
     return tuple(ipaddress.ip_network(value, strict=False) for value in values)
+
+
+def credential_matches(authorization, secret):
+    """A loopback tunnel still authenticates with its destination credential."""
+    return bool(secret and hmac.compare_digest(str(authorization), 'Bearer ' + str(secret)))

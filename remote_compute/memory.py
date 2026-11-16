@@ -26,10 +26,11 @@ class PressureGuard:
     def update(self,host,now=None):
         now=time.monotonic()if now is None else now
         threshold=pressure_threshold(host)
+        commit_threshold=host.get('memory_commit_headroom_mb',COMMIT_EMERGENCY_MB)
         physical=host.get('host_memory_available_mb',threshold)
         commit=host.get('host_commit_available_mb',math.inf)
-        warning=physical<threshold+512 or commit<COMMIT_EMERGENCY_MB+512
-        critical=physical<threshold or commit<COMMIT_EMERGENCY_MB
+        warning=physical<threshold+512 or commit<commit_threshold+512
+        critical=physical<threshold or commit<commit_threshold
         predicted=False
         if self.previous is not None:
             at,old_physical,old_commit=self.previous;span=max(.05,now-at)
@@ -37,7 +38,7 @@ class PressureGuard:
                 rates=(max(0,(old_physical-physical)/span),
                        max(0,(old_commit-commit)/span)if math.isfinite(old_commit)and math.isfinite(commit)else 0)
                 predicted=(physical-min(rates[0],self.fall_rates[0])<threshold or
-                           commit-min(rates[1],self.fall_rates[1])<COMMIT_EMERGENCY_MB)
+                           commit-min(rates[1],self.fall_rates[1])<commit_threshold)
                 self.fall_rates=rates
             else:self.fall_rates=(0,0)
         self.previous=(now,physical,commit)
@@ -58,7 +59,7 @@ class PressureGuard:
         # actual sample crosses the configured physical/commit protection line.
         terminate=critical
         self.state=dict(limited=warning or settling,waiting=bool(waiting),terminate=bool(terminate),
-            warning=warning,predicted=predicted,critical=critical,physical_threshold_mb=threshold,commit_emergency_mb=COMMIT_EMERGENCY_MB,
+            warning=warning,predicted=predicted,critical=critical,physical_threshold_mb=threshold,commit_emergency_mb=commit_threshold,
             warning_seconds=0 if self.warning_since is None else round(now-self.warning_since,3))
         return self.state
 
@@ -162,7 +163,7 @@ def pressure_victim(jobs,host,*,emergency=False):
     threshold=pressure_threshold(host)
     physical=host.get('host_memory_available_mb',threshold)
     commit=host.get('host_commit_available_mb',math.inf)
-    if not emergency and physical>=threshold and commit>=COMMIT_EMERGENCY_MB:return None
+    if not emergency and physical>=threshold and commit>=host.get('memory_commit_headroom_mb',COMMIT_EMERGENCY_MB):return None
     candidates=[j for j in jobs if j['result']['status']=='running'and not j['cancel'].is_set()
                 and j.get('process') is not None]
     return max(candidates,key=lambda j:(j['result'].get('started',0),j['result'].get('submitted',0),j['result'].get('id','')),default=None)

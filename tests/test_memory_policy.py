@@ -13,6 +13,13 @@ GIB=1024
 
 
 class MemoryPolicyTests(unittest.TestCase):
+    def test_configured_commit_reserve_drives_pressure_admission(self):
+        host=dict(memory_total_mb=48*GIB,host_memory_available_mb=20*GIB,
+            memory_headroom_mb=0,host_commit_available_mb=1800,memory_commit_headroom_mb=2000)
+        self.assertTrue(PressureGuard().update(host,now=0)['critical'])
+        host['memory_commit_headroom_mb']=1000
+        self.assertFalse(PressureGuard().update(host,now=0)['critical'])
+
     def test_private_usage_is_cleared_before_starting_the_next_command(self):
         from remote_compute import command
         from remote_compute.process import Process
@@ -120,7 +127,7 @@ class MemoryPolicyTests(unittest.TestCase):
 
     def test_real_process_with_high_estimate_does_not_block_another_job(self):
         with scratch() as root,provider(root+'/worker',cpus=2,memory_mb=512,memory_headroom_mb=0) as (_,node):
-            pool=Pool([dict(name='test',url=node.url)])
+            pool=Pool([dict(name='test',url=node.url,token=node.token)])
             try:
                 with center(pool,root+'/center') as (_,client):
                     first=client.submit(python("import time;print('ready',flush=True);time.sleep(30)",memory_mb=400))['id']

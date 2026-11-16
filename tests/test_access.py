@@ -36,6 +36,14 @@ def external_peer(worker, **options):
 
 
 class AccessTests(unittest.TestCase):
+    def test_node_set_saves_explicit_relay_and_peer_without_parsing_them_as_numbers(self):
+        pool=Mock()
+        shell=SimpleNamespace(center=None,pool=pool,_node=lambda name:SimpleNamespace(name='device'),
+                              do_save=Mock(),do_nodes=Mock())
+        SchedulerShell.do_set(shell,'device relay_url=http://127.0.0.1:27101 peer_id=device')
+        pool.configure.assert_called_once_with('device',relay_url='http://127.0.0.1:27101',peer_id='device')
+        shell.do_save.assert_called_once_with('')
+
     def test_host_shorthand_uses_default_port_and_secure_public_transport(self):
         for address,expected in [
             ('1.191.212.42','https://1.191.212.42:26133'),
@@ -52,8 +60,9 @@ class AccessTests(unittest.TestCase):
         with scratch() as root:
             root=Path(root);url='https://203.0.113.42:26133'
             row=dict(name='remote',url=url,token='node-secret',ca_file='trusted-node.pem',
-                     enabled=False,limit=52,timeout=30)
-            (root/'nodes.local.json').write_text(json.dumps({'nodes':[row]}))
+                     enabled=False,limit=52,timeout=30,relay_url='http://127.0.0.1:27101',peer_id='remote')
+            (Path(root)/'.local').mkdir(parents=True,exist_ok=True)
+            (root/'.local/nodes.json').write_text(json.dumps({'nodes':[row]}))
             control=Mock();control.nodes.return_value=dict(nodes=[row])
             shell=SimpleNamespace(center=control,pool=None,do_nodes=Mock(),do_save=Mock())
             with patch('remote_compute.commands.ROOT',root), \
@@ -61,15 +70,18 @@ class AccessTests(unittest.TestCase):
                  patch.dict(os.environ,{},clear=True):
                 constructor.return_value.health.return_value=dict(node='remote')
                 SchedulerShell.do_add(shell,'203.0.113.42')
-            constructor.assert_called_once_with(url,'node-secret',ca_file='trusted-node.pem',timeout=30,operator=True)
+            constructor.assert_called_once_with(url,'node-secret',ca_file='trusted-node.pem',timeout=30,operator=True,
+                                                relay_url=row['relay_url'],peer_id=row['peer_id'])
             self.assertEqual(control.control.call_args.kwargs['routing'],
-                             dict(url=url,enabled=True,ca_file='trusted-node.pem',timeout=30))
+                             dict(url=url,enabled=True,ca_file='trusted-node.pem',timeout=30,
+                                  relay_url=row['relay_url'],peer_id=row['peer_id']))
             self.assertNotIn('limit',control.control.call_args.kwargs['routing'])
 
     def test_bare_lan_address_keeps_a_saved_https_profile(self):
         with scratch() as root:
             root=Path(root);row=dict(name='remote',url='https://192.168.1.12:26133',token='node-secret',ca_file='cert.pem')
-            (root/'nodes.local.json').write_text(json.dumps({'nodes':[row]}))
+            (Path(root)/'.local').mkdir(parents=True,exist_ok=True)
+            (root/'.local/nodes.json').write_text(json.dumps({'nodes':[row]}))
             control=Mock();control.nodes.return_value=dict(nodes=[row])
             shell=SimpleNamespace(center=control,pool=None,do_nodes=Mock(),do_save=Mock())
             with patch('remote_compute.commands.ROOT',root),patch('remote_compute.commands.Client') as constructor, \
@@ -85,7 +97,7 @@ class AccessTests(unittest.TestCase):
                 nodes=lambda:dict(policy='adaptive',nodes=[row]),token='center-only-secret'))
             with patch('remote_compute.commands.ROOT',Path(root)):
                 SchedulerShell.do_save(shell,'')
-            self.assertNotIn('token',json.loads((Path(root)/'nodes.local.json').read_text())['nodes'][0])
+            self.assertNotIn('token',json.loads((Path(root)/'.local/nodes.json').read_text())['nodes'][0])
 
     def test_lan_worker_admission_needs_no_token(self):
         with scratch() as root, provider(root, token='remote-secret') as (_, remote):
@@ -131,7 +143,8 @@ class AccessTests(unittest.TestCase):
                 self.assertEqual(Client(url, token='remote-secret', ca_file=str(cert)).health()['role'], 'worker')
                 name=worker.health()['node']
                 row=dict(name=name,url=url,token='remote-secret',ca_file=str(cert),enabled=False,limit=1)
-                (root/'nodes.local.json').write_text(json.dumps({'nodes':[row]}))
+                (Path(root)/'.local').mkdir(parents=True,exist_ok=True)
+                (root/'.local/nodes.json').write_text(json.dumps({'nodes':[row]}))
                 with Pool([row]) as pool,center(pool,root/'center') as (_,control):
                     shell=SimpleNamespace(center=control,pool=pool,do_nodes=Mock(),do_save=Mock())
                     with patch('remote_compute.commands.ROOT',root),patch.dict(os.environ,{'REMOTE_COMPUTE_TOKEN':'remote-secret'}):
@@ -160,12 +173,14 @@ class AccessTests(unittest.TestCase):
         for explicit in [False, True]:
             with self.subTest(explicit=explicit), scratch() as temporary:
                 root = Path(temporary)
-                (root/'worker.local.json').write_text(json.dumps(dict(mode='worker', host='127.0.0.1',
+                (root/'.local').mkdir(parents=True,exist_ok=True)
+                (root/'.local/worker.json').write_text(json.dumps(dict(mode='worker', host='127.0.0.1',
                     port=0 if not explicit else 26134, cpus=1, root=str(root/'state'),
                     temp_root=str(root/'tmp'), trusted_networks=['127.0.0.0/8'])), encoding='utf-8')
                 observed = []
                 def console(health, url, alive):
-                    observed.append(Client(url).health()['role'])
+                    token=json.loads((root/'.local/worker.json').read_text())['token']
+                    observed.append(Client(url,token).health()['role'])
                 args = ['--service-child'] + (['--port', '0'] if explicit else [])
                 with patch('remote_compute.cli.ROOT', root), \
                         patch('remote_compute.cli.require_visible'), \

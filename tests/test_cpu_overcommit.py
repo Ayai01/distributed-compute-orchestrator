@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Pool,RemoteError
-from remote_compute.allocation import cpu_capacity,validate_cpu_overcommit
+from remote_compute.allocation import cpu_capacity,validate_cpu_overcommit,validate_cpu_utilization
 from remote_compute.client import Node
 from test_compute import provider,python,scratch,until
 import test_center as fixtures
@@ -14,6 +14,12 @@ HOLD="import os,time\nfrom pathlib import Path\nprint('ready',os.environ['REMOTE
 
 
 class CpuOvercommitTests(unittest.TestCase):
+    def test_configured_utilization_stops_borrowing_at_its_exact_boundary(self):
+        self.assertEqual(cpu_capacity(8,8,69.99,1.5,70),12)
+        self.assertEqual(cpu_capacity(8,8,70,1.5,70),8)
+        for value in(0,101,True,float('nan'),'70'):
+            with self.subTest(value=value),self.assertRaises(ValueError):validate_cpu_utilization(value)
+
     def test_limit_is_based_on_full_base_not_previous_borrowed_ceiling(self):
         for base,factor,ceiling in [(16,1.5,24),(24,1.25,30),(96,1.25,120),(5,1.25,6)]:
             with self.subTest(base=base,factor=factor):

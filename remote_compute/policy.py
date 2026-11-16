@@ -22,6 +22,27 @@ MAX_REQUIREMENT_LENGTH = 64
 MAX_TOOL_CONSTRAINTS = 32
 MAX_ACCELERATORS = 16
 MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
+RESOURCE_CONTROL_FIELDS = frozenset((
+    'cpus','cpu_limit','cpu_overcommit_factor','cpu_overcommit_utilization',
+    'memory_mb','memory_reserve_mb','memory_headroom_mb','memory_commit_headroom_mb'))
+
+
+def validate_resource_controls(value, *, logical_cpus, cpu_limit):
+    """The numeric resource surface shared by the website and device owner."""
+    from .allocation import validate_cpu_overcommit,validate_cpu_utilization
+    if not isinstance(value,dict)or not value or set(value)-RESOURCE_CONTROL_FIELDS:
+        raise ValueError('Resource controls accept only '+', '.join(sorted(RESOURCE_CONTROL_FIELDS)))
+    limit=value.get('cpu_limit',cpu_limit)
+    if type(limit)is not int or not 1<=limit<=logical_cpus:
+        raise ValueError('cpu_limit must be in 1..%d'%logical_cpus)
+    if 'cpus'in value and (type(value['cpus'])is not int or not 0<=value['cpus']<=limit):
+        raise ValueError('cpus must be in 0..%d (0 = automatic)'%limit)
+    if 'cpu_overcommit_factor'in value:validate_cpu_overcommit(value['cpu_overcommit_factor'])
+    if 'cpu_overcommit_utilization'in value:validate_cpu_utilization(value['cpu_overcommit_utilization'])
+    for key in RESOURCE_CONTROL_FIELDS-{'cpus','cpu_limit','cpu_overcommit_factor','cpu_overcommit_utilization'}:
+        if key in value and (type(value[key])is not int or value[key]<0):
+            raise ValueError(key+' must be a nonnegative integer in MiB')
+    return dict(value)
 
 
 def validate_platform(value):
@@ -256,6 +277,7 @@ def public_capabilities():
         "resize_memory",
         "resize_memory_model",
         "resize_active_cpus",
+        "resize_min_cpus",
         "semantic_requires",
 
         "single_thread_weight",

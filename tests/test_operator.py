@@ -13,6 +13,35 @@ from test_compute import provider, python, scratch, until
 
 
 class OperatorTests(unittest.TestCase):
+    def test_resource_control_surface_persists_policy_and_keeps_active_grants(self):
+        source="from pathlib import Path\nimport time\nprint('ready',flush=True)\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=4096)as(worker,remote),Pool([remote])as pool,center(pool,Path(root)/'center')as(_,client):
+            identity=client.submit(python(source,max_cpus=4,memory_mb=512))['id']
+            until(lambda:'ready'in client.logs(identity)['stdout'])
+            until(lambda:worker.used==4)
+            saved=[];worker.save_settings=saved.append
+            changes=dict(cpus=2,cpu_limit=3,cpu_overcommit_factor=1.25,cpu_overcommit_utilization=70,
+                memory_mb=256,memory_reserve_mb=512,memory_headroom_mb=256,memory_commit_headroom_mb=512)
+            try:
+                view=client.request('/control/resources',dict(node='node1',changes=changes))
+                row=view['nodes'][0]
+                self.assertEqual(row['name'],'node1');self.assertEqual(row['configured'],changes)
+                self.assertEqual(saved,[changes]);self.assertEqual(row['effective']['base_cpus'],2)
+                self.assertEqual(row['actual']['cpus'],4);self.assertEqual(row['restart_required'],[])
+                self.assertNotIn('url',row);self.assertNotIn('active_jobs',row)
+                self.assertEqual(client.resize(identity,4,active_cpus=4,min_cpus=4)['cpus'],4)
+                self.assertEqual(client.status(identity)['id'],identity)
+                self.assertEqual(client.status(identity)['status'],'running')
+                for invalid in(dict(tools={'python':['wrong']}),dict(cpus=True),dict(cpu_overcommit_utilization=0)):
+                    with self.subTest(invalid=invalid),self.assertRaises(RemoteError)as rejected:
+                        client.request('/control/resources',dict(node='node1',changes=invalid))
+                    self.assertEqual(rejected.exception.status_code,400)
+                self.assertEqual(client.request('/control/resources')['nodes'][0]['configured'],changes)
+            finally:client.write_job_file(identity,'release','yes')
+            self.assertEqual(client.wait(identity)['status'],'succeeded')
+            client.fetch(identity)
+            until(lambda:worker.used==0)
+
     def test_device_ip_comes_from_accepted_connection_and_survives_loopback_probe(self):
         activity=Activity()
         self.assertIsNone(activity.snapshot()['host_ip'])

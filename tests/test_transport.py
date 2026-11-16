@@ -393,7 +393,7 @@ class OriginalSubmitReceiptTests(unittest.TestCase):
             with patch.object(Handler,'_reply',reply):
                 accepted=client.submit(python('print("one paid execution")'),job_id=identity)
             self.assertEqual(accepted['id'],identity)
-            self.assertEqual(posts,[identity,identity])
+            self.assertEqual(posts,[identity])
             self.assertEqual(len(reads),5)
             self.assertEqual(len(worker.jobs),1)
             self.assertEqual(client.wait(identity)['status'],'succeeded')

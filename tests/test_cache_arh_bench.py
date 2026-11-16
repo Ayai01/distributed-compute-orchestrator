@@ -5,6 +5,7 @@ from contextlib import closing
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -14,7 +15,10 @@ from unittest.mock import patch
 import zipfile
 import zlib
 
-from remote_compute import cache_arh as arh, cache_bench as bench
+from remote_compute.cache_assets import load_adapter
+PROJECTS = Path(os.environ.get('REMOTE_COMPUTE_TEST_PROJECTS_ROOT', Path(__file__).resolve().parents[2]))
+arh = load_adapter(PROJECTS/'ARH-DSE-v3', 'framework/cache_exchange.py')
+dcbfs = load_adapter(PROJECTS/'DCBFS-MO', 'src/dcbfs/_runtime/cache_exchange.py')
 from test_compute import scratch
 
 
@@ -116,16 +120,18 @@ def storage_fixture(root, *, legacy=True, wal=False):
 
 
 def snapshot(root, name, value):
-    path = root/'reference'/name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # The adapter transfers the complete archive, including auxiliary arrays.
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w') as archive:
-        archive.writestr('X.npy', value)
-        archive.writestr('hv_reference_F.npy', b'frozen-front')
-        archive.writestr('metadata.npy', b'physical-identity')
-    path.write_bytes(output.getvalue())
-    return 'reference/'+name
+        for member, data in [('X.npy', value), ('hv_reference_F.npy', b'frozen-front'),
+                             ('metadata.npy', b'physical-identity')]:
+            entry = zipfile.ZipInfo(member, date_time=(2020,1,1,0,0,0))
+            archive.writestr(entry, data)
+    data = output.getvalue()
+    key = 'data/reference/' + hashlib.sha256(data).hexdigest() + '.npz'
+    path = root/key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return key
 
 
 class ArhCacheTests(unittest.TestCase):
@@ -347,86 +353,69 @@ class ArhCacheTests(unittest.TestCase):
                 connection.execute('SELECT 1')
 
 
-class BenchCacheTests(unittest.TestCase):
-    def test_selected_complete_snapshot_missing_same_and_conflict(self):
+class DcbfsCacheTests(unittest.TestCase):
+    def test_complete_reference_roundtrip_is_atomic_and_idempotent(self):
         with scratch() as directory:
             source, target = Path(directory)/'source', Path(directory)/'target'
-            key = snapshot(source, 'class-ab.npz', b'measured-designs')
-            snapshot(source, 'other.npz', b'other')
-            manifest = bench.manifest(source)
-            records = json.loads(json.dumps(bench.export(source, [key])))
-            self.assertEqual(set(records), {key})
-            source_bytes = (source/key).read_bytes()
-            self.assertEqual(manifest[key]['bytes'], len(source_bytes))
-            first = bench.merge(target, records)
-            self.assertEqual(first['added'], 1)
-            self.assertEqual((target/key).read_bytes(), source_bytes)
-            before = (target/key).stat().st_mtime_ns
-            self.assertEqual(bench.merge(target, records)['unchanged'], 1)
-            snapshot(source, 'class-ab.npz', b'different-measurements')
-            conflict = bench.merge(target, bench.export(source, [key]))
-            self.assertEqual((conflict['conflicts'], conflict['updated']), (1, 0))
-            self.assertEqual(conflict['digests'], first['digests'])
-            self.assertEqual((target/key).stat().st_mtime_ns, before)
-            self.assertEqual((target/key).read_bytes(), source_bytes)
-            self.assertFalse((target/'reference/other.npz').exists())
-            self.assertEqual(list((target/'reference').glob('.dco-*')), [])
+            key = snapshot(source, 'front', b'paid-points')
+            records = json.loads(json.dumps(dcbfs.export(source, [key])))
+            self.assertEqual(dcbfs.merge(target, records)['added'], 1)
+            self.assertEqual((target/key).read_bytes(), (source/key).read_bytes())
+            self.assertEqual(dcbfs.merge(target, records)['unchanged'], 1)
+            self.assertEqual(dcbfs.manifest(source), dcbfs.manifest(target))
+            self.assertEqual(list((target/'data/reference').glob('.dco-*')), [])
 
-    def test_concurrent_publication_wins_without_replacing_target(self):
+    def test_hash_filename_and_payload_must_agree(self):
         with scratch() as directory:
             source, target = Path(directory)/'source', Path(directory)/'target'
-            key = snapshot(source, 'class-ab.npz', b'source-measurement')
-            def publish(pending, destination):
-                destination.write_bytes(b'concurrent-bench-publication')
-                raise FileExistsError(str(destination))
-            with patch.object(bench.os, 'link', side_effect=publish):
-                result = bench.merge(target, bench.export(source, [key]))
-            self.assertEqual(result['conflicts'], 1)
-            self.assertEqual((target/key).read_bytes(), b'concurrent-bench-publication')
-            self.assertEqual(result['digests'][key],
-                             hashlib.sha256(b'concurrent-bench-publication').hexdigest())
-            self.assertEqual(list((target/'reference').glob('.dco-*')), [])
-
-    def test_publication_failure_cleans_only_own_pending_file(self):
-        with scratch() as directory:
-            source, target = Path(directory)/'source', Path(directory)/'target'
-            key = snapshot(source, 'class-ab.npz', b'source')
-            retained = snapshot(target, 'retained.npz', b'existing')
-            before = (target/retained).read_bytes()
-            with patch.object(bench.os, 'link', side_effect=OSError('fixture write failure')):
-                with self.assertRaises(OSError):
-                    bench.merge(target, bench.export(source, [key]))
-            self.assertEqual((target/retained).read_bytes(), before)
-            self.assertFalse((target/key).exists())
-            self.assertEqual(list((target/'reference').glob('.dco-*')), [])
-
-    def test_invalid_snapshot_path_or_digest_is_rejected(self):
-        with scratch() as directory:
-            target = Path(directory)/'new'
-            record = dict(digest='bad-digest', data=base64.b64encode(b'data').decode())
-            records = {key: record for key in ('reference/../outside.npz',
-                       'reference/valid.npz', '/reference/file.npz')}
-            result = bench.merge(target, records)
-            self.assertEqual(result['rejected'], 3)
+            key = snapshot(source, 'front', b'paid-points')
+            row = dcbfs.export(source, [key])[key]
+            bad = 'data/reference/' + '0'*64 + '.npz'
+            self.assertEqual(dcbfs.merge(target, {bad:row, '../escape':row})['rejected'], 2)
             self.assertFalse(target.exists())
+            (source/key).write_bytes(b'corrupted')
+            with self.assertRaisesRegex(ValueError, 'filename'):
+                dcbfs.manifest(source)
 
-    def test_publisher_temporary_snapshot_is_not_exported(self):
+    def test_concurrent_publication_wins_without_replacement(self):
+        with scratch() as directory:
+            source, target = Path(directory)/'source', Path(directory)/'target'
+            key = snapshot(source, 'front', b'paid-points')
+            data = (source/key).read_bytes()
+            def publish(pending, destination):
+                destination.write_bytes(data)
+                raise FileExistsError(str(destination))
+            with patch.object(dcbfs.os, 'link', side_effect=publish):
+                result = dcbfs.merge(target, dcbfs.export(source, [key]))
+            self.assertEqual(result['unchanged'], 1)
+            self.assertEqual((target/key).read_bytes(), data)
+            self.assertEqual(list((target/'data/reference').glob('.dco-*')), [])
+
+    def test_publication_failure_reclaims_own_pending_file(self):
+        with scratch() as directory:
+            source, target = Path(directory)/'source', Path(directory)/'target'
+            key = snapshot(source, 'front', b'paid-points')
+            with patch.object(dcbfs.os, 'link', side_effect=OSError('fixture write failure')):
+                with self.assertRaises(OSError):
+                    dcbfs.merge(target, dcbfs.export(source, [key]))
+            self.assertFalse((target/key).exists())
+            self.assertEqual(list((target/'data/reference').glob('.dco-*')), [])
+
+    def test_temporary_snapshots_are_not_exported(self):
         with scratch() as directory:
             root = Path(directory)
-            key = snapshot(root, 'class-ab.npz', b'published')
-            snapshot(root, 'class-ab.tmp.npz', b'partial-next-publication')
-            (root/'reference/.dco-reference-pending.tmp').write_bytes(b'partial-transfer')
-            self.assertEqual(set(bench.manifest(root)), {key})
+            key = snapshot(root, 'front', b'paid-points')
+            (root/'data/reference/partial.tmp.npz').write_bytes(b'partial')
+            self.assertEqual(set(dcbfs.manifest(root)), {key})
             with self.assertRaises(ValueError):
-                bench.export(root, ['reference/class-ab.tmp.npz'])
+                dcbfs.export(root, ['data/reference/partial.tmp.npz'])
 
-    def test_empty_projects_are_read_only(self):
+    def test_empty_cache_is_read_only(self):
         with scratch() as directory:
             root = Path(directory)/'absent'
-            self.assertEqual(bench.manifest(root), {})
+            self.assertEqual(dcbfs.manifest(root), {})
+            self.assertEqual(dcbfs.export(root, []), {})
             self.assertEqual(arh.manifest(root), {})
-            self.assertEqual(bench.export(root, []), {})
-            self.assertEqual(arh.export(root, []), {})
             self.assertFalse(root.exists())
 
 

@@ -37,6 +37,8 @@ def read_json(path):
 @contextmanager
 def node_configuration(path):
     """One read/merge/write across consoles and the background node monitor."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with single_instance('node-config:'+str(Path(path).resolve()),wait=10):
             value=read_json(path) if Path(path).exists() else {}
@@ -56,6 +58,9 @@ def save_detached_node(path, node):
                 if getattr(node,'aliases',None):row['aliases']=list(node.aliases)
                 if getattr(node.client,'ca_file',None):row['ca_file']=node.client.ca_file
                 else:row.pop('ca_file',None)
+                for key in ('relay_url','peer_id'):
+                    if getattr(node.client,key,None):row[key]=getattr(node.client,key)
+                    else:row.pop(key,None)
                 if node.detached:
                     row['reconnect']={'attempts':node.reconnect_attempts,'after':node.reconnect_after}
                 else:
@@ -73,7 +78,7 @@ def scan_parser():
 
 def scan_devices(args):
     from .discovery import scan
-    path=Path(getattr(args,'nodes',None) or ROOT/'nodes.local.json')
+    path=Path(getattr(args,'nodes',None) or ROOT/'.local/nodes.json')
     known=read_json(path).get('nodes',[]) if path.exists() else []
     value=scan(args.networks,port=args.scan_port,timeout=args.scan_timeout,known=known)
     print('扫描网段: '+', '.join(value['networks']))
@@ -168,11 +173,7 @@ def prepare(kind, args):
 
 def cache_parser():
     parser = argparse.ArgumentParser(prog="sync_cache")
-    aliases = {'aop_v2': 'aop', 'rgcn-v2': 'rgcn', 'arh-dse': 'arh',
-               'arh-dse-v2': 'arh', 'analog-opt-bench-v2': 'bench'}
-    parser.add_argument("project", choices=('all', 'aop', 'rgcn', 'arh', 'bench'),
-                        type=lambda value: aliases.get(value.casefold(), value.casefold()),
-                        help="同步全部工程或指定工程")
+    parser.add_argument("project", type=str.lower, help="all 或已注册工程ID")
     parser.add_argument("--kind", choices=('all', 'research', 'assets'), default='all',
                         help="all同时同步科研缓存和内容资产；research仅科研缓存，assets仅源码/模型")
     return parser
@@ -402,7 +403,8 @@ class Shell(cmd.Cmd):
         elif command == 'sync_cache' and previous == '--kind':
             choices = ['all', 'research', 'assets']
         elif command == 'sync_cache' and index == 1:
-            choices = ['all', 'aop', 'rgcn', 'arh', 'bench']
+            from .cache_assets import load_projects
+            choices = ['all', *sorted(load_projects())]
         elif command == 'set' and index >= 2:
             choices = ['weight=', 'limit=', 'memory_limit_mb=', 'enabled=true', 'enabled=false']
         elif command == 'kill' and index == 1:
@@ -728,7 +730,7 @@ class SchedulerShell(Shell):
         self._start(batch, self.dispatch, source, output, on_submit=self._accepted, stop_event=self.closing)
 
     def do_sync_cache(self, line):
-        """sync_cache all|aop|rgcn|arh|bench [--kind all|research|assets]：手动同步工程缓存。"""
+        """sync_cache 工程ID|all [--kind all|research|assets]：手动同步已注册工程缓存。"""
         args = cache_parser().parse_args(words(line))
         if self.center is None:
             raise ValueError("sync_cache 需要连接调度中心；使用 main.py --url 中心地址 sync_cache all")
@@ -766,14 +768,14 @@ class SchedulerShell(Shell):
                 if value.lower() not in {"true", "false"}:
                     raise ValueError("enabled=true|false")
                 value = value.lower() == "true"
-            elif key not in ('url','ca_file','host_ip'):
+            elif key not in ('url','relay_url','peer_id','ca_file','host_ip'):
                 value = int(value) if key in {"limit", "memory_limit_mb"} else float(value)
             changes[key] = value
         if self.center:
             self.center.control(node=name, routing=changes)
         else:
             self.pool.configure(name, **changes)
-        if set(changes)&{'enabled','url','ca_file'}:self.do_save('')
+        if set(changes)&{'enabled','url','relay_url','peer_id','ca_file'}:self.do_save('')
         self.do_nodes("")
 
     def do_add(self, line):
@@ -781,7 +783,7 @@ class SchedulerShell(Shell):
         args=words(line)
         if len(args)!=1:raise ValueError('add 设备IP[:端口] 或 http(s)://设备IP[:端口]')
         address=args[0]
-        path = ROOT / 'nodes.local.json'
+        path = ROOT / '.local/nodes.json'
         previous = read_json(path) if path.exists() else {}
         saved = next((row for row in previous.get('nodes', [])
                       if address == row['name'] or address in row.get('aliases',[])), {})
@@ -793,30 +795,31 @@ class SchedulerShell(Shell):
         token = os.environ.get('REMOTE_COMPUTE_TOKEN', saved.get('token', ''))
         ca_file=saved.get('ca_file')
         timeout=saved.get('timeout',10)
-        name = Client(url, token, ca_file=ca_file, timeout=timeout, operator=True).health()['node']
+        route = {key:saved[key] for key in ('relay_url','peer_id') if saved.get(key)}
+        name = Client(url, token, ca_file=ca_file, timeout=timeout, operator=True, **route).health()['node']
         snapshot = self.center.nodes() if self.center else self.pool.snapshot()
         existing = next((row for row in snapshot['nodes'] if row['name'] == name
                          or row['url'].rstrip('/') == url.rstrip('/')), None)
         if existing:
-            routing = dict(url=url, enabled=True,ca_file=ca_file,timeout=timeout)
+            routing = dict(url=url, enabled=True,ca_file=ca_file,timeout=timeout, **route)
             if self.center:
                 self.center.control(node=existing['name'], routing=routing)
             else:
                 self.pool.configure(existing['name'], **routing)
         elif self.center:
-            node = dict(name=name, url=url, token=token)
+            node = dict(name=name, url=url, token=token, **route)
             if ca_file:node['ca_file'] = ca_file
             node['timeout']=timeout
             self.center.control(add=node)
         else:
-            self.pool.add(name, url, token=token, ca_file=ca_file,timeout=timeout)
+            self.pool.add(name, url, token=token, ca_file=ca_file,timeout=timeout, **route)
         # Remote center snapshots intentionally omit worker secrets. Remember
         # only the verified endpoint's credentials before saving its routing.
         with node_configuration(path) as current:
             profile=next((row for row in current.get('nodes',[]) if row['name']==name or row['url']==url),None)
             if profile is None:
                 profile=dict(name=name,url=url);current.setdefault('nodes',[]).append(profile)
-            profile.update(url=url,token=token,enabled=True)
+            profile.update(url=url,token=token,enabled=True, **route)
             if ca_file:profile['ca_file']=ca_file
             profile.pop('reconnect',None)
         self.do_nodes("")
@@ -832,8 +835,8 @@ class SchedulerShell(Shell):
             for node in found:self.do_add(node['url'])
 
     def do_save(self, _line):
-        """保存当前节点和策略到 nodes.local.json，下次启动自动加载。"""
-        path = ROOT / "nodes.local.json"
+        """保存当前节点和策略到 .local/nodes.json，下次启动自动加载。"""
+        path = ROOT / ".local/nodes.json"
         with node_configuration(path) as previous:
             snapshot = self.center.nodes() if self.center else self.pool.snapshot()
             tokens = {n['url']: n.get('token', '') for n in previous.get('nodes', [])}
@@ -842,14 +845,17 @@ class SchedulerShell(Shell):
             addresses.update({n.name:getattr(n,'host_ip','') for n in self.pool.nodes})
             value = {"policy": snapshot["policy"], "nodes": []}
             for row in snapshot["nodes"]:
+                saved = next((profile for profile in previous.get('nodes', [])
+                              if profile.get('name') == row['name'] or profile.get('url') == row['url']), {})
                 node = {key: row[key] for key in ("name", "url", "weight", "limit", "memory_limit_mb", "enabled")}
                 if addresses.get(row['name']):
                     node['host_ip'] = addresses[row['name']]
                 if row.get('timeout',10)!=10:
                     node['timeout']=row['timeout']
-                for key in ('ca_file','aliases','reconnect'):
-                    if row.get(key):node[key]=row[key]
-                token = tokens.get(row["url"], "")
+                for key in ('ca_file','aliases','reconnect','relay_url','peer_id'):
+                    setting = row.get(key, saved.get(key) if key in ('relay_url','peer_id') else None)
+                    if setting:node[key]=setting
+                token = tokens.get(row["url"], saved.get('token', ''))
                 if token:
                     node["token"] = token
                 value["nodes"].append(node)

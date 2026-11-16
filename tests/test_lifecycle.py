@@ -229,7 +229,8 @@ class SharedRamdiskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='compute-ramdisk-') as directory:
             root=Path(directory);cache=root/'existing-cache.bin'
             cache.write_bytes(b'existing simulation evidence')
-            (ramdisk.ROOT/'worker.local.json').write_text('{"ramdisk_gib":4}',encoding='utf8')
+            (ramdisk.ROOT/'.local').mkdir(parents=True,exist_ok=True)
+            (ramdisk.ROOT/'.local/worker.json').write_text('{"ramdisk_gib":4}',encoding='utf8')
             with patch.object(ramdisk,'shared_volume',return_value=root), \
                     patch.object(ramdisk,'driver',return_value='imdisk.exe'), \
                     patch.object(ramdisk,'_run') as run, \
@@ -344,7 +345,7 @@ class RepositoryUpdateTests(unittest.TestCase):
         self.source.mkdir()
         self.git(self.source, 'init', '-b', 'main')
         self.configure(self.source)
-        (self.source / '.gitignore').write_text('.tools/\nworker.local.json\n', encoding='utf8')
+        (self.source / '.gitignore').write_text('.tools/\n.local/worker.json\n', encoding='utf8')
         (self.source / 'code.py').write_text('print(1)\n', encoding='utf8')
         self.git(self.source, 'add', '.')
         self.git(self.source, 'commit', '-m', 'initial')
@@ -374,7 +375,8 @@ class RepositoryUpdateTests(unittest.TestCase):
 
     def test_fast_forward_preserves_device_config_and_local_tools(self):
         before = self.git(self.checkout, 'rev-parse', 'HEAD')
-        config = self.checkout / 'worker.local.json'
+        config = self.checkout / '.local/worker.json'
+        config.parent.mkdir(parents=True,exist_ok=True)
         config.write_text('{"cpus":31}', encoding='utf8')
         tool = self.checkout / '.tools' / 'runtime.bin'
         tool.parent.mkdir()
@@ -420,12 +422,13 @@ class ControlLifecycleTests(unittest.TestCase):
             root=Path(directory);copied=root/'tool';copied.mkdir()
             write_entry(copied)
             shutil.copytree(ROOT/'remote_compute',copied/'remote_compute',ignore=shutil.ignore_patterns('__pycache__'))
-            config=copied/'worker.local.json'
-            config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False,
+            config=copied/'.local/worker.json'
+            config.parent.mkdir(parents=True,exist_ok=True)
+            config.write_text(json.dumps(dict(mode='hybrid',cpus=2,root=str(root/'worker'),console=False,token='isolated-service-token',
                 memory_mb=256,memory_reserve_mb=0,memory_headroom_mb=0)),encoding='utf8')
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
-            client=Client(f'http://127.0.0.1:{port}',timeout=1,operator=True)
+            client=Client(f'http://127.0.0.1:{port}','isolated-service-token',timeout=1,operator=True)
             with (root/'service.log').open('wb') as log:
                 process=Process([sys.executable,'-B',str(copied/'main.py'),'--no-dashboard','--port',str(port),
                                  '--root',str(root/'state'),'--cpus=2'],copied,dict(os.environ,PYTHONPATH='',PYTHONUTF8='1'),log,log)
@@ -485,12 +488,13 @@ class ControlLifecycleTests(unittest.TestCase):
             write_entry(copied)
             shutil.copytree(ROOT / 'remote_compute', copied / 'remote_compute',
                             ignore=shutil.ignore_patterns('__pycache__'))
-            config = copied / 'worker.local.json'
-            config.write_text(json.dumps({'console': False, 'tags': ['reload-check']}), encoding='utf8')
+            config = copied / '.local/worker.json'
+            config.parent.mkdir(parents=True,exist_ok=True)
+            config.write_text(json.dumps({'console': False, 'tags': ['reload-check'], 'token':'isolated-service-token'}), encoding='utf8')
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1', 0))
                 port = probe.getsockname()[1]
-            client = Client(f'http://127.0.0.1:{port}', timeout=1)
+            client = Client(f'http://127.0.0.1:{port}', 'isolated-service-token', timeout=1)
             with (root / 'worker.log').open('wb') as log:
                 process = Process([sys.executable, '-B', str(copied / 'main.py'), '--mode', 'worker',
                     '--no-dashboard', '--port', str(port), '--root', str(root / 'state'),

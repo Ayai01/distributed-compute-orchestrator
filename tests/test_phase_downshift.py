@@ -12,6 +12,12 @@ from test_compute import provider,scratch
 
 
 class PhaseDownshiftTests(unittest.TestCase):
+    def test_a_drained_phase_starts_no_probe_until_one_cpu_is_reacquired(self):
+        client=Client();lease=client.cpu_lease(self.identity,max_cpus=4,**self.phase)
+        grant=dict(status='running',cpus=0,memory_mb=94,memory_phase=self.previous)
+        with patch.object(client,'resize',side_effect=self.refused()):
+            self.assertIsNone(lease._retained_downshift(grant,0))
+
     identity='d'*32
     previous=dict(base_memory_mb=768,memory_per_cpu_mb=256)
     phase=dict(base_memory_mb=256,memory_per_cpu_mb=128)

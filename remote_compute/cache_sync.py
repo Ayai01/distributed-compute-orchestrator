@@ -7,9 +7,10 @@ import uuid
 
 from .bundle import TERMINAL
 from .client import RemoteError
-from .policy import canonical_capability, canonical_capabilities
+from .policy import canonical_capabilities
+from .cache_assets import load_projects, load_adapter, groups
+from .bundle import pack
 
-PROJECTS = ('aop', 'rgcn', 'arh', 'bench')
 _SCRIPT = """from pathlib import Path
 from remote_compute.cache_task import main
 main(Path(__file__).with_name('request.json'))
@@ -21,8 +22,9 @@ class _Stopped(Exception):
 
 
 class _RPC:
-    def __init__(self, client, on_submit, stop_event):
+    def __init__(self, client, on_submit, stop_event, projects):
         self.client = client
+        self.projects = projects
         self.on_submit = on_submit
         self.stop = stop_event or threading.Event()
         self.pending = {}
@@ -49,9 +51,11 @@ class _RPC:
     def call(self, node, project, action, **arguments):
         self.check()
         assets = arguments.pop('_assets', {})
-        runtime = canonical_capability(project + '_python')
-        requires = arguments.pop('_requires', [runtime])
-        request = dict(project=project, action=action,
+        registration = self.projects[project]
+        assets['cache_adapter'] = registration['_adapter_asset']
+        runtime = registration.get('runtime', 'python')
+        requires = arguments.pop('_requires', registration['requires'])
+        request = dict(project=project, adapter=registration['adapter'], action=action,
                        root=node.get('shared_paths', {}).get(project), **arguments)
         data = json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')
         identity = uuid.uuid4().hex
@@ -63,8 +67,9 @@ class _RPC:
                 files={'remote_op/request.json': data},
                 outputs=['remote_op/result/*'], wait=False, job_id=identity,
                 on_submit=self.on_submit, assets=assets, requires=requires,
-                env={'DCO_CACHE_PRODUCER': '${asset:cache_producer}'}
-                    if 'cache_producer' in assets else {},
+                env=dict({'DCO_CACHE_ADAPTER': '${asset:cache_adapter}'},
+                         **({'DCO_CACHE_PRODUCER': '${asset:cache_producer}'}
+                            if 'cache_producer' in assets else {})),
                 max_cpus=1, memory_mb=512, priority=-100, timeout=900,
                 retries=0, project='DCO-cache', label='sync_cache/' + project + '/' + action)
         except RemoteError as error:
@@ -93,11 +98,10 @@ class _RPC:
             self.collected += 1
             raise RemoteError('Cache operation on ' + node['name'] + ': ' + error)
         response = json.loads(files['remote_op/result/response.json'])
-        bundle = files.get('remote_op/result/bundle.zip')
         self.client.delete(identity)
         self.pending.pop(identity, None)
         self.collected += 1
-        return (response, bundle) if action == 'asset_export' else response
+        return response
 
     def collect_pending(self):
         # Other projects can finish while an endpoint recovers. Revisit each
@@ -219,34 +223,29 @@ def _research(rpc, project, nodes, producer_asset=None):
 def _assets(rpc, project, sources, nodes):
     result = dict(groups=0, uploaded_bytes=0, reused_groups=0, warmed=[], identities={},
                   errors=[])
-    if not sources:
-        result.update(status='skipped', reason='No registered source project')
-        return result
-    source = sources[0]
+    registration = rpc.projects[project]
     try:
-        groups = rpc.call(source, project, 'asset_manifest')
-    except (RemoteError, OSError, ValueError, KeyError) as error:
-        result.update(status='partial', errors=[dict(node=source['name'], error=str(error))])
+        adapter = load_adapter(registration['root'], registration['adapter'])
+        bundles = groups(registration['root'], adapter)
+    except (OSError, ValueError, KeyError, ImportError) as error:
+        result.update(status='partial', errors=[dict(action='asset_manifest', error=str(error))])
         return result
     present = {}
-    for name, group in sorted(groups.items()):
+    for name, group in sorted(bundles.items()):
         rpc.check()
         try:
-            digest = group['digest']
+            data = pack(group['files'])
+            digest = hashlib.sha256(data).hexdigest()
             if not rpc.client.request('/assets/' + digest)['exists']:
-                metadata, data = rpc.call(source, project, 'asset_export',
-                                          group=name, digest=digest)
-                if metadata['digest'] != digest or hashlib.sha256(data).hexdigest() != digest:
-                    raise ValueError('Asset checksum mismatch: ' + name)
                 rpc.client.request('/assets/' + digest, data)
                 result['uploaded_bytes'] += len(data)
             else:
                 result['reused_groups'] += 1
-            present[name] = group
+            present[name] = dict(digest=digest, requires=group['requires'])
             result['identities'][name] = digest
         except (RemoteError, OSError, ValueError, KeyError) as error:
             result['errors'].append(dict(group=name, error=str(error)))
-    result['groups'] = len(groups)
+    result['groups'] = len(bundles)
     for node in nodes:
         matching = {name: group for name, group in present.items()
                     if set(canonical_capabilities(group['requires'])).issubset(
@@ -268,14 +267,14 @@ def _assets(rpc, project, sources, nodes):
 
 def sync_cache(client, project='all', *, kind='all', on_submit=None, stop_event=None):
     """Synchronize both cache kinds, or one, only when explicitly invoked."""
-    aliases = {'arh-dse': 'arh', 'arh-dse-v2': 'arh', 'aop_v2': 'aop',
-               'rgcn-v2': 'rgcn', 'analog-opt-bench': 'bench',
-               'analog-opt-bench-v2': 'bench'}
-    project = aliases.get(project.lower(), project.lower())
-    if project not in (*PROJECTS, 'all') or kind not in ('all', 'research', 'assets'):
-        raise ValueError('Expected project all/aop/rgcn/arh/bench and kind all/research/assets')
-    projects = PROJECTS if project == 'all' else (project,)
-    rpc = _RPC(client, on_submit, stop_event)
+    registered = load_projects()
+    project = project.lower()
+    if project != 'all' and project not in registered:
+        raise ValueError('Project is not registered in .local/projects.json: ' + project)
+    if kind not in ('all', 'research', 'assets'):
+        raise ValueError('Expected kind all/research/assets')
+    projects = registered if project == 'all' else (project,)
+    rpc = _RPC(client, on_submit, stop_event, registered)
     report = dict(status='succeeded', projects={}, unavailable=[])
     try:
         snapshot = client.nodes()['nodes']
@@ -291,17 +290,23 @@ def sync_cache(client, project='all', *, kind='all', on_submit=None, stop_event=
         nodes.sort(key=lambda node: (not node.get('url', '').startswith('local://'), node['name']))
         for name in projects:
             rpc.check()
+            registration = registered[name]
+            adapter = load_adapter(registration['root'], registration['adapter'])
+            registration['_adapter_asset'] = client.sync_files(adapter.source_files(registration['root']))
             sources = [node for node in nodes if node.get('shared_paths', {}).get(name)
-                       and canonical_capability(name + '_python') in canonical_capabilities(node.get('tags', ()))]
+                       and set(registration['requires']).issubset(canonical_capabilities(node.get('tags', ())))]
             item = report['projects'][name] = {}
             producer = None
-            if name == 'arh' and len(sources) > 1 and kind in ('all', 'research'):
-                # Shared ARH roots can intentionally contain only tools and
-                # caches. Run the producer from its ordinary immutable source
-                # asset, without installing source into those shared roots.
+            if registration.get('producer_group') and len(sources) > 1 and kind in ('all', 'research'):
+                # Cache roots keep data; producer code comes from its ordinary
+                # immutable source asset.
                 prepared = _assets(rpc, name, sources, nodes if kind == 'all' else [])
                 item['assets' if kind == 'all' else 'producer_assets'] = prepared
-                producer = prepared['identities'].get('arh_source')
+                producer = prepared['identities'].get(registration['producer_group'])
+                if not producer:
+                    item['research'] = dict(status='partial', errors=[dict(
+                        action='producer_asset', error='Registered producer group is unavailable')])
+                    continue
             if kind in ('all', 'research'):
                 item['research'] = _research(rpc, name, sources, producer)
             if kind in ('all', 'assets') and 'assets' not in item:

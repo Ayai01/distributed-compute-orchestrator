@@ -1,15 +1,92 @@
 """A duplicate launcher reloads the original terminal before taking its lock."""
-from contextlib import redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 import io
+import json
+import os
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
 
-from remote_compute import cli, startup, RemoteError
+from remote_compute import cli, startup, RemoteError, network
 from test_compute import scratch
 
 
 class LaunchHandoffTests(unittest.TestCase):
+    def test_local_service_owns_its_profile_until_exit_and_starts_after_http(self):
+        for mode, profile in [('worker','worker'), ('scheduler','center'), ('hybrid','center')]:
+            with self.subTest(mode=mode), scratch() as directory:
+                root=Path(directory);private=root/'.local';private.mkdir()
+                (private/'worker.json').write_text(json.dumps(dict(mode=mode,token='isolated-device',temp_root=str(root/'tmp'))))
+                config=private/'network'/(profile+'.json');config.parent.mkdir();config.write_text('{}')
+                events=[]
+                @contextmanager
+                def console(stopping):
+                    stopping.set();yield
+                with patch.object(cli,'ROOT',root), patch.object(cli,'require_visible'), \
+                     patch.object(cli,'handoff_python',return_value=False), patch.object(cli,'resolve',return_value=None), \
+                     patch.object(cli,'console_close',side_effect=console), patch.object(cli,'keep_awake',return_value=nullcontext()), \
+                     patch.object(cli,'load_nodes',return_value={'nodes':[]}), patch.object(cli,'Pool') as pool, \
+                     patch.object(cli,'Coordinator') as center, patch.object(cli,'Worker') as worker, \
+                     patch.object(cli,'Server') as server, patch.object(cli.threading,'Thread') as thread, \
+                     patch.object(network,'FrpProcess') as tunnel, redirect_stdout(io.StringIO()):
+                    worker.return_value.startup_recoveries=[]
+                    worker.return_value.health.return_value={'node':'isolated-local'}
+                    worker.return_value.capacity=2
+                    worker.return_value.root=root/'state'
+                    server.return_value.server_port=26133
+                    center.return_value.paused=False
+                    thread.return_value.start.side_effect=lambda *args:events.append('http')
+                    tunnel.return_value.__enter__.side_effect=lambda *args:events.append('tunnel')
+                    tunnel.return_value.__exit__.side_effect=lambda *args:events.append('closed')
+                    self.assertEqual(cli.main(['--service-child','--no-dashboard']),0)
+                    executable=root/'.tools/frp/0.71.1'/('frpc.exe' if os.name=='nt' else 'frpc')
+                    tunnel.assert_called_once_with(executable,config,config.with_suffix('.log'))
+                    self.assertLess(events.index('http'),events.index('tunnel'))
+                    self.assertEqual(events[-1],'closed')
+
+    def test_missing_profile_remote_console_and_ordinary_action_do_not_start_frp(self):
+        with scratch() as directory:
+            root=Path(directory)
+            with patch.object(cli,'ROOT',root),patch.object(network,'FrpProcess') as tunnel:
+                from contextlib import ExitStack
+                with ExitStack() as lifetime:cli._start_network(lifetime,'worker')
+                tunnel.assert_not_called()
+            (root/'.local/network').mkdir(parents=True)
+            (root/'.local/network/center.json').write_text('{}')
+            (root/'.local/network/worker.json').write_text('{}')
+            with patch.object(cli,'ROOT',root),patch.object(network,'FrpProcess') as tunnel, \
+                 patch.object(cli,'require_visible'), patch.object(cli,'single_instance',return_value=nullcontext()), \
+                 patch.object(cli,'console_close',return_value=nullcontext()), \
+                 patch.object(cli,'load_nodes',return_value={'nodes':[]}),patch.object(cli,'Pool') as pool, \
+                 patch.object(cli,'Client') as client, patch.object(cli,'Server') as server, \
+                 patch.object(cli,'Coordinator'),patch.object(cli.threading,'Thread'), \
+                 patch.object(cli,'SchedulerShell') as shell,patch.object(cli,'resolve',return_value=None), \
+                 redirect_stdout(io.StringIO()):
+                client.return_value.health.return_value={'role':'scheduler'}
+                client.return_value.nodes.return_value={'nodes':[]}
+                server.return_value.server_port=26133
+                self.assertEqual(cli.main(['--url','http://127.0.0.1:26133']),0)
+                self.assertEqual(cli.main(['--mode','scheduler','nodes']),0)
+                tunnel.assert_not_called()
+
+    def test_failed_http_bind_leaves_tunnel_unstarted(self):
+        with scratch() as directory:
+            root=Path(directory);(root/'.local/network').mkdir(parents=True)
+            (root/'.local/network/center.json').write_text('{}')
+            (root/'.local/worker.json').write_text('{"mode":"scheduler","token":"isolated"}')
+            @contextmanager
+            def console(stopping):
+                stopping.set();yield
+            with patch.object(cli,'ROOT',root),patch.object(network,'FrpProcess') as tunnel, \
+                 patch.object(cli,'require_visible'),patch.object(cli,'handoff_python',return_value=False), \
+                 patch.object(cli,'console_close',side_effect=console),patch.object(cli,'keep_awake',return_value=nullcontext()), \
+                 patch.object(cli,'resolve',return_value=None),patch.object(cli,'load_nodes',return_value={'nodes':[]}), \
+                 patch.object(cli,'Pool'),patch.object(cli,'Coordinator'), \
+                 patch.object(cli,'Server',side_effect=OSError('isolated bind failure')), \
+                 redirect_stdout(io.StringIO()),patch('sys.stderr',io.StringIO()):
+                self.assertEqual(cli.main(['--service-child','--no-dashboard']),2)
+                tunnel.assert_not_called()
+
     def test_managed_restart_waits_for_new_pid_in_the_original_service(self):
         old = {'pid': 10, 'role': 'worker', 'version': '0.8.45'}
         new = {'pid': 11, 'role': 'worker', 'version': '0.8.46'}

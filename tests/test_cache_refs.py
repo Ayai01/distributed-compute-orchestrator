@@ -40,7 +40,7 @@ class CacheReferenceTests(unittest.TestCase):
         with scratch()as folder,provider(Path(folder)/'one')as(a,ca),provider(Path(folder)/'two')as(b,cb),Pool([dict(name='producer',client=ca),dict(name='other',client=cb)])as pool:
             root=Path(folder)/'center'
             with center(pool,root)as(state,op):
-                client=Client(op.url);task=command(['${tool:python}','-c','print(1)'],max_cpus=1,project='P',node='producer')
+                client=Client(op.url,op.token);task=command(['${tool:python}','-c','print(1)'],max_cpus=1,project='P',node='producer')
                 result=op.run(task,keep=True)
                 self.assertEqual(result['status'],'succeeded')
                 identity=result['id'];reference=client.cache_ref(identity,content_id='d'*64)
@@ -77,13 +77,13 @@ class CacheReferenceTests(unittest.TestCase):
                 pool.nodes[0].enabled=True
             # A new center reads the registered reference after the job is gone.
             with center(pool,root)as(_,op):
-                client=Client(op.url)
+                client=Client(op.url,op.token)
                 self.assertEqual(client.cache_ref(identity),reference)
                 self.assertEqual(client.run(consumer)['status'],'succeeded')
 
     def test_running_and_failed_producers_and_direct_worker_are_rejected(self):
         with scratch()as folder,provider(Path(folder)/'worker')as(worker,remote),Pool([remote])as pool,center(pool,Path(folder)/'center',paused=True)as(state,op):
-            client=Client(op.url)
+            client=Client(op.url,op.token)
             queued=client.submit(command(['${tool:python}','-c','print(1)'],project='P'))['id']
             with self.assertRaises(RemoteError):client.cache_ref(queued)
             client.cancel(queued);client.wait(queued);client.fetch(queued)

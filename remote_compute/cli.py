@@ -39,7 +39,7 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
         token = os.environ.get('REMOTE_COMPUTE_TOKEN', '')
         health = Client(url, token, operator=bool(operator_token), operator_token=operator_token).health()
         return {"nodes": [{"name": health.get('node', 'scheduler'), "url": url, "token": token}]}
-    path = Path(path) if path else ROOT / "nodes.local.json"
+    path = Path(path) if path else ROOT / ".local/nodes.json"
     value = read_json(path) if path.exists() else {"nodes": [{"name": socket.gethostname(), "url": 'local://' + socket.gethostname()}]}
     for node in value["nodes"]:
         node.setdefault("token", os.environ.get("REMOTE_COMPUTE_TOKEN", ""))
@@ -48,7 +48,8 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
             continue
         if not node.get('enabled',True):continue
         try:
-            actual = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),operator=True).health()['node']
+            actual = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),
+                            relay_url=node.get('relay_url'),peer_id=node.get('peer_id'),operator=True).health()['node']
             if actual != node.get('name'):
                 node['aliases'] = list(dict.fromkeys([*node.get('aliases',[]),*([node['name']] if node.get('name') else [])]))
                 node['aliases'] = [name for name in node['aliases'] if name != actual]
@@ -83,13 +84,21 @@ def _operator_token(args, configured_token='', *, url=None):
     return ''
 
 
+def _start_network(lifetime, profile):
+    config = ROOT / '.local/network' / (profile + '.json')
+    if config.is_file():
+        from .network import FRP_VERSION, FrpProcess
+        executable = ROOT / '.tools/frp' / FRP_VERSION / ('frpc.exe' if os.name == 'nt' else 'frpc')
+        lifetime.enter_context(FrpProcess(executable, config, config.with_suffix('.log')))
+
+
 def run_scheduler(args, local_client=None, restarting=None, stopping=None):
     restarting = restarting or threading.Event()
     stopping = stopping or threading.Event()
     operator_token = _operator_token(args)
     config = load_nodes(args.nodes, args.url, local_client, operator_token=operator_token or None)
     if local_client:
-        if not args.nodes and not args.url and not (ROOT / "nodes.local.json").exists():
+        if not args.nodes and not args.url and not (ROOT / ".local/nodes.json").exists():
             config["nodes"] = []
         if not any(n["url"].rstrip("/") == local_client.url for n in config["nodes"]):
             name = socket.gethostname()
@@ -101,14 +110,15 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
     coordinator = api = api_thread = None
     def detached(node):
         from .commands import save_detached_node
-        save_detached_node(args.nodes or ROOT/'nodes.local.json',node)
+        save_detached_node(args.nodes or ROOT/'.local/nodes.json',node)
         if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源；每60秒重连，最多5次')
     def reconnected(node):
         from .commands import save_detached_node
-        save_detached_node(args.nodes or ROOT/'nodes.local.json',node)
+        save_detached_node(args.nodes or ROOT/'.local/nodes.json',node)
         if node.enabled and not node.error and coordinator:coordinator.activity.notify(node.name+' 已重连，恢复原预算')
     pool = Pool(config["nodes"], policy=args.policy or config.get("policy", "adaptive"),
                 on_detach=detached,on_reconnect=reconnected)
+    network_lifetime = ExitStack()
     dispatch = None
     try:
         if args.url:
@@ -141,6 +151,8 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
                          trusted_networks=getattr(args, 'trusted_networks', None))
             api_thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
             api_thread.start()
+            if args.action is None:
+                _start_network(network_lifetime, 'center')
             print(f"调度中心 http://{args.host or '127.0.0.1'}:{api.server_port}  DCO {__version__}", flush=True)
             print(f"DCO已就绪 version={__version__} paused={'true' if coordinator.paused else 'false'} calibration=manual", flush=True)
             dispatch = Client(f"http://127.0.0.1:{api.server_port}", args.local_token, operator=True,
@@ -228,6 +240,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
         pool.close(cancel=True)
         return 130
     finally:
+        network_lifetime.close()
         if coordinator:
             coordinator.close(preserve_queued=restarting.is_set())
         if api:
@@ -277,7 +290,7 @@ def _supervise(argv):
         if code in (76,-9,0xC0000017,0xC000009A,-1073741801,-1073741670):
             from .memory import PressureGuard
             from .resources import memory,commit_memory
-            config=json.loads((ROOT/'worker.local.json').read_text(encoding='utf-8-sig'))if(ROOT/'worker.local.json').is_file()else{}
+            config=json.loads((ROOT/'.local/worker.json').read_text(encoding='utf-8-sig'))if(ROOT/'.local/worker.json').is_file()else{}
             guard=PressureGuard()
             print('内存中断：等待实际RAM和提交余量恢复后自动重启。',flush=True)
             stable=None
@@ -402,10 +415,22 @@ def main(argv=None):
         if (args.service_child and not args.url and args.action is None and
                 not (args.test or args.test_native or args.check) and handoff_python(invocation)):
             return 0
-        path = Path(args.config) if args.config else ROOT / "worker.local.json"
+        path = Path(args.config) if args.config else ROOT / ".local/worker.json"
         if args.config and not path.exists():
             raise ValueError("Missing worker config: " + str(path))
         config = read_json(path) if path.exists() else {}
+        if args.action is None and not args.url and not (args.test or args.test_native or args.check):
+            if not config.get('token'):
+                import secrets
+                config['token'] = secrets.token_urlsafe(32)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_json(path, config, private=True)
+            local_port = args.center_port or config.get('center_port') or args.port or config.get('port', DEFAULT_PORT)
+            local_scheme = 'https' if config.get('certfile') else 'http'
+            (ROOT / '.local').mkdir(parents=True, exist_ok=True)
+            atomic_json(ROOT / '.local/client.json',
+                        dict(url=f'{local_scheme}://127.0.0.1:{local_port}', token=config['token']), private=True)
+
         # One shared entry point: explicit CLI values win, then the ignored
         # device configuration, then the existing built-in defaults.
         for name in ('host', 'port', 'center_port', 'nodes', 'policy'):
@@ -549,7 +574,7 @@ def main(argv=None):
                 saved = read_json(path)
                 saved.pop('migrate_root_from', None)
                 atomic_json(path, saved, private=True)
-            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "cpu_overcommit_factor", "temp_root", "cache_root", "accelerators", "python_runtimes") if key in config}
+            options = {key: config[key] for key in ("tools", "shared", "env", "tags", "memory_mb", "memory_reserve_mb", "memory_headroom_mb", "cpu_limit", "cpu_overcommit_factor", "cpu_overcommit_utilization", "memory_commit_headroom_mb", "temp_root", "cache_root", "accelerators", "python_runtimes") if key in config}
             if options.get('cache_root') is None:
                 options['cache_root'] = ROOT / '.local/cache'
             if options.get('temp_root') is None:
@@ -593,6 +618,8 @@ def main(argv=None):
                 print(f"算力提供者 {worker_url}  DCO {__version__}  CPU={worker.capacity}  工作目录={worker.root}", flush=True)
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
                 thread.start()
+                if args.action is None:
+                    _start_network(lifetime, 'worker')
             else:
                 print(f"本机算力（进程内）CPU={worker.capacity}  工作目录={worker.root}", flush=True)
         if args.mode == "worker":

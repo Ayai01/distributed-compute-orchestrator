@@ -19,7 +19,8 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
                      public_capabilities, normalize_accelerator_requirement,
-                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform)
+                     aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
+                     RESOURCE_CONTROL_FIELDS, validate_resource_controls)
 from .telemetry import Activity
 from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .memory import plan_memory, startup_memory, same_phase
@@ -46,7 +47,7 @@ RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing gra
 # These observations describe one worker attempt, rather than the frozen job.
 ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
     'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
-    'memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request')
+    'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request')
 
 
 def _matching_pass(pool):
@@ -612,6 +613,54 @@ class Coordinator:
             self.condition.notify_all()
         return self.health()
 
+    def resource_controls(self, changes=None):
+        """The website changes numeric device policy through the same owner."""
+        if changes is not None:
+            if not isinstance(changes,dict)or set(changes)!={'node','changes'}:
+                raise ValueError('Resource control requires node and changes')
+            node=next((n for n in self.pool.nodes if n.name==changes['node']),None)
+            if node is None:raise ValueError('Unknown node: '+str(changes['node']))
+            logical=node.health.get('logical_cpus')
+            if type(logical)is not int or logical<1:raise Conflict('Device CPU limits are awaiting a health sample')
+            requested=validate_resource_controls(changes['changes'],logical_cpus=logical,
+                cpu_limit=node.health.get('cpu_limit',logical))
+            try:node.client.control(**requested)
+            except RemoteError as error:
+                if error.status_code==400:raise ValueError(str(error))from None
+                raise Conflict(str(error))from None
+            self.pool.refresh(nodes=[node])
+        snapshots={row['name']:row for row in self.pool.snapshot()['nodes']}
+        nodes=[]
+        for node in self.pool.nodes:
+            source=snapshots[node.name];health=node.health
+            fields=('name','enabled','capacity','base_capacity','logical_cpus','cpu_limit','cpu_overcommit_factor',
+                'reserved','external_cpus','used_cpus','queued','cpu_percent','memory_capacity_mb','memory_available_mb',
+                'memory_reserved_mb','memory_total_mb','host_memory_available_mb','host_commit_limit_mb','host_commit_available_mb',
+                'memory_headroom_mb','memory_reserve_mb','memory_budget_mb','rss_mb','private_mb','paused','error')
+            row={key:source.get(key)for key in fields}
+            configured=dict(health.get('configured')or {})
+            defaults=dict(cpus=health.get('base_cpus',row['base_capacity']),
+                cpu_limit=health.get('cpu_limit'),cpu_overcommit_factor=health.get('cpu_overcommit_factor',1.),
+                cpu_overcommit_utilization=health.get('cpu_overcommit_utilization',90.),
+                memory_mb=health.get('memory_budget_mb',0),memory_reserve_mb=health.get('memory_reserve_mb',0),
+                memory_headroom_mb=health.get('memory_headroom_mb',0),
+                memory_commit_headroom_mb=health.get('memory_commit_headroom_mb',1024))
+            row['configured']={key:configured.get(key,defaults[key])for key in sorted(RESOURCE_CONTROL_FIELDS)}
+            row['effective']=dict(cpus=row['capacity'],base_cpus=row['base_capacity'],
+                max_cpus=int(row['base_capacity']*defaults['cpu_overcommit_factor']),memory_mb=row['memory_capacity_mb'],
+                memory_available_mb=row['memory_available_mb'])
+            row['actual']=dict(cpus=health.get('used_cpus',0),active_cpus=sum(j.get('active_cpus',0)for j in health.get('active_jobs',())),
+                cpu_percent=health.get('cpu_percent'),rss_mb=health.get('rss_mb',0),private_mb=health.get('private_mb'))
+            reasons=[]
+            if node.error:reasons.append('offline')
+            if health.get('paused')or not node.enabled:reasons.append('paused')
+            if health.get('memory_pressure_state',{}).get('limited'):reasons.append('memory_pressure')
+            if health.get('queued',0)and health.get('used_cpus',0)>=row['capacity']:reasons.append('cpu_budget')
+            if row['memory_available_mb']<=0:reasons.append('memory_budget')
+            row.update(wait_reasons=reasons,restart_required=[])
+            nodes.append(row)
+        return dict(nodes=nodes)
+
     @staticmethod
     def _publish(job):
         # Replace one complete view; readers never observe an in-place update.
@@ -863,24 +912,35 @@ class Coordinator:
     def _fixed_queue_claims(self, resources):
         """Let a ready fixed-width job accumulate its share on one worker."""
         claims, groups = {}, set()
+        candidates=[];queued=set(self.queue)
+        for identity,job in active_items(self.jobs):
+            if (job['task'].get('project')or'default')not in resources:continue
+            minimum=job['result'].get('min_cpus')or 0
+            waiting=(job.get('node')is not None and minimum>1
+                and not job['result'].get('active_cpus',0)and job['task']['cpus']<minimum)
+            if identity in queued or waiting:
+                candidates.append((identity,dict(job['task'],cpus=minimum)if waiting else job['task']))
         def order(identity):
             task = self.jobs[identity]['task']
             group = task.get('project') or 'default'
             return (resources[group]['used']/resources[group]['resource_share'], group, -task['priority'])
         with self.pool.condition:
-            for identity in sorted(self.queue, key=order):
-                job = self.jobs[identity]; task = job['task']
+            for identity,task in sorted(candidates,key=lambda row:order(row[0])):
+                job = self.jobs[identity]
                 if job['result'].get('resource_retry_after',0)>time.time():continue
                 group = task.get('project') or 'default'; resource = resources[group]
                 width = task['cpus']
-                if (job.get('auto_cpus') or width <= 1 or group in groups or job['cancel'].is_set()
+                if (job.get('auto_cpus')and job.get('node')is None or width <= 1 or group in groups or job['cancel'].is_set()
                         ):
                     continue
+                held=job.get('node')
                 ready = [node for node in self.pool._matching(task)
                          if node.name not in claims and not node.error and node.enabled
+                         and (held is None or node is held)
                          and not node.health.get('paused') and not node.health.get('queued', 0)
                          and node.capacity-node.external >= width
-                         and min(node.memory_free, self.pool._host_memory_free(node)) >= node.startup_memory(task)
+                         and min(node.memory_free, self.pool._host_memory_free(node))
+                             +(node.memory_credit(job.get('worker_id',identity),job['task']['memory_mb'])if held is node else 0) >= node.startup_memory(task)
                          and node.can_match_accelerator(node.execution_accelerator(task,available=True))]
                 if ready:
                     node = max(ready, key=lambda node: (node.capacity-node.reserved-node.external, node.name))
@@ -1434,6 +1494,8 @@ class Coordinator:
         if remote.get('request_sha256') and remote['request_sha256']!=assigned.get('request_sha256'):
             assigned['worker_request_sha256']=remote['request_sha256']
         assigned.pop('resource_request',None)
+        if remote.get('status')not in TERMINAL and 'min_cpus'in job['result']:
+            assigned['min_cpus']=job['result']['min_cpus']
         if job.get('task'):
             assigned['cpus']=job['task']['cpus']
             assigned['memory_mb']=job['task']['memory_mb']
@@ -1521,6 +1583,20 @@ class Coordinator:
         fixed-width requests retain their indivisible admission contract.
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
+        if desired==0:return 0
+        claims=self._fixed_queue_claims(resources)
+        claim=claims.get(current['node'].name)
+        minimum=current['result'].get('min_cpus')or 0
+        if minimum>1 and not current['result'].get('active_cpus',0):
+            # Weighted shares choose the next indivisible opportunity. Rounding
+            # every waiting four-core stage down to two would strand both.
+            return desired if claim is None or (claim[1].get('project')or'default')==group else 0
+        claimed_room=None
+        if claim is not None:
+            owner=claim[1].get('project')or'default'
+            if owner==group or resources[owner]['used']/resources[owner]['resource_share']<=resources[group]['used']/resources[group]['resource_share']:
+                claimed_room=max(0,current['node'].capacity-current['node'].external-current['node'].reserved+current['task']['cpus']-claim[1]['cpus'])
+                if claimed_room==0:return 0
         if desired==1:
             # The plan grants at most the requested width and at least one.
             # A one-thread phase therefore has the exact target without a plan.
@@ -1540,6 +1616,7 @@ class Coordinator:
                       and(peer['task'].get('project')or'default')==group)
         share_room=(max(1,projects.get(group,{}).get(current['node'].name,0)-max(0,held_here-current['task']['cpus']))
                     if len(projects)>1 else desired)
+        if claimed_room is not None:share_room=min(share_room,claimed_room)
         if warm_cache is not None and group in warm_cache.get('warm',{}):
             return min(share_room,max(1,warm_cache['warm'][group].get(identity,{}).get(current['node'].name,0)))
         members={key:job for key,job in active_items(self.jobs)
@@ -1615,15 +1692,18 @@ class Coordinator:
         extra={key:max(0,value-sum(warm[key].values())) for key,value in running.items()}
         wide=weighted_node_threads(spare,shares,extra,rooms)
         name=current['node'].name
-        return min(share_room,max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0)))
+        target=min(share_room,max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0)))
+        return target
 
-    def resize(self, identity, cpus, *, active_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
+    def resize(self, identity, cpus, *, active_cpus=None, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:
             raise ValueError('resize cpus must be nonnegative; 0 uses the current node budget')
         if memory_mb is not None and (type(memory_mb) is not int or memory_mb<1):
             raise ValueError('resize memory_mb must be a positive integer in MiB')
         if active_cpus is not None and (type(active_cpus) is not int or active_cpus<0):
             raise ValueError('active_cpus must count nonnegative in-flight threads')
+        if min_cpus is not None and (type(min_cpus)is not int or not 0<=min_cpus<=cpus):
+            raise ValueError('min_cpus must be an integer in 0..cpus')
         with self.condition:
             resize_lock=self.jobs[identity].setdefault('resize_lock',threading.Lock())
         # A slow worker must not hold up health, admission or other tasks.
@@ -1645,8 +1725,13 @@ class Coordinator:
                 if ('resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities)
                         or active_cpus is not None and 'resize_active_cpus' not in capabilities):
                     return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus,supported=False)
-                desired=min(cpus or node.capacity,job['task'].get('max_cpus',node.capacity))
-                active_floor=max(1,active_cpus or 0)
+                maximum=job['task'].get('max_cpus',node.capacity)
+                if min_cpus is not None and min_cpus>maximum:
+                    raise ValueError('min_cpus exceeds task max_cpus')
+                explicit=min_cpus is not None and 'resize_min_cpus'in capabilities
+                desired=min(cpus if min_cpus is not None else cpus or node.capacity,maximum)
+                if not explicit:desired=max(1,desired)
+                active_floor=(active_cpus or 0)if explicit else max(1,active_cpus or 0)
                 if active_cpus is not None and (active_cpus>old or active_cpus>desired):
                     raise ValueError('active_cpus must count threads within the existing grant and requested width')
                 model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
@@ -1654,12 +1739,17 @@ class Coordinator:
                 sample=next((j for j in node.health.get('active_jobs',())if j['id']==job.get('worker_id',identity)),{})
                 phase_calibrated=bool(sample.get('memory_calibrated')and same_phase(requested_model,sample.get('memory_phase')or sample.get('memory_phase_model')))
                 model=node.resize_memory_model(job.get('worker_id',identity),model)
-                planner=(lambda width,available,**values:plan_memory(width,available,floor=active_floor,**values))if 'adaptive_memory'in node.health.get('capabilities',())else lambda width,available,**values:plan_resize(width,available_mb=available,**values)
+                planner=(lambda width,available,**values:plan_memory(width,available,
+                    floor=max(active_floor,min(min_cpus or 1,width)),**values))if 'adaptive_memory'in node.health.get('capabilities',())else lambda width,available,**values:plan_resize(width,available_mb=available,**values)
                 previous_desired=job.get('desired_cpus')
                 previous_memory=job.get('phase_memory')
+                previous_active=job['result'].get('active_cpus',0)
                 job['desired_cpus']=desired
+                if min_cpus is not None:job['result']['min_cpus']=min_cpus
+                else:job['result'].pop('min_cpus',None)
+                job['result']['active_cpus']=active_cpus or 0
                 granted=desired
-                cooperative=cpus==0 or _elastic_job(job)
+                cooperative=min_cpus is not None or cpus==0 or _elastic_job(job)
                 # Elastic jobs may report a finite useful phase width.
                 # Repeating that width is still a drained boundary; returning
                 # to one CPU stays cheap for synchronous microkernels.
@@ -1671,27 +1761,31 @@ class Coordinator:
                         # projection, but still belong to their original worker.
                         return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
                     available=node.capacity-node.reserved-node.external+old
-                    floor=1 if cooperative else old
-                    granted=max(floor,min(desired,available)) if node.enabled and not node.health.get('paused') else old
+                    floor=active_floor if cooperative else old
+                    granted=max(floor,min(desired,available)) if node.enabled and not node.health.get('paused') else active_floor if explicit else old
                     if cooperative and node.enabled and not node.health.get('paused'):
                         granted=min(granted,self._cooperative_cpu_target(identity,desired,resources,phase_model=requested_model))
                 # The report describes work already in flight. Return only
                 # unoccupied slots, then let the owner refill from the grant.
                 granted=max(active_floor,granted)
+                if min_cpus is not None and granted<min_cpus:granted=active_floor
                 cpu_ready_limit=granted
                 changes_memory=(memory_mb is not None and memory_mb!=old_memory) or modeled
                 credit=node.memory_credit(job.get('worker_id',identity),old_memory) if changes_memory else old_memory
-                granted,memory=planner(granted,min(node.memory_capacity,credit+max(0,min(node.memory_free,self.pool._host_memory_free(node)))),**model)
+                if granted==0:memory=old_memory
+                else:
+                    granted,memory=planner(granted,max(credit,min(node.memory_capacity,credit+max(0,min(node.memory_free,self.pool._host_memory_free(node))))),**model)
+                    if min_cpus is not None and granted<min_cpus:granted,memory=active_floor,old_memory
                 memory=old_memory if memory is None else memory
                 extra=max(0,memory-credit)
-                if granted<active_floor or memory>node.memory_capacity or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
+                if granted<active_floor or memory>node.memory_capacity and memory>old_memory or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
                     if previous_desired is None:job.pop('desired_cpus',None)
                     else:job['desired_cpus']=previous_desired
                     raise Conflict('Insufficient memory for resource resize; existing grant retained')
                 job['phase_memory']=(dict(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,
                                          memory_limit_mb=memory_limit_mb) if modeled else
                                      dict(memory_mb=old_memory if memory_mb is None else memory_mb))
-                active_changed=job['result'].get('active_cpus',0)!=(active_cpus or 0)
+                active_changed=previous_active!=(active_cpus or 0)
                 job['result'].update(active_cpus=active_cpus or 0,requested_cpus=cpus)
                 previous_phase=previous_memory or job['task'].get('memory_model') or dict(memory_mb=old_memory)
                 phase_changed=({key:value for key,value in previous_phase.items() if value is not None} !=
@@ -1738,6 +1832,7 @@ class Coordinator:
                 elif memory_mb is not None:options['memory_mb']=memory_mb if 'adaptive_memory'in capabilities else memory
                 if 'adaptive_memory'in capabilities:options['_memory_budget_mb']=memory
                 if active_cpus is not None:options['active_cpus']=active_cpus
+                if explicit:options['min_cpus']=min(min_cpus,granted)
                 result=node.client.resize(worker_id,granted,**options)
             except RemoteError as error:
                 if getattr(error,'status_code',None) is not None:

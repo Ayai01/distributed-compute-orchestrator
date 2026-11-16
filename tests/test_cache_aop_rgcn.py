@@ -15,12 +15,14 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from remote_compute import cache_aop, cache_rgcn
+from remote_compute.cache_assets import load_adapter
 
 
 PROJECTS = Path(os.environ.get('REMOTE_COMPUTE_TEST_PROJECTS_ROOT',Path(__file__).resolve().parents[2]))
 AOP = PROJECTS / 'AOP_v2'
 RGCN = PROJECTS / 'RGCN-v2'
+cache_aop = load_adapter(AOP, 'compute/cache_exchange.py')
+cache_rgcn = load_adapter(RGCN, 'src/cache_exchange.py')
 
 
 def scratch():

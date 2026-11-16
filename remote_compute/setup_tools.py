@@ -142,7 +142,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
     tools = root/'.tools'
     tools.mkdir(exist_ok=True)
     if ngspice_source is None:
-        config_path = root/'worker.local.json'
+        config_path = root/'.local/worker.json'
         configured = json.loads(config_path.read_text(encoding='utf-8-sig')) if config_path.exists() else {}
         known = configured.get('tools', {}).get('ngspice') or configured.get('tools', {}).get('ng47') or shutil.which('ngspice')
         candidate = Path(known[0] if isinstance(known, list) else known) if known else None
