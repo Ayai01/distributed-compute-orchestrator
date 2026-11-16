@@ -1,7 +1,7 @@
 """Kill real trees without starving the host or using the scheduler lock."""
 import threading,time,unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock,patch
 from remote_compute.memory import PressureGuard,pressure_victim
 from test_compute import provider,scratch,until,python
 
@@ -23,11 +23,35 @@ class MemoryEmergencyTests(unittest.TestCase):
         host['host_commit_available_mb']=900
         self.assertTrue(g.update(host,3)['terminate'])
 
-    def test_two_falling_samples_predict_danger_but_one_jump_does_not(self):
+    def test_two_falling_samples_pause_growth_without_terminating_a_safe_tree(self):
         g=PressureGuard();h=dict(memory_total_mb=32768,memory_headroom_mb=4096,host_commit_available_mb=16000)
         self.assertFalse(g.update(dict(h,host_memory_available_mb=10000),0)['terminate'])
         self.assertFalse(g.update(dict(h,host_memory_available_mb=8000),.1)['terminate'])
-        self.assertTrue(g.update(dict(h,host_memory_available_mb=6000),.2)['terminate'])
+        warning=g.update(dict(h,host_memory_available_mb=6000),.2)
+        self.assertTrue(warning['predicted']);self.assertTrue(warning['limited']);self.assertTrue(warning['waiting'])
+        self.assertFalse(warning['critical']);self.assertFalse(warning['terminate'])
+        self.assertTrue(g.update(dict(h,host_memory_available_mb=4000),.3)['terminate'])
+
+    def test_observed_local_prediction_above_12GiB_preserves_the_running_process(self):
+        with scratch()as root,provider(Path(root)/'worker',memory_headroom_mb=12288)as(w,c):
+            identity=c.submit(python('import time;time.sleep(30)',timeout=35,retries=0))['id']
+            until(lambda:w.jobs[identity].get('process')is not None)
+            process=w.jobs[identity]['process']
+            w.pressure_stop.set();w.memory_watchdog.join(timeout=2)
+            w.pressure_guard=PressureGuard();update=w.pressure_guard.update;times=iter([0,.1,.2,.3])
+            h=dict(memory_total_mb=48907,memory_headroom_mb=12288,host_commit_available_mb=11419)
+            with patch.object(w.pressure_guard,'update',side_effect=lambda host:update(host,next(times))):
+                for physical in (13200,13000,12743):w._memory_emergency(dict(h,host_memory_available_mb=physical))
+                self.assertTrue(w.pressure_guard.state['predicted'])
+                self.assertTrue(w.pressure_guard.state['waiting'])
+                self.assertFalse(w.pressure_guard.state['terminate'])
+                self.assertIsNone(process.child.poll())
+                self.assertFalse(w.jobs[identity]['cancel'].is_set())
+                w._memory_emergency(dict(h,host_memory_available_mb=12200))
+            result=c.wait(identity,wait_timeout=5)
+            self.assertEqual(result['status'],'failed')
+            self.assertEqual(result['error_kind'],'memory_pressure')
+            self.assertTrue(result['memory_pressure']['guard']['critical'])
 
     def test_newest_unsampled_tree_is_selected_before_larger_older_job(self):
         def job(i,at):return dict(result=dict(id=i,status='running',started=at),cancel=threading.Event(),process=Mock(),task=dict(priority=0))

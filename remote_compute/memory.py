@@ -16,7 +16,7 @@ def pressure_threshold(host):
 
 
 class PressureGuard:
-    """Actual and one-second projected headroom; immediate kills, stable recovery."""
+    """Predictions pause growth; actual critical headroom terminates a tree."""
     def __init__(self):
         self.warning_since=None;self.critical_since=None;self.recovered_since=None
         self.state=dict(limited=False,waiting=False,terminate=False)
@@ -53,9 +53,12 @@ class PressureGuard:
         else:self.critical_since=None
         settling=not warning and self.warning_since is not None
         waiting=settling or warning
-        terminate=critical or predicted
+        # A short allocation burst can predict a crossing that never happens.
+        # Stop admission and new kernels first; keep paid work alive until an
+        # actual sample crosses the configured physical/commit protection line.
+        terminate=critical
         self.state=dict(limited=warning or settling,waiting=bool(waiting),terminate=bool(terminate),
-            warning=warning,predicted=predicted,physical_threshold_mb=threshold,commit_emergency_mb=COMMIT_EMERGENCY_MB,
+            warning=warning,predicted=predicted,critical=critical,physical_threshold_mb=threshold,commit_emergency_mb=COMMIT_EMERGENCY_MB,
             warning_seconds=0 if self.warning_since is None else round(now-self.warning_since,3))
         return self.state
 

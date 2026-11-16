@@ -2,7 +2,7 @@
 
 ## 当前入口与负责人
 
-- 当前发布源码：**0.11.40**。中心在worker确认受理后释放传输ZIP和解包副本；原请求保留在原ID目录，恢复重新读取原件。四台远端worker保留0.11.35原进程。源码、实际加载代码、PID、内存采样及当前验收见 `.local/maintenance/local-start-stall-20261115/current.json`；attempt观察验收见 `.local/maintenance/yolo-memory-state-20261115/current.json`，阶段需求验收见 `.local/maintenance/queued-idle-20261115/current.json`，进度诊断验收见 `.local/maintenance/progress-semantics-20261115/current.json`，资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
+- 当前发布源码：**0.11.41**。预测内存下降只暂停新准入和新数值核，实际物理/提交余量越线才终止最新任务。原保护线保持。四台远端worker保留0.11.35原进程。源码、实际加载代码、PID、内存采样及当前验收见 `.local/maintenance/predictive-pressure-20261115/current.json`；传输驻留及ARH内存交接见 `.local/maintenance/local-start-stall-20261115/current.json`；attempt观察验收见 `.local/maintenance/yolo-memory-state-20261115/current.json`，阶段需求验收见 `.local/maintenance/queued-idle-20261115/current.json`，进度诊断验收见 `.local/maintenance/progress-semantics-20261115/current.json`，资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
 - 传输副本生命周期修复通过23项定向检查：计算运行中不保留中心的传输副本，大输入原件、原SHA、结果和中断恢复费用保持。CPU空槽的准入仍受实际物理余量、未物化预留与提交余量约束；外部控制器占用与DCO任务树分别核对，内存保护线继续沿设备配置。
 - 原ID恢复时，旧进程、业务进度、阶段预留和诊断随费用存入原attempt；新attempt从自己的观察开始，worker采样未含运行/业务字段时同步清除当前旧字段。47项定向检查通过，包含真实内存中断后原ID重派、首次进程创建前等待、原输入摘要及完整attempt费用核对。内存声明与实测预留分别保留；256MiB单核冷探测、冷启动标定栅栏及真实压力保护继续沿既有策略运行。
 - 串行业务入口初始需求为1核；重新接回原worker时恢复其最后实际阶段需求，自动容量请求在提供者确定后解析。真实并行阶段继续取得最多4个有用核的优先机会，串行阶段不占用扩核预留。49项定向检查及3项最终阶段检查通过，包含原生中心退出后原科学进程、输入摘要和排队原ID连续性；最初13个兼容排队任务均已离开队列。
@@ -20,7 +20,7 @@
 
 内存申报是调度估计。冷准备及新阶段保留完整启动资金，稳定采样后按任务树RSS/private峰值、增长余量和实际宽度校准。共享线程的公共基线只计一次，独立进程按实际工作集计账。主机空闲RAM不覆盖worker已筹资但尚未物化的预留，中心派发及未确认扩容也保留资金。
 
-物理保留余量和提交保护线独立：本机物理余量为12GiB，其余当前设备为4GiB；提交危险线为1GiB。100ms独立守护采样按实际余量及连续下降的一秒趋势保护，危险时直接终止最新任务的进程树，稳定恢复2秒后重新放行。冷任务树逐一启动并完成标定。Windows内存、提交和系统资源耗尽进入监督器的内存恢复退出路径；其他启动错误保留错误退出。
+物理保留余量和提交保护线独立：本机物理余量为12GiB，其余当前设备为4GiB；提交危险线为1GiB。100ms独立守护采样按连续下降的一秒趋势暂停增长，只有实际余量越过保护线时终止最新任务的进程树，稳定恢复2秒后重新放行。冷任务树逐一启动并完成标定。Windows内存、提交和系统资源耗尽进入监督器的内存恢复退出路径；其他启动错误保留错误退出。
 
 可重入计算的实测资源中断沿原ID最多恢复2次，退避5/15秒并等待实际工作集余量，保留已成功map项、输出、原输入和累计费用。普通重试预算单独记账。业务失败及用户取消按原终态发布。
 
