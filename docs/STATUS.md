@@ -1,45 +1,23 @@
-# DCO 当前事实
+# DCO v1 当前状态
 
-## 当前入口与负责人
+2026-11-16（美国太平洋时间）。
 
-- 当前发布源码：**0.11.42**。工程接入发布与五机实际版本、PID、原状态根及C910在途连续性见 `.local/maintenance/arh-integration/current.json`。预测内存下降只暂停新准入和新数值核，实际物理/提交余量越线才终止最新任务。原保护线保持。各设备的实际运行版本、源码、加载代码、PID、内存采样及当前验收见 `.local/maintenance/predictive-pressure-20261115/current.json`；传输驻留及ARH内存交接见 `.local/maintenance/local-start-stall-20261115/current.json`；attempt观察验收见 `.local/maintenance/yolo-memory-state-20261115/current.json`，阶段需求验收见 `.local/maintenance/queued-idle-20261115/current.json`，进度诊断验收见 `.local/maintenance/progress-semantics-20261115/current.json`，资产接口验收见 `.local/maintenance/asset-interface-20261114/current.json`，五机基础验收见 `.local/maintenance/takeover-20261114/current.json`。
-- 传输副本生命周期修复通过23项定向检查：计算运行中不保留中心的传输副本，大输入原件、原SHA、结果和中断恢复费用保持。CPU空槽的准入仍受实际物理余量、未物化预留与提交余量约束；外部控制器占用与DCO任务树分别核对，内存保护线继续沿设备配置。
-- 原ID恢复时，旧进程、业务进度、阶段预留和诊断随费用存入原attempt；新attempt从自己的观察开始，worker采样未含运行/业务字段时同步清除当前旧字段。47项定向检查通过，包含真实内存中断后原ID重派、首次进程创建前等待、原输入摘要及完整attempt费用核对。内存声明与实测预留分别保留；256MiB单核冷探测、冷启动标定栅栏及真实压力保护继续沿既有策略运行。
-- 串行业务入口初始需求为1核；重新接回原worker时恢复其最后实际阶段需求，自动容量请求在提供者确定后解析。真实并行阶段继续取得最多4个有用核的优先机会，串行阶段不占用扩核预留。49项定向检查及3项最终阶段检查通过，包含原生中心退出后原科学进程、输入摘要和排队原ID连续性；最初13个兼容排队任务均已离开队列。
-- 执行采样、进程存活、CPU推进与业务报告/计数分别保留。CPU推进但业务报告静默时显示“计算中，暂未报告新进度”，未知CPU活动保留为未上报；资源等待、实际停滞、采样陈旧、连接或进程异常分别提示。98项定向检查及31项最终进度/看板复测通过，C910原观测回放与浏览器详情、空状态、离线状态验收通过；Web发布器为1.0.6。
-- 大队列调度锁分片及旧中心请求身份读取修复已通过97项定向检查，实际加载的调度字节码与当前源码一致。沿本机科学进程自然完成边界交接，核对2643个原队列输入及166个远端原任务；四台远端worker PID保持。C910/Rocket资产查询、handoff与释放共21次实测全部成功、无超时，该次负载下延迟中位4.38秒、最长10.82秒。YOLO原ID `ab7f99f7aa9b421092b14f09b5aca2a2` 的中心原请求与worker运输包摘要分别保留，1514.94 CPU秒及成果保持，ARH已按严格原ID领取。
-- DCO由2026-11-14接管会话 `01a1dabc-384b-7830-8015-1f0bee6c57ac` 统一负责；旧操作员会话仅作为历史参考，不再唤醒。
-- 调度中心与worker通过 `main.py` 原生监督器运行；本机提供者使用设备配置中的原状态根。配置、凭据、工具、输入、原ID、检查点和未领取结果保留在各设备的忽略目录。
-- 使用与部署见[README](../README.md)，机制见[DESIGN](DESIGN.md)，协作要求见[AGENTS](../AGENTS.md)，持续职责见[ROADMAP](ROADMAP.md)。
+- 已批准：强机单中心、直连优先、nurikoi仅中转及远程控制；四工程联合适配和迁移后清理。
+- 新工程：D:/Projects/#4-Arclight/DCO_v1，独立Git克隆，当前分支v1，起点60b031b（已发布0.11.42）。源码实现提取与清理进行中。
+- 旧生产入口：D:/Projects/#4-Arclight/DCO，五机0.11.42；新目录尚未替换任何生产进程。ARH服务与原科学任务继续运行。
+- 六份文档已建立；具体实施和验收见ROADMAP，已生效项目逐项替换本页。
+- 目录合同：Windows有D盘用D:/Projects/#4-Arclight/DCO_v1，否则C盘；Linux用~/Projects/#4-Arclight/DCO_v1。
+- 当前主线接管v1实现与部署；旧维护会话只作来源参考。
 
-## 工程接入合同
+## 四工程入口
 
-0.11.42统一SDK客户端持久索引根，跨启动目录共享同工程窗口，并在新原ID受理前验证活跃工程的resource_share一致性；原ID重放及既有恢复请求保留。241项定向回归通过，涵盖真实回环SDK双进程、旧索引领取、并发首投与中心恢复。操作员补验6项发布关键检查通过；Git与官方ZIP发布源、原生更新及在途保护回执统一见上述维护入口。
+| 工程 | 当前适配入口 | 迁移责任 |
+| --- | --- | --- |
+| AOP_v2 | compute/center.py | execute/python_call/python_task/iter_items及原始角点缓存 |
+| RGCN-v2 | src/parallelism.py、remote_native.py、remote_research.py | 阶段资源、原生测量与逻辑观察缓存 |
+| ARH-DSE-v3 | arh/dco.py、framework/distributed_tasks.py、remote_execution.py | 原ID、资产、原生阶段与独立服务连续运行 |
+| DCBFS-MO | src/dcbfs/_runtime/parallel.py | map/run_call与完整reference缓存 |
 
-## 调度与资源
+## 后续
 
-跨工程按已授权CPU除以 `resource_share` 优先补齐低占用工程；同工程先将已有任务扩至最多4个有用核，再以1核接纳新任务，最后用余核扩展已有任务。已启动工作保留授权，空槽在所属执行器的安全边界归还。能力、真实需求、物理RAM、Windows私有提交及设备倍率共同约束授权。
-
-普通任务声明 `max_cpus`、语义能力和内存需求，由 `python_map/python_call/python_task` 与 `Client.execute` 管理排队、并行、扩缩核和领取。默认窗口覆盖兼容CPU并保持真实排队工作。独立输出目录共用原project及窗口；业务依赖使用 `after`。
-
-内存申报是调度估计。冷准备及新阶段保留完整启动资金，稳定采样后按任务树RSS/private峰值、增长余量和实际宽度校准。共享线程的公共基线只计一次，独立进程按实际工作集计账。主机空闲RAM不覆盖worker已筹资但尚未物化的预留，中心派发及未确认扩容也保留资金。
-
-物理保留余量和提交保护线独立：本机物理余量为12GiB，其余当前设备为4GiB；提交危险线为1GiB。100ms独立守护采样按连续下降的一秒趋势暂停增长，只有实际余量越过保护线时终止最新任务的进程树，稳定恢复2秒后重新放行。冷任务树逐一启动并完成标定。Windows内存、提交和系统资源耗尽进入监督器的内存恢复退出路径；其他启动错误保留错误退出。
-
-可重入计算的实测资源中断沿原ID最多恢复2次，退避5/15秒并等待实际工作集余量，保留已成功map项、输出、原输入和累计费用。普通重试预算单独记账。业务失败及用户取消按原终态发布。
-
-## 进度、维护与生命周期
-
-`report_progress` 提供业务心跳、真实计数、等待和检查点摘要；固定总量才显示百分比。正常进程退出到成果发布之间显示“收尾”，未启动任务显示准备或资源等待。诊断只作提醒，worker退出码与最终回执决定任务结果。
-
-兼容维护保留受理及领取入口；暂停新派发后，在途任务完成，已受理的原队列继续持久保留。原生中心重载保留未派发原ID和输入，恢复后继续执行；worker在无在途计算时原生重载。日常退出和显式取消保持各自的排空/取消语义。
-
-领取顺序为 `fetch(delete=False)`、工程持久发布成果/费用/恢复状态、`delete`。原ID锁管理准备、领取与删除；不同ID共用有界连接池并行。终态完整回执冷读，内存最多缓存64份。源码与静态数据分包，资产按内容复用；活跃、未领取和恢复引用持续保留。
-
-## 能力与验证
-
-运行能力为 `ng47、hsp、chisel、ml、cuda、layout、rtl、onnx`，Python/C++为基础环境。Python统一通过 `${tool:python}` 使用设备的CPU/ML/CUDA绑定。普通任务使用汇总能力视图；设备、平台和外部工作目录仅限操作员调试。
-
-当前设备覆盖为五个CPU/ML提供者、两个CUDA提供者；ng47、Chisel、RTL、ONNX和layout覆盖五台，HSPICE位于ku26s。设备预算和可用性以实时health为准。既有真实工具资格入口为 `.local/maintenance/layout-ku26s-20261104/` 及 `.local/maintenance/capability-contract-20261104/`。
-
-本轮完整核心/原生检查日志为 `.local/maintenance/takeover-20261114/validation.log`，定向修复与重载检查、审查裁定、原队列连续性和五台实机任务回执汇总在当前维护入口。科学输入、数值容差、评价及业务恢复账本由调用工程维护。
+先登记旧五机与现有SDK消费者，再完成隧道、资源控制和网站的实际接入。当前运行身份与部署回执集中在忽略的 .local/migration/current.json。
