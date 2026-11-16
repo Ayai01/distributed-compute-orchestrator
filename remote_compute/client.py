@@ -517,6 +517,10 @@ class Client:
             raise ValueError('active_cpus must count nonnegative in-flight threads')
         if min_cpus is not None and (type(min_cpus) is not int or not 0<=min_cpus<=cpus):
             raise ValueError('min_cpus must be an integer between zero and cpus')
+        # An unfunded adaptive estimate is an automatic-budget hint. The
+        # worker's explicit memory budget accepts positive MiB values only.
+        if type(_memory_budget_mb) is int and _memory_budget_mb==0:
+            _memory_budget_mb=None
         request = dict(cpus=cpus)
         for key, value in dict(active_cpus=active_cpus, min_cpus=min_cpus, memory_mb=memory_mb,
                               base_memory_mb=base_memory_mb, memory_per_cpu_mb=memory_per_cpu_mb,
@@ -833,8 +837,9 @@ class Client:
     def fetch(self, identity, output_dir=None, *, delete=True):
         if output_dir is None:
             return self._fetch(identity,output_dir,delete=delete)
-        temporary_root=Path(os.environ['LOCALAPPDATA'])/'Temp' if os.name=='nt' else None
-        with tempfile.TemporaryDirectory(prefix='dco-artifact-',dir=temporary_root) as folder:
+        # The caller owns TEMP/TMPDIR (including shared RAM scratch). Preserve
+        # that policy instead of forcing every transfer onto the Windows SSD.
+        with tempfile.TemporaryDirectory(prefix='dco-artifact-') as folder:
             return self._fetch(identity,output_dir,delete=delete,artifact_path=Path(folder)/'result.zip')
 
     def _fetch(self, identity, output_dir=None, *, delete=True, artifact_path=None):

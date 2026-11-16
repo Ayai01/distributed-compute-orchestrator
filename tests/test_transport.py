@@ -690,9 +690,13 @@ class StatusReadReconnectTests(unittest.TestCase):
     def test_resize_sends_one_current_request_without_capability_probes(self):
         client=Client();identity='b'*32
         state=dict(id=identity,cpus=2,memory_mb=256)
-        with patch.object(client,'request',return_value=state) as request:
-            self.assertEqual(client.resize(identity,0,memory_mb=256),state)
-        request.assert_called_once_with('/jobs/'+identity+'/resize',dict(cpus=0,memory_mb=256))
+        for budget in (None,0,256):
+            with self.subTest(memory_budget_mb=budget),patch.object(client,'request',return_value=state) as request:
+                self.assertEqual(client.resize(identity,0,active_cpus=0,min_cpus=0,
+                    memory_mb=256,_memory_budget_mb=budget),state)
+                payload=dict(cpus=0,active_cpus=0,min_cpus=0,memory_mb=256)
+                if budget:payload['memory_budget_mb']=budget
+                request.assert_called_once_with('/jobs/'+identity+'/resize',payload)
 
     def test_lease_error_keeps_original_worker_identity_and_is_not_replayed(self):
         client=Client();identity='c'*32;worker='d'*32
