@@ -154,9 +154,12 @@ class FrpProcess:
                        stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,**flags)
         self.log_file.parent.mkdir(parents=True,exist_ok=True)
         self.log=self.log_file.open('ab')
+        environment=os.environ.copy()
+        if self.executable.stem.lower()=='frpc':
+            environment={key:value for key,value in environment.items() if key.lower()!='http_proxy'}
         try:
             self.process=subprocess.Popen([str(self.executable),'-c',str(self.config)],stdin=subprocess.DEVNULL,
-                                          stdout=self.log,stderr=subprocess.STDOUT,**flags)
+                                          stdout=self.log,stderr=subprocess.STDOUT,env=environment,**flags)
         except BaseException:
             self.log.close();self.log=None
             raise

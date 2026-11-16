@@ -12,6 +12,24 @@ from test_compute import scratch
 
 
 class LaunchHandoffTests(unittest.TestCase):
+    def test_frpc_uses_its_configured_transport_without_inheriting_http_proxy(self):
+        for executable in ('frpc','frps'):
+            with self.subTest(executable=executable),scratch() as directory:
+                root=Path(directory)
+                with patch.dict(os.environ,{'http_proxy':'http://inherited.example:8080',
+                                            'HTTPS_PROXY':'http://retained.example:8080',
+                                            'DCO_TEST_SETTING':'retained'}), \
+                     patch.object(network.subprocess,'run') as verify, \
+                     patch.object(network.subprocess,'Popen') as child:
+                    verify.return_value.stdout=network.FRP_VERSION
+                    with network.FrpProcess(root/(executable+'.exe' if os.name=='nt' else executable),
+                                            root/'network.json',root/'network.log'):
+                        environment=child.call_args.kwargs['env']
+                        self.assertEqual(any(key.lower()=='http_proxy' for key in environment),executable=='frps')
+                        self.assertEqual(environment['HTTPS_PROXY'],'http://retained.example:8080')
+                        self.assertEqual(environment['DCO_TEST_SETTING'],'retained')
+                        self.assertIn('http_proxy',os.environ)
+
     def test_local_service_owns_its_profile_until_exit_and_starts_after_http(self):
         for mode, profile in [('worker','worker'), ('scheduler','center'), ('hybrid','center')]:
             with self.subTest(mode=mode), scratch() as directory:
