@@ -338,7 +338,7 @@ def center(pool, root, **options):
         # The scheduler test harness represents the visible DCO operator
         # console; project-facing redaction is covered with a normal Client.
         yield state, Client(f'http://127.0.0.1:{server.server_port}', operator=True,
-                            operator_token=state.operator_token)
+                            operator_token=state.operator_token,state_dir=Path(root)/'client')
     finally:
         state.close()
         server.shutdown()

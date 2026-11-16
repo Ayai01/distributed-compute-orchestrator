@@ -267,7 +267,7 @@ class PipelineTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 identity=sha256((client.url+'\0parallel-test').encode()).hexdigest()
-                lock=Path.cwd()/'.local/dco-client'/identity
+                lock=client.state_dir/identity
                 code="import sys; from pathlib import Path; from remote_compute.worker import lock_root; hold=lock_root(Path(sys.argv[1]),'pipeline'); print('locked',flush=True); sys.stdin.readline(); hold.close()"
                 with subprocess.Popen([sys.executable,'-B','-c',code,str(lock)],
                         stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)as child,ThreadPoolExecutor(1)as callers:
@@ -589,7 +589,7 @@ class PipelineTests(unittest.TestCase):
                 state=Path(root)/'center'
                 with center(pool,state)as(_,operator):operator.control(accepting=False)
                 with center(pool,state)as(_,operator):
-                    client=Client(operator.url)
+                    client=Client(operator.url,state_dir=operator.state_dir)
                     self.assertFalse(client.admission('pipeline-test')['accepting'])
                     with self.assertRaisesRegex(Exception,'new task admissions'):
                         client.submit(task(1)['task'])
@@ -707,7 +707,7 @@ class PipelineTests(unittest.TestCase):
     def test_maintenance_gate_defers_new_work_and_keeps_original_id_recovery(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,operator):
-                client=Client(operator.url)
+                client=Client(operator.url,state_dir=operator.state_dir)
                 original=client.submit(task(1)['task'])['id']
                 operator.control(accepting=False)
                 requests={'new':task(2)};out=Path(root)/'delivery'
@@ -731,7 +731,7 @@ class PipelineTests(unittest.TestCase):
     def test_closed_admissions_still_drain_recovered_ids_and_defer_new_work(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,operator):
-                client=Client(operator.url);identity=client.submit(task(1)['task'])['id']
+                client=Client(operator.url,state_dir=operator.state_dir);identity=client.submit(task(1)['task'])['id']
                 operator.control(accepting=False)
                 plan={'original':dict(job_id=identity),'new':dict(spec=2,after=['original'])}
                 with patch.object(client,'submit_bundle',side_effect=AssertionError('Maintenance must not submit')):

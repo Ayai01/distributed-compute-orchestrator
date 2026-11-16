@@ -1,7 +1,11 @@
 """Cross-project CPU opportunity follows usable weighted shares at boundaries."""
-import json,threading,time,unittest
+import json,threading,time,unittest,uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 from remote_compute import Pool,python_map
+from remote_compute.bundle import task_bundle
+from remote_compute.client import RemoteError
 import test_center as fixtures
 from test_center import center
 from test_compute import provider,scratch,until
@@ -19,6 +23,47 @@ class ProjectShareTests(unittest.TestCase):
         if queued:state.queue.append(key)
         else:node.reserved+=cpus;node.reserved_memory_mb+=64;node.live_jobs.add(key)
         return row
+
+    def test_new_originals_keep_active_project_weight_and_terminal_ids_keep_identity(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center',paused=True)as(state,client):
+                payload=task_bundle(fixtures.python('pass',project='A',resource_share=1))
+                original=client.submit_bundle(uuid.uuid4().hex,payload)
+                client.submit(fixtures.python('pass',project='A',resource_share=1))
+                with self.assertRaisesRegex(RemoteError,'same resource_share')as rejected:
+                    client.submit(fixtures.python('pass',project='A',resource_share=4))
+                self.assertEqual(rejected.exception.status_code,400)
+                client.submit(fixtures.python('pass',project='B',resource_share=4))
+                with state.condition:
+                    for key,job in state.jobs.items():
+                        if job['task']['project']=='A':
+                            job['result']['status']='succeeded';state._save(job)
+                            state.queue.remove(key)
+                client.submit(fixtures.python('pass',project='A',resource_share=4))
+                replay=client.submit_bundle(original['id'],payload)
+                self.assertEqual(replay['id'],original['id'])
+                self.assertEqual(replay['request_sha256'],original['request_sha256'])
+                self.assertEqual(replay['status'],'succeeded')
+                self.assertEqual(state.project_resources()['A']['resource_share'],4)
+
+    def test_concurrent_first_originals_establish_one_project_weight(self):
+        from remote_compute import coordinator
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center',paused=True)as(state,client):
+                ready=threading.Barrier(2);write=coordinator.atomic_json
+                def save(path,value,*args,**kwargs):
+                    if path.name=='admission.json':ready.wait(timeout=5)
+                    return write(path,value,*args,**kwargs)
+                with patch('remote_compute.coordinator.atomic_json',side_effect=save),ThreadPoolExecutor(2)as callers:
+                    futures=[callers.submit(client.submit,fixtures.python('pass',project='A',resource_share=share))for share in (1,4)]
+                    accepted=[];rejected=[]
+                    for future in futures:
+                        try:accepted.append(future.result(timeout=8))
+                        except RemoteError as error:rejected.append(error)
+                self.assertEqual(len(accepted),1);self.assertEqual(len(rejected),1)
+                self.assertIn('same resource_share',str(rejected[0]))
+                self.assertEqual(len(state.jobs),1);self.assertEqual(len(state.queue),1)
+                self.assertEqual(len(list((Path(root)/'center/jobs').iterdir())),1)
 
     def test_two_equal_shares_have_equal_growth_opportunity_despite_priority(self):
         s=self.state();self.job(s,'a','A',desired=64,priority=1000);self.job(s,'b','B',desired=64,priority=-1000)

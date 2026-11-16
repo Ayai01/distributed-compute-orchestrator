@@ -94,7 +94,7 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 ## 持久准备与收齐
 
-`Client.execute(requests, project=..., output_dir=..., prepare=None, publish=None, ready_tasks=None, stop_when=None, cancel_when=None)`同步执行有限业务计划，直到已受理原ID收齐。独立output_dir在同进程或不同进程中并发调用；相同调用目录、中心URL和project共用待收窗口。共享状态索引位于调用目录`.local/dco-client/`，工程文件锁只覆盖该索引的短读改写。准备、计算、网络查询、领取与业务发布回调均在工程锁外执行；每个output_dir保留原ID恢复所需的单写入者锁。不同批次保留同一project及公平份额。
+`Client.execute(requests, project=..., output_dir=..., prepare=None, publish=None, ready_tasks=None, stop_when=None, cancel_when=None)`同步执行有限业务计划，直到已受理原ID收齐。独立output_dir在同进程或不同进程中并发调用；相同SDK状态根、中心URL和project共用待收窗口，与进程启动目录无关。`Client(state_dir=...)`可指定持久客户端状态根，默认复用SDK安装目录的`.local/dco-client/`；不同SDK安装需要共享窗口时使用同一显式根。调用目录中已有的旧索引按需导入一次，保留未发布原ID及其窗口位置。工程文件锁只覆盖该索引的短读改写。准备、计算、网络查询、领取与业务发布回调均在工程锁外执行；每个output_dir保留原ID恢复所需的单写入者锁。不同批次保留同一project及公平份额。
 
 - `requests`为业务键到请求的映射，或`(key, spec)`序列；业务键非空且唯一。
 - 业务请求为`{'task': task, 'inputs': directory, 'files': mapping}`，也可由`prepare(spec, original_id)`返回。依赖包装为`{'spec': business_input, 'after': [keys]}`。依赖图在受理前校验。
@@ -131,7 +131,7 @@ result = run_call('business:train', limits={'max_cpus': 8}, config=config)
 
 中心按每个设备分别限制相邻任务派发，worker限制每个任务的首次进程创建：普通任务最少间隔0.5秒，超发任务最少间隔1秒；与超发启动相邻的间隔至少1秒。设备之间独立派发。启动等待使用设备独立互斥与可取消等待，不持全局调度锁；已运行计算、资源协商和结果领取继续并行。同一任务的后续命令不额外等待启动间隔。
 
-跨工程的新任务准入与扩核都优先照顾已授权CPU除以resource_share较小的工程；同次比较中，它与“已授权线程占比除以权重占比”同序。Share是正数工程权重，priority及操作员dispatch_priority用于同工程的排队顺序。DCO按当前真实就绪需求、任务所在设备、兼容能力和实测内存规划动态CPU机会；其他工程用不上的份额继续供可执行工作使用。没有固定的工程CPU目标或永久比例上限。
+跨工程的新任务准入与扩核都优先照顾已授权CPU除以resource_share较小的工程；同次比较中，它与“已授权线程占比除以权重占比”同序。Share是正数工程权重；同工程有活跃任务时，新原ID使用相同resource_share，冲突在受理前报错。原ID重放及在途恢复保持冻结请求；工程全部任务终态后可为新工作设置新权重。priority及操作员dispatch_priority用于同工程的排队顺序。DCO按当前真实就绪需求、任务所在设备、兼容能力和实测内存规划动态CPU机会；其他工程用不上的份额继续供可执行工作使用。没有固定的工程CPU目标或永久比例上限。
 
 任务内唯一业务进度入口为`report_progress`，在本任务根目录原子更新最多16KiB的快照；不调用网络、不创建监视线程。phase描述真实阶段，completed/total/unit只在总量固定时计算比例，未知终点省略total；counters保存至多16个非负有限的绝对工作计数，metrics保存CPU用时等至多16个非推进观测量。metrics增长或单独发送心跳不更新last_advanced。省略字段保留原值，空调用更新业务心跳。checkpoint只传保存周期、已发布时间、可恢复标志和简短恢复标识，完整业务状态与跨任务接续由调用工程持久化。映射执行器自动报告实际完成项数，业务报告覆盖这一备用视图。
 

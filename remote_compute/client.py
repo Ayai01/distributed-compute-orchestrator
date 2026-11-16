@@ -126,8 +126,12 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None, state_dir=None):
         self.url, self.token, self.operator = url.rstrip("/"), token, bool(operator)
+        # One installed SDK owns its durable client index across caller cwds.
+        # Explicit roots let isolated clients share the same ownership domain.
+        self.state_dir = native_path(Path(state_dir).expanduser().resolve() if state_dir is not None
+                                     else Path(__file__).resolve().parent.parent / '.local/dco-client', force=True)
         self.operator_token = operator_token if self.operator else None
         if timeout is None:
             timeout = (float(os.environ.get('REMOTE_COMPUTE_TIMEOUT',10))

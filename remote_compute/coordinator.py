@@ -691,6 +691,17 @@ class Coordinator:
                 content_id=request.get('content_id'))
             return public(record)
 
+    def _validate_project_share(self, task):
+        """New originals keep the active project's weight; recovery keeps its request."""
+        project=task.get('project')or'default'
+        share=task.get('resource_share',1.0)
+        for job in active_values(self.jobs):
+            if job['result']['status']in TERMINAL:continue
+            existing=job['task']
+            if (existing.get('project')or'default')==project and existing.get('resource_share',1.0)!=share:
+                raise ValueError('Project '+repr(project)+' has active tasks with resource_share='
+                                 +str(existing.get('resource_share',1.0))+'; new tasks must use the same resource_share')
+
     def submit(self, identity, payload, *, operator=False):
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
@@ -715,6 +726,8 @@ class Coordinator:
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
                 task=self._cache_placement(task)
+            with self.condition:
+                self._validate_project_share(task)
             with self.asset_cache.lock:
                 for asset in set(task['assets'].values()):
                     if not (self.root/'assets'/(asset+'.zip')).is_file():
@@ -753,14 +766,22 @@ class Coordinator:
                 with self.condition:
                     stopping = self.stopping
                     held_admission=not self.accepting and not operator
+                    rejected=None
                     if not stopping and not held_admission:
-                        self.jobs[identity] = job
-                        self.asset_handoffs.pop(identity, None)
-                        self.queue.append(identity)
-                        self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
-                        self.condition.notify_all()
-                if stopping or held_admission:
+                        # Independent request IDs can prepare concurrently.
+                        # Recheck with insertion under the same lock so only
+                        # one weight establishes a previously idle project.
+                        try:self._validate_project_share(task)
+                        except ValueError as error:rejected=error
+                        else:
+                            self.jobs[identity] = job
+                            self.asset_handoffs.pop(identity, None)
+                            self.queue.append(identity)
+                            self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
+                            self.condition.notify_all()
+                if stopping or held_admission or rejected is not None:
                     shutil.rmtree(directory)
+                    if rejected is not None:raise rejected
                     raise Conflict('Scheduler is stopping'if stopping else'DCO maintenance: new task admissions are paused')
                 return dict(job["result"])
             finally:

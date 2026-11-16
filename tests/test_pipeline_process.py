@@ -5,7 +5,7 @@ from pathlib import Path
 import json,subprocess,sys,threading,time,unittest
 from unittest.mock import patch
 
-from remote_compute import Pool,command
+from remote_compute import Client,Pool,command
 from test_center import center
 from test_compute import scratch,provider
 
@@ -18,7 +18,7 @@ CHILD=r'''import json,sys
 from pathlib import Path
 from remote_compute import Client
 from remote_compute.bundle import atomic_json
-p=json.loads(Path(sys.argv[1]).read_bytes());client=Client(p['url'],timeout=5)
+p=json.loads(Path(sys.argv[1]).read_bytes());client=Client(p['url'],timeout=5,state_dir=p['state_dir'])
 if p['mode']=='recovery':
  from remote_compute.pipeline_control import _Call
  original=_Call.recovered
@@ -41,6 +41,17 @@ print(json.dumps([dict(id=r['id'],status=r['status'],stdout=r['stdout'])for r in
 
 
 class RegistryTransactionTests(unittest.TestCase):
+    def test_default_client_state_root_is_independent_of_cwd(self):
+        from remote_compute.bundle import native_path
+        with scratch()as folder:
+            with patch('remote_compute.client.Path.cwd',return_value=Path(folder)):
+                first=Client()
+            with patch('remote_compute.client.Path.cwd',return_value=Path(folder)/'other'):
+                second=Client()
+            self.assertEqual(first.state_dir,second.state_dir)
+            self.assertEqual(first.state_dir,native_path(Path(__file__).resolve().parent.parent/'.local/dco-client',force=True))
+            self.assertEqual(Client(state_dir=Path(folder)/'client').state_dir,native_path(Path(folder)/'client',force=True))
+
     def test_registry_reader_and_replacement_share_the_native_lock(self):
         from remote_compute.bundle import atomic_json
         from remote_compute.pipeline_control import _Controller
@@ -77,13 +88,14 @@ class RegistryTransactionTests(unittest.TestCase):
 
 class ProcessPipelineTests(unittest.TestCase):
     @contextmanager
-    def child(self,root,client,output,*,mode='',window=2,plan=None):
+    def child(self,root,client,output,*,mode='',window=2,plan=None,cwd=None):
         output=Path(output);request=Path(root)/('request-'+output.name+'.json')
         marker=Path(root)/('marker-'+output.name+'.json')
         request.write_text(json.dumps(dict(url=client.url,output=str(output),mode=mode,
-            window=window,plan=plan or {'one':task(1)},marker=str(marker))),encoding='utf8')
-        with subprocess.Popen([sys.executable,'-B','-c',CHILD,str(request)],stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)as child:
+            window=window,plan=plan or {'one':task(1)},marker=str(marker),state_dir=str(client.state_dir))),encoding='utf8')
+        script='import sys;sys.path.insert(0,'+repr(str(Path(__file__).resolve().parent.parent))+');'+CHILD
+        with subprocess.Popen([sys.executable,'-B','-c',script,str(request)],stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,cwd=cwd)as child:
             try:yield child,marker
             finally:
                 if child.poll()is None:child.terminate()
@@ -142,7 +154,7 @@ class ProcessPipelineTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 key=sha256((client.url+'\0process-test').encode()).hexdigest()
-                registry=Path.cwd()/'.local/dco-client'/key/'executions.json'
+                registry=client.state_dir/key/'executions.json'
                 missing=_owner(Path(root)/'missing');original='abcde012345678901234567890123456'
                 registry.parent.mkdir(parents=True,exist_ok=True)
                 atomic_json(registry,dict(project='process-test',ready_tasks=2,
@@ -213,7 +225,7 @@ class ProcessPipelineTests(unittest.TestCase):
                 with self.assertRaises(ExecutionFailure):
                     client.execute(plan,project='process-test',output_dir=output,publish=publish,ready_tasks=1)
                 key=sha256((client.url+'\0process-test').encode()).hexdigest()
-                registry=Path.cwd()/'.local/dco-client'/key/'executions.json'
+                registry=client.state_dir/key/'executions.json'
                 atomic_json(registry,dict(project='process-test',directories=[str(output)]))
                 with self.child(root,client,Path(root)/'second',window=1)as(child,_):
                     time.sleep(.2);self.assertIsNone(child.poll())
@@ -239,3 +251,49 @@ class ProcessPipelineTests(unittest.TestCase):
                             self.assertNotEqual(child.returncode,0);self.assertIn('Another pipeline',err)
                     finally:release.set()
                     self.assertEqual(first.result(timeout=6)[0]['status'],'succeeded')
+
+    def test_different_cwds_share_pending_credit_and_reject_different_windows(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                entered=threading.Event();release=threading.Event()
+                other=Path(root)/'other-cwd';other.mkdir()
+                def publish(receipt):
+                    entered.set()
+                    if not release.wait(10):raise RuntimeError('Publication not released')
+                with ThreadPoolExecutor(1)as callers:
+                    first=callers.submit(client.execute,{'one':task(1)},project='process-test',
+                        output_dir=Path(root)/'first',publish=publish,ready_tasks=1)
+                    try:
+                        self.assertTrue(entered.wait(4))
+                        with self.child(root,client,Path(root)/'conflict',window=2,cwd=other)as(child,_):
+                            _,err=child.communicate(timeout=5)
+                            self.assertNotEqual(child.returncode,0);self.assertIn('same ready_tasks',err)
+                        with self.child(root,client,Path(root)/'second',mode='prepare',window=1,cwd=other)as(child,marker):
+                            time.sleep(.2);self.assertFalse(marker.exists());self.assertIsNone(child.poll())
+                            release.set();self.assertEqual(self.marker(marker,child)['phase'],'prepare')
+                            out,err=child.communicate('\n',timeout=6)
+                            self.assertEqual(child.returncode,0,err)
+                            self.assertEqual(json.loads(out)[0]['stdout'].strip(),'1')
+                    finally:release.set()
+                    self.assertEqual(first.result(timeout=6)[0]['stdout'].strip(),'1')
+
+    def test_cwd_index_import_keeps_unpublished_original_and_shared_credit(self):
+        from hashlib import sha256
+        from remote_compute import ExecutionFailure
+        with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                legacy_cwd=Path(root)/'legacy';legacy_cwd.mkdir()
+                legacy=Client(client.url,state_dir=legacy_cwd/'.local/dco-client')
+                output=Path(root)/'first';plan={'one':task(1)};original=[]
+                def publish(receipt):original.append(receipt['id']);raise RuntimeError('Interrupted publication')
+                with self.assertRaises(ExecutionFailure):
+                    legacy.execute(plan,project='process-test',output_dir=output,publish=publish,ready_tasks=1)
+                with patch('remote_compute.pipeline_control.Path.cwd',return_value=legacy_cwd):
+                    with patch.object(client,'submit_bundle')as post:
+                        resumed=client.execute(plan,project='process-test',output_dir=output,ready_tasks=1)
+                    post.assert_not_called()
+                self.assertEqual(resumed[0]['id'],original[0])
+                key=sha256((client.url+'\0process-test').encode()).hexdigest()
+                registry=json.loads((client.state_dir/key/'executions.json').read_bytes())
+                self.assertEqual(len(registry['imported_indexes']),1)
+                self.assertFalse(registry['directories'])

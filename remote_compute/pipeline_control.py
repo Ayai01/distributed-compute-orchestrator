@@ -116,6 +116,42 @@ class _Controller:
         finally:
             for hold in holds:hold.close()
 
+    def import_legacy(self,path,owner):
+        """Import the caller's old cwd index once, retaining unpublished originals."""
+        if _owner(path)==self.identity or not(path/'executions.json').is_file():return
+        identity=_owner(path)
+        if identity in self.read().get('imported_indexes',()):return
+        source=_Controller(path,self.project)
+        previous=source.read()
+        directories=previous['directories']
+        if isinstance(directories,list):
+            # Old list indexes have no pending IDs. Reuse their bounded
+            # directory migration while leaving the original index in place.
+            holds=[];entries={}
+            try:
+                for root in directories:
+                    root=_owner(root)
+                    if root!=owner and Path(root).is_dir():holds.append(lock_root(Path(root),'pipeline'))
+                    pending={}
+                    for row_path in (Path(root)/'jobs').glob('*/state.json'):
+                        row=json.loads(row_path.read_bytes())
+                        if _unfinished(row):pending[row['id']]=row_path.parent.name
+                    if pending:entries[root]=dict(pending=pending,recovering=False)
+                directories=entries
+            finally:
+                for hold in holds:hold.close()
+        with self.transaction()as value:
+            imports=value.setdefault('imported_indexes',[])
+            if identity in imports:return
+            share=previous.get('ready_tasks',self.ready_tasks)
+            if directories and value['directories']and value['ready_tasks']!=share:
+                raise ValueError('Concurrent executions of one project require the same ready_tasks')
+            if directories and not value['directories']:value['ready_tasks']=share
+            for root,entry in directories.items():
+                current=value['directories'].setdefault(root,dict(pending={},recovering=False))
+                current['pending'].update(entry['pending'])
+            imports.append(identity);self.save(value)
+
     def reap(self,owner):
         for root,entry in self.read()['directories'].items():
             if root==owner:continue
@@ -236,7 +272,7 @@ class _Call:
 @contextmanager
 def project_call(client,project,root,ready_tasks):
     identity=sha256((client.url+'\0'+project).encode()).hexdigest()
-    path=Path.cwd()/'.local/dco-client'/identity
+    path=client.state_dir/identity
     key=_owner(path)
     if getattr(_callback,'identity',None)==key:
         raise Conflict('Execute callbacks cannot reenter their project; declare business dependencies with after')
@@ -247,6 +283,7 @@ def project_call(client,project,root,ready_tasks):
     call=None
     try:
         controller.initialize(client,ready_tasks,_owner(root))
+        controller.import_legacy(Path.cwd()/'.local/dco-client'/identity,_owner(root))
         call=_Call(controller,root);controller.register(call.owner)
         yield call
     finally:
