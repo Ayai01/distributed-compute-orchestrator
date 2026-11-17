@@ -204,11 +204,16 @@ class MemoryObservation:
 def reservation(job):
     """Return physical and commit targets without rewriting the request."""
     task = job['task']
+    phase=job.get('memory_phase_model')
+    # A sampled interpreter can be much smaller than the compilation work it
+    # is about to start. Keep the explicit phase's funded width available.
+    phase_floor=((phase.get('memory_mb') or 0)+(phase.get('base_memory_mb') or 0)
+                 +(phase.get('memory_per_cpu_mb') or 0)*task.get('cpus',1)) if phase else 0
     rss = job.get('rss_mb',0)
     private = job.get('private_mb',rss)
     observation = job.get('memory_observation')
     if observation is None or observation.envelope is None:
         initial=job.get('startup_memory_mb',task['memory_mb'])
-        return max(initial,rss), max(initial,private)
+        return max(initial,phase_floor,rss), max(initial,phase_floor,private)
     physical, commit = observation.envelope
-    return max(physical,rss), max(commit,private)
+    return max(phase_floor,physical,rss), max(phase_floor,commit,private)

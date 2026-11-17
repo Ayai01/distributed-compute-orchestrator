@@ -54,9 +54,14 @@ class ObservedMemoryTests(unittest.TestCase):
         self.assertEqual(state['commit_unallocated_mb'],32)
         self.assertEqual(state['memory_available_mb'],416)
 
-    def test_modeled_and_fixed_estimates_both_calibrate_after_stable_samples(self):
+    def test_explicit_phase_retains_its_startup_floor_while_fixed_estimates_calibrate(self):
         job=self.job(memory_observation=observed());job['memory_phase_model']=dict(base_memory_mb=768,memory_per_cpu_mb=0)
-        self.assertEqual(reservation(job),(128,127))
+        self.assertEqual(reservation(job),(768,768))
+        job['memory_phase_model']=dict(base_memory_mb=512,memory_per_cpu_mb=600)
+        job['task'].update(cpus=2,memory_mb=256)
+        self.assertEqual(reservation(job),(1712,1712))
+        job['task']['cpus']=0
+        self.assertEqual(reservation(job),(512,512))
         job['memory_phase_model']=None
         self.assertEqual(reservation(job),(128,127))
 

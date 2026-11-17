@@ -1374,13 +1374,14 @@ class Coordinator:
         attempts[-1].update({key:deepcopy(outcome.get(key,job['result'].get(key)))
                             for key in ATTEMPT_OBSERVATIONS if key in outcome or key in job['result']})
         if recovering:
+            peak=max(max(attempt.get('peak_rss_mb',0),attempt.get('peak_private_mb',0)) for attempt in attempts)
+            reservation_floor=max(max(attempt.get('memory_reservation_mb')or 0,
+                                      attempt.get('memory_commit_reservation_mb')or 0) for attempt in attempts)
             job['result'].update(resource_recovery_count=used+1,
                 resource_retry_after=time.time()+RESOURCE_RECOVERY_DELAYS[used],
                 resource_wait_reason='memory recovery: cooldown and measured working-set headroom',
-                resource_recovery_memory_mb=max(startup_memory({**job['task'],'cpus':1}),outcome.get('memory_reservation_mb')or 0,
-                    outcome.get('memory_commit_reservation_mb')or 0,
-                    max(outcome.get('peak_rss_mb',0),outcome.get('peak_private_mb',0))*1.25,
-                    max(outcome.get('peak_rss_mb',0),outcome.get('peak_private_mb',0))+32),
+                resource_recovery_memory_mb=max(job['result'].get('resource_recovery_memory_mb',0),
+                    startup_memory({**job['task'],'cpus':1}),reservation_floor,peak*1.25,peak+32),
                 resource_recovery_policy='same identity; completed map items retained; unknown running prefixes preserved')
         cached=job['directory']/'worker-artifacts.zip'
         if cached.is_file():

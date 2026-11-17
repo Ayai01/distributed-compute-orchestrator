@@ -15,6 +15,8 @@ class AttemptObservationTests(unittest.TestCase):
    identity=client.submit(task,files={'work.py':code})['id']
    until(lambda:client.status(identity).get('progress',{}).get('completed')==3,seconds=8)
    original=client.status(identity);sha=original['request_sha256']
+   with state.condition:
+    state.jobs[identity]['result']['resource_recovery_memory_mb']=12345
    worker.start_lock.acquire()
    try:
     pressure_fixture.PressureRetryTests().stop(worker,identity)
@@ -27,6 +29,7 @@ class AttemptObservationTests(unittest.TestCase):
     self.assertNotIn('memory_reservation_mb',current)
     self.assertNotIn('memory_commit_reservation_mb',current)
     self.assertEqual(current['request_sha256'],sha)
+    self.assertGreaterEqual(current['resource_recovery_memory_mb'],12345)
     self.assertEqual(len(current['attempts']),1)
     attempt=current['attempts'][0]
     self.assertEqual(attempt['progress']['completed'],3)
