@@ -772,7 +772,10 @@ class Worker:
             elif calibrated and (phase_model or memory_mb is not None):
                 job['memory_adaptive_model']=dict(adaptive_model)
                 if samples:job.update(memory_width_samples=samples,memory_width_sampled_at=sampled_at)
-            if phase_changed or granted!=old:
+            # Rolling width changes keep the same funded phase. Restarting its
+            # sample window on every completion makes a busy phase look cold
+            # forever and blocks unrelated process starts behind the cold gate.
+            if phase_changed or granted!=old and phase_model is None:
                 job['memory_observation']=MemoryObservation()
                 job.pop('startup_memory_mb',None)
             job['memory_phase_model']=phase_model

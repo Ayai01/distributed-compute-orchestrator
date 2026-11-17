@@ -156,8 +156,19 @@ class AdaptiveMemoryTests(unittest.TestCase):
         worker,job=self.sampled_worker(cpus=4,per=128)
         observation=job['memory_observation']
         reply=worker.resize('one',4,active_cpus=4)
-        self.assertEqual(reply['memory_mb'],128)
+        self.assertEqual(reply['memory_mb'],576)
         self.assertIs(job['memory_observation'],observation)
+        worker,job=self.sampled_worker(cpus=2,per=128)
+        observation=job['memory_observation']=MemoryObservation(now=0)
+        for at in (0,1):observation.observe(96,95,now=at)
+        self.assertIsNone(observation.envelope)
+        self.assertEqual(worker.resize('one',4,active_cpus=2)['cpus'],4)
+        self.assertIs(job['memory_observation'],observation)
+        observation.observe(96,95,now=2)
+        self.assertIsNotNone(observation.envelope)
+        worker.resize('one',4,active_cpus=0,base_memory_mb=128,memory_per_cpu_mb=64)
+        self.assertIsNot(job['memory_observation'],observation)
+        self.assertIsNone(job['memory_observation'].envelope)
 
     def test_new_phase_discards_the_previous_learned_cost(self):
         worker,job=self.sampled_worker()
