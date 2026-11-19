@@ -2114,6 +2114,8 @@ class Coordinator:
                 granted=max(active_floor,granted)
                 if min_cpus is not None and granted<min_cpus:granted=active_floor
                 cpu_ready_limit=granted
+                previous_phase=previous_memory or job['task'].get('memory_model') or dict(memory_mb=old_memory)
+                cpu_return=granted<old and same_phase(requested_model or previous_phase,previous_phase)
                 changes_memory=(memory_mb is not None and memory_mb!=old_memory) or modeled
                 credit=node.memory_credit(job.get('worker_id',identity),old_memory) if changes_memory else old_memory
                 if granted==0:memory=old_memory
@@ -2123,15 +2125,16 @@ class Coordinator:
                 memory=old_memory if memory is None else memory
                 extra=max(0,memory-credit)
                 if granted<active_floor or memory>node.memory_capacity and memory>old_memory or (extra and extra>min(node.memory_free,self.pool._host_memory_free(node))):
-                    if previous_desired is None:job.pop('desired_cpus',None)
-                    else:job['desired_cpus']=previous_desired
-                    raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                    if not cpu_return:
+                        if previous_desired is None:job.pop('desired_cpus',None)
+                        else:job['desired_cpus']=previous_desired
+                        raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                    granted,memory=cpu_ready_limit,old_memory
                 job['phase_memory']=(dict(base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,
                                          memory_limit_mb=memory_limit_mb) if modeled else
                                      dict(memory_mb=old_memory if memory_mb is None else memory_mb))
                 active_changed=previous_active!=(active_cpus or 0)
                 job['result'].update(active_cpus=active_cpus or 0,requested_cpus=cpus)
-                previous_phase=previous_memory or job['task'].get('memory_model') or dict(memory_mb=old_memory)
                 phase_changed=({key:value for key,value in previous_phase.items() if value is not None} !=
                                {key:value for key,value in job['phase_memory'].items() if value is not None})
                 if (granted==old and memory==old_memory and not phase_changed and not job.get('resize_uncertain') and not active_changed

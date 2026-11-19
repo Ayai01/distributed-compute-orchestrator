@@ -131,7 +131,7 @@ class _Grants:
         while True:
             with self.condition:
                 if self.stopping:return
-                if not self.active and not self.ready and self.cpus==0 and not self.fenced:
+                if not self.active and not self.ready and self.cpus==0 and not self.fenced and not self.lease.resize_pending:
                     self.condition.wait(.1);continue
                 active,ready=self.active,self.ready
                 self.pending=True;self.pending_floor=active
