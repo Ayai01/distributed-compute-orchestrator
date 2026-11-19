@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,native_path,
                      tree, unpack, batch_status, progress, progress_fields)
-from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS,
+from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS, SINGLE_CORE_PHASE_HANDOFF,
                        python_backend, python_accelerator, supports_python, uses_python, execution_tool,
                        validate_native_cache, native_architecture)
 from .runtime_profiles import check_onnx_int8, elf_aapcs64_available, pe64_available
@@ -429,6 +429,8 @@ class Worker:
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
                         capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress']+(['restart'] if self.restart_available else []))
+        if SINGLE_CORE_PHASE_HANDOFF in self.tags:
+            identity['capabilities'].append(SINGLE_CORE_PHASE_HANDOFF)
         if brief:return identity
         with self.condition:
             resources = self._memory_state()
@@ -533,6 +535,8 @@ class Worker:
         tags.update('shared:'+name for name in self.shared)
         available=set(canonical_capabilities(name for name,item in self.tool_info.items()if item['available']))
         tags.update(available)
+        if 'python' in available:tags.add(SINGLE_CORE_PHASE_HANDOFF)
+        else:tags.discard(SINGLE_CORE_PHASE_HANDOFF)
         if CHISEL_TOOLS <= available:tags.add('chisel')
         else:tags.discard('chisel')
         if not LAYOUT_TOOLS <= available:tags.discard('layout')

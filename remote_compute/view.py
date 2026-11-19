@@ -156,7 +156,8 @@ def _task_memory(job):
 
 
 def _capabilities(tags):
-    labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','npu':'NPU','layout':'Layout','rtl':'RTL','onnx':'ONNX','onnx-int8':'ONNX INT8','pe64':'PE64','elf-aapcs64':'ARM64 ELF'}
+    labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','npu':'NPU','layout':'Layout','rtl':'RTL','onnx':'ONNX','onnx-int8':'ONNX INT8','pe64':'PE64','elf-aapcs64':'ARM64 ELF',
+            'single-core-phase-handoff':'单核交接'}
     return ' '.join(labels.get(name,name) for name in execution_capabilities(tags or ())) or '-'
 
 

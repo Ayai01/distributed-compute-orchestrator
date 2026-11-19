@@ -645,6 +645,26 @@ class AdaptiveWaitTests(unittest.TestCase):
 
 
 class StatusReadReconnectTests(unittest.TestCase):
+    def test_local_pool_backpressure_retries_a_read_without_replacing_its_id(self):
+        client=Client()
+        identity='a'*32
+        reads=[]
+
+        def read():
+            reads.append(identity)
+            if len(reads)==1:
+                raise PoolBusy('connection pool is busy')
+            return {'id':identity}
+
+        self.assertEqual(client._read_reconnecting(read,deadline=time.monotonic()+2),{'id':identity})
+        self.assertEqual(reads,[identity,identity])
+        with self.assertRaises(PoolBusy):
+            client._read_reconnecting(lambda: self._busy(),deadline=time.monotonic())
+
+    @staticmethod
+    def _busy():
+        raise PoolBusy('connection pool is busy')
+
     @staticmethod
     def outage(status=None):
         error=RemoteError('temporary status connection loss')

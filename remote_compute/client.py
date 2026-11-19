@@ -35,7 +35,7 @@ from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
 
 
 from .runtimes import (supports_python, execution_bindings, execution_tool_set, capability_set,
-                       python_accelerator, supports_native_cache)
+                       python_accelerator, supports_native_cache, provider_tags)
 
 
 class RemoteError(RuntimeError):
@@ -943,7 +943,7 @@ class Client:
             try:
                 return read()
             except RemoteError as error:
-                transient=(getattr(error,'status_code',None) in (502,503,504)
+                transient=(isinstance(error, PoolBusy) or getattr(error,'status_code',None) in (502,503,504)
                            or getattr(error,'transport_retryable',False))
                 remaining=expires-time.monotonic()
                 if not transient or remaining<=0:
@@ -1488,7 +1488,9 @@ class Pool:
                 node.last_connected_at=time.monotonic()
                 if previous_name != value.get('node'):
                     node.health.pop('node_ip',None)
-                node.health={**node.health,**value}
+                merged = {**node.health, **value}
+                merged['tags'] = provider_tags(merged)
+                node.health=merged
                 for identity,row in list(node.memory_holds.items()):
                     if row.get('after') is not None and probe_started>=row['after']:
                         node.memory_holds.pop(identity,None)

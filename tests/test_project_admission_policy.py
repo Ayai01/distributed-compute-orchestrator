@@ -4,11 +4,34 @@ from pathlib import Path
 from unittest.mock import patch
 from remote_compute import Client,Pool,RemoteError,command,python_map
 from remote_compute.bundle import task_bundle
+from remote_compute.runtimes import SINGLE_CORE_PHASE_HANDOFF
 from test_compute import provider,scratch,until
 from test_center import center,AdmissionPlanningTests
 
 
 class ProjectAdmissionPolicyTests(unittest.TestCase):
+    def test_single_core_handoff_capability_matches_running_provider_protocol(self):
+        with scratch() as folder, provider(Path(folder)/'old',cpus=4) as (old,old_client), \
+                provider(Path(folder)/'first-release',cpus=2) as (new,new_client):
+            def without_wire_flag(health,version):
+                def report(**options):
+                    sample=health(**options)
+                    return {**sample, 'version':version, 'capabilities':[
+                        flag for flag in sample['capabilities'] if flag!=SINGLE_CORE_PHASE_HANDOFF]}
+                return report
+
+            with patch.object(old,'health',side_effect=without_wire_flag(old.health,'1.0.17')), \
+                    patch.object(new,'health',side_effect=without_wire_flag(new.health,'1.0.20')), \
+                    Pool([old_client,new_client]) as pool, center(pool,Path(folder)/'center') as (_,operator):
+                project=Client(operator.url,operator.token)
+                required=[SINGLE_CORE_PHASE_HANDOFF]
+                self.assertEqual(project.admission('compute',requires=required)['capable_cpus'],2)
+                self.assertNotIn(SINGLE_CORE_PHASE_HANDOFF,pool.nodes[0].health['tags'])
+                result=project.run(command(['${tool:python}','-c','print(42)'],requires=required,max_cpus=1),keep=True)
+                self.assertEqual(result['stdout'].strip(),'42')
+                self.assertNotIn('assigned_node',result)
+                self.assertEqual(operator.status(result['id'])['assigned_node'],pool.nodes[1].name)
+
     def test_sdk_rejects_placement_and_external_paths_without_any_request(self):
         client=Client()
         with patch.object(client,'request')as request:

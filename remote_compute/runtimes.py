@@ -5,7 +5,9 @@ from functools import lru_cache
 from .policy import canonical_capability, canonical_capabilities, select_accelerator_units
 
 
-EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','npu','layout','rtl','onnx','onnx-int8','pe64','elf-aapcs64')
+SINGLE_CORE_PHASE_HANDOFF = 'single-core-phase-handoff'
+EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','npu','layout','rtl','onnx','onnx-int8','pe64',
+                          'elf-aapcs64',SINGLE_CORE_PHASE_HANDOFF)
 CHISEL_TOOLS = {'java', 'scala-cli', 'firtool', 'circt', 'verilator', 'cxx', 'make'}
 LAYOUT_TOOLS = {'layout', 'magic', 'netgen'}
 _TOOLS = re.compile(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}')
@@ -44,6 +46,20 @@ def execution_capabilities(tags):
         try:available.add(canonical_capability(tag))
         except ValueError:continue  # Retired display labels have no execution role.
     return [name for name in EXECUTION_CAPABILITIES if name in available]
+
+
+def provider_tags(health):
+    """Project capabilities come from the running executor's protocol."""
+    tags = set(health.get('tags', ()))
+    capabilities = health.get('capabilities', ())
+    # The first release implementing the handoff predates its wire flag.
+    supported = (SINGLE_CORE_PHASE_HANDOFF in capabilities or health.get('version') == '1.0.20'
+                 and {'resize_min_cpus', 'resize_active_cpus'}.issubset(capabilities))
+    if supported and 'python' in tags:
+        tags.add(SINGLE_CORE_PHASE_HANDOFF)
+    else:
+        tags.discard(SINGLE_CORE_PHASE_HANDOFF)
+    return sorted(tags)
 
 
 def execution_tool(name):
