@@ -11,7 +11,7 @@ from test_capability_packages import packaged_worker
 
 
 class ProjectAdmissionPolicyTests(unittest.TestCase):
-    def test_single_core_handoff_capability_matches_running_provider_protocol(self):
+    def test_rtl_and_chisel_remain_available_before_the_handoff_upgrade(self):
         with scratch() as folder, packaged_worker(Path(folder)/'old','rtl',cpus=4) as (old,old_client), \
                 packaged_worker(Path(folder)/'first-release','rtl',cpus=2) as (new,new_client):
             def without_wire_flag(health,version):
@@ -23,15 +23,17 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
 
             with patch.object(old,'health',side_effect=without_wire_flag(old.health,'1.0.17')), \
                     patch.object(new,'health',side_effect=without_wire_flag(new.health,'1.0.20')), \
-                    Pool([old_client,new_client]) as pool, center(pool,Path(folder)/'center') as (_,operator):
+                    Pool([dict(name='old',client=old_client),dict(name='new',client=new_client,enabled=False)]) as pool, \
+                    center(pool,Path(folder)/'center') as (_,operator):
                 project=Client(operator.url,operator.token)
-                required=['rtl']
-                self.assertEqual(project.admission('compute',requires=required)['capable_cpus'],2)
+                required=['rtl','chisel','shared:arh',SINGLE_CORE_PHASE_HANDOFF]
+                for spellings in (['rtl'], ['chisel'], required):
+                    self.assertEqual(project.admission('compute',requires=spellings)['capable_cpus'],4)
                 self.assertNotIn(SINGLE_CORE_PHASE_HANDOFF,pool.nodes[0].health['tags'])
                 result=project.run(command(['${tool:python}','-c','print(42)'],requires=required,max_cpus=1),keep=True)
                 self.assertEqual(result['stdout'].strip(),'42')
                 self.assertNotIn('assigned_node',result)
-                self.assertEqual(operator.status(result['id'])['assigned_node'],pool.nodes[1].name)
+                self.assertEqual(operator.status(result['id'])['assigned_node'],pool.nodes[0].name)
 
     def test_sdk_rejects_placement_and_external_paths_without_any_request(self):
         client=Client()
@@ -44,7 +46,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
             request.assert_not_called()
 
     def test_raw_http_and_sdk_have_the_same_ordinary_boundary(self):
-        with scratch()as folder,packaged_worker(Path(folder)/'worker','cpu',cpus=2)as(_,remote),Pool([remote])as pool:
+        with scratch()as folder,packaged_worker(Path(folder)/'worker','python',cpus=2)as(_,remote),Pool([remote])as pool:
             with center(pool,Path(folder)/'center')as(state,operator):
                 client=Client(operator.url, operator.token)
                 for field,value in (('node','node1'),('platform',sys.platform),('cwd','C:/external')):
@@ -90,7 +92,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
                 client.submit_bundle(uuid.uuid4().hex,task_bundle(command(['echo'],platform=sys.platform)))
 
     def test_public_activity_reads_during_dispatch_lock_contention(self):
-        with scratch() as folder, packaged_worker(Path(folder) / 'worker', 'cpu', cpus=2) as (_, remote), Pool([remote]) as pool:
+        with scratch() as folder, packaged_worker(Path(folder) / 'worker', 'python', cpus=2) as (_, remote), Pool([remote]) as pool:
             with center(pool, Path(folder) / 'center') as (state, operator):
                 operator.control(paused=True)
                 client = Client(operator.url, operator.token, timeout=1)

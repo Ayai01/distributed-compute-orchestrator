@@ -19,33 +19,46 @@ class Package:
         return sorted(self.tools | self.tags | {'shared:' + name for name in self.shared})
 
 
-DEFAULT_PACKAGE = 'cpu'
-CPU_TOOLS = frozenset({'python', 'onnx', 'onnx-int8'})
-CPU_TAGS = frozenset({'ml'})
-RTL_TOOLS = CPU_TOOLS | CHISEL_TOOLS
-RTL_TAGS = CPU_TAGS | {'rtl', 'chisel', SINGLE_CORE_PHASE_HANDOFF}
+DEFAULT_PACKAGE = 'python'
+PYTHON_TOOLS = frozenset({'python'})
+PYTHON_TAGS = frozenset({'ml'})
+ONNX_TOOLS = PYTHON_TOOLS | {'onnx', 'onnx-int8'}
+RTL_TOOLS = ONNX_TOOLS | CHISEL_TOOLS
+RTL_TAGS = PYTHON_TAGS | {'rtl', 'chisel'}
 RTL_SHARED = frozenset({'arh'})
 TIMING_TOOLS = frozenset({'yosys', 'opensta', 'iverilog', 'g++', 'make'})
 
 PACKAGES = {
-    'cpu': Package(CPU_TOOLS, CPU_TAGS),
-    'spice': Package(CPU_TOOLS | {'ng47', 'ngspice'}, CPU_TAGS),
-    'hspice': Package(CPU_TOOLS | {'hsp'}, CPU_TAGS),
+    'python': Package(PYTHON_TOOLS, PYTHON_TAGS),
+    'ng47': Package(PYTHON_TOOLS | {'ng47'}, PYTHON_TAGS),
+    'hsp': Package(PYTHON_TOOLS | {'hsp'}, PYTHON_TAGS),
     'rtl': Package(RTL_TOOLS, RTL_TAGS, RTL_SHARED),
-    'layout': Package(CPU_TOOLS | {'layout', 'magic', 'netgen'}, CPU_TAGS),
-    'timing': Package(CPU_TOOLS | TIMING_TOOLS, CPU_TAGS),
+    'onnx': Package(ONNX_TOOLS, PYTHON_TAGS),
+    'layout': Package(PYTHON_TOOLS | {'layout', 'magic', 'netgen'}, PYTHON_TAGS),
+    'timing': Package(PYTHON_TOOLS | TIMING_TOOLS, PYTHON_TAGS),
     'cuda': Package(RTL_TOOLS, RTL_TAGS, RTL_SHARED, 'cuda'),
-    'npu': Package(CPU_TOOLS, CPU_TAGS, accelerator='npu'),
+    'npu': Package(PYTHON_TOOLS, PYTHON_TAGS, accelerator='npu'),
 }
+
+# Existing original IDs accepted by 1.0.22 still carry these execution profiles.
+# They are used only for already-accepted work.
+_RETAINED = {
+    'cpu': PACKAGES['onnx'],
+    'spice': Package(ONNX_TOOLS | {'ng47', 'ngspice'}, PYTHON_TAGS),
+    'hspice': Package(ONNX_TOOLS | {'hsp'}, PYTHON_TAGS),
+}
+RETAINED_NAMES = {'cpu': 'python', 'spice': 'ng47', 'hspice': 'hsp'}
 
 # The old SDKs can request a known legacy set. It always expands to the
 # entire package, so adding or removing aliases cannot refine placement.
-_CPU_ALIASES = CPU_TOOLS | CPU_TAGS | {'cpu'}
+_PYTHON_ALIASES = PYTHON_TOOLS | PYTHON_TAGS
+_ONNX_ALIASES = ONNX_TOOLS - PYTHON_TOOLS
 _RTL_ALIASES = frozenset({'rtl', 'chisel', 'shared:arh', SINGLE_CORE_PHASE_HANDOFF})
 _LEGACY = {
-    'spice': frozenset({'spice', 'ng47', 'ngspice'}),
-    'hspice': frozenset({'hsp'}),
+    'ng47': frozenset({'spice', 'ng47', 'ngspice'}),
+    'hsp': frozenset({'hsp'}),
     'rtl': _RTL_ALIASES,
+    'onnx': _ONNX_ALIASES,
     'layout': frozenset({'layout'}),
     'timing': TIMING_TOOLS - {'g++', 'make'} | {'timing'},
     'cuda': frozenset({'cuda'}),
@@ -59,8 +72,7 @@ def project_package(requires, accelerator=None):
             or any(not isinstance(name, str) or not 0 < len(name) <= MAX_REQUIREMENT_LENGTH for name in requires)):
         raise ValueError('requires must name one DCO capability package')
     names = frozenset(canonical_capabilities(requires))
-    if (SINGLE_CORE_PHASE_HANDOFF in names and not names & {'rtl', 'chisel', 'shared:arh'}
-            or 'cpu' in names and not names <= _CPU_ALIASES):
+    if SINGLE_CORE_PHASE_HANDOFF in names and not names & {'rtl', 'chisel', 'shared:arh'}:
         raise ValueError('Choose one DCO capability package: ' + ', '.join(PACKAGES))
     if accelerator is not None and (
             not isinstance(accelerator, dict) or accelerator.get('requires')
@@ -68,12 +80,14 @@ def project_package(requires, accelerator=None):
                                   'max_jobs', 'fallback_after_seconds'}):
         raise ValueError('Accelerator requests accept package resource quantities only')
 
-    if names <= _CPU_ALIASES:
+    if names <= _PYTHON_ALIASES:
         name = DEFAULT_PACKAGE
     else:
         name = None
         for candidate, aliases in _LEGACY.items():
-            ignored = _CPU_ALIASES
+            ignored = _PYTHON_ALIASES
+            if candidate in ('rtl', 'cuda'):
+                ignored = ignored | _ONNX_ALIASES
             if candidate == 'timing':
                 ignored = ignored | {'g++', 'make'}
             elif candidate == 'cuda':
@@ -87,9 +101,9 @@ def project_package(requires, accelerator=None):
     if accelerator is not None:
         kind = accelerator.get('kind', PACKAGES[name].accelerator)
         # Existing auto-CUDA callers use the same combined CUDA package.
-        if name in ('cpu', 'rtl') and kind == 'cuda':
+        if name in (DEFAULT_PACKAGE, 'onnx', 'rtl') and kind == 'cuda':
             name = 'cuda'
-        if name == 'cpu' and kind == 'npu':
+        if name == DEFAULT_PACKAGE and kind == 'npu':
             name = 'npu'
         if not kind or kind != PACKAGES[name].accelerator:
             raise ValueError('Accelerator kind must agree with the DCO capability package')
@@ -101,7 +115,14 @@ def project_package(requires, accelerator=None):
 
 def package_task(task, name, accelerator):
     """Expand a project task to a complete, provider-independent execution profile."""
-    package = PACKAGES[name]
+    package = PACKAGES.get(name) or _RETAINED[name]
+    if name == 'ng47':
+        # Existing SDKs use the unversioned placeholder. The package always
+        # executes the verified ng47 registration.
+        binding = '${tool:ngspice}'
+        ng47 = '${tool:ng47}'
+        task = dict(task, steps=[[arg.replace(binding, ng47) for arg in argv] for argv in task['steps']],
+                    env={key: value.replace(binding, ng47) for key, value in task['env'].items()})
     tools, shared, _, _ = execution_bindings(task)
     if not tools <= package.tools or not shared <= package.shared:
         raise ValueError('Tool or shared binding is outside the ' + name + ' capability package')
@@ -113,7 +134,7 @@ def package_task(task, name, accelerator):
 
 def provider_has_package(health, name):
     """Require the same probes for all work in a package, including unused bindings."""
-    package = PACKAGES[name]
+    package = PACKAGES.get(name) or _RETAINED[name]
     if not capability_set(health.get('tags', ())).issuperset(package.requirements):
         return False
     tools = execution_tool_set(tuple(tool for tool, probe in health.get('tools', {}).items()

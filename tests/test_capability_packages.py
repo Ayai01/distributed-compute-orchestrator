@@ -38,9 +38,10 @@ def packaged_worker(root, *names, cpus=1, **options):
 class CapabilityPackageTests(unittest.TestCase):
     def test_release_aliases_produce_one_package(self):
         groups = {
-            'cpu': [[], ['python'], ['onnx', 'onnx-int8'], ['ml']],
-            'spice': [['spice'], ['ng47'], ['ngspice47', 'python']],
-            'hspice': [['hspice'], ['hsp']],
+            'python': [[], ['python'], ['ml']],
+            'ng47': [['spice'], ['ng47'], ['ngspice47', 'python']],
+            'hsp': [['hspice'], ['hsp']],
+            'onnx': [['onnx'], ['onnx-int8'], ['onnx', 'onnx-int8']],
             'rtl': [['rtl'], ['chisel'], ['rtl', 'shared:arh', 'single-core-phase-handoff'],
                     ['rtl', 'onnx', 'onnx-int8']],
             'timing': [['timing'], ['yosys', 'opensta'], ['make', 'g++', 'opensta', 'iverilog']],
@@ -49,7 +50,7 @@ class CapabilityPackageTests(unittest.TestCase):
             for requires in expressions:
                 with self.subTest(requires=requires):
                     self.assertEqual(project_package(requires), (package, None))
-        for requires in (['rtl', 'layout'], ['cpu', 'rtl'], ['single-core-phase-handoff'],
+        for requires in (['rtl', 'layout'], ['cpu'], ['cpu', 'rtl'], ['single-core-phase-handoff'],
                          ['rtl', 'pe64'], ['elf-aapcs64'], ['custom'], ['rtl', 'shared:private']):
             with self.subTest(requires=requires), self.assertRaises(ValueError):
                 project_package(requires)
@@ -63,17 +64,20 @@ class CapabilityPackageTests(unittest.TestCase):
     def test_real_http_quote_dispatch_and_original_recovery(self):
         with scratch() as folder:
             root = Path(folder)
-            with packaged_worker(root / 'basic', 'cpu', cpus=4) as (_, basic), \
+            with packaged_worker(root / 'basic', 'python', cpus=4) as (_, basic), \
                     packaged_worker(root / 'full', 'rtl', cpus=2) as (_, full), \
                     Pool([dict(name='basic', client=basic), dict(name='full', client=full)]) as pool:
                 with center(pool, root / 'center', paused=True) as (state, operator):
                     client = Client(operator.url, operator.token)
                     catalog = client.capabilities()
-                    self.assertEqual(catalog['default_package'], 'cpu')
+                    self.assertEqual(catalog['default_package'], 'python')
                     self.assertEqual(set(catalog['capability_cpus']), set(PACKAGES))
                     for field in ('tags', 'tools', 'accelerators', 'nodes', 'platforms'):
                         self.assertNotIn(field, catalog)
-                    self.assertEqual(catalog['capability_cpus']['cpu']['capacity'], 6)
+                    self.assertNotIn('cpu', catalog['capability_cpus'])
+                    self.assertNotIn('spice', catalog['capability_cpus'])
+                    self.assertEqual(catalog['capability_cpus']['python']['capacity'], 6)
+                    self.assertEqual(catalog['capability_cpus']['onnx']['capacity'], 2)
                     self.assertEqual(catalog['capability_cpus']['rtl']['capacity'], 2)
                     self.assertEqual(client.admission('audit', requires=['npu'])['in_flight'], 0)
                     argv = ['${tool:python}', '-c', 'print(42)']
@@ -112,6 +116,23 @@ class CapabilityPackageTests(unittest.TestCase):
                     self.assertNotIn('tools', result)
                     self.assertEqual(operator.status(identity)['assigned_node'], 'full')
                     self.assertEqual(client.submit_bundle(identity, payload)['id'], identity)
+
+    def test_ng47_uses_standard_binding_and_restores_accepted_legacy_receipt(self):
+        with scratch() as folder:
+            root = Path(folder)
+            with packaged_worker(root / 'worker', 'ng47', tools={'ng47': sys.executable}) as (_, remote), \
+                    Pool([remote]) as pool, center(pool, root / 'center') as (state, operator):
+                client = Client(operator.url, operator.token)
+                raw = command(['${tool:ngspice}', '-c', 'print(47)'], requires=['ng47'], max_cpus=1)
+                self.assertEqual(client.admission('AOP', requires=['ng47'])['capable_cpus'], 1)
+                self.assertEqual(client.admission('rgcn-v3', requires=['ng47'])['capable_cpus'], 1)
+                result = client.run(raw)
+                self.assertEqual((result['status'], result['stdout'].strip()), ('succeeded', '47'))
+                retained = state._restored_task(
+                    command(['${tool:onnx}', '-c', 'pass'], requires=['cpu']),
+                    {'capability_package': 'cpu', 'accelerator': None})
+                self.assertEqual(retained['_capability_package'], 'cpu')
+                self.assertEqual(retained['steps'][0][0], '${tool:onnx}')
 
 
 if __name__ == '__main__':

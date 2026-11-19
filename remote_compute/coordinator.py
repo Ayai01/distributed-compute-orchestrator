@@ -44,7 +44,8 @@ from urllib.parse import urlsplit
 from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python, execution_bindings, capability_set
 from . import __version__
 from .policy import validate_operator_fields
-from .packages import DEFAULT_PACKAGE, PACKAGES, package_names, package_task, project_package, provider_has_package
+from .packages import (DEFAULT_PACKAGE, PACKAGES, RETAINED_NAMES, package_names, package_task,
+                       project_package, provider_has_package)
 
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
@@ -640,6 +641,9 @@ class Coordinator:
 
         def clean_mapping(mapping):
             cleaned = {key: item for key, item in mapping.items() if key not in hidden}
+            package = cleaned.get('capability_package')
+            if package in RETAINED_NAMES:
+                cleaned['capability_package'] = RETAINED_NAMES[package]
             for key in ('error', 'connection_error'):
                 if isinstance(cleaned.get(key), str):
                     cleaned[key] = self.public_error(cleaned[key])
@@ -1001,7 +1005,7 @@ class Coordinator:
         package = result.get('capability_package')
         if package is None:
             return self._cache_placement(task)
-        _, accelerator = project_package(raw_task.get('requires', []), raw_task.get('accelerator'))
+        accelerator = result.get('requested_accelerator', result.get('accelerator', task['accelerator']))
         return package_task(task, package, accelerator)
 
     def cache_reference(self,identity,request=None):

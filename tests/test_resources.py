@@ -264,14 +264,14 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertIn('1.23/56.8','\n'.join(lines))
 
     def test_capability_column_uses_only_public_packages(self):
-        packages=['cpu','rtl','long-custom-tag'*8]
-        self.assertEqual(_capabilities(packages),'cpu rtl')
-        self.assertEqual(_capabilities([*packages,'spice','hspice']),'cpu spice hspice rtl')
+        packages=['python','rtl','onnx','long-custom-tag'*8]
+        self.assertEqual(_capabilities(packages),'Python RTL/Chisel ONNX')
+        self.assertEqual(_capabilities([*packages,'ng47','hsp']),'Python ng47 hsp RTL/Chisel ONNX')
         value=dict(role='worker',node='Aya1-TX',cpus=30,packages=packages)
         for width in (56,80,110,160):
             lines=format_status(value,width=width)
             self.assertTrue(all(_width(line)<=width for line in lines))
-            self.assertIn('rtl','\n'.join(lines))
+            self.assertIn('RTL/Chisel','\n'.join(lines))
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):
         with patch('remote_compute.benchmark.measure') as kernel:

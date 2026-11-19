@@ -124,15 +124,15 @@ class CapabilityTests(unittest.TestCase):
         from test_capability_packages import packaged_worker
         with scratch() as directory:
             root = Path(directory)
-            with packaged_worker(root/'legacy', 'cpu') as (_, legacy), \
-                    packaged_worker(root/'canonical', 'cpu', cpus=2) as (_, canonical):
+            with packaged_worker(root/'legacy', 'python') as (_, legacy), \
+                    packaged_worker(root/'canonical', 'python', cpus=2) as (_, canonical):
                 with Pool([legacy, canonical]) as pool, center(pool, root/'center') as (_, operator):
                     project = Client(operator.url, operator.token)
                     self.assertEqual(project.admission('runtime', requires=['rgcn_python'])['capable_cpus'], 3)
                     public = project.capabilities()
                     self.assertNotIn('tags', public)
                     self.assertNotIn('tools', public)
-                    self.assertEqual(public['capability_cpus']['cpu']['capacity'], 3)
+                    self.assertEqual(public['capability_cpus']['python']['capacity'], 3)
                     task = command(['${tool:aop_python}', '-c',
                                     'import os,pathlib,time;assert pathlib.Path(os.environ["PY"]).is_file();'
                                     'time.sleep(.35);print("ready")'],

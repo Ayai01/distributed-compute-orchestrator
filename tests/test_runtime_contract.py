@@ -37,8 +37,8 @@ class RuntimeContractTests(unittest.TestCase):
               'python_torch_scientific','shared:rocket','gpu:training','very_long_internal_tool']
         self.assertEqual(execution_capabilities(tags),
                          ['ng47','hsp','chisel','ml','cuda','layout','rtl','onnx'])
-        self.assertEqual(_capabilities(['spice', 'rtl', 'layout', *tags]), 'spice hspice rtl layout cuda')
-        self.assertEqual(_capabilities(['cpu','python','cxx','g++']), 'cpu')
+        self.assertEqual(_capabilities(['hsp', *tags]), 'Python ng47 hsp RTL/Chisel ONNX layout cuda')
+        self.assertEqual(_capabilities(['cpu','python','cxx','g++']), 'Python')
 
     def test_chisel_and_layout_require_the_complete_toolchain(self):
         self.assertNotIn('chisel',execution_capabilities(['java','scala-cli','firtool']))

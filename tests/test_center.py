@@ -213,9 +213,9 @@ class AdmissionPlanningTests(unittest.TestCase):
         pool.nodes=[]
         for index,capacity in enumerate(capacities):
             node=Node(str(index),SimpleNamespace(url=str(index)))
-            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=PACKAGES['spice'].requirements,
+            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=PACKAGES['ng47'].requirements,
                              python_backends=['cpu', 'ml'],
-                             tools={name: {'available': True} for name in PACKAGES['spice'].tools},
+                             tools={name: {'available': True} for name in PACKAGES['ng47'].tools},
                              memory_capacity_mb=8192,memory_available_mb=8192,host_memory_available_mb=8192)
             pool.nodes.append(node)
         state=Coordinator.__new__(Coordinator)
