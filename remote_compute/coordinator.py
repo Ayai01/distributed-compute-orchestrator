@@ -31,6 +31,7 @@ from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_
 from .compat import unlink
 from .cleanup import AssetCache, AssetMaintenance, TransportRetirement, prune_asset_caches, remove_owned, retire_job
 from .acceptance import SubmissionAssets, SubmissionLocks
+from .asset_upload import ASSET_RESUME_CAPABILITY, ASSET_RESUME_MIN_BYTES
 from .asset_variants import bind_asset_variants, freeze_asset_variants, load_asset_variants
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .observations import Observations, observation_batch, terminal_observation
@@ -1597,6 +1598,10 @@ class Coordinator:
     def _submit(self, job, identity, payload, callback, *, assets=None):
         node, force, uncertain = job['node'], False, False
         assets = job['task']['assets'] if assets is None else assets
+        asset_metrics = None
+        if assets:
+            asset_metrics = job['result'].setdefault('asset_transport', {'uploads': {}})
+            asset_metrics['selected'] = sorted(assets)
         while True:
             if not uncertain and job['cancel'].is_set():return False
             submitting=False
@@ -1605,7 +1610,8 @@ class Coordinator:
                     started = time.monotonic()
                     try:
                         self._ensure_assets(node, assets.values(), force=force,
-                                            cancel=None if uncertain else job['cancel'].is_set)
+                                            cancel=None if uncertain else job['cancel'].is_set,
+                                            report=asset_metrics['uploads'] if asset_metrics is not None else None)
                     finally:
                         job['result']['asset_preparation_seconds'] = (
                             job['result'].get('asset_preparation_seconds', 0.0) + time.monotonic() - started)
@@ -1772,7 +1778,17 @@ class Coordinator:
                 except RemoteError:
                     pass  # Worker expiry also releases an unreachable sender's hold.
 
-    def _ensure_assets(self, node, assets, *, force=False, cancel=None):
+    def _resumable_asset_receiver(self, node, shared_cache):
+        if not shared_cache:
+            return None
+        for receiver in (node, *self.pool.nodes):
+            health = receiver.health
+            if (receiver.enabled and not receiver.error and health.get('shared_asset_cache') == shared_cache
+                    and ASSET_RESUME_CAPABILITY in health.get('capabilities', ())):
+                return receiver
+        return None
+
+    def _ensure_assets(self, node, assets, *, force=False, cancel=None, report=None):
         # Cache changes invalidate presence, but keep same-hash uploads serialized.
         assets=set(assets)
         if not assets:return
@@ -1855,15 +1871,26 @@ class Coordinator:
                         if current_publication != published:
                             exists = node.client.request(route, cancel=abandoned)['exists']
                 if not exists:
-                    node.client.request(route, archive.read_bytes(), cancel=abandoned)
+                    archive_bytes = archive.stat().st_size
+                    metrics = report.setdefault(asset, {}) if report is not None else {}
+                    receiver = self._resumable_asset_receiver(node, shared_cache) if archive_bytes >= ASSET_RESUME_MIN_BYTES else None
+                    if receiver is not None:
+                        receiver.client.upload_resumable(asset, archive, cancel=abandoned, report=metrics)
+                    elif metrics.get('protocol') == 'resumable':
+                        raise RemoteError('Waiting for the shared asset upload receiver to reconnect')
+                    else:
+                        metrics.update(protocol='legacy', archive_bytes=archive_bytes)
+                        node.client.request(route, archive.read_bytes(), cancel=abandoned)
                     if shared_cache:
                         key = (shared_cache, asset)
                         with self.shared_asset_upload_lock:
                             publications = self.shared_asset_publications
                             publications.pop(key, None)
-                            publications[key] = (node.name, time.monotonic())
+                            publications[key] = ((receiver or node).name, time.monotonic())
                             if len(publications) > 1024:
                                 del publications[next(iter(publications))]
+                    if receiver is not None and not node.client.request(route, cancel=abandoned)['exists']:
+                        raise RemoteError('Waiting for the committed archive on the shared asset volume')
                 with node.asset_lock:
                     if node.asset_session==session:node.known_assets.add(asset)
                 _check_cancelled(cancel)

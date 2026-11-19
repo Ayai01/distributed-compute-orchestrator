@@ -9,6 +9,7 @@ import tempfile
 import time
 
 from .cleanup import ASSET_CACHE_BYTES, ASSET_CACHE_IDLE_SECONDS, ASSET_SWEEP_SECONDS, evict_unused
+from .asset_upload import AssetUploads, is_resumable_part, is_resumable_stage
 
 
 class SharedAssets:
@@ -18,6 +19,7 @@ class SharedAssets:
         if os.name != 'nt' and self.root.stat().st_mode & 0o077:
             raise ValueError('Shared asset cache must be private to the worker user')
         self.identity = hashlib.sha256(os.fsencode(self.root)).hexdigest()
+        self.uploads = AssetUploads(self.root)
 
     def read(self, identity):
         path = self.root / (identity + '.zip')
@@ -71,7 +73,7 @@ class SharedAssets:
         with lock:
             if not due():
                 return []
-            entries, original = {}, {}
+            entries, original, protected = {}, {}, set()
             for path in self.root.iterdir():
                 if not re.fullmatch(r'[a-f0-9]{64}\.zip|\.upload-[a-z0-9_]+', path.name):
                     continue
@@ -80,11 +82,17 @@ class SharedAssets:
                 except FileNotFoundError:
                     continue
                 if stat.S_ISREG(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 1024:
-                    if path.suffix == '.zip' or now - info.st_mtime > ASSET_CACHE_IDLE_SECONDS:
+                    partial = is_resumable_part(path)
+                    age = now - info.st_mtime
+                    if path.suffix == '.zip' or partial or age > ASSET_CACHE_IDLE_SECONDS:
                         entries[path] = (info.st_size, info.st_mtime)
                         original[path] = (info.st_ino, info.st_mtime_ns)
+                    if partial and age < ASSET_SWEEP_SECONDS:
+                        protected.add(path)
 
             def discard(path):
+                if is_resumable_stage(path):
+                    return self.uploads.discard(path, original[path])
                 try:
                     info = path.lstat()
                     if (info.st_ino, info.st_mtime_ns) != original[path]:
@@ -94,7 +102,7 @@ class SharedAssets:
                     pass
                 return True
 
-            errors = evict_unused(entries, set(), ASSET_CACHE_BYTES, ASSET_CACHE_IDLE_SECONDS,
+            errors = evict_unused(entries, protected, ASSET_CACHE_BYTES, ASSET_CACHE_IDLE_SECONDS,
                                   discard, now=now)
             stamp.touch()
             return errors

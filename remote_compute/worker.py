@@ -41,6 +41,7 @@ from .progress import sample as sample_progress, diagnose
 from .client import RemoteError
 from .cleanup import ASSET_CACHE_BYTES, AssetCache, AssetMaintenance, Reclaimer, TransportRetirement, remove_owned, retire_job
 from .shared_assets import SharedAssets
+from .asset_upload import ASSET_CHUNK_BYTES, ASSET_RESUME_CAPABILITY
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .compat import unlink
 from .receipts import read_receipt
@@ -428,7 +429,9 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress']+(['restart'] if self.restart_available else []))
+                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress']
+                        + ([ASSET_RESUME_CAPABILITY] if self.shared_assets else [])
+                        + (['restart'] if self.restart_available else []))
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:
             identity['capabilities'].append(SINGLE_CORE_PHASE_HANDOFF)
         if brief:return identity
@@ -1883,12 +1886,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply({"error": "Operator token required"}, 403)
         worker.activity.access(self.client_address[0], self.connection.getsockname()[0])
         parts = urlsplit(self.path).path.strip("/").split("/")
+        asset_upload = len(parts) == 3 and parts[0] == 'assets' and parts[2] == 'upload'
         try:
             body = None
             if self.command == "POST":
                 length = int(self.headers.get("Content-Length", 0))
                 if not 0 <= length <= MAX_BODY:
                     return self._reply({"error": "Bundle exceeds 512 MiB; use a shared root for large inputs"}, 413)
+                if asset_upload and length > ASSET_CHUNK_BYTES:
+                    self.close_connection = True
+                    return self._reply({'error': 'Asset upload chunk exceeds 2 MiB'}, 413)
                 # Lost relay senders must not retain a POST handler forever.
                 # Bound only body inactivity; leases keep their long wait.
                 self.connection.settimeout(self.body_timeout)
@@ -1901,6 +1908,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.connection.settimeout(None)
                 if len(body) != length:
                     self.close_connection=True
+                    if asset_upload:
+                        return self._reply({'error': 'Incomplete asset chunk'}, 408)
                     raise ValueError("Incomplete request body")
             if parts == ["health"] and self.command == "GET":
                 if scheduler and not operator:
@@ -2029,6 +2038,10 @@ class Handler(BaseHTTPRequestHandler):
                         except KeyError:
                             continue
                         value.append(result)
+            elif asset_upload and self.command in {'GET', 'POST'}:
+                if scheduler or not worker.shared_assets:
+                    raise KeyError('Resumable asset uploads are unavailable')
+                value = worker.shared_assets.uploads.receive(parts[1], body, self.headers.get('Content-Range'))
             elif len(parts) == 2 and parts[0] == "assets" and self.command in {"GET", "POST"}:
                 job_id = self.headers.get('X-DCO-Asset-Job')
                 value = worker.asset(parts[1], body, **({'job_id':job_id} if job_id else {}))

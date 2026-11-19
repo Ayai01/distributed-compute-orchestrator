@@ -47,6 +47,10 @@ class LocalClient(Client):
             if len(parts) == 2 and parts[0] == 'assets':
                 job_id = (extra_headers or {}).get('X-DCO-Asset-Job')
                 return worker.asset(parts[1], data, **({'job_id':job_id} if job_id else {}))
+            if len(parts) == 3 and parts[0] == 'assets' and parts[2] == 'upload' and method in {'GET', 'POST'}:
+                if not worker.shared_assets:
+                    raise KeyError('Resumable asset uploads are unavailable')
+                return worker.shared_assets.uploads.receive(parts[1], data, (extra_headers or {}).get('Content-Range'))
             if len(parts) >= 2 and parts[0] == 'jobs':
                 identity = parts[1]
                 if len(parts) == 2:

@@ -137,17 +137,28 @@ def tree(root, patterns=("**/*",), *, cancel=None):
     return files
 
 
+def _archive_members(archive, root):
+    entries = archive.infolist()
+    if sum(item.file_size for item in entries) > 2 * 1024**3:
+        raise ValueError("Expanded bundle exceeds 2 GiB; predeploy large assets with shared roots")
+    for item in entries:
+        target = inside(root, item.filename)
+        mode = item.external_attr >> 16
+        if stat.S_ISLNK(mode):
+            raise ValueError("Bundle requires regular files")
+        yield item, target, mode
+
+
+def validate_archive(path, root):
+    with zipfile.ZipFile(path) as archive:
+        for _ in _archive_members(archive, native_path(root, force=True)):
+            pass
+
+
 def unpack(data, root):
     root = native_path(root,force=True)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        entries = archive.infolist()
-        if sum(item.file_size for item in entries) > 2 * 1024**3:
-            raise ValueError("Expanded bundle exceeds 2 GiB; predeploy large assets with shared roots")
-        for item in entries:
-            target = inside(root, item.filename)
-            mode = item.external_attr >> 16
-            if stat.S_ISLNK(mode):
-                raise ValueError("Bundle requires regular files")
+        for item, target, mode in _archive_members(archive, root):
             if item.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue

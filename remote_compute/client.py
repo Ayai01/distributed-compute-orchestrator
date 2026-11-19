@@ -109,6 +109,8 @@ class _UploadBody:
 def _short_dispatch_request(path, data, method):
     """Asset preparation shares the bounded short-job slot with its final POST."""
     verb = method or ('GET' if data is None else 'POST')
+    if verb == 'GET' and re.fullmatch(r'/assets/[0-9a-f]{64}/upload', path):
+        return True
     if re.fullmatch(r'/assets/[0-9a-f]{64}', path):
         return ((verb == 'GET' and data is None) or
                 (verb == 'POST' and isinstance(data, bytes) and len(data) <= SHORT_DISPATCH_BYTES))
@@ -410,12 +412,13 @@ class Client:
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         large_asset = asset_upload and len(data) >= 1024 * 1024
+        asset_chunk = method == 'POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}/upload', path))
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
         # Bulk streams tolerate relay stalls without resetting a paid prefix.
         # Control requests keep their short socket deadline.
         short_relay_job = (job_upload and len(data) <= SHORT_DISPATCH_BYTES
                            and _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint))
-        if asset_upload or job_upload:network_timeout=max(120,network_timeout)
+        if asset_upload or asset_chunk or job_upload:network_timeout=max(120,network_timeout)
         request_digest=None
         for attempt in range(attempts):
             _check_cancelled(cancel)
@@ -1187,6 +1190,75 @@ class Client:
         """Read immutable asset presence without preparing or uploading it."""
         options = {'extra_headers':{'X-DCO-Asset-Job':job_id}} if job_id else {}
         return self._read_reconnecting(lambda:self.request('/assets/'+identity, **options))['exists']
+
+    def upload_resumable(self, identity, archive, *, cancel=None, report=None):
+        """Resume from the receiver's committed prefix after a lost connection."""
+        from .asset_upload import ASSET_CHUNK_BYTES
+
+        if not re.fullmatch(r'[a-f0-9]{64}', identity):
+            raise ValueError('Asset id requires SHA256')
+        archive = Path(archive)
+        total = archive.stat().st_size
+        if not 0 < total <= MAX_BODY:
+            raise ValueError('Asset upload exceeds the archive size limit')
+        path = '/assets/' + identity + '/upload'
+        metrics = report if report is not None else {}
+        metrics.setdefault('confirmed_bytes', 0)
+        metrics.setdefault('attempted_bytes', 0)
+        metrics.setdefault('reconciliations', 0)
+        metrics.setdefault('resumed_from_bytes', 0)
+        metrics['protocol'] = 'resumable'
+        metrics['archive_bytes'] = total
+        current, failures = None, 0
+        with archive.open('rb') as stream:
+            while True:
+                _check_cancelled(cancel)
+                offset = current['offset'] if current is not None else None
+                try:
+                    if offset is None:
+                        receipt = self.request(path, cancel=cancel)
+                    elif offset == total:
+                        receipt = self.request(path, {'total': total}, cancel=cancel)
+                    else:
+                        stream.seek(offset)
+                        chunk = stream.read(min(ASSET_CHUNK_BYTES, total - offset))
+                        if not chunk:
+                            raise ValueError('Asset archive changed during upload')
+                        metrics['attempted_bytes'] += len(chunk)
+                        header = f'bytes {offset}-{offset + len(chunk) - 1}/{total}'
+                        receipt = self.request(path, chunk, extra_headers={'Content-Range': header}, cancel=cancel)
+                    confirmed = receipt.get('offset')
+                    if (receipt.get('id') != identity or type(confirmed) is not int or not 0 <= confirmed <= total
+                            or receipt.get('total') not in (None, total) or (confirmed and receipt.get('total') != total)
+                            or type(receipt.get('complete')) is not bool
+                            or (receipt['complete'] and confirmed != total)):
+                        raise ValueError('Invalid asset upload checkpoint from receiver')
+                    if offset is None and confirmed and not receipt['complete']:
+                        metrics['resumed_from_bytes'] = max(metrics['resumed_from_bytes'], confirmed)
+                    previous = metrics.get('confirmed_offset', confirmed)
+                    metrics['confirmed_bytes'] += max(0, confirmed - previous)
+                    metrics['confirmed_offset'] = confirmed
+                    if receipt['complete']:
+                        return receipt
+                    if offset is not None and confirmed == offset:
+                        stalled = RemoteError('Asset receiver has not advanced its checkpoint')
+                        stalled.transport_retryable = True
+                        raise stalled
+                    if confirmed > (offset if offset is not None else previous):
+                        failures = 0
+                    current = receipt
+                except RemoteError as error:
+                    if isinstance(error, RequestCancelled) or (not isinstance(error, PoolBusy)
+                            and not error.transport_retryable and error.status_code not in (408, 409, 502, 503, 504)):
+                        raise
+                    failures += 1
+                    metrics['reconciliations'] += 1
+                    if failures >= 6:
+                        pending = RemoteError(f'Asset upload {identity} awaits receiver checkpoint: {error}')
+                        pending.transport_retryable = True
+                        raise pending from error
+                    current = None
+                    time.sleep(min(2, .1 * 2**failures))
 
     def sync_files(self, files, *, content_id=None, job_id=None):
         """Reuse a caller's immutable content identity before preparing a ZIP.
