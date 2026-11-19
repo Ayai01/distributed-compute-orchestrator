@@ -177,18 +177,24 @@ def _loopback_route(node, center_host):
     return '本机' if worker_host.casefold()==center_host.casefold() else '本机中转'
 
 
-def _device_address(node, url='', *, center_host=None):
+def _device_address(node, url='', *, center_host=None, show_entry=False):
     address=node.get('url') or url
     if address.startswith('local://'):
+        if show_entry:
+            return node.get('host_ip') or '本机 127.0.0.1'
         return '本机'
     if node.get('host_ip'):
         return node['host_ip']
     if center_host is not None:
         route=_loopback_route(node,center_host)
-        if route is not None:return route
+        if route is not None:
+            if show_entry:
+                label='中转' if route=='本机中转' else route
+                return f"{label} {urlsplit(address).netloc.rsplit('@', 1)[-1]}"
+            return route
     host=urlsplit(address).hostname if address else None
     if host in ('127.0.0.1','localhost','::1'):
-        return '本机'
+        return f'本机 {host}' if show_entry else '本机'
     return node.get('host_ip') or (host if host and host not in ('0.0.0.0','::') else '等待连接')
 
 
@@ -411,9 +417,11 @@ class StatusRows(list):
             allocated=(node.get('reserved',0)+node.get('external_cpus',0) if 'reserved' in node else node.get('used_cpus',0))
             budget=node.get('base_capacity',node.get('base_cpus',node.get('capacity',0)))
             threads=f"{allocated}/{budget}({node.get('logical_cpus','?')})"
-            total=node.get('memory_total_mb') or 0
-            available=node.get('host_memory_available_mb') or 0
-            memory=f'{_gb(total-available)}/{_gb(total)}'
+            total=node.get('memory_total_mb')
+            available=node.get('host_memory_available_mb')
+            memory=f'{_gb(total-available)}/{_gb(total)}' if total and available is not None else '-'
+            cpu=node.get('cpu_percent')
+            cpu_percent=f'{cpu:.1f}%' if cpu is not None else '-'
             peers=list(dict.fromkeys(item['ip'] for item in node.get('peers') or []))
             external=[ip for ip in peers if ip not in ('local','127.0.0.1','::1')]
             loopback='本机'
@@ -429,11 +437,11 @@ class StatusRows(list):
                 score=(f'{single:.3g}/' if single is not None else '-/')+f'{measured:.3g}'
             else:
                 score='-/待依赖' if 'Install NumPy' in benchmark.get('reason','') else '-/待校准'
-            self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
+            self.devices.append((node,[name,threads,cpu_percent,memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
                                        benchmark.get('threads','-'),_device_address(node,'' if center else self.url,
-                                           center_host=(value.get('node') or '') if center else None),
+                                           center_host=(value.get('node') or '') if center else None, show_entry=self.viewport),
                                        number,_accelerator_summary(node),
                                        node.get('benchmark_state','ready'),_capabilities(node.get('tags'))]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
@@ -445,7 +453,6 @@ class StatusRows(list):
             self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
-        self.capability_width = max([4]+[_width(record[13]) for _,record in self.devices])
         self.available_capabilities = _capabilities(tag for node, _ in self.devices
             if _node_state(node) in ('运行','就绪') for tag in node.get('tags') or ())
         now=time.time()
@@ -547,57 +554,50 @@ class StatusRows(list):
         start=self.device_page*size
         return self.devices[start:start+size]
 
-    def _fleet(self, limit, columns):
-        """Give the overview one row per registered node."""
+    def _fleet(self, limit):
+        """Keep the same information in the table and the narrow viewport."""
         width = self.width
-        table = limit >= 5 and width >= 58
-        rows_per_column = max(1, limit - (4 if table else 2))
-        page = self._device_slice(rows_per_column * columns)
-        active_columns = min(columns, max(1, math.ceil(len(page) / rows_per_column)))
-        column_height = max(1, math.ceil(len(page) / active_columns))
-        inner_width = width + active_columns - 1
-        widths = [inner_width // active_columns + int(i < inner_width % active_columns)
-                  for i in range(active_columns)]
-        blocks = []
-        for index, pane_width in enumerate(widths):
-            entries = page[index * column_height:(index + 1) * column_height]
-            rows = []
-            for node, record in entries:
-                health = _node_state(node)
-                reachable = health not in ('禁用', '失联')
-                rows.append([f'#{record[10]} {record[0]}', health, record[1].split('(')[0],
-                             record[2] if reachable else '-',
-                             record[3] if reachable and node.get('memory_total_mb') else '-',
-                             record[13] if reachable else '-'])
-            if table and pane_width >= self.capability_width+61:
-                block = _table(['节点', '状态', '线程', 'CPU%', '内存 GiB', '能力'], rows,
-                               [None,4,7,6,11,self.capability_width],pane_width,right=(2,3,4))
-            elif table and pane_width >= self.capability_width+38:
-                block = _table(['节点', '状态', '线程', '能力'],
-                               [[r[0],r[1],r[2],r[5]] for r in rows],
-                               [None,4,7,self.capability_width],pane_width,right=(2,))
-            elif table:
-                block = _table(['节点', '状态', '线程', 'CPU%', '内存 GiB'], rows,
-                               [None, 4, 7, 6, 11], pane_width, right=(2, 3, 4))
-            else:
-                block = [_line(f'{state} {name} {threads}', pane_width)
-                         for name, state, threads, *_ in rows]
-            blocks.append(block + [_line('', pane_width)] *
-                          max(0, column_height + 2 * table - len(block)))
-        present = [_node_state(node) for node, _ in self.devices]
+        headers = ['节点','状态','线程','CPU%','内存用/总 GiB','IP/入口','能力']
+        records = []
+        for node, record in self.devices:
+            state = _node_state(node)
+            sampled = state not in ('禁用','失联')
+            records.append([f'#{record[10]} {record[0]}',state,record[1].split('(')[0],
+                            record[2] if sampled else '-',record[3] if sampled else '-',
+                            record[9],record[13] if sampled else '-'])
+        widths = [max(_width(header),*(_width(item) for item in column))
+                  for header,column in zip(headers,zip(*records))] if records else []
+        pages = []
+        if records and limit >= 5 and width >= sum(widths)+4+3*(len(headers)-1):
+            size = limit-4
+            for start in range(0,len(records),size):
+                pages.append(_table(headers,records[start:start+size],[*widths[:-1],None],width,right=(2,3,4)))
+        else:
+            size = max(1,limit-2)
+            for name,state,threads,cpu,memory,address,capabilities in records:
+                identity = f'{name}  {state}  线程 {threads}'
+                fields = [identity,f'CPU% {cpu}  内存用/总 GiB {memory}',f'IP/入口 {address}',f'能力 {capabilities}']
+                lines = [_line(line,width) for field in fields for line in wrap_lines(field,width-4)]
+                if len(lines) > size and size > 1:
+                    heading = _line(name,width)
+                    pages.extend([heading,*lines[start:start+size-1]] for start in range(0,len(lines),size-1))
+                elif len(lines) > size:
+                    pages.extend([line] for line in lines)
+                elif pages and len(pages[-1])+len(lines) <= size:
+                    pages[-1].extend(lines)
+                else:
+                    pages.append(lines)
+        self.device_page_count = max(1,len(pages))
+        self.device_page %= self.device_page_count
+        present = [record[1] for record in records]
         title = f'设备资源 {len(present)} 台 {self.device_page+1}/{self.device_page_count}页'
         if width >= 54:
             title += f" | 失联 {present.count('失联')} | 暂停 {present.count('暂停')} | 禁用 {present.count('禁用')}"
-        lines = [parts[0][:-1] + ''.join(part[:-1] for part in parts[1:]) + parts[-1][-1]
-                 for parts in zip(*blocks)] if active_columns > 1 else blocks[0]
-        if not page:
-            lines = [_line('没有节点', width)]
+        lines = pages[self.device_page] if pages else [_line('没有节点',width)]
         return [_rule(title, width), *lines, _rule('', width)][:limit]
 
     def _overview(self, limit):
         width = self.width
-        minimum_pane = max(58, self.capability_width+38)
-        columns = min(3,max(1,(width-1)//(minimum_pane-1)),max(1,math.ceil(len(self.devices)/6)))
         metadata = ([_line(line,width) for line in wrap_lines('可调度能力  '+self.available_capabilities,width-4)]
                     if limit >= 10 else [])
         if self.projects and limit >= 15:
@@ -607,11 +607,8 @@ class StatusRows(list):
         remaining = limit - len(metadata)
         # At ordinary window sizes, spend only as many rows as the fleet needs.
         # In a short terminal both panes keep at least one data row.
-        fleet_height = min(4 + math.ceil(len(self.devices) / columns),
-                           max(1, remaining - min(7, max(4, remaining//2))))
-        if fleet_height < 5 or width < 58:
-            fleet_height = min(fleet_height, max(0, remaining - 4))
-        devices = self._fleet(fleet_height, columns) if fleet_height else []
+        fleet_height = max(0,remaining-min(7,max(4,remaining//2)))
+        devices = self._fleet(fleet_height) if fleet_height else []
         task_height = max(0, remaining - len(devices))
         tasks = self._tasks(width, max(1, task_height - 4))[:task_height]
         return [*devices, *metadata, *tasks]
