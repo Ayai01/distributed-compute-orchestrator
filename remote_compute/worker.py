@@ -29,6 +29,7 @@ from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_byt
 from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS,
                        python_backend, python_accelerator, supports_python, uses_python, execution_tool,
                        validate_native_cache, native_architecture)
+from .runtime_profiles import check_onnx_int8, pe64_available
 from . import __version__
 from .process import Process, low_integrity_directory
 from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, service_usage,
@@ -548,6 +549,13 @@ class Worker:
             if executable:argv[0]=str(Path(executable).absolute())
             resolved[name]=argv
             info[name]=dict(argv=argv,available=executable is not None)
+            if name == 'pe64':
+                info[name]['available'] = bool(executable and pe64_available())
+            if name == 'onnx-int8' and executable:
+                contract = check_onnx_int8(argv, {**os.environ, **self.env})
+                info[name]['available'] = contract is not None
+                if contract is not None:
+                    info[name].update(version=contract['runtime'], protocol='cpu-conv-integer')
             if name=='verilator' and argv[1:]==[str(Path(__file__).with_name('rtl.py'))]:
                 if os.name == 'nt':
                     msys=self.env.get('MSYS2_ROOT',os.environ.get('MSYS2_ROOT'))
@@ -688,6 +696,8 @@ class Worker:
     def _tool_argv(self, name, task=None):
         """Resolve one semantic capability for commands and path variables."""
         canonical = execution_tool(name)
+        if canonical == 'onnx' and task is not None and 'onnx-int8' in task.get('requires', ()):
+            name = canonical = 'onnx-int8'
         if canonical=='python' and task is not None:
             backend=python_backend(task)
             if backend not in self.python_runtimes:raise ValueError('Python backend is not configured: '+backend)
@@ -961,15 +971,18 @@ class Worker:
                     if isinstance(value,dict):return {key:freeze(item)for key,item in value.items()}
                     return value
                 execution=freeze(task['execution'])if 'execution'in task else None
+                tools = self.tool_info
+                if 'onnx-int8' in task['requires']:
+                    tools = {**tools, 'onnx': tools['onnx-int8']}
                 result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"], 'max_cpus':task['max_cpus'],
                           "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
                           'initial_cpus':task['cpus'],'peak_cpus':task['cpus'],'resize_count':0,
                           "submitted": time.time(), "started": None, "finished": None,
                           "request_sha256": digest, "node": socket.gethostname(), "steps": [],
                           "total_steps": len(task["steps"]),
-                          "stdout": "", "stderr": "", "tools": ({**self.tool_info,
+                          "stdout": "", "stderr": "", "tools": ({**tools,
                               'python':dict(argv=self._tool_argv('python',task),available=True)}
-                              if uses_python(task) else self.tool_info),
+                              if uses_python(task) else tools),
                           "assets": task["assets"], "cwd": cwd.as_posix(),
                           "accelerator": task.get('accelerator'), "bundle_unpack_seconds": unpack_seconds}
                 job = Job({"result": result, "cancel": threading.Event(), "task": task,
