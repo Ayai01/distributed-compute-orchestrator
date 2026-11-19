@@ -50,7 +50,7 @@ class ForwardedLeaseTests(unittest.TestCase):
                          patch('remote_compute.leases.time.monotonic',return_value=10)as clock:
                         lease=client.cpu_lease('a'*32,max_cpus=8,**phase);lease.refresh(ready_cpus=8)
                         clock.return_value=11
-                        self.assertEqual(lease.refresh(active_cpus=active,ready_cpus=8-active),max(1,active))
+                        self.assertEqual(lease.refresh(active_cpus=active,ready_cpus=8-active),active)
 
     def test_real_polling_map_keeps_completed_items_through_forwarded_eof(self):
         source='''import time

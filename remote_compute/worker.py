@@ -790,7 +790,11 @@ class Worker:
             if active_cpus is not None and (active_cpus>old or requested_cpus and active_cpus>cpus):
                 raise ValueError('active_cpus must count threads within the existing grant and requested width')
             cpus=max(cpus,floor)
-            granted=max(floor,min(cpus,max(0,capacity-self.used+old)))
+            # Shrinking the borrowed ceiling blocks new grants. An exact one-CPU
+            # phase can reuse its incumbent slot while the other grants drain.
+            incumbent = int(min_cpus == requested_cpus == 1 and old >= 1)
+            cpu_room = max(incumbent, capacity-self.used+old)
+            granted=max(floor,min(cpus,cpu_room))
             if self.pressure_guard.state['limited']:granted=min(granted,floor)
             if min_cpus is not None and granted<min_cpus:granted=floor
             cpu_ready_limit=granted

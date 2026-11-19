@@ -39,10 +39,56 @@ def single():
     result=run_call(kernel,limits={'exact_cpus':1,'memory_mb':512,'start_timeout':5})
     result.update(prepared=prepared,linked=linked)
     return result
+def overcommitted_single():
+    Path('preparing').touch()
+    while not Path('resume').exists():time.sleep(.02)
+    return run_call(kernel,limits={'exact_cpus':1,'memory_mb':512,'start_timeout':2})
 '''
 
 
 class ExactKernelTests(unittest.TestCase):
+    def test_single_kernel_keeps_its_existing_grant_when_temporary_ceiling_shrinks(self):
+        hold = ('import time\nfrom pathlib import Path\nPath("preparing").touch()\n'
+                'while not Path("resume").exists():time.sleep(.02)')
+        with scratch() as folder, provider(Path(folder)/'worker', cpus=2, cpu_overcommit_factor=1.5,
+                                           memory_mb=8192, memory_headroom_mb=0) as (worker, remote):
+            host = dict(worker.host.sample(), cpu_percent=20)
+            with patch.object(worker.host, 'sample', side_effect=lambda:dict(host)), \
+                    Pool([remote], refresh=.05) as pool, \
+                    center(pool, Path(folder)/'center') as (_, client):
+                peers = [client.submit(python(hold, memory_mb=128, timeout=20))['id'] for _ in range(2)]
+                def started(identity):
+                    return (worker.root/'jobs'/identity/'input'/'preparing').exists()
+                until(lambda:all(started(i) for i in peers), seconds=8)
+                original = client.submit(python_task('business:overcommitted_single', max_cpus=1, memory_mb=1536,
+                                                     timeout=20, retries=0), files={'business.py':SOURCE})['id']
+                until(lambda:started(original), seconds=8)
+                self.assertEqual(worker.used, 3)
+                host['cpu_percent'] = 95
+                pool.refresh()
+                self.assertEqual(worker._cpu_capacity(), 2)
+                try:
+                    changes = []
+                    resize = worker.resize
+                    def observe(identity, cpus, **options):
+                        grant = resize(identity, cpus, **options)
+                        changes.append((identity, cpus, options.get('active_cpus'), options.get('min_cpus'), grant['cpus']))
+                        return grant
+                    with patch.object(worker, 'resize', side_effect=observe):
+                        client.write_job_file(original, 'resume', 'yes')
+                        client.wait(original, wait_timeout=8)
+                        result = client.fetch(original, delete=False)
+                    self.assertEqual(result['status'], 'succeeded', result.get('stderr'))
+                    self.assertEqual(result['id'], original)
+                    value = json.loads(result['files']['.dco-results.json'])['items'][0]['value']
+                    self.assertEqual(value, dict(cpus=1, calls=1))
+                    self.assertTrue(all(client.status(i)['status']=='running' for i in peers))
+                    self.assertEqual([row[1:] for row in changes if row[0]==original], [(1,0,1,1), (1,1,1,1)])
+                finally:
+                    for i in peers:
+                        client.write_job_file(i, 'resume', 'yes')
+                        client.wait(i, wait_timeout=8)
+
     def test_single_slot_survives_map_link_and_fixed_commit_with_a_peer_queued(self):
         with scratch() as folder, provider(Path(folder)/'worker',cpus=1,memory_mb=4096,memory_headroom_mb=0) as (worker,remote):
             with Pool([remote]) as pool, center(pool,Path(folder)/'center') as (_,client):
