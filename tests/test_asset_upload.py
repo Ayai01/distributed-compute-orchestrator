@@ -13,8 +13,8 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
-from remote_compute import Client, Pool
-from remote_compute.asset_upload import ASSET_CHUNK_BYTES, ASSET_RESUME_CAPABILITY, AssetUploads
+from remote_compute import Client, Pool, RemoteError
+from remote_compute.asset_upload import ASSET_CHUNK_BYTES, ASSET_RESUME_CAPABILITY, ASSET_RESUME_MIN_BYTES, AssetUploads
 from remote_compute.bundle import pack
 from remote_compute.shared_assets import SharedAssets
 from test_center import center
@@ -190,3 +190,79 @@ class AssetUploadTests(unittest.TestCase):
                 self.assertEqual(len(commits), 1)
                 self.assertEqual(json.loads(commits[0].args[1]), {'total': self.total})
                 self._check_published(root / 'shared')
+
+    def test_center_switches_receivers_without_replaying_the_job_or_confirmed_prefix(self):
+        contents = Random(1028).randbytes(ASSET_RESUME_MIN_BYTES + 137)
+        payload = pack({'model.bin': contents})
+        identity = sha256(payload).hexdigest()
+        endpoint = f'/assets/{identity}/upload'
+        with TemporaryDirectory(prefix='dco-asset-failover-') as temporary:
+            root = Path(temporary)
+            options = {'env': {'DCO_SHARED_ASSET_CACHE': str(root / 'shared')}}
+            with provider(root / 'compute', **options) as (compute, compute_client), \
+                    provider(root / 'primary', **options) as (_, primary), \
+                    provider(root / 'backup', **options) as (_, backup):
+                original_health = compute.health
+                primary_request, backup_request = primary.request, backup.request
+                primary_ranges, backup_ranges, backup_queries = [], [], []
+
+                def legacy_health(**options):
+                    health = original_health(**options)
+                    return dict(health, capabilities=[capability for capability in health['capabilities']
+                                                      if capability != ASSET_RESUME_CAPABILITY])
+
+                def disconnect_primary(path, data=None, **options):
+                    if path != endpoint:
+                        return primary_request(path, data, **options)
+                    if len(primary_ranges) == 2:
+                        self.fail('Primary receiver was retried before its available peer')
+                    receipt = primary_request(path, data, **options)
+                    if content_range := (options.get('extra_headers') or {}).get('Content-Range'):
+                        primary_ranges.append(content_range)
+                        if len(primary_ranges) == 2:
+                            error = RemoteError('Primary receiver disconnected after persisting the chunk')
+                            error.transport_retryable = True
+                            raise error
+                    return receipt
+
+                def observe_backup(path, data=None, **options):
+                    receipt = backup_request(path, data, **options)
+                    if path == endpoint and data is None:
+                        backup_queries.append(receipt['offset'])
+                        if len(backup_queries) == 1:
+                            return dict(receipt, offset=0, total=None)  # Simulate delayed shared-volume visibility.
+                    if path == endpoint and (content_range := (options.get('extra_headers') or {}).get('Content-Range')):
+                        backup_ranges.append(content_range)
+                    return receipt
+
+                workers = [{'name': name, 'client': connection} for name, connection in
+                           [('compute', compute_client), ('primary', primary), ('backup', backup)]]
+                with patch.object(compute, 'health', side_effect=legacy_health), \
+                        patch.object(primary, 'request', side_effect=disconnect_primary), \
+                        patch.object(backup, 'request', side_effect=observe_backup), \
+                        patch.object(compute_client, 'submit_bundle', wraps=compute_client.submit_bundle) as dispatch, \
+                        Pool(workers) as pool, center(pool, root / 'center') as (_, operator):
+                    operator.request('/assets/' + identity, payload)
+                    task = python(
+                        'import hashlib, pathlib, sys; '
+                        'print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())',
+                        node='compute', assets={'model': identity})
+                    task['steps'][0].append('${asset:model}/model.bin')
+                    original = '2' * 32
+                    self.assertEqual(operator.submit(task, job_id=original)['id'], original)
+                    operator.wait(original, wait_timeout=20)
+                    result = operator.fetch(original, delete=False)
+
+                self.assertEqual(backup_queries, [2 * ASSET_CHUNK_BYTES] * 2)
+                self.assertEqual(backup_ranges[0].split('-', 1)[0], f'bytes {backup_queries[0]}')
+                dispatch.assert_called_once()
+                self.assertEqual(dispatch.call_args.args[0], original)
+                self.assertEqual((result['id'], result['status'], result['assigned_node']),
+                                 (original, 'succeeded', 'compute'))
+                self.assertEqual(result['stdout'].strip(), sha256(contents).hexdigest())
+                self.assertGreaterEqual(result['cpu_seconds'], 0)
+                metrics = result['asset_transport']['uploads'][identity]
+                self.assertEqual(metrics['receiver_failovers'], 1)
+                self.assertEqual(metrics['attempted_bytes'], len(payload))
+                self.assertEqual(metrics['confirmed_bytes'], len(payload))
+                self.assertEqual(metrics['resumed_from_bytes'], 2 * ASSET_CHUNK_BYTES)

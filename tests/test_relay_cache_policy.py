@@ -39,8 +39,9 @@ class CachePolicyTests(unittest.TestCase):
                 path.write_bytes(b'x' * size)
                 os.utime(path, (now - age, now - age))
             caches = [AssetCache(store, 11, archives=True) for store in stores]
-            owners = (SimpleNamespace(asset_cache=caches[0], _protected_assets=lambda: {keys[1]}),
-                      SimpleNamespace(asset_cache=caches[1], _protected_assets=set))
+            owners = (SimpleNamespace(asset_cache=caches[0], _protected_assets=lambda: {keys[1]},
+                                      condition=threading.Condition()),
+                      SimpleNamespace(asset_cache=caches[1], _protected_assets=set, condition=threading.Condition()))
             try:
                 self.assertEqual(prune_asset_caches(owners), [])
                 self.assertEqual(set(caches[0].entries), {keys[1]})

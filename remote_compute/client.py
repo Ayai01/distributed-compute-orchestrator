@@ -407,18 +407,23 @@ class Client:
             partial.seek(0,os.SEEK_END);etag=headers['If-Range']
         else:
             partial.seek(0);partial.truncate()
-        attempts = 1 if _asset_probe else 4 if binary and method == 'GET' else 2
+        asset_checkpoint = bool(re.fullmatch(r'/assets/[0-9a-f]{64}/upload', path))
+        attempts = 1 if _asset_probe or asset_checkpoint else 4 if binary and method == 'GET' else 2
         retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status') or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         large_asset = asset_upload and len(data) >= 1024 * 1024
-        asset_chunk = method == 'POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}/upload', path))
+        asset_chunk = method == 'POST' and stream_body and asset_checkpoint
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
         # Bulk streams tolerate relay stalls without resetting a paid prefix.
         # Control requests keep their short socket deadline.
         short_relay_job = (job_upload and len(data) <= SHORT_DISPATCH_BYTES
                            and _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint))
-        if asset_upload or asset_chunk or job_upload:network_timeout=max(120,network_timeout)
+        if asset_upload or job_upload:network_timeout=max(120,network_timeout)
+        if asset_chunk:
+            # A bounded socket idle timeout lets the next receiver take over.
+            # Streaming continues while the socket makes progress.
+            network_timeout = max(30, network_timeout)
         request_digest=None
         for attempt in range(attempts):
             _check_cancelled(cancel)
@@ -1191,7 +1196,7 @@ class Client:
         options = {'extra_headers':{'X-DCO-Asset-Job':job_id}} if job_id else {}
         return self._read_reconnecting(lambda:self.request('/assets/'+identity, **options))['exists']
 
-    def upload_resumable(self, identity, archive, *, cancel=None, report=None):
+    def upload_resumable(self, identity, archive, *, cancel=None, report=None, fail_fast=False):
         """Resume from the receiver's committed prefix after a lost connection."""
         from .asset_upload import ASSET_CHUNK_BYTES
 
@@ -1233,9 +1238,13 @@ class Client:
                             or type(receipt.get('complete')) is not bool
                             or (receipt['complete'] and confirmed != total)):
                         raise ValueError('Invalid asset upload checkpoint from receiver')
+                    previous = metrics.get('confirmed_offset', confirmed)
+                    if confirmed < previous:
+                        stale = RemoteError('Shared asset checkpoint is still becoming visible')
+                        stale.transport_retryable = True
+                        raise stale
                     if offset is None and confirmed and not receipt['complete']:
                         metrics['resumed_from_bytes'] = max(metrics['resumed_from_bytes'], confirmed)
-                    previous = metrics.get('confirmed_offset', confirmed)
                     metrics['confirmed_bytes'] += max(0, confirmed - previous)
                     metrics['confirmed_offset'] = confirmed
                     if receipt['complete']:
@@ -1249,11 +1258,11 @@ class Client:
                     current = receipt
                 except RemoteError as error:
                     if isinstance(error, RequestCancelled) or (not isinstance(error, PoolBusy)
-                            and not error.transport_retryable and error.status_code not in (408, 409, 502, 503, 504)):
+                            and not error.transport_retryable and error.status_code not in (404, 408, 409, 502, 503, 504)):
                         raise
                     failures += 1
                     metrics['reconciliations'] += 1
-                    if failures >= 6:
+                    if fail_fast or failures >= 6:
                         pending = RemoteError(f'Asset upload {identity} awaits receiver checkpoint: {error}')
                         pending.transport_retryable = True
                         raise pending from error

@@ -1778,15 +1778,28 @@ class Coordinator:
                 except RemoteError:
                     pass  # Worker expiry also releases an unreachable sender's hold.
 
-    def _resumable_asset_receiver(self, node, shared_cache):
+    def _resumable_asset_receivers(self, node, shared_cache):
         if not shared_cache:
-            return None
-        for receiver in (node, *self.pool.nodes):
+            return []
+        receivers = []
+        for receiver in (node, *(peer for peer in self.pool.nodes if peer is not node)):
             health = receiver.health
             if (receiver.enabled and not receiver.error and health.get('shared_asset_cache') == shared_cache
                     and ASSET_RESUME_CAPABILITY in health.get('capabilities', ())):
+                receivers.append(receiver)
+        return receivers
+
+    def _upload_shared_asset(self, receivers, asset, archive, *, cancel, report):
+        for index, receiver in enumerate(receivers):
+            has_peer = index + 1 < len(receivers)
+            try:
+                receiver.client.upload_resumable(asset, archive, cancel=cancel, report=report, fail_fast=has_peer)
+            except RemoteError as error:
+                if not has_peer or not error.transport_retryable:
+                    raise
+                report['receiver_failovers'] = report.get('receiver_failovers', 0) + 1
+            else:
                 return receiver
-        return None
 
     def _ensure_assets(self, node, assets, *, force=False, cancel=None, report=None):
         # Cache changes invalidate presence, but keep same-hash uploads serialized.
@@ -1873,9 +1886,10 @@ class Coordinator:
                 if not exists:
                     archive_bytes = archive.stat().st_size
                     metrics = report.setdefault(asset, {}) if report is not None else {}
-                    receiver = self._resumable_asset_receiver(node, shared_cache) if archive_bytes >= ASSET_RESUME_MIN_BYTES else None
-                    if receiver is not None:
-                        receiver.client.upload_resumable(asset, archive, cancel=abandoned, report=metrics)
+                    receivers = self._resumable_asset_receivers(node, shared_cache) if archive_bytes >= ASSET_RESUME_MIN_BYTES else []
+                    receiver = None
+                    if receivers:
+                        receiver = self._upload_shared_asset(receivers, asset, archive, cancel=abandoned, report=metrics)
                     elif metrics.get('protocol') == 'resumable':
                         raise RemoteError('Waiting for the shared asset upload receiver to reconnect')
                     else:
