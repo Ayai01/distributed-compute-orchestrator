@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError, command
 from remote_compute.bundle import task_bundle
-from remote_compute.packages import PACKAGES, project_package
+from remote_compute.packages import PACKAGES, project_package, provider_environment
 from test_center import center
 from test_compute import provider, scratch
 
@@ -36,6 +36,18 @@ def packaged_worker(root, *names, cpus=1, **options):
 
 
 class CapabilityPackageTests(unittest.TestCase):
+    def test_rtl_package_supplies_the_bound_firtool(self):
+        task = dict(env={}, requires=['ml'], _capability_package='rtl')
+        for platform, executable, expected in (
+            ('linux', '/opt/eda/firtool/firtool', '/opt/eda/firtool'),
+            ('win32', 'D:/EDA Tools/CIRCT/firtool.exe', r'D:\EDA Tools\CIRCT'),
+        ):
+            health = dict(platform=platform, tools={'firtool': {'available': True, 'argv': [executable]}})
+            with self.subTest(platform=platform):
+                self.assertEqual(provider_environment(task, health)['CHISEL_FIRTOOL_PATH'], expected)
+                self.assertEqual(provider_environment(dict(task, env={'CHISEL_FIRTOOL_PATH': 'explicit'}),
+                                                      health)['CHISEL_FIRTOOL_PATH'], 'explicit')
+
     def test_release_aliases_produce_one_package(self):
         groups = {
             'python': [[], ['python'], ['ml']],

@@ -1,5 +1,6 @@
 """Fixed project execution packages. Worker probes and placement stay private."""
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 
 from .policy import (MAX_REQUIREMENTS, MAX_REQUIREMENT_LENGTH, canonical_capabilities,
                      normalize_accelerator_requirement)
@@ -141,6 +142,21 @@ def provider_has_package(health, name):
                                      if probe.get('available')))
     return (package.tools <= tools and package.shared.issubset(health.get('shared', ()))
             and 'ml' in health.get('python_backends', ()))
+
+
+def provider_environment(task, health):
+    """Supply the registered FIRRTL compiler to Chisel on the chosen worker."""
+    env = task['env']
+    if 'CHISEL_FIRTOOL_PATH' in env:
+        return env
+    if task.get('_capability_package') not in ('rtl', 'cuda') and 'chisel' not in task['requires']:
+        return env
+    firtool = health.get('tools', {}).get('firtool', {})
+    argv = firtool.get('argv')
+    if not firtool.get('available') or not argv:
+        return env
+    path_type = PureWindowsPath if health.get('platform') == 'win32' else PurePosixPath
+    return dict(env, CHISEL_FIRTOOL_PATH=str(path_type(argv[0]).parent))
 
 
 def package_names(health):

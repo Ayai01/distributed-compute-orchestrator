@@ -45,7 +45,7 @@ from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_p
 from . import __version__
 from .policy import validate_operator_fields
 from .packages import (DEFAULT_PACKAGE, PACKAGES, RETAINED_NAMES, package_names, package_task,
-                       project_package, provider_has_package)
+                       project_package, provider_environment, provider_has_package)
 
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
@@ -1428,6 +1428,7 @@ class Coordinator:
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                         files = {name: archive.read(name) for name in archive.namelist()}
                     worker_task = dict(task)
+                    worker_task['env'] = provider_environment(task, node.health)
                     # Placement hints belong to the dispatcher, not the executable.
                     worker_task.pop('node',None)
                     worker_task.pop('cache_ref',None)
