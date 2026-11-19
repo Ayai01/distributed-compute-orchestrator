@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError, command
 from remote_compute.bundle import task_bundle
-from remote_compute.packages import PACKAGES, project_package, provider_environment
+from remote_compute.packages import PACKAGES, package_task, project_package, provider_environment
 from test_center import center
 from test_compute import provider, scratch
 
@@ -55,14 +55,14 @@ class CapabilityPackageTests(unittest.TestCase):
             'hsp': [['hspice'], ['hsp']],
             'onnx': [['onnx'], ['onnx-int8'], ['onnx', 'onnx-int8']],
             'rtl': [['rtl'], ['chisel'], ['rtl', 'shared:arh', 'single-core-phase-handoff'],
-                    ['rtl', 'onnx', 'onnx-int8']],
+                    ['rtl', 'onnx', 'onnx-int8'], ['rtl', 'shared:arh', 'ccache']],
             'timing': [['timing'], ['yosys', 'opensta'], ['make', 'g++', 'opensta', 'iverilog']],
         }
         for package, expressions in groups.items():
             for requires in expressions:
                 with self.subTest(requires=requires):
                     self.assertEqual(project_package(requires), (package, None))
-        for requires in (['rtl', 'layout'], ['cpu'], ['cpu', 'rtl'], ['single-core-phase-handoff'],
+        for requires in (['rtl', 'layout'], ['cpu'], ['cpu', 'rtl'], ['single-core-phase-handoff'], ['ccache'],
                          ['rtl', 'pe64'], ['elf-aapcs64'], ['custom'], ['rtl', 'shared:private']):
             with self.subTest(requires=requires), self.assertRaises(ValueError):
                 project_package(requires)
@@ -72,6 +72,13 @@ class CapabilityPackageTests(unittest.TestCase):
         self.assertEqual(project_package(['rtl', 'ml', 'cuda'], {'kind': 'cuda'})[0], 'cuda')
         with self.assertRaisesRegex(ValueError, 'resource quantities'):
             project_package(['cuda'], {'kind': 'cuda', 'requires': ['gpu:training']})
+
+    def test_int8_binding_follows_the_task_inside_the_fixed_package(self):
+        task = command(['${tool:python}', '-c', 'pass'], requires=['rtl', 'onnx'],
+                       env={'INFERENCE': '${tool:onnx-int8}'})
+        applied = package_task(task, 'rtl', None)
+        self.assertEqual(applied['_capability_package'], 'rtl')
+        self.assertIn('onnx-int8', applied['requires'])
 
     def test_real_http_quote_dispatch_and_original_recovery(self):
         with scratch() as folder:

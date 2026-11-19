@@ -54,7 +54,8 @@ RETAINED_NAMES = {'cpu': 'python', 'spice': 'ng47', 'hspice': 'hsp'}
 # entire package, so adding or removing aliases cannot refine placement.
 _PYTHON_ALIASES = PYTHON_TOOLS | PYTHON_TAGS
 _ONNX_ALIASES = ONNX_TOOLS - PYTHON_TOOLS
-_RTL_ALIASES = frozenset({'rtl', 'chisel', 'shared:arh', SINGLE_CORE_PHASE_HANDOFF})
+_RTL_BUILD_HINTS = frozenset({SINGLE_CORE_PHASE_HANDOFF, 'ccache'})
+_RTL_ALIASES = frozenset({'rtl', 'chisel', 'shared:arh'}) | _RTL_BUILD_HINTS
 _LEGACY = {
     'ng47': frozenset({'spice', 'ng47', 'ngspice'}),
     'hsp': frozenset({'hsp'}),
@@ -73,7 +74,7 @@ def project_package(requires, accelerator=None):
             or any(not isinstance(name, str) or not 0 < len(name) <= MAX_REQUIREMENT_LENGTH for name in requires)):
         raise ValueError('requires must name one DCO capability package')
     names = frozenset(canonical_capabilities(requires))
-    if SINGLE_CORE_PHASE_HANDOFF in names and not names & {'rtl', 'chisel', 'shared:arh'}:
+    if names & _RTL_BUILD_HINTS and not names & (_RTL_ALIASES - _RTL_BUILD_HINTS):
         raise ValueError('Choose one DCO capability package: ' + ', '.join(PACKAGES))
     if accelerator is not None and (
             not isinstance(accelerator, dict) or accelerator.get('requires')
@@ -128,7 +129,7 @@ def package_task(task, name, accelerator):
     if not tools <= package.tools or not shared <= package.shared:
         raise ValueError('Tool or shared binding is outside the ' + name + ' capability package')
     bindings = ['ml']
-    if 'onnx-int8' in task.get('requires', ()):
+    if 'onnx-int8' in tools or 'onnx-int8' in task.get('requires', ()):
         bindings.append('onnx-int8')
     return dict(task, requires=bindings, accelerator=accelerator, _capability_package=name)
 
