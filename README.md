@@ -4,9 +4,11 @@ Distributed Compute Orchestrator：一个调度中心，统一 SDK、终端和�
 
 ## 当前入口
 
-本仓库当前分支为 `v1`。终端标题分别显示面板版本和当前连接的中心或节点版本，健康接口报告实际运行的服务版本。面板源码对应同版本的 `console-v*` Git 标签。各设备的部署情况见 [STATUS](docs/STATUS.md)，变更见 [HISTORY](docs/HISTORY.md)。
+本仓库当前分支为 `v1`。终端和中心统一使用 DCO 版本，发布源码由 `v<版本>` Git 标签标识。终端标题和健康接口显示实际运行版本。[当前部署](docs/STATUS.md) · [版本更新日志](docs/HISTORY.md)
 
 Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读取 `.local/worker.json`，中心同时读取 `.local/nodes.json`。独立worker可显式运行 `start.cmd --mode worker --config .local\worker.json`。服务保留原生终端，关闭Codex会话不结束计算；终端是人工停止入口。远程资源控制使用 [nurikoi控制页](https://nurikoi.com/manage/live/)。
+
+终端总览显示各台能力与当前可调度能力。F6/F7 翻节点，F8 切换总览与完整单节点详情，PgUp/PgDn 翻任务，Ctrl+PgUp/PgDn 翻命令输出。
 
 ## 安装位置
 
@@ -31,4 +33,20 @@ Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读�
 
 CPU总线程硬限额＝基础预算×超发倍率向下取整，硬限额和倍率双向联动。看板有人观看时每15秒发布，无人观看时每60秒发布；页面隐藏后停止轮询。
 
+任务Tag显示工程、任务类型、规模和实际进度，例如 `YOLOv8n 曲线 n2 7.15Mcy`。L1/L2/L3标明评价层级，n为调用工程声明的条件数，Mcy为百万周期；完整标签另带输入/源根/剂量数量和四位方案。源覆盖标为src，与实际完成量分开。窄终端优先保留这些字段；原任务ID和冻结label不因显示调整而改变。
+
+任务可设置 `resource_recovery=False`，关闭内存压力引起的资源重入及其泛重试；默认 `True`，普通 worker 丢失恢复保持原合同。Aya1-PC 的 ONNX 工具指向 DCO 本地运行时，保留原 Python、ONNX 和 ONNX Runtime 版本。
+
 现有 `Client.execute`、`python_map/python_call/python_task`、`map_items/iter_items/run_call`、内容资产及进度接口作为迁移合同。接口与资源语义见 [DESIGN](docs/DESIGN.md)；协作与验证见 [AGENTS](AGENTS.md)。
+
+## 昇腾容器
+
+学校常驻 ARM64 CPU 节点显示为 xjtu-A 至 O。节点身份证明、原 ID 和费用按稳定路由名保留。学校开通、实例映射和已知阻碍见[本机学校接入目录](../../st-platform/README.md)。
+
+学校平台先分配 CPU/RAM/NPU，再在该容器内启动 worker。Linux 标准 `setup` 已在学校 ARM 隔离 venv 验证科学依赖及 ONNX 推理。Linux 的 CPU/RAM 读取按 cgroup 有效限额裁定；容器模板为 `examples/worker-ascend.json`，关闭 CPU 超发并使用适合小容器的内存保留线。
+
+复用已有 PyTorch 昇腾镜像，在私有 worker 配置上执行 `python main.py --config <配置.json> setup --ascend`。命令加载镜像内 CANN 环境、验证实际设备和反向传播，并登记 `python_runtimes.npu`、设备 ID、容量和语义标签，不安装软件。可用 `--cann-env` 指定镜像的 set_env.sh。
+
+普通任务使用既有 SDK：`accelerator={"kind":"npu","count":1,"requires":["npu:pytorch"]}`；任务代码使用 PyTorch 的 `npu:0`。DCO 按授予的 runtime ID 设置 `ASCEND_RT_VISIBLE_DEVICES`，保留外层容器的设备挂载设置。CPU 任务的 Ascend runtime 设备列表为空。
+
+独立资格入口为 `python -m examples.ascend_qualification --config <配置.json> --smoke <ascend_smoke.py> --output <结果.json>`；只启动回环 worker，完成 CPU/NPU 任务、原 ID 与费用回执、结果回传后退出。平台资料和基础实测位于 `D:/Projects/st-platform`；长期节点沿现有私网中转接入，不改本地 VPN、TUN、DNS。

@@ -83,11 +83,12 @@ def stcp_visitor(name, server_user, server_name, secret_key, bind_port):
 
 
 def frpc_config(device_id, token_file, *, server='nurikoi.com', server_port=443,
-                proxies=(), visitors=(), ca_file):
+                proxies=(), visitors=(), ca_file, tcp_mux=True):
     """One outbounds-only WSS client, with optional services and private visitors."""
+    if type(tcp_mux) is not bool:raise ValueError('tcp_mux must be a boolean')
     config=dict(user=_name(device_id), clientID=device_id, serverAddr=server,
                 serverPort=_port(server_port), loginFailExit=False, auth=_auth(token_file),
-                transport=dict(protocol='wss', tcpMux=True, tcpMuxKeepaliveInterval=30,
+                transport=dict(protocol='wss', tcpMux=tcp_mux, tcpMuxKeepaliveInterval=30,
                                tls=dict(enable=True, disableCustomTLSFirstByte=True, serverName=server)),
                 log=dict(to='console', level='warn', disablePrintColor=True),
                 proxies=list(proxies), visitors=list(visitors))
@@ -95,10 +96,11 @@ def frpc_config(device_id, token_file, *, server='nurikoi.com', server_port=443,
     return config
 
 
-def frps_config(token_file, *, bind_port=27000):
+def frps_config(token_file, *, bind_port=27000, tcp_mux=True):
     """Only Nginx reaches this listener. STCP allocates no public service ports."""
+    if type(tcp_mux) is not bool:raise ValueError('tcp_mux must be a boolean')
     return dict(bindAddr='127.0.0.1', bindPort=_port(bind_port), proxyBindAddr='127.0.0.1',
-                auth=_auth(token_file), transport=dict(tcpMux=True),
+                auth=_auth(token_file), transport=dict(tcpMux=tcp_mux),
                 log=dict(to='console', level='warn', disablePrintColor=True))
 
 

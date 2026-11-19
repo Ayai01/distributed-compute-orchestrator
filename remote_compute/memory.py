@@ -204,7 +204,7 @@ class MemoryObservation:
 def reservation(job):
     """Return physical and commit targets without rewriting the request."""
     task = job['task']
-    phase=job.get('memory_phase_model')
+    phase=job.get('memory_phase_model',task.get('memory_model'))
     # A sampled interpreter can be much smaller than the compilation work it
     # is about to start. Keep the explicit phase's funded width available.
     phase_floor=((phase.get('memory_mb') or 0)+(phase.get('base_memory_mb') or 0)

@@ -11,7 +11,8 @@ class BusinessItemFailure(ValueError):
 
 
 def reentrant_computation(task):
-    return (not task.get('cwd')and task.get('execution',{}).get('mode')in('map','call','entry'))
+    return (task.get('resource_recovery',True) and not task.get('cwd')
+            and task.get('execution',{}).get('mode')in('map','call','entry'))
 
 
 def resource_recovery(task,outcome):

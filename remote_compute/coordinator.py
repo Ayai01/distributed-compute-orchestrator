@@ -1,7 +1,8 @@
 """A central HTTP endpoint forwarding accepted jobs to the shared worker pool."""
 
 import hashlib
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import io
 import json
@@ -13,6 +14,7 @@ import weakref
 import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
+from . import client as transport
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff, retire_asset, missing_task_assets
 from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
@@ -29,6 +31,7 @@ from .compat import unlink
 from .cleanup import AssetCache, remove_owned
 from .acceptance import SubmissionAssets, SubmissionLocks
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
+from .observations import Observations, observation_batch, terminal_observation
 from .receipts import read_center_receipt as read_receipt
 import socket
 import math
@@ -91,6 +94,11 @@ def _infrastructure_interruption(job, outcome):
 
 
 class Coordinator:
+    shared_asset_visibility_seconds = 150
+    observation_poll_seconds = 5
+    observation_grace_seconds = 10
+    display_health_interval = .75
+
     def __init__(self, pool, root, *, token="", operator_token=None, paused=False):
         started=time.monotonic();self.startup={}
         self.pool, self.token = pool, token
@@ -104,8 +112,16 @@ class Coordinator:
         self.submission_lock = SubmissionLocks()
         self.accepting_assets = SubmissionAssets()
         self.asset_writes = weakref.WeakValueDictionary()
+        self.shared_asset_upload_lock = threading.Lock()
+        self.shared_asset_uploads = weakref.WeakValueDictionary()
+        self.shared_asset_publications = {}
         self.jobs, self.queue, self.threads = JobRecords(
             self.root / 'jobs', index_path=self.root / 'history.index.jsonl',receipt_reader=read_receipt), [], set()
+        self.observations = Observations(self.root / 'observed-jobs.json')
+        self.observation_due = 0
+        self.observation_retries = {}
+        self.observation_probe = None
+        self.observation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='observed-receipts')
         self.asset_handoffs = {}
         self.legacy_assets = set()
         self.stopping = False
@@ -211,6 +227,107 @@ class Coordinator:
 
     def nodes(self):
         return self.pool.snapshot()
+
+    def job_observed(self, identity):
+        observations = getattr(self, 'observations', None)
+        return observations is not None and identity in observations.rows
+
+    def job_identities(self):
+        return (*self.observations.rows, *self.jobs)
+
+    def jobs_page(self, *, limit, offset, prefix=None):
+        active = [identity for identity in self.jobs.active if prefix is None or identity.startswith(prefix)]
+        observed = sorted((row for row in self.observations.rows.values()
+                           if prefix is None or row['id'].startswith(prefix)),
+                          key=lambda row: (row['submitted'], row['id']), reverse=True)
+        active.extend(row['id'] for row in observed if row['status'] not in TERMINAL)
+        head = active + [row['id'] for row in observed if row['status'] in TERMINAL]
+        selected = head[offset:offset + limit]
+        slots = limit-len(selected)
+        native, total = self.jobs.page(limit=max(1, slots), offset=max(0, offset-len(head)),
+                                       prefix=prefix, include_active=False)
+        return [*selected, *native[:slots]], len(head)+total
+
+    def observe(self, rows):
+        batch = observation_batch(rows)
+        with ExitStack() as locks:
+            for identity in sorted(batch):
+                locks.enter_context(self.submission_lock.hold(identity))
+            with self.condition, self.pool.condition:
+                if self.stopping:
+                    raise Conflict('Scheduler is stopping')
+                nodes = {node.name for node in self.pool.nodes}
+                reply = self.observations.upsert(batch, nodes, self.jobs.knows_worker)
+                self.condition.notify_all()
+                return reply
+
+    def _poll_observations(self):
+        """Schedule one small original-ID lookup from the existing scheduler tick."""
+        now = time.monotonic()
+        if not self.observations.active or now < self.observation_due or (
+                self.observation_probe is not None and not self.observation_probe.done()):
+            return
+        self.observation_due = now + self.observation_poll_seconds
+        self.observation_retries = {key: retry for key, retry in self.observation_retries.items()
+                                    if key in self.observations.active}
+        with self.pool.condition:
+            nodes = {n.name: n for n in self.pool.nodes if n.enabled and not n.error and not n.detached
+                     and 'active_jobs' in n.health and n.sampled_at and
+                     now-n.sampled_at <= max(15, self.pool.sample_seconds*3)}
+            sampled = {name: {item['id'] for item in (node.health['active_jobs'] or ())} for name, node in nodes.items()}
+            batch, selected = {}, None
+            wall = time.time()
+            for identity in sorted(self.observations.active,
+                                   key=lambda key: self.observation_retries.get(key, (0, 0))[0]):
+                row = self.observations.rows[identity]
+                node = nodes.get(row['node'])
+                if node is None or (selected is not None and node is not selected):
+                    continue
+                if identity in sampled[node.name]:
+                    self.observation_retries.pop(identity, None)
+                    continue
+                due, attempts = self.observation_retries.get(identity, (0, 0))
+                if now < due or wall-row['submitted'] < self.observation_grace_seconds:
+                    continue
+                selected = node
+                batch[identity] = row
+                self.observation_retries[identity] = now + min(120, 10*2**min(attempts, 4)), attempts+1
+                if len(batch) == 8:
+                    break
+            if batch:
+                self.observation_probe = self.observation_executor.submit(
+                    self._read_observed_receipts, selected, selected.client, selected.connection_generation, batch)
+
+    def _read_observed_receipts(self, node, peer, generation, batch):
+        client = peer if peer.url.startswith('local://') else transport.Client(
+            peer.url, peer.token, timeout=min(peer.timeout, 3), ca_file=peer.ca_file,
+            operator=True, operator_token=peer.operator_token, relay_url=peer.relay_url, peer_id=peer.peer_id)
+        try:
+            states = client.request('/jobs/status', {'ids': list(batch)})
+        except RemoteError:
+            return  # A failed control read leaves observations pending for the next bounded retry.
+        if not isinstance(states, dict):
+            return
+        for identity, previous in batch.items():
+            candidate = states.get(identity)
+            if not isinstance(candidate, dict) or candidate.get('status') not in TERMINAL:
+                continue
+            try:
+                if 'cpu_seconds' not in candidate:
+                    # Older workers omit fees in brief state. Read only the
+                    # just-confirmed terminal original, never its artifacts.
+                    candidate = client.status(identity)
+                update = terminal_observation(previous, candidate)
+            except (RemoteError, ValueError):
+                continue
+            if update is None:
+                continue
+            with self.condition, self.pool.condition:
+                if self.stopping or node.client is not peer or node.connection_generation != generation:
+                    return
+                if self.observations.rows.get(identity) is previous:
+                    self.observations.upsert(update, {node.name}, self.jobs.knows_worker)
+                    self.observation_retries.pop(identity, None)
 
     def admission(self, request, *, operator=False):
         project = request.get('project') or 'default'
@@ -321,7 +438,25 @@ class Coordinator:
             value.update(ready_tasks=ready_tasks, ready_source='center', queue_scope='project',
                          project_active_tasks=active, running_tasks=running,
                          queued_tasks=ready_tasks-running, in_flight=ready_tasks, max_in_flight=ready_tasks)
+        if request.get('activity') is True:
+            value['activity'] = self._project_activity(project)
         return value
+
+    def _project_activity(self, project):
+        """Expose each original's CPU sample without revealing its worker."""
+        snapshot = self.health()
+        sampled_at = time.time()
+        samples = {}
+        for node in snapshot['nodes']:
+            for job in node.get('active_jobs') or ():
+                if job.get('project') != project:
+                    continue
+                runtime = job.get('runtime') or {}
+                samples[job['id']] = dict(id=job['id'], status=job.get('status'),
+                    cpus=job.get('cpus'), active_cpus=job.get('active_cpus'),
+                    cpu_seconds=runtime.get('cpu_seconds'),
+                    sampled_at=runtime.get('sampled_at'), process_alive=runtime.get('process_alive'))
+        return dict(sampled_at=sampled_at, jobs=list(samples.values()))
 
     def restart_node(self, name):
         node = next((n for n in self.pool.nodes if n.name == name), None)
@@ -332,12 +467,36 @@ class Coordinator:
         except RemoteError as error:
             raise Conflict(str(error)) from None
 
-    def health(self, *, brief=False, sample=False):
+    def health(self, *, brief=False, sample=False, display=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []))
+        if display:
+            return self._display_health()
         with self.condition, self.pool.condition:
             return self._health()
+
+    def _display_health(self):
+        """Let monitors read the last sample while scheduling owns either lock."""
+        cached = getattr(self, '_display_health_cache', None)
+        if cached is None or time.monotonic() - cached[0] >= self.display_health_interval:
+            if self.condition.acquire(blocking=cached is None):
+                try:
+                    latest = getattr(self, '_display_health_cache', None)
+                    if latest is not cached:
+                        cached = latest
+                    elif self.pool.condition.acquire(blocking=cached is None):
+                        try:
+                            value = deepcopy(self._health())
+                            cached = self._display_health_cache = (time.monotonic(), time.time(), value)
+                        finally:
+                            self.pool.condition.release()
+                finally:
+                    self.condition.release()
+        sampled, wall, value = cached
+        age = time.monotonic() - sampled
+        return dict(value, health_sampled_at=wall, health_age_seconds=round(age, 3),
+                    health_stale=age >= self.display_health_interval)
 
     def capabilities(self, *, platform=None, operator=False):
         """Return the scheduler's aggregate project-facing capability view.
@@ -456,10 +615,17 @@ class Coordinator:
                     item.update({key:job['task'].get(key,default) for key,default in
                                  (('priority',0),('resource_share',1.0))})
                     active.setdefault(result['assigned_node'],[]).append(item)
+            observation_rows = self.observations.rows
+            observed_active = {}
+            for row in observation_rows.values():
+                if row['status'] not in TERMINAL:
+                    observed_active.setdefault(row['node'], []).append(row)
             for node in snapshot['nodes']:
                 external, remaining = [], node['external_cpus']
                 sampled={item['id']:item for item in node.get('active_jobs',[])}
-                owned=active.get(node['name'],[])
+                # Receipts retain their original assigned name across a rename.
+                owned=[item for name in dict.fromkeys([node['name'], *node.get('aliases', [])])
+                       for item in active.get(name, [])]
                 for item in owned:
                     job=self.jobs[item['id']]
                     worker_id=job.get('worker_id',job['result'].get('worker_id',item['id']))
@@ -469,10 +635,13 @@ class Coordinator:
                     known = item['id'] in known_ids or item['id'] in self.jobs
                     if isinstance(self.jobs, JobRecords):
                         known = known or self.jobs.knows_worker(item['id'])
-                    if not known and 0 < item.get('cpus',0) <= remaining:
-                        external.append(item)
+                    if not known and 0 < (item.get('cpus') or 0) <= remaining:
+                        if item['id'] not in observation_rows:
+                            external.append(item)
                         remaining -= item['cpus']
-                node['active_jobs'] = owned + external
+                observed = [self.observations.project(row, sampled.get(row['id']) if not node['error'] else None)
+                            for row in observed_active.get(node['name'], ())]
+                node['active_jobs'] = owned + observed + external
             return {"protocol": PROTOCOL, "role": "scheduler",
                     "mode":"hybrid" if any(n.client.url.startswith('local://')for n in self.pool.nodes)else"scheduler",
                     "node": socket.gethostname(), "tools": tools,
@@ -480,8 +649,9 @@ class Coordinator:
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
-                                     + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs)),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
+                                     + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
+                                     + sum(row['status'] in TERMINAL for row in observation_rows.values()),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -549,6 +719,8 @@ class Coordinator:
                           capacity=ceilings[name],eligible_nodes=sorted(rooms[name]),node_demands=rooms[name]) for name in shares}
 
     def control(self, changes):
+        if isinstance(changes, dict) and set(changes) == {'observations'}:
+            return self.observe(changes['observations'])
         if isinstance(changes,dict)and set(changes)=={'retire_asset'}:
             return retire_asset(self,changes['retire_asset'])
         if isinstance(changes,dict)and 'job'in changes:
@@ -559,6 +731,8 @@ class Coordinator:
                 raise ValueError('Job id requires 32 lowercase hex characters')
             if type(priority)is not int or not MIN_PRIORITY<=priority<=MAX_PRIORITY:
                 raise ValueError('priority must be an integer in%d..%d'%(MIN_PRIORITY,MAX_PRIORITY))
+            if self.job_observed(identity):
+                raise Conflict('Externally observed jobs are read-only')
             job=load_job(self.jobs,self.condition,identity)
             with self.condition:
                 if self.stopping:raise Conflict('Scheduler is stopping')
@@ -633,7 +807,7 @@ class Coordinator:
         nodes=[]
         for node in self.pool.nodes:
             source=snapshots[node.name];health=node.health
-            fields=('name','enabled','capacity','base_capacity','logical_cpus','cpu_limit','cpu_overcommit_factor',
+            fields=('name','display_name','enabled','capacity','base_capacity','logical_cpus','cpu_limit','cpu_overcommit_factor',
                 'reserved','external_cpus','used_cpus','queued','cpu_percent','memory_capacity_mb','memory_available_mb',
                 'memory_reserved_mb','memory_total_mb','host_memory_available_mb','host_commit_limit_mb','host_commit_available_mb',
                 'memory_headroom_mb','memory_reserve_mb','memory_budget_mb','rss_mb','private_mb','paused','error')
@@ -649,7 +823,7 @@ class Coordinator:
             row['effective']=dict(cpus=row['capacity'],base_cpus=row['base_capacity'],
                 max_cpus=int(row['base_capacity']*defaults['cpu_overcommit_factor']),memory_mb=row['memory_capacity_mb'],
                 memory_available_mb=row['memory_available_mb'])
-            row['actual']=dict(cpus=health.get('used_cpus',0),active_cpus=sum(j.get('active_cpus',0)for j in health.get('active_jobs',())),
+            row['actual']=dict(cpus=health.get('used_cpus',0),active_cpus=sum(j.get('active_cpus')or 0 for j in health.get('active_jobs',())),
                 cpu_percent=health.get('cpu_percent'),rss_mb=health.get('rss_mb',0),private_mb=health.get('private_mb'))
             reasons=[]
             if node.error:reasons.append('offline')
@@ -759,6 +933,8 @@ class Coordinator:
             with self.condition:
                 if self.stopping:
                     raise Conflict("Scheduler is stopping")
+                if self.job_observed(identity):
+                    raise Conflict('Job ID already belongs to an external observation')
                 existing = identity in self.jobs
             if existing:
                 job = load_job(self.jobs, self.condition, identity)
@@ -883,7 +1059,12 @@ class Coordinator:
                    resources[group]['used']/resources[group]['resource_share']<resources[other]['used']/resources[other]['resource_share'])
             startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
             desired=job.get('desired_cpus',startup)
-            if not lower:desired=min(4,desired)
+            request=job['result'].get('resource_request')or {}
+            pending=request and request.get('request_id')!=job.get('lease_answered')
+            # Beyond warmup, protect growth only while its owner is actually
+            # requesting it. A standing ceiling during a long native step
+            # must not strand idle slots or prevent overcommit from opening.
+            if not lower or not pending:desired=min(4,desired)
             old=current.get('cpus',0)
             if (held is None or desired<=old
                     or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
@@ -962,6 +1143,7 @@ class Coordinator:
         with self.condition:
             while not self.stopping:
                 self._recover_running()
+                self._poll_observations()
                 if not self.paused:
                     for identity in self.queue:
                         self._fallback_accelerator(self.jobs[identity])
@@ -1032,7 +1214,10 @@ class Coordinator:
                         self.threads.add(thread)
                         thread.start()
                 delayed=self.queue and all(self.jobs[key]['result'].get('resource_retry_after',0)>time.time()for key in self.queue)
-                self.condition.wait(.5 if self.paused or delayed else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None)
+                wait = .5 if self.paused or delayed else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None
+                if wait is None and self.observations.active:
+                    wait = self.observation_poll_seconds
+                self.condition.wait(wait)
 
     def _recover_running(self):
         """Reattach accepted work from fresh worker snapshots; never resubmit it."""
@@ -1124,6 +1309,7 @@ class Coordinator:
                     # Placement hints belong to the dispatcher, not the executable.
                     worker_task.pop('node',None)
                     worker_task.pop('cache_ref',None)
+                    worker_task.pop('native_cache',None)
                     worker_task.pop('single_thread_weight',None)
                     worker_task.pop('retries',None)
                     if worker_task.get('accelerator') is not None:
@@ -1288,7 +1474,8 @@ class Coordinator:
                         if not self._pace_submission(job):return False
                         if self.stopping or job['cancel'].is_set():return False
                     submitting=True
-                    node.client.submit_bundle(identity,payload,**({'callback':callback} if callback else {}))
+                    node.client.submit_bundle(identity,payload,cancel=job['cancel'].is_set,
+                        **({'callback':callback} if callback else {}))
                 return True
             except RequestCancelled:
                 return False
@@ -1326,6 +1513,7 @@ class Coordinator:
                         return True
                     except RemoteError as observed:
                         if getattr(observed,'status_code',None)==404:
+                            if job['cancel'].is_set():return False
                             # The first POST may still arrive later. Repeating
                             # its exact ID and payload remains worker-idempotent.
                             break
@@ -1350,6 +1538,9 @@ class Coordinator:
         self._save(job)
         attempts=job['result'].setdefault('attempts',[])
         allowance=job['result'].get('max_retries',0)
+        if outcome.get('error_kind')=='memory_pressure' and job['task'].get('resource_recovery',True) is False:
+            self._save(job)
+            return
         recovering=resource_recovery(job['task'],outcome)
         if recovering:
             used=sum(a.get('error_kind')=='memory_pressure'for a in attempts)
@@ -1422,34 +1613,51 @@ class Coordinator:
             yield
             return
         route='/jobs/'+identity+'/asset-handoff'
-        node.client.request(route,{'assets':sorted(set(assets))})
+        pending=self.jobs.get(identity)if hasattr(self,'jobs')else None
+        options={'cancel':pending['cancel'].is_set}if pending is not None else {}
+        node.client.request(route,{'assets':sorted(set(assets))},**options)
+        accepted=False
         try:
             yield
+            accepted=True
         finally:
-            # Acceptance replaces the handoff with the ordinary job reference.
-            # Failure/cancellation releases it without changing the original ID.
-            try:
-                node.client.request(route,method='DELETE')
-            except RemoteError:
-                pass  # Worker expiry also releases an unreachable sender's hold.
+            # The sole caller completes this body only after submit succeeds.
+            # Worker acceptance already removes the handoff under the same
+            # lock that publishes its durable task reference. Start polling
+            # leases immediately instead of queuing redundant bulk cleanup.
+            pending=self.jobs.get(identity)if hasattr(self,'jobs')else None
+            cancelled=pending is not None and pending['cancel'].is_set()
+            if not accepted and not cancelled:
+                try:
+                    node.client.request(route,method='DELETE')
+                except RemoteError:
+                    pass  # Worker expiry also releases an unreachable sender's hold.
 
     def _ensure_assets(self, node, assets, *, force=False, cancel=None):
         # Cache changes invalidate presence, but keep same-hash uploads serialized.
         assets=set(assets)
         if not assets:return
+        shared_cache = node.health.get('shared_asset_cache')
         with node.asset_lock:
             session = (node.health.get('pid'), node.health.get('root'), node.health.get('asset_revision'))
             if node.asset_session != session:
                 node.known_assets.clear()
                 node.asset_session = session
             if force:node.known_assets.difference_update(assets)
-            # Pending callers keep strong references; idle locks disappear.
-            locks=node.__dict__.setdefault('_asset_upload_locks',weakref.WeakValueDictionary())
-            pending=[(asset,locks.setdefault(asset,threading.Lock())) for asset in assets-node.known_assets]
+            pending_assets = assets - node.known_assets
+            if not shared_cache:
+                locks = node.__dict__.setdefault('_asset_upload_locks', weakref.WeakValueDictionary())
+                pending = [(asset, locks.setdefault(asset, threading.Lock())) for asset in pending_assets]
+        if shared_cache:
+            # Workers with the same mount serialize the presence check and upload.
+            with self.shared_asset_upload_lock:
+                pending = [(asset, self.shared_asset_uploads.setdefault((shared_cache, asset), threading.Lock()))
+                           for asset in pending_assets]
         for asset,transfer in pending:
             _check_cancelled(cancel)
             while not transfer.acquire(timeout=.1):
                 _check_cancelled(cancel)
+            held = True
             try:
                 _check_cancelled(cancel)
                 with node.asset_lock:
@@ -1460,16 +1668,69 @@ class Coordinator:
                     # Finish their shared transfer while cancelling its owner
                     # before job submission; cancelled waiters leave the lock.
                     with self.condition:
-                        return not any(job.get('node') is node and not job['cancel'].is_set()
+                        return not any((job.get('node') is node or
+                                        (shared_cache and job.get('node') is not None and
+                                         job['node'].health.get('shared_asset_cache') == shared_cache))
+                                       and not job['cancel'].is_set()
                                        and asset in job.get('task',{}).get('assets',{}).values()
                                        for job in active_values(self.jobs))
-                if not node.client.request('/assets/' + asset,cancel=abandoned)['exists']:
-                    node.client.request('/assets/' + asset, (self.root/'assets'/(asset+'.zip')).read_bytes(),cancel=abandoned)
+                route = '/assets/' + asset
+                archive = self.root / 'assets' / (asset + '.zip')
+                exists = node.client.request(route, cancel=abandoned)['exists']
+                wait_until = time.monotonic() + self.shared_asset_visibility_seconds
+                while shared_cache and not exists:
+                    key = (shared_cache, asset)
+                    with self.shared_asset_upload_lock:
+                        published = self.shared_asset_publications.get(key)
+                    if not published or published[0] == node.name:
+                        break
+                    budget = transport._RELAY_BULK_BUDGET
+                    size = archive.stat().st_size
+                    rate = (budget.bytes_per_second if budget and size >= transport.MIN_BULK_BYTES
+                            and budget.matches(node.client.endpoint) else 8 * 1024**2)
+                    # Bound the visibility wait by the cost of retransmitting this archive.
+                    deadline = min(wait_until, published[1] + 1 + 2 * size / rate)
+                    if time.monotonic() >= deadline:
+                        break
+                    # Other nodes may already see the archive. Serialize sends, not waiting.
+                    transfer.release()
+                    held = False
+                    delay = 1
+                    while not exists:
+                        retry = min(deadline, time.monotonic() + delay)
+                        while (remaining := retry - time.monotonic()) > 0:
+                            _check_cancelled(cancel)
+                            time.sleep(min(.25, remaining))
+                        _check_cancelled(cancel)
+                        exists = node.client.request(route, cancel=abandoned)['exists']
+                        if time.monotonic() >= deadline:
+                            break
+                        delay = min(30, delay * 2)
+                    if not exists:
+                        while not transfer.acquire(timeout=.1):
+                            _check_cancelled(cancel)
+                        held = True
+                        _check_cancelled(cancel)
+                        with self.shared_asset_upload_lock:
+                            current_publication = self.shared_asset_publications.get(key)
+                        if current_publication != published:
+                            exists = node.client.request(route, cancel=abandoned)['exists']
+                if not exists:
+                    node.client.request(route, archive.read_bytes(), cancel=abandoned)
+                    if shared_cache:
+                        key = (shared_cache, asset)
+                        with self.shared_asset_upload_lock:
+                            publications = self.shared_asset_publications
+                            publications.pop(key, None)
+                            publications[key] = (node.name, time.monotonic())
+                            if len(publications) > 1024:
+                                del publications[next(iter(publications))]
                 with node.asset_lock:
                     if node.asset_session==session:node.known_assets.add(asset)
                 _check_cancelled(cancel)
             finally:
-                transfer.release()
+                if held:
+                    transfer.release()
 
     def _update(self, job, remote):
         if job.get('retired'):return
@@ -1749,12 +2010,13 @@ class Coordinator:
                 if min_cpus is not None:job['result']['min_cpus']=min_cpus
                 else:job['result'].pop('min_cpus',None)
                 job['result']['active_cpus']=active_cpus or 0
-                granted=desired
+                draining=not node.enabled and not node.detached
+                granted=min(desired,old)if draining else desired
                 cooperative=min_cpus is not None or cpus==0 or _elastic_job(job)
                 # Elastic jobs may report a finite useful phase width.
                 # Repeating that width is still a drained boundary; returning
                 # to one CPU stays cheap for synchronous microkernels.
-                if desired>old or cpus==0 or (cooperative and desired>1):
+                if not draining and (desired>old or cpus==0 or (cooperative and desired>1)):
                     resources=self.project_resources();group=job['task'].get('project') or 'default'
                     resource=resources.get(group)
                     if resource is None:
@@ -1876,14 +2138,47 @@ class Coordinator:
         if job.get("node"):
             return job["node"].client
         assigned = job["result"].get("assigned_node")
-        return next(n.client for n in self.pool.nodes if n.name == assigned or assigned in getattr(n,'aliases',())
-                    or n.client.url == job['result'].get('worker_url')) if assigned else None
+        return next((n.client for n in self.pool.nodes if n.name == assigned or assigned in getattr(n,'aliases',())
+                     or n.client.url == job['result'].get('worker_url')), None) if assigned else None
+
+    def _queued_memory_wait(self, job):
+        """Explain the current admission predicate without changing a grant."""
+        if self.paused or job['result'].get('resource_wait_reason'):
+            return None
+        task=job['task']; choices=[]
+        for node in self.pool._matching(task):
+            if (node.error or not node.enabled or node.health.get('paused') or node.health.get('queued',0)
+                    or node.capacity-node.reserved-node.external < (task.get('cpus') or 1)
+                    or task.get('accelerator') is not None and not node.can_match_accelerator(
+                        node.execution_accelerator(task,available=True))):
+                continue
+            floor=max(job['result'].get('resource_recovery_memory_mb',0),node.startup_memory(task))
+            available=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
+            choices.append((available-floor,available,floor))
+        if not choices:return None
+        margin,available,floor=max(choices)
+        if margin>=0:return None
+        return ('memory: declared %s MiB; startup requires %s MiB; best eligible headroom %.0f MiB'
+                %(task.get('memory_mb',256),floor,available))
 
     def get(self, identity):
+        if self.job_observed(identity):
+            with self.condition, self.pool.condition:
+                row = self.observations.rows[identity]
+                node = next((n for n in self.pool.nodes if n.name == row['node'] and not n.error), None)
+                sample = next((item for item in node.health.get('active_jobs') or ()
+                               if item['id'] == identity), None) if node else None
+                return self.observations.project(row, sample)
         if isinstance(self.jobs, JobRecords):
             job = self.jobs.cached(identity)
             if job is not None and 'read_result' in job:
-                return json.loads(json_bytes(job['read_result']))
+                result=json.loads(json_bytes(job['read_result']))
+                if result.get('status')=='queued' and not result.get('resource_wait_reason'):
+                    with self.condition,self.pool.condition:
+                        if job['result'].get('status')=='queued':
+                            reason=self._queued_memory_wait(job)
+                            if reason:result['resource_wait_reason']=reason
+                return result
             if identity in self.jobs.history:
                 return self.jobs.read_result(identity)
             if job is None:
@@ -2050,7 +2345,9 @@ class Coordinator:
             result, client = json.loads(json_bytes(job['result'])), self._client(job)
             if result.get('cancelled_before_submit')or result.get('rejected_before_submit'):client=None
             node=job.get('node') or next((n for n in self.pool.nodes if n.client is client),None)
-            if result['status']=='interrupted' and node is not None and (node.detached or not node.enabled):
+            cached=job['directory']/'worker-artifacts.zip'
+            if (result['status']=='interrupted' and node is not None and (node.detached or not node.enabled)
+                    and not cached.is_file()):
                 result['cost_incomplete']=True
                 client=None
             worker_id=job.get('worker_id',result.get('worker_id',identity))
@@ -2060,30 +2357,27 @@ class Coordinator:
                 if self.jobs.get(identity) is not job:
                     raise KeyError(identity)
             files = {}
-            if client:
+            if client or cached.is_file():
                 from .local import LocalClient
                 if isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts'):
                     return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
                 try:
                     if is_connected and not is_connected():
                         raise ConnectionAbortedError('Result download caller disconnected while queued')
-                    cached=job['directory']/'worker-artifacts.zip'
                     if cached.is_file():
                         raw=cached.read_bytes()
                     else:
                         # The original-ID lock coalesces duplicate reads. The
                         # existing bounded HTTP pool handles distinct results;
                         # a slow provider ZIP must not serialize every ID.
-                        raw=client.artifacts(worker_id)
+                        temporary=cached.with_suffix('.partial')
+                        client.artifacts(worker_id,destination=temporary)
+                        raw=temporary.read_bytes()
                         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                             if json.loads(archive.read('result.json'))['id']!=worker_id:
                                 raise ValueError('Artifact task identity mismatch')
-                        temporary=cached.with_suffix('.partial')
-                        try:
-                            temporary.write_bytes(raw)
-                            temporary.replace(cached)
-                        finally:
-                            unlink(temporary)
+                        temporary.replace(cached)
+                        unlink(temporary.with_name(temporary.name+'.http.json'))
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
                         raise
@@ -2242,6 +2536,7 @@ class Coordinator:
                 self.cancel(identity)
             self.condition.notify_all()
         self.scheduler.join()
+        self.observation_executor.shutdown(wait=True, cancel_futures=True)
         for thread in list(self.threads):
             thread.join()
         self.asset_handoffs.clear()

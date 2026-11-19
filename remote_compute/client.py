@@ -31,10 +31,11 @@ from .policy import (normalize_accelerator_requirement, select_accelerator_units
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
 from .allocation import elastic_cpus,cpu_capacity
+from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
 
 
 from .runtimes import (supports_python, execution_bindings, execution_tool_set, capability_set,
-                       python_accelerator)
+                       python_accelerator, supports_native_cache)
 
 
 class RemoteError(RuntimeError):
@@ -53,6 +54,19 @@ class RequestCancelled(RemoteError):
 
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
+_RELAY_BULK_BUDGET = load_relay_bulk_budget()
+SHORT_DISPATCH_BYTES = 256 * 1024
+# Waits after each unsuccessful probe. A relay recovering in the first
+# minute has two opportunities before falling back to minute spacing.
+RELAY_RECONNECT_INTERVALS = (10, 25, 60, 60, 60, 60)
+DIRECT_RECONNECT_INTERVALS = (60, 60, 60, 60)
+
+
+def _reconnect_intervals(client):
+    endpoint = getattr(client, 'endpoint', None)
+    if endpoint and _RELAY_BULK_BUDGET and _RELAY_BULK_BUDGET.matches(endpoint):
+        return RELAY_RECONNECT_INTERVALS
+    return DIRECT_RECONNECT_INTERVALS
 
 
 def _check_cancelled(cancel):
@@ -74,17 +88,35 @@ def _pause(seconds, check=None):
 
 
 class _UploadBody:
-    def __init__(self, data, cancel):
+    def __init__(self, data, cancel, budget=None):
         self.data = memoryview(data)
         self.offset = 0
         self.cancel = cancel
+        self.budget = budget
 
     def read(self, size=-1):
         _check_cancelled(self.cancel)
         stop = len(self.data) if size < 0 else min(len(self.data), self.offset + size)
         block = self.data[self.offset:stop]
+        if self.budget is not None:
+            self.budget.pace(len(block), lambda: _check_cancelled(self.cancel),
+                             remaining=len(self.data) - self.offset)
         self.offset = stop
         return block
+
+
+def _short_dispatch_request(path, data, method):
+    """Asset preparation shares the bounded short-job slot with its final POST."""
+    verb = method or ('GET' if data is None else 'POST')
+    if re.fullmatch(r'/assets/[0-9a-f]{64}', path):
+        return ((verb == 'GET' and data is None) or
+                (verb == 'POST' and isinstance(data, bytes) and len(data) <= SHORT_DISPATCH_BYTES))
+    if re.fullmatch(r'/jobs/[0-9a-f]{32}/asset-handoff', path):
+        return verb in ('POST', 'DELETE')
+    if verb == 'DELETE' and re.fullmatch(r'/jobs/[0-9a-f]{32}', path):
+        return True
+    return (verb == 'POST' and isinstance(data, bytes) and len(data) <= SHORT_DISPATCH_BYTES
+            and re.fullmatch(r'/jobs/[0-9a-f]{32}', path) is not None)
 
 
 class _ConnectionPool:
@@ -96,8 +128,13 @@ class _ConnectionPool:
         self.bulk_active = 0
         self.waiting = deque()
 
-    def acquire(self, timeout, *, bulk=False, cancel=None):
-        ticket = (object(), bulk)
+    def acquire(self, timeout, *, bulk=False, short_job=False, cancel=None):
+        ticket = (object(), 'short_job' if short_job else bulk)
+
+        def eligible(kind):
+            if kind == 'short_job':
+                return self.available > 1 and not getattr(self, 'short_job_active', False)
+            return not kind or self.bulk_active < getattr(self, 'bulk_limit', 7)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
             self.waiting.append(ticket)
@@ -105,7 +142,7 @@ class _ConnectionPool:
                 # Reserve one of the same eight slots for health, status and
                 # grants, even when slow uploads have queued more transfers.
                 while not self.available or next((entry for entry in self.waiting
-                        if not entry[1] or self.bulk_active < 7), None) is not ticket:
+                        if eligible(entry[1])), None) is not ticket:
                     _check_cancelled(cancel)
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
@@ -116,15 +153,19 @@ class _ConnectionPool:
                 _check_cancelled(cancel)
                 self.available -= 1
                 self.bulk_active += int(bulk)
+                if short_job:
+                    self.short_job_active = True
                 return True
             finally:
                 self.waiting.remove(ticket)
                 self.condition.notify_all()
 
-    def release(self, *, bulk=False):
+    def release(self, *, bulk=False, short_job=False):
         with self.condition:
             self.available += 1
             self.bulk_active -= int(bulk)
+            if short_job:
+                self.short_job_active = False
             self.condition.notify_all()
 
     def __del__(self):
@@ -220,9 +261,25 @@ class Client:
         return destination
 
     def _routed_request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
+        authority = self.endpoint.geturl()
+        paced = _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint)
+        artifact_get = (paced and binary and data is None and method in (None, 'GET')
+                        and re.fullmatch(r'/jobs/[0-9a-f]{32}/artifacts', path))
         pools=self.__dict__.setdefault('_transports',{})
-        pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if self.endpoint.geturl()==self.url
-              else pools.setdefault(self.endpoint.geturl(),_ConnectionPool()))
+        if artifact_get:
+            # Keep completed jobs clear of uploads, and let a second receipt
+            # advance while the first one is waiting on a slow archive.
+            # Both directions share the byte budget in _request.
+            pool = self.__dict__.setdefault('_artifact_transports', {}).setdefault(authority, _ConnectionPool())
+            limit = 2
+        else:
+            pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if authority==self.url
+                  else pools.setdefault(authority,_ConnectionPool()))
+            limit=getattr(self,'bulk_limit',7)
+        with pool.condition:
+            if getattr(pool,'bulk_limit',7)!=limit:
+                pool.bulk_limit=limit
+                pool.condition.notify_all()
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
         # Cache lookups/handoffs and collection cleanup may wait behind disk I/O,
@@ -230,7 +287,13 @@ class Client:
         bulk = (isinstance(data, bytes) or binary or path.startswith('/assets/')
                 or path.endswith(('/asset-handoff', '/logs'))
                 or method == 'DELETE' and path.startswith('/jobs/'))
-        if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, cancel=cancel):
+        # A near-ready task can acquire its pins, look up assets and send a
+        # small missing archive without waiting for a multi-MB result stream.
+        # _request still charges the shared byte budget for these uploads.
+        short_job = (paced and not artifact_get and limit <= 2
+                     and _short_dispatch_request(path, data, method))
+        bulk = bulk and not short_job
+        if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, short_job=short_job, cancel=cancel):
             raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         # Old live instances may still own a per-thread cached connection.
         previous=getattr(self.connections,'connection',None)
@@ -255,9 +318,9 @@ class Client:
             self.connections.connection=None
             if connection is not None:
                 with pool.lock:pool.idle.append(connection)
-            pool.release(bulk=bulk)
+            pool.release(bulk=bulk, short_job=short_job)
 
-    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
+    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None, _reuse=True):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         if self.endpoint.scheme == 'http':
@@ -294,13 +357,35 @@ class Client:
         if data is not None and len(data)>MAX_BODY:
             raise ValueError('Request body has %d bytes; protocol limit is %d bytes. Use separate content assets for large inputs.'%(len(data),MAX_BODY))
         method = method or ('POST' if data is not None else 'GET')
+        bulk_budget = _RELAY_BULK_BUDGET
+        large_upload = stream_body and len(data) >= MIN_BULK_BYTES
+        binary_download = binary and method == 'GET'
+        if bulk_budget is not None and (large_upload or binary_download) and bulk_budget.matches(self.endpoint):
+            upload_budget = bulk_budget if large_upload else None
+        else:
+            upload_budget = bulk_budget = None
+        relayed_artifact = (bulk_budget is not None and binary_download
+                            and re.fullmatch(r'/jobs/[0-9a-f]{32}/artifacts', path))
         partial, etag = _output if _output is not None else io.BytesIO(), None
-        partial.seek(0);partial.truncate()
+        receiver = None
+        if (_reuse and relayed_artifact and _output is not None
+                and isinstance(getattr(_output, 'name', None), (str, os.PathLike))):
+            from .artifact_reuse import Receiver
+            receiver = Receiver()
+        if _output is not None and binary and method=='GET' and headers.get('If-Range'):
+            partial.seek(0,os.SEEK_END);etag=headers['If-Range']
+        else:
+            partial.seek(0);partial.truncate()
         attempts = 4 if binary and method == 'GET' else 2
         retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status') or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
+        # Bulk streams tolerate relay stalls without resetting a paid prefix.
+        # Control requests keep their short socket deadline.
+        short_relay_job = (job_upload and len(data) <= SHORT_DISPATCH_BYTES
+                           and _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint))
+        if asset_upload or job_upload:network_timeout=max(120,network_timeout)
         request_digest=None
         for attempt in range(attempts):
             _check_cancelled(cancel)
@@ -312,9 +397,10 @@ class Client:
             if remaining is not None and remaining<=0:
                 raise TimeoutError('DCO kernel startup wait expired')
             attempt_timeout=min(network_timeout,remaining)if remaining is not None else network_timeout
-            if attempt and asset_upload:
-                # A lost reply can follow a fully validated upload. Probe within
-                # this pool slot before sending the same content again.
+            if asset_upload and (attempt or (upload_budget is not None and len(data) >= 1024 * 1024)):
+                # Another campus worker may have published this archive while
+                # this upload waited for the bulk slot. Check inside the slot.
+                # The same check recovers an upload whose reply was lost.
                 try:
                     published=self._request(path,method='GET',extra_headers=extra_headers,cancel=cancel)
                 except RequestCancelled:
@@ -345,34 +431,101 @@ class Client:
                 # A bytes body uses one sendall with a whole-body deadline.
                 # The reader loop sends bounded blocks, so active uploads can
                 # outlast the socket timeout. Each retry starts at byte zero.
-                body=_UploadBody(data,cancel) if stream_body else data
+                body=_UploadBody(data,cancel,upload_budget) if stream_body else data
                 if connection.sock is None:connection.connect()
                 sent=True
                 connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
+                artifact_socket = connection.sock if relayed_artifact and attempt==0 else None
+                if artifact_socket is not None:
+                    # Retry a silent relay promptly. A fresh retry still allows
+                    # slow archive preparation by older workers.
+                    artifact_socket.settimeout(min(attempt_timeout,getattr(self,'_artifact_header_timeout',10)))
+                if short_relay_job:
+                    # Once the body is sent, a short dispatch uses the normal RPC
+                    # deadline. Lost acceptance is reconciled using the same ID.
+                    connection.sock.settimeout(min(attempt_timeout,self.timeout))
                 response = connection.getresponse()
+                if artifact_socket is not None and not response.isclosed():
+                    artifact_socket.settimeout(attempt_timeout)
                 if self.peer_id and response.getheader('X-DCO-Node') != self.peer_id:
                     connection.close();self.connections.connection=None
                     error=RemoteError('Destination device identity differs: '+str(self.peer_id));error.status_code=409
                     raise error
                 self.connections.response_status=response.status
-                self.connections.etag=response.getheader("ETag")
-                if binary and response.status < 400:
+                if _output is None:
+                    self.connections.etag=response.getheader("ETag")
+                if binary and response.status==202 and _output is not None:
+                    raw=response.read()
+                elif binary and response.status < 400:
                     continued=(partial.tell() and response.status==206 and response.getheader('ETag')==etag
                                and response.getheader('Content-Range','').startswith('bytes '+str(partial.tell())+'-'))
                     if response.status==206 and not continued:
                         partial.seek(0);partial.truncate();etag=None
+                        if receiver is not None:
+                            receiver = Receiver()
+                        self.connections.etag=None
                         raise http.client.HTTPException('Invalid artifact resume range')
                     if not continued:
+                        if partial.tell() and receiver is not None:
+                            receiver = Receiver()
                         partial.seek(0);partial.truncate()
                     etag=response.getheader('ETag') if response.getheader('Accept-Ranges')=='bytes' else None
+                    if _output is not None:
+                        self.connections.etag=etag
+                    download_budget = bulk_budget if binary_download and (
+                        continued or response.length is None or response.length >= MIN_BULK_BYTES) else None
+                    chunk_size = MIN_BULK_BYTES if download_budget is not None else 128 * 1024
                     while True:
-                        chunk=response.read1(128*1024)
+                        chunk=response.read1(chunk_size)
                         if not chunk:
                             if response.length not in (None,0):
                                 raise http.client.IncompleteRead(b'',response.length)
                             break
                         _check_cancelled(cancel)
+                        if download_budget is not None:
+                            download_budget.pace(len(chunk), lambda: _check_cancelled(cancel),
+                                                 remaining=None if response.length is None else response.length + len(chunk))
                         partial.write(chunk)
+                        if receiver is not None:
+                            try:
+                                candidate = receiver.candidate(partial, etag)
+                            except OSError:
+                                receiver = None
+                                continue
+                            if candidate is not None:
+                                def resume(output):
+                                    # Release the current upstream response before the
+                                    # Range GET. Keep its pool slot and byte budget.
+                                    response.close()
+                                    connection.close()
+                                    current = getattr(self.connections, 'connection', None)
+                                    if current is not None and current is not connection:
+                                        current.close()
+                                    self.connections.connection = None
+                                    return self._request(path, binary=True, cancel=cancel,
+                                        extra_headers={**(extra_headers or {}), 'If-Range': etag},
+                                        _output=output, _reuse=False)
+
+                                def fetch_tail(stage):
+                                    resume(stage)
+                                    return self.connections.response_status, self.connections.etag
+
+                                try:
+                                    saved = receiver.complete(partial, etag, candidate, fetch_tail)
+                                except (OSError, EOFError):
+                                    saved = None
+                                except RemoteError as exc:
+                                    if isinstance(exc, RequestCancelled) or not getattr(exc, 'transport_retryable', False):
+                                        raise
+                                    saved = None
+                                finally:
+                                    # Outer metadata always describes the original
+                                    # file, even if the staged request fails.
+                                    self.connections.etag = etag
+                                if saved is None:
+                                    return resume(partial)
+                                self.connections.reused_artifact_bytes = saved
+                                return b''
                     raw=partial.getvalue() if _output is None else b''
                 else:
                     raw = response.read()
@@ -385,6 +538,9 @@ class Client:
                     raise error
                 break
             except (http.client.HTTPException, OSError, RemoteError) as exc:
+                if isinstance(exc,RequestCancelled):
+                    exc.request_may_have_been_sent=sent
+                    raise
                 if isinstance(exc,RemoteError) and (not job_upload or getattr(exc,'status_code',None)!=404):
                     raise
                 connection.close()
@@ -420,8 +576,13 @@ class Client:
                 time.sleep(min(1,.1*2**attempt))
         return raw if binary else json.loads(raw)
 
-    def health(self, *, brief=False, sample=False):
-        result = self.request("/health", brief=brief, **({"extra_headers":{"X-DCO-Sample":"1"}} if sample else {}))
+    def health(self, *, brief=False, sample=False, display=False):
+        headers = {}
+        if sample:
+            headers['X-DCO-Sample'] = '1'
+        if display:
+            headers['X-DCO-Health-Display'] = '1'
+        result = self.request("/health", brief=brief, **({'extra_headers':headers} if headers else {}))
         if result.get("protocol") != PROTOCOL:
             raise RemoteError("Worker protocol differs: " + self.url)
         self._capabilities = result.get('capabilities',getattr(self,'_capabilities',None) or [])
@@ -480,13 +641,16 @@ class Client:
         # A stable id can be queried or resubmitted to THIS node after a lost reply.
         return self.submit_bundle(identity, task_bundle(task, inputs, files))
 
-    def submit_bundle(self, identity, payload, *, callback=None):
+    def submit_bundle(self, identity, payload, *, callback=None, cancel=None):
         path='/jobs/'+identity
         options={'extra_headers':{'X-DCO-Callback':json.dumps(callback)}} if callback else {}
+        options['cancel']=cancel
         try:
             return self.request(path,payload,**options)
         except RemoteError as error:
-            if not (error.transport_retryable or error.status_code in (502,503)):
+            if isinstance(error,RequestCancelled)and not getattr(error,'request_may_have_been_sent',False):
+                raise
+            if not (error.transport_retryable or error.status_code in (502,503)or isinstance(error,RequestCancelled)):
                 raise
         # A busy center can accept a task while both its reply and the first
         # receipt read time out. Reconcile that paid ID before another upload.
@@ -496,6 +660,7 @@ class Client:
                 saved=self.request(path)
             except RemoteError as error:
                 if error.status_code!=404:raise
+                _check_cancelled(cancel)
                 return self.request(path,payload,**options)
             if saved.get('id')==identity and saved.get('request_sha256')==digest:
                 return saved
@@ -573,11 +738,13 @@ class Client:
             raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None, platform=None):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None, platform=None, activity=False):
         """Center-owned transport window; execution slots stay in the central queue."""
         if node is not None and not self.operator:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,requires=list(requires))
+        if activity:
+            request['activity'] = True
         platform = validate_platform(platform)
         if platform is not None and not self.operator:
             raise RemoteError('platform selection is operator/debug-only; ordinary requests must omit platform')
@@ -618,11 +785,22 @@ class Client:
                 return dict(active[identity])
         return self.request("/jobs" + ("/" + identity if identity else ""), brief=brief)
 
-    def status_page(self, *, limit=256, offset=0, brief=False):
+    def status_page(self, *, limit=256, offset=0, brief=False, prefix=None):
         """Read a bounded recent task page without scanning retained receipts."""
         limit = max(1, min(int(limit), 512))
         offset = max(0, int(offset))
-        value = self.request('/jobs?' + urlencode({'limit': limit, 'offset': offset}),
+        query = {'limit': limit, 'offset': offset}
+        if prefix is not None:
+            if not isinstance(prefix, str) or not 8 <= len(prefix) <= 32 or any(c not in '0123456789abcdef' for c in prefix):
+                raise ValueError('Job prefix requires 8 to 32 lowercase hex digits')
+            if self._capabilities is None:
+                self.health(brief=True)
+            if 'job_prefix' not in self._capabilities:
+                matches = [j for j in self.status(brief=True) if j['id'].startswith(prefix)]
+                return dict(items=matches[offset:offset+limit], total=len(matches), offset=offset,
+                            limit=limit, has_more=offset+limit < len(matches), legacy_center=True)
+            query['prefix'] = prefix
+        value = self.request('/jobs?' + urlencode(query),
                              brief=brief)
         # Older centers return a plain list; keep the page API usable while
         # those processes drain and make the truncation explicit to callers.
@@ -796,13 +974,22 @@ class Client:
         # A center may first need to retrieve the complete remote ZIP. Keep
         # that header wait and its connections separate from status/control.
         if self.endpoint.scheme not in {'http', 'https'}:
-            return self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/artifacts',binary=True))
+            raw=self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/artifacts',binary=True))
+            if destination is None:return raw
+            target=Path(destination)
+            target.write_bytes(raw)
+            return target
         backend=self
         if self.endpoint.scheme in {'http','https'}:
             backend=self.__dict__.get('_result_client')
             if backend is None:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None),relay_url=self.relay_url,peer_id=self.peer_id))
             backend.timeout=max(120,self.timeout)
+            backend._artifact_header_timeout=self.timeout
+            if getattr(self,'bulk_limit',7)!=7:
+                backend.bulk_limit=self.bulk_limit
+                backend._transport=self.__dict__.setdefault('_transport',_ConnectionPool())
+                backend._transports=self.__dict__.setdefault('_transports',{})
         metrics=self.__dict__.setdefault('_artifact_timing',threading.local())
         stats=dict(requests=0,request_seconds=0.0,preparing_responses=0,prepare_sleep_seconds=0.0)
         metrics.value=stats
@@ -811,11 +998,32 @@ class Client:
             try:
                 if destination is None:
                     return backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers={'X-DCO-Artifact-Poll':'1'})
-                with Path(destination).open('w+b') as output:
-                    backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers={'X-DCO-Artifact-Poll':'1'},_output=output)
-                    if getattr(backend.connections,'response_status',200)==202:
-                        output.seek(0);return output.read()
-                return Path(destination)
+                from .bundle import atomic_json
+                target=Path(destination);metadata=target.with_name(target.name+'.http.json')
+                try:saved=json.loads(metadata.read_text())
+                except (OSError,ValueError):saved={}
+                headers={'X-DCO-Artifact-Poll':'1'}
+                if (saved.get('id')==identity and saved.get('url')==self.url and saved.get('etag')
+                        and target.is_file() and saved.get('bytes')==target.stat().st_size):
+                    headers['If-Range']=saved['etag']
+                with target.open('r+b' if target.exists() else 'w+b') as output:
+                    backend.connections.etag=headers.get('If-Range')
+                    backend.connections.response_status=None
+                    backend.connections.reused_artifact_bytes=0
+                    try:
+                        raw=backend.request('/jobs/'+identity+'/artifacts',binary=True,extra_headers=headers,_output=output)
+                        if backend.connections.response_status==202:return raw
+                    finally:
+                        output.flush()
+                        if backend.connections.response_status!=202:
+                            atomic_json(metadata,dict(id=identity,url=self.url,
+                                etag=getattr(backend.connections,'etag',None),bytes=target.stat().st_size))
+                if (_RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(backend.endpoint)
+                        and target.stat().st_size >= 1024 * 1024):
+                    from .artifact_reuse import cache
+                    cache.remember(target)
+                stats['reused_artifact_bytes'] = backend.connections.reused_artifact_bytes
+                return target
             finally:
                 stats['requests']+=1;stats['request_seconds']+=time.monotonic()-started
         delay = .2
@@ -886,7 +1094,15 @@ class Client:
         result["url"] = self.url
         retired=time.monotonic()
         if delete:
-            self.delete(identity)
+            try:
+                self.delete(identity)
+            except RemoteError as error:
+                if not error.transport_retryable and error.status_code not in (502,503,504):
+                    raise
+                # Files are already verified and received. A lost cleanup
+                # acknowledgement must not discard the caller's only copy.
+                result['retirement_pending']=True
+                fetched.value['retirement_error']=str(error)
         fetched.value['delete_seconds']=time.monotonic()-retired if delete else 0.0
         fetched.value['total_seconds']=time.monotonic()-started
         return result
@@ -1003,6 +1219,7 @@ class Node:
     live_jobs: set = field(default_factory=set)
     memory_holds: dict = field(default_factory=dict)
     host_ip: str = ""
+    native_architecture: str | None = None
     aliases: list = field(default_factory=list)
     accelerator_reservations: dict = field(default_factory=dict)
     external_accelerator_reservations: list = field(default_factory=list)
@@ -1012,6 +1229,7 @@ class Node:
     dispatch_lock: object = field(default_factory=threading.Lock,repr=False,compare=False)
     next_dispatch: float = 0.0
     dispatch_interval: float = .5
+    display_name: str = ""
 
     @property
     def base_capacity(self):
@@ -1178,15 +1396,21 @@ class Pool:
                             weight=entry.get("weight", 1.0), limit=entry.get("limit", 0),
                             memory_limit_mb=entry.get("memory_limit_mb", 0),
                             enabled=entry.get("enabled", True))
+                bulk_limit=entry.get('bulk_limit',7)
+                if type(bulk_limit)is not int or not 1<=bulk_limit<=7:
+                    raise ValueError('Node bulk_limit must be an integer in 1..7')
+                node.client.bulk_limit=bulk_limit
                 node.host_ip = entry.get("host_ip", "")
+                node.native_architecture = entry.get('architecture')
                 node.aliases = entry.get('aliases',[])
+                node.display_name = entry.get('display_name','')
                 retry = entry.get('reconnect')
                 if retry is not None and not node.enabled:
                     attempts, after = (retry.get('attempts'), retry.get('after')) if isinstance(retry,dict) else (None,None)
-                    if (type(attempts) is not int or not 0 <= attempts <= 5
+                    if (type(attempts) is not int or not 0 <= attempts <= 1 + len(RELAY_RECONNECT_INTERVALS)
                             or isinstance(after, bool) or not isinstance(after, (int, float))
                             or not 0 <= after < float('inf')):
-                        raise ValueError('Node reconnect requires attempts 0..5 and a nonnegative timestamp')
+                        raise ValueError('Invalid persisted reconnect attempts or timestamp')
                     node.detached = True
                     node.reconnect_attempts, node.reconnect_after = attempts, after
             if isinstance(node.client,Client):node.client.operator=True
@@ -1213,6 +1437,8 @@ class Pool:
         aliases=getattr(node,'aliases',[])
         if not isinstance(aliases,list) or any(not isinstance(alias,str) or not alias for alias in aliases):
             raise ValueError('Node aliases must be a list of previous node names')
+        if not isinstance(getattr(node,'display_name',''),str):
+            raise ValueError('Node display_name must be a string')
         if (not isinstance(node.weight, (int, float)) or not 0 < node.weight < float("inf")
                 or type(node.limit) is not int or node.limit < 0 or not isinstance(node.enabled, bool)
                 or type(node.memory_limit_mb) is not int or node.memory_limit_mb < 0):
@@ -1314,6 +1540,11 @@ class Pool:
             for node in selected:
                 pending=self.probe_futures.get(node.name)
                 interval=min(self.sample_seconds,.2) if node.live_jobs else self.sample_seconds
+                # A worker sample carries all active jobs and their lease requests.
+                # Keep relayed samples inside Client.status's two-second reuse window.
+                endpoint = getattr(node.client, 'endpoint', None)
+                if monitor and node.live_jobs and endpoint and _RELAY_BULK_BUDGET and _RELAY_BULK_BUDGET.matches(endpoint):
+                    interval = min(self.sample_seconds, 1.25)
                 if pending is not None and not pending.done():
                     if monitor or timeout is not None:continue
                     pending.result()
@@ -1334,7 +1565,10 @@ class Pool:
                     node.enabled=False
                     node.detached=True
                     node.reconnect_attempts=0
-                    node.reconnect_after=time.time()+60
+                    paced_relay = _reconnect_intervals(node.client) is RELAY_RECONNECT_INTERVALS
+                    # A recovered relay need not wait another minute to take
+                    # work. Later attempts retain the existing minute spacing.
+                    node.reconnect_after=time.time()+(5 if paced_relay else 60)
                     if not node.error:node.error='No successful connection for 60 seconds'
                     removed.append(node)
             if removed:self.condition.notify_all()
@@ -1352,15 +1586,16 @@ class Pool:
             with self.condition:
                 for node in self.nodes:
                     pending = self.probe_futures.get(node.name)
+                    intervals = _reconnect_intervals(node.client)
                     if (not node.detached or node.enabled or not node.reconnect_after
-                            or now < node.reconnect_after or node.reconnect_attempts >= 5
+                            or now < node.reconnect_after or node.reconnect_attempts > len(intervals)
                             or pending is not None and not pending.done()):
                         continue
+                    index = node.reconnect_attempts
+                    node.reconnect_after = now + intervals[index] if index < len(intervals) else 0.0
                     node.reconnect_attempts += 1
-                    node.reconnect_after = now + 60 if node.reconnect_attempts < 5 else 0.0
                     retry.append((node, node.connection_generation))
-            # Persist the consumed attempt before starting its network request,
-            # so a center restart cannot reset the five-attempt limit.
+            # Persist the consumed attempt before starting its network request.
             retry = [(node, generation) for node, generation in retry if self._save_reconnect(node)]
             for node, generation in retry:
                 self.probe_futures[node.name] = self.probes.submit(self._probe, node, True, True, generation)
@@ -1389,8 +1624,11 @@ class Pool:
                 self.policy = policy
             if name is not None:
                 node = next(x for x in self.nodes if x.name == name)
-                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "timeout", "host_ip", "url", "ca_file", "aliases", "relay_url", "peer_id"}:
-                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, timeout, host_ip, url, ca_file, aliases, relay_url, peer_id")
+                if set(changes) - {"weight", "limit", "enabled", "memory_limit_mb", "timeout", "host_ip", "url", "ca_file", "aliases", "relay_url", "peer_id", "display_name", "bulk_limit"}:
+                    raise ValueError("Node settings: weight, limit, enabled, memory_limit_mb, timeout, host_ip, url, ca_file, aliases, relay_url, peer_id, display_name, bulk_limit")
+                bulk_limit=changes.pop('bulk_limit',getattr(node.client,'bulk_limit',7))
+                if type(bulk_limit)is not int or not 1<=bulk_limit<=7:
+                    raise ValueError('Node bulk_limit must be an integer in 1..7')
                 timeout=changes.pop('timeout',None)
                 if timeout is not None and (isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not 0<timeout<float('inf')):
                     raise ValueError('Node timeout must be positive and finite')
@@ -1398,6 +1636,7 @@ class Pool:
                     key: changes.get(key, getattr(node, key)) for key in ("weight", "limit", "enabled", "memory_limit_mb")})
                 proposed.host_ip = changes.get('host_ip', getattr(node, 'host_ip', ''))
                 proposed.aliases = changes.get('aliases',getattr(node,'aliases',[]))
+                proposed.display_name = changes.get('display_name',getattr(node,'display_name',''))
                 self._validate_node(proposed)
                 address=changes.pop('url',node.client.url)
                 ca_file=changes.pop('ca_file',getattr(node.client,'ca_file',None))
@@ -1412,6 +1651,15 @@ class Pool:
                     node.client=Client(address,node.client.token,timeout=timeout or node.client.timeout,ca_file=ca_file,operator=True,relay_url=relay_url,peer_id=peer_id)
                     node.connection_generation+=1
                     node.error='Node address changed; checking worker'
+                node.client.bulk_limit=bulk_limit
+                transport=getattr(node.client,'_transport',None)
+                route_pools=list(getattr(node.client,'_transports',{}).values())
+                if transport is not None:
+                    route_pools.append(transport)
+                for pool in route_pools:
+                    with pool.condition:
+                        pool.bulk_limit=bulk_limit
+                        pool.condition.notify_all()
                 for key, value in changes.items():
                     setattr(node, key, value)
                 if 'enabled' in changes:
@@ -1424,10 +1672,14 @@ class Pool:
             self.condition.notify_all()
         if name is not None and connection_change:self._save_reconnect(node)
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None, relay_url=None, peer_id=None):
+    def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None, relay_url=None, peer_id=None, bulk_limit=7, display_name=""):
+        if type(bulk_limit)is not int or not 1<=bulk_limit<=7:
+            raise ValueError('Node bulk_limit must be an integer in 1..7')
         node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file,operator=True,relay_url=relay_url,peer_id=peer_id), weight=weight, limit=limit)
+        node.client.bulk_limit=bulk_limit
         node.host_ip = host_ip
         node.aliases=[] if aliases is None else aliases
+        node.display_name=display_name
         self._validate_node(node)
         with self.condition:
             if any(n.name == name or n.client.url == node.client.url for n in self.nodes):
@@ -1440,6 +1692,8 @@ class Pool:
             return {"policy": self.policy,
                 "reconnect_policy": {"offline_seconds":60,"interval_seconds":60,"attempts":5}, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
+                 "display_name":getattr(n,'display_name','')or n.name,
+                 "bulk_limit":getattr(n.client,'bulk_limit',7),
                  "detached": n.detached,
                  **({'reconnect': {'attempts': n.reconnect_attempts, 'after': n.reconnect_after}} if n.detached else {}),
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
@@ -1490,6 +1744,7 @@ class Pool:
             health=node.health
             if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
                     or task.get('platform') is not None and health.get('platform') != task['platform']
+                    or not supports_native_cache(health, task.get('native_cache'), getattr(node,'native_architecture',None))
                     or node.memory_capacity<node.startup_memory(task)
                     or not required.issubset(capability_set(health.get('tags',())))
                     or not required_shared.issubset(health.get('shared',()))

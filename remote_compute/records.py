@@ -2,7 +2,7 @@
 from collections import Counter, OrderedDict
 from collections.abc import MutableMapping
 from copy import deepcopy
-from itertools import islice
+from itertools import chain, islice
 import json
 import os
 from pathlib import Path
@@ -252,7 +252,7 @@ class JobRecords(MutableMapping):
     def __len__(self):
         return len(self.active) + len(self.history)
 
-    def page(self, *, limit=256, offset=0):
+    def page(self, *, limit=256, offset=0, prefix=None, include_active=True):
         """Return a bounded recent-first identity page without loading results.
 
         The complete receipt history stays on disk and remains addressable by
@@ -262,7 +262,11 @@ class JobRecords(MutableMapping):
         """
         limit = max(1, min(int(limit), 512))
         offset = max(0, int(offset))
-        active = tuple(self.active)
+        if prefix is not None:
+            identities = [identity for identity in chain(self.active if include_active else (), reversed(self.history))
+                          if identity.startswith(prefix)]
+            return identities[offset:offset + limit], len(identities)
+        active = tuple(self.active) if include_active else ()
         total = len(active) + len(self.history)
         ids = []
         if offset < len(active):

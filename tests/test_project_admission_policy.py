@@ -22,7 +22,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
     def test_raw_http_and_sdk_have_the_same_ordinary_boundary(self):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=2)as(_,remote),Pool([remote])as pool:
             with center(pool,Path(folder)/'center')as(state,operator):
-                client=Client(operator.url)
+                client=Client(operator.url, operator.token)
                 for field,value in (('node','node1'),('platform',sys.platform),('cwd','C:/external')):
                     identity=uuid.uuid4().hex
                     with self.subTest(field=field),self.assertRaisesRegex(RemoteError,'operator/debug-only'):
@@ -37,6 +37,9 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
                 with self.assertRaises(RemoteError):client.request('/control',dict(paused=True))
                 with self.assertRaises(RemoteError):client.request('/restart',{})
                 self.assertNotIn('target_cpus',client.admission('A'))
+                activity = client.admission('A', queue_ratio=0, activity=True)['activity']
+                self.assertEqual(set(activity), {'sampled_at', 'jobs'})
+                self.assertEqual(activity['jobs'], [])
                 result=operator.run(command(['${tool:python}','-c','import sys;print(sys.platform)'],
                     platform=sys.platform,max_cpus=2,memory_mb=128,project='debug'))
                 self.assertEqual(result['status'],'succeeded',result)
@@ -78,7 +81,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
         node.reserved=4
         state.jobs={'running':dict(task=dict(steps=[['echo']],cpus=4,max_cpus=8,memory_mb=64,project='A'),
             auto_cpus=False,elastic_cpus=True,desired_cpus=8,node=node,cancel=threading.Event(),result=dict(status='running',submitted=0)),
-            'waiting':dict(task=dict(steps=[['echo']],cpus=0,max_cpus=8,memory_mb=64,project='B'),
+            'waiting':dict(task=dict(steps=[['echo']],cpus=0,max_cpus=8,memory_mb=64,project='B',priority=0),
             auto_cpus=True,node=None,cancel=threading.Event(),result=dict(status='queued',submitted=1))}
         self.assertEqual(state._cooperative_cpu_target('running',8,state.project_resources()),7)
         state.queue.clear();state.jobs.pop('waiting')
@@ -97,8 +100,8 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
         with scratch()as folder,provider(Path(folder)/'worker')as(_,remote),Pool([remote])as pool:
             with center(pool,Path(folder)/'center')as(_,operator):
                 with self.assertRaisesRegex(RemoteError,'Operator token required'):
-                    Client(operator.url,operator=True).health()
-                client=Client(operator.url)
+                    Client(operator.url,operator.token,operator=True).health()
+                client=Client(operator.url,operator.token)
                 with self.assertRaisesRegex(RemoteError,'operator/debug-only'):
                     client.request('/capabilities?platform='+sys.platform,extra_headers={'X-DCO-Role':'operator'})
 

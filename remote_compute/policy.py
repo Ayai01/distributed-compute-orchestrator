@@ -266,9 +266,11 @@ def public_capabilities():
     """Names of the stable project-facing capability concepts."""
     return [
         "cache_references",
+        "native_cache",
         "admission",
         "admission_ready_tasks",
         "batch_status",
+        "job_prefix",
         "task_progress",
         "artifact_fetch",
         "max_cpus",

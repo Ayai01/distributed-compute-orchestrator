@@ -19,6 +19,42 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
+    def test_disabled_connected_node_drains_original_grants_without_growth(self):
+        state=self.center([4]);node=state.pool.nodes[0]
+        node.enabled=False;node.reserved=2;node.reserved_memory_mb=64;node.live_jobs.add('original')
+        node.health['capabilities']=['resize','resize_memory','resize_active_cpus','resize_min_cpus']
+        state.stopping=False;state._publish=lambda job:None;state._save=lambda job:None
+        node.client.resize=lambda identity,cpus,**options:dict(id=identity,cpus=cpus,memory_mb=64)
+        state.jobs={'original':dict(task=dict(cpus=2,max_cpus=4,memory_mb=64,project='A'),
+            node=node,cancel=threading.Event(),result=dict(id='original',status='running',cpus=2,memory_mb=64))}
+        self.assertEqual(state.resize('original',4,active_cpus=0,min_cpus=1)['cpus'],2)
+        self.assertEqual(state.resize('original',1,active_cpus=0,min_cpus=1)['cpus'],1)
+        self.assertEqual(state.resize('original',1,active_cpus=0,min_cpus=1)['cpus'],1)
+        self.assertEqual(node.reserved,1)
+        self.assertEqual(state.jobs['original']['result']['id'],'original')
+
+    def test_standing_growth_demand_does_not_block_overcommit_bootstrap(self):
+        state=self.center([64]);node=state.pool.nodes[0];node.reserved=62
+        node.health.update(used_cpus=62,cpu_percent=20,cpu_overcommit_factor=1.5)
+        active=dict(task=dict(steps=[['echo']],cpus=14,max_cpus=16,memory_mb=64,project='A'),
+            node=node,elastic_cpus=True,cancel=threading.Event(),desired_cpus=16,
+            result=dict(status='running',active_cpus=0,requested_cpus=16))
+        state.jobs={'native':active}
+        for index in range(49):
+            state.jobs[str(index)]=dict(task=dict(steps=[['echo']],cpus=1,max_cpus=1,memory_mb=64,project='B'),
+                node=node if index<48 else None,cancel=threading.Event(),
+                result=dict(status='running'if index<48 else'queued'))
+        resources=state.project_resources();candidate=state.jobs['48']['task']
+        self.assertEqual(state._growth_headroom(resources,candidate=candidate),{})
+        self.assertEqual(node.capacity,64)
+        active['result']['resource_request']=dict(request_id='pending',cpus=16)
+        self.assertEqual(state._growth_headroom(resources,candidate=candidate),{'0':2})
+        active['lease_answered']='pending'
+        self.assertEqual(state._growth_headroom(resources,candidate=candidate),{})
+        node.reserved=64;node.health['used_cpus']=64
+        self.assertEqual(node.capacity,96)
+        self.assertEqual(active['task']['cpus'],14)
+
     def test_unmatched_priority_waiter_does_not_disable_cross_project_warmup(self):
         state=self.center([4]);node=state.pool.nodes[0];node.reserved=1
         def queued(project,priority=0,requires=()):
@@ -358,6 +394,25 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_worker_alias_keeps_legacy_active_receipt_visible(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,worker):
+            with Pool([dict(name='xjtu-arm64',client=worker,aliases=['legacy-worker'])]) as pool, \
+                    center(pool,Path(root)/'center') as (state,client):
+                identity=client.submit(python('import time; time.sleep(10)',node='xjtu-arm64'))['id']
+                try:
+                    until(lambda:client.status(identity)['status']=='running')
+                    with state.condition:
+                        state.jobs[identity]['result']['assigned_node']='legacy-worker'
+                    row=client.health()['nodes'][0]
+                    self.assertEqual(row['name'],'xjtu-arm64')
+                    self.assertIn(identity,[job['id'] for job in row['active_jobs']])
+                    with state.condition:
+                        self.assertEqual(state.jobs[identity]['result']['assigned_node'],'legacy-worker')
+                finally:
+                    client.cancel(identity)
+                    client.wait(identity)
+                    client.fetch(identity)
+
     def test_receipt_cleanup_does_not_block_another_jobs_file_read(self):
         from remote_compute import coordinator
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
@@ -409,7 +464,7 @@ class CenterTests(unittest.TestCase):
 
     def test_simultaneous_one_thread_admissions_protect_four_thread_warmup(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=16)as (_,worker):
-            with Pool([dict(name='only',url=worker.url)],refresh=60)as pool:
+            with Pool([dict(name='only',url=worker.url,token=worker.token)],refresh=60)as pool:
                 with center(pool,Path(root)/'center',paused=True)as (state,client):
                     ids=[client.submit(python('import time;time.sleep(30)',max_cpus=16,
                         project='warmup',retries=0))['id']for _ in range(6)]
@@ -497,7 +552,7 @@ class CenterTests(unittest.TestCase):
 
         with scratch() as root, provider(Path(root) / 'worker') as (state, worker):
             with Pool([worker]) as pool, center(pool, Path(root) / 'center') as (scheduler, client):
-                public = Client(client.url, timeout=2)
+                public = Client(client.url, client.token, timeout=2)
                 try:
                     with patch('remote_compute.coordinator.atomic_json', side_effect=slow_commit):
                         identity = client.submit(python("print('original-result')"))['id']
@@ -1117,7 +1172,7 @@ class CenterTests(unittest.TestCase):
                         thread.start()
                         try:
                             self.assertTrue(entered.wait(2))
-                            quick=Client(client.url,timeout=.5)
+                            quick=Client(client.url,client.token,timeout=.5)
                             self.assertEqual(quick.health()['used_cpus'],4)
                             self.assertEqual(quick.admission('B')['capable_cpus'],4)
                             self.assertEqual(pool.nodes[0].reserved_memory_mb,512)
@@ -1264,6 +1319,22 @@ class CenterTests(unittest.TestCase):
                 client.wait(identity)
                 self.assertEqual(client.fetch(identity)['stdout'].strip(),'executed once')
 
+    def test_retired_worker_keeps_original_cached_artifacts_readable(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root / 'worker') as (_, worker), Pool([dict(name='retired', client=worker)]) as pool:
+                with center(pool, root / 'center') as (_, client):
+                    task = python("from pathlib import Path; Path('answer').write_bytes(b'42')", outputs=['answer'])
+                    identity = client.submit(task)['id']
+                    client.wait(identity)
+                    self.assertEqual(client.fetch(identity, delete=False)['files']['answer'], b'42')
+            with provider(root / 'other') as (_, worker), Pool([dict(name='other', client=worker)]) as pool:
+                with center(pool, root / 'center') as (_, client):
+                    result = client.fetch(identity, delete=False)
+                    self.assertEqual(result['id'], identity)
+                    self.assertEqual(result['assigned_node'], 'retired')
+                    self.assertEqual(result['files']['answer'], b'42')
+
     def test_interrupted_result_recovers_worker_outcome_and_upstream_failure_is_typed(self):
         for private in (False,True):
             with self.subTest(private=private),scratch() as root,provider(Path(root)/'worker') as (state,worker):
@@ -1299,7 +1370,7 @@ class CenterTests(unittest.TestCase):
             with self.subTest(policy=policy), scratch() as root:
                 with provider(Path(root)/'busy',cpus=8) as (busy,one), provider(Path(root)/'idle',cpus=8) as (idle,two):
                     with host_load(busy,75,'busy-host'), host_load(idle,0,'idle-host'):
-                        with Pool([dict(name='busy',url=one.url),dict(name='idle',url=two.url)],policy=policy,refresh=60) as pool:
+                        with Pool([dict(name='busy',client=one),dict(name='idle',client=two)],policy=policy,refresh=60) as pool:
                             pool.nodes[0].durations['cpu-placement']=.01
                             pool.nodes[1].durations['cpu-placement']=1
                             with center(pool,Path(root)/'center') as (_,client):
@@ -1322,7 +1393,7 @@ class CenterTests(unittest.TestCase):
         code="from pathlib import Path;import time\nwhile not Path('release').exists():time.sleep(.05)"
         with scratch() as root, provider(Path(root)/'warm',cpus=8) as (warm,one), provider(Path(root)/'busy',cpus=8) as (busy,two):
             with host_load(warm,50,'warm-host'), host_load(busy,75,'busy-host'):
-                with Pool([dict(name='warm',url=one.url),dict(name='busy',url=two.url)],refresh=60) as pool:
+                with Pool([dict(name='warm',client=one),dict(name='busy',client=two)],refresh=60) as pool:
                     with center(pool,Path(root)/'center') as (_,client):
                         initial=client.submit(python(code,max_cpus=4,node='warm',project='CPU-placement'))['id']
                         until(lambda:client.status(initial)['status']=='running' and bool(one.status(initial).get('steps')))
@@ -1589,7 +1660,8 @@ class CenterTests(unittest.TestCase):
 
     def test_submission_window_refreshes_shares_and_honors_node(self):
         with scratch() as root, provider(Path(root)/'big',cpus=4,cpu_limit=4) as (_,big), provider(Path(root)/'small',cpus=2,cpu_limit=2) as (_,small):
-            with Pool([dict(name='big',url=big.url),dict(name='small',url=small.url)]) as pool, center(pool,Path(root)/'center') as (_,client):
+            with Pool([dict(name='big',url=big.url,token=big.token),
+                       dict(name='small',url=small.url,token=small.token)]) as pool, center(pool,Path(root)/'center') as (_,client):
                 client.control(paused=True)
                 identities=[client.submit(python('pass',project='A'))['id'] for _ in range(6)]
                 window=client.window('B',queue_ratio=0)
@@ -1666,7 +1738,7 @@ class CenterTests(unittest.TestCase):
 
     def test_auto_uses_idle_smaller_node_while_larger_node_is_busy(self):
         with scratch() as root, provider(Path(root)/'big',cpus=3) as (_,big), provider(Path(root)/'small',cpus=2) as (_,small):
-            with Pool([dict(name='big',url=big.url),dict(name='small',url=small.url)]) as pool, center(pool,Path(root)/'center') as (_,client):
+            with Pool([dict(name='big',client=big),dict(name='small',client=small)]) as pool, center(pool,Path(root)/'center') as (_,client):
                 busy=client.submit(python("from pathlib import Path; import time\nwhile not Path('release').exists(): time.sleep(.02)",
                                           max_cpus=3,node='big',project='busy'))['id']
                 until(lambda: client.status(busy)['status']=='running')
@@ -1709,6 +1781,26 @@ class CenterTests(unittest.TestCase):
                 worker.wait(direct)
                 worker.fetch(direct)
 
+    def test_display_health_uses_last_complete_sample_while_either_lock_is_held(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, worker):
+            with Pool([worker], refresh=60) as pool, center(pool, Path(root)/'center') as (state, client):
+                self.assertNotIn('health_sampled_at', worker.health(display=True))
+                state.display_health_interval = .01
+                captured = client.health(display=True)
+                self.assertFalse(captured['health_stale'])
+                self.assertNotIn('health_sampled_at', client.health())
+                time.sleep(.02)
+                for lock in (state.condition, pool.condition):
+                    with lock:
+                        display = client.health(display=True)
+                        self.assertTrue(display['health_stale'])
+                        self.assertEqual(display['health_sampled_at'], captured['health_sampled_at'])
+                        self.assertGreater(display['health_age_seconds'], 0)
+                        self.assertEqual(display['nodes'], captured['nodes'])
+                fresh = client.health(display=True)
+                self.assertGreater(fresh['health_sampled_at'], captured['health_sampled_at'])
+                self.assertFalse(fresh['health_stale'])
+
     def test_brief_polling_omits_payload_and_wait_returns_full_provenance(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
             identity=client.submit(python("import time; print('complete'); time.sleep(.2)"))['id']
@@ -1728,11 +1820,12 @@ class CenterTests(unittest.TestCase):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
             endpoint=urlsplit(client.url)
             connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port)
+            headers={'Authorization':'Bearer '+client.token}
             try:
-                connection.request('GET','/health')
+                connection.request('GET','/health',headers=headers)
                 response=connection.getresponse();plain=response.read()
                 self.assertIsNone(response.getheader('Content-Encoding'))
-                connection.request('GET','/health',headers={'Accept-Encoding':'gzip'})
+                connection.request('GET','/health',headers={**headers,'Accept-Encoding':'gzip'})
                 response=connection.getresponse();compressed=response.read()
                 self.assertEqual(response.getheader('Content-Encoding'),'gzip')
                 self.assertLess(len(compressed),len(plain))

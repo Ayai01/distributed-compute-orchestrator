@@ -8,14 +8,12 @@ import time
 import unicodedata
 from functools import lru_cache
 from urllib.parse import urlsplit
-from . import ABBREVIATION
+from . import ABBREVIATION, __version__
 from .policy import canonical_capabilities
 from .runtimes import execution_capabilities
 from .task_tags import compact_tag, quantity
 from .telemetry import sampling_notice
 
-
-CONSOLE_VERSION = '1.0.2'
 
 _ambiguous_width = None
 
@@ -394,9 +392,8 @@ class StatusRows(list):
         role='混合模式' if center and value.get('mode')=='hybrid' else '调度中心' if center else '算力提供者'
         self.title=f"{ABBREVIATION} | {value.get('node','')} | {role}{port_label}{version_label}"
         if self.viewport:
-            service = ('中心' if center else '节点') + ' ' + str(value['version']) if value.get('version') else ''
-            releases = f'{ABBREVIATION} 面板 {CONSOLE_VERSION}' + (f' | {service}' if service else '')
-            self.title = f"{releases} | {value.get('node', '')} | {role}{port_label}"
+            release = value.get('version') or __version__
+            self.title = f"{ABBREVIATION} {release} | {value.get('node', '')} | {role}{port_label}"
             sample_time=value.get('health_sampled_at') or time.time()
             self.title+=' | 采样 '+time.strftime('%H:%M:%S',time.localtime(sample_time))
             if value.get('health_stale'):
@@ -438,7 +435,7 @@ class StatusRows(list):
                                        benchmark.get('threads','-'),_device_address(node,'' if center else self.url,
                                            center_host=(value.get('node') or '') if center else None),
                                        number,_accelerator_summary(node),
-                                       node.get('benchmark_state','ready')]))
+                                       node.get('benchmark_state','ready'),_capabilities(node.get('tags'))]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
         self.projects=[]
         if center:
@@ -448,6 +445,9 @@ class StatusRows(list):
             self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
+        self.capability_width = max([4]+[_width(record[13]) for _,record in self.devices])
+        self.available_capabilities = _capabilities(tag for node, _ in self.devices
+            if _node_state(node) in ('运行','就绪') for tag in node.get('tags') or ())
         now=time.time()
         offline_nodes={n.get('display_name')or n.get('name')for n in value.get('nodes',[])if n.get('error')}
         self.records=[]
@@ -567,13 +567,21 @@ class StatusRows(list):
                 reachable = health not in ('禁用', '失联')
                 rows.append([f'#{record[10]} {record[0]}', health, record[1].split('(')[0],
                              record[2] if reachable else '-',
-                             record[3] if reachable and node.get('memory_total_mb') else '-'])
-            if table:
+                             record[3] if reachable and node.get('memory_total_mb') else '-',
+                             record[13] if reachable else '-'])
+            if table and pane_width >= self.capability_width+61:
+                block = _table(['节点', '状态', '线程', 'CPU%', '内存 GiB', '能力'], rows,
+                               [None,4,7,6,11,self.capability_width],pane_width,right=(2,3,4))
+            elif table and pane_width >= self.capability_width+38:
+                block = _table(['节点', '状态', '线程', '能力'],
+                               [[r[0],r[1],r[2],r[5]] for r in rows],
+                               [None,4,7,self.capability_width],pane_width,right=(2,))
+            elif table:
                 block = _table(['节点', '状态', '线程', 'CPU%', '内存 GiB'], rows,
                                [None, 4, 7, 6, 11], pane_width, right=(2, 3, 4))
             else:
                 block = [_line(f'{state} {name} {threads}', pane_width)
-                         for name, state, threads, _, _ in rows]
+                         for name, state, threads, *_ in rows]
             blocks.append(block + [_line('', pane_width)] *
                           max(0, column_height + 2 * table - len(block)))
         present = [_node_state(node) for node, _ in self.devices]
@@ -588,13 +596,15 @@ class StatusRows(list):
 
     def _overview(self, limit):
         width = self.width
-        columns = min(3, max(1, (width+1)//61), max(1, math.ceil(len(self.devices)/6)))
-        projects = []
+        minimum_pane = max(58, self.capability_width+38)
+        columns = min(3,max(1,(width-1)//(minimum_pane-1)),max(1,math.ceil(len(self.devices)/6)))
+        metadata = ([_line(line,width) for line in wrap_lines('可调度能力  '+self.available_capabilities,width-4)]
+                    if limit >= 10 else [])
         if self.projects and limit >= 15:
             summary = '  '.join(f'{name} {running} 排{queued}'
                                 for name, _, running, queued in self.projects)
-            projects = [_line('工程  '+summary, width)]
-        remaining = limit - len(projects)
+            metadata.append(_line('工程  '+summary,width))
+        remaining = limit - len(metadata)
         # At ordinary window sizes, spend only as many rows as the fleet needs.
         # In a short terminal both panes keep at least one data row.
         fleet_height = min(4 + math.ceil(len(self.devices) / columns),
@@ -604,7 +614,7 @@ class StatusRows(list):
         devices = self._fleet(fleet_height, columns) if fleet_height else []
         task_height = max(0, remaining - len(devices))
         tasks = self._tasks(width, max(1, task_height - 4))[:task_height]
-        return [*devices, *projects, *tasks]
+        return [*devices, *metadata, *tasks]
 
     def _paged_resources(self, width, limit, *, bottom):
         footer=int(bottom)
@@ -680,7 +690,7 @@ class StatusRows(list):
             f'内存 已用/总 {record[3]} | 可派 {record[4]} | 进程/预留 {record[5]} GiB',
             f'IP {record[9]} | 链路 {route}',
             f'来源 {record[6]} | 加速器 {record[11]}',
-            '能力 ' + _capabilities(node.get('tags')),
+            '能力 ' + record[13],
         ]
         if node.get('error'):
             details.insert(2, '连接 ' + str(node['error']))

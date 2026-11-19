@@ -38,7 +38,10 @@ def _proc_rows(fresh=False):
 def keep_awake():
     """Own a sleep inhibitor for the service lifetime, including reloads."""
     if os.name != 'nt':
-        inhibitor = shutil.which('systemd-inhibit') if sys.platform.startswith('linux') else None
+        # A container image can ship the binary without running systemd/logind.
+        # Only the systemd host owns idle-sleep inhibition.
+        inhibitor = (shutil.which('systemd-inhibit') if sys.platform.startswith('linux')
+                     and Path('/run/systemd/system').is_dir() else None)
         if inhibitor:
             import select
             command = [inhibitor, '--what=idle', '--mode=block', '--who=DCO',

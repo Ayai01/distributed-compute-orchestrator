@@ -74,8 +74,13 @@ def progress_fields(value):
 def progress(value):
     """Small polling view; full provenance remains in the final result."""
     result = {key: value[key] for key in ('id','status','label','cpus', 'active_cpus', 'min_cpus', 'requested_cpus','memory_mb','memory_phase','submitted','started',
-             'finished','elapsed','assigned_node','worker_url','center_submitted','dispatched','resource_request') if key in value}
+             'finished','elapsed','assigned_node','worker_url','center_submitted','dispatched','resource_request','resource_wait_reason') if key in value}
     result.update(progress_fields(value))
+    if value.get('status') in TERMINAL:
+        result.update({key: value[key] for key in ('cpu_seconds', 'cumulative_cpu_seconds', 'total_cpu_seconds') if key in value})
+    if value.get('observe_only'):
+        result.update({key: value[key] for key in ('observe_only', 'source', 'revision', 'project', 'phase',
+                       'cpu_seconds', 'cumulative_cpu_seconds', 'cpu_sampled_at', 'measured_cpus') if key in value})
     return result
 
 

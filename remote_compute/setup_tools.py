@@ -52,7 +52,8 @@ def preferred_python():
 
 
 def _python(temporary):
-    executable = preferred_python()
+    # A Linux setup invoked inside a venv must install into that exact venv.
+    executable = Path(sys.executable) if sys.platform.startswith('linux') else preferred_python()
     env = dict(os.environ, PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1',
                TEMP=str(temporary), TMP=str(temporary), TMPDIR=str(temporary))
     env.pop('PYTHONHOME', None)
@@ -123,6 +124,61 @@ def _ngspice(destination, temporary, source=None):
     return executable, {'version':next((line.strip(' *') for line in version.splitlines() if 'ngspice-' in line), version.strip())}
 
 
+
+def _native_ngspice(source=None):
+    """Reuse a native Linux executable or prefix; never fetch a Windows bundle."""
+    if source:
+        path = Path(source).expanduser()
+        executable = path if path.is_file() else path / 'bin/ngspice'
+    else:
+        known = shutil.which('ngspice')
+        executable = Path(known) if known else None
+    if executable is None or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError('Native ngspice not found or not executable; add its bin directory to PATH '
+                         'or run setup --ngspice-source /path/to/ngspice-prefix (or executable). '
+                         'Install a native ngspice 47 build to provide ng47.')
+    executable = executable.resolve()
+    version = _run([executable, '--version'], capture_output=True, text=True, timeout=15).stdout
+    return executable, {'version':next((line.strip(' *') for line in version.splitlines()
+                                        if 'ngspice-' in line.lower()), version.strip()), 'reused':True}
+
+
+def _install_linux(root, ngspice_source=None, temporary_root=None):
+    """Use the invoking venv and a preinstalled native simulator."""
+    root = Path(root).resolve()
+    config_path = root/'.local/worker.json'
+    configured = json.loads(config_path.read_text(encoding='utf-8-sig')) if config_path.exists() else {}
+    if ngspice_source is None:
+        known = configured.get('tools', {}).get('ngspice') or configured.get('tools', {}).get('ng47')
+        ngspice_source = known[0] if isinstance(known, list) and len(known) == 1 else known
+        if isinstance(ngspice_source, list):
+            raise ValueError('Native ngspice config must be a single executable path; '
+                             'use setup --ngspice-source /path/to/ngspice')
+    ngspice, simulator = _native_ngspice(ngspice_source)
+    scratch = Path(temporary_root) if temporary_root else Path('/dev/shm')
+    if not scratch.is_dir() or not os.access(scratch, os.W_OK):
+        if temporary_root:
+            raise ValueError('Temporary directory is unavailable: '+str(scratch))
+        scratch = Path(tempfile.gettempdir())
+    with tempfile.TemporaryDirectory(prefix='install-science-', dir=scratch) as directory:
+        try:
+            python, runtime = _python(Path(directory))
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError('Science package setup failed in the current Python environment; '
+                               'activate an isolated venv and run python -m pip install '
+                               + ' '.join(('numpy','scipy','numba','pymoo','moocore','threadpoolctl',
+                                           'scikit-learn','umap-learn','opencv-python-headless','onnx','onnxruntime'))
+                               + ', then rerun setup') from exc
+    tools = root/'.tools'
+    tools.mkdir(parents=True, exist_ok=True)
+    result = {'tools':{'python':python.as_posix(), 'ngspice':ngspice.as_posix()},
+              'python_runtimes':{'cpu':[python.as_posix()]}, 'env':{'PYTHONNOUSERSITE':'1'},
+              'runtime':runtime, 'ngspice':simulator, 'installed_mib':{'ngspice':0}}
+    if re.search(r'\bngspice-47\b', simulator['version'], re.IGNORECASE):
+        result['tools']['ng47'] = ngspice.as_posix()
+    (tools/'science.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
+    return result
+
 def _merge_tree(source, destination):
     destination.mkdir(parents=True,exist_ok=True)
     for path in source.iterdir():
@@ -135,8 +191,10 @@ def _merge_tree(source, destination):
 
 def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
     """Return tools/env using system Python and project-local native tools."""
+    if sys.platform.startswith('linux'):
+        return _install_linux(root, ngspice_source, temporary_root)
     if os.name != 'nt':
-        raise ValueError('This installer supplies Windows x64 workers; use native Python/ngspice on other systems')
+        raise ValueError('Science setup supports Windows and Linux')
     from .ramdisk import scratch
     root = Path(root).resolve()
     tools = root/'.tools'

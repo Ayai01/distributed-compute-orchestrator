@@ -50,10 +50,13 @@ def load_nodes(path=None, url=None, local_client=None, operator_token=None):
         try:
             actual = Client(node['url'], node['token'], timeout=2,ca_file=node.get('ca_file'),
                             relay_url=node.get('relay_url'),peer_id=node.get('peer_id'),operator=True).health()['node']
-            if actual != node.get('name'):
-                node['aliases'] = list(dict.fromkeys([*node.get('aliases',[]),*([node['name']] if node.get('name') else [])]))
-                node['aliases'] = [name for name in node['aliases'] if name != actual]
+            if not node.get('name'):
                 node['name'] = actual
+            elif actual != node['name']:
+                # Keep the configured stable name for routing and display;
+                # retain the worker-reported hostname for older receipts.
+                node['aliases'] = list(dict.fromkeys([*node.get('aliases', []), actual]))
+                node['aliases'] = [name for name in node['aliases'] if name != node['name']]
         except RemoteError:
             pass
     return value
@@ -111,7 +114,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
     def detached(node):
         from .commands import save_detached_node
         save_detached_node(args.nodes or ROOT/'.local/nodes.json',node)
-        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源；每60秒重连，最多5次')
+        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源，按退避策略自动重连')
     def reconnected(node):
         from .commands import save_detached_node
         save_detached_node(args.nodes or ROOT/'.local/nodes.json',node)
@@ -168,7 +171,9 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
             shell = SchedulerShell(pool, dispatch)
             try:
                 shell.do_nodes("")
-                shell.loop(dispatch.health if dispatch else None, dispatch.url if dispatch else '',
+                read_display = (lambda: coordinator.health(display=True)) if coordinator else (
+                    (lambda: dispatch.health(display=True)) if dispatch else None)
+                shell.loop(read_display, dispatch.url if dispatch else '',
                            lambda: not stopping.is_set() and (api_thread is None or api_thread.is_alive()))
             finally:
                 shell.close()
@@ -371,6 +376,8 @@ def main(argv=None):
     item = sub.add_parser('update', help='从统一GitHub仓库快进更新当前工程')
     item.add_argument('--check', action='store_true', dest='update_check')
     item = sub.add_parser('setup', help='复用系统Python安装科学包；原生工具存放于.tools')
+    item.add_argument('--ascend', action='store_true', help='探测现有昇腾镜像，登记NPU后端和挂载设备；不安装软件')
+    item.add_argument('--cann-env', help='昇腾镜像的CANN set_env.sh路径')
     item.add_argument('--ngspice-source', help='复用已有ngspice目录，省去下载')
     item.add_argument('--rtl-source', help='原位复用已有MSYS2的GCC/Verilator，不复制安装')
     item = sub.add_parser('setup-https', help='配置本设备公网HTTPS和认证；空闲时在原终端重载')
@@ -500,13 +507,27 @@ def main(argv=None):
                               config_path=path, restart=not args.no_restart))
             return 0
         if args.action == 'setup':
-            from .setup_tools import install, reuse_rtl
-            result = install(ngspice_source=args.ngspice_source)
+            if args.ascend:
+                if args.ngspice_source or args.rtl_source:
+                    raise ValueError('Ascend setup uses the existing image; configure CPU/RTL tools separately')
+                from .ascend import configure
+                result = configure(cann_env=args.cann_env)
+            else:
+                if args.cann_env:raise ValueError('--cann-env requires --ascend')
+                from .setup_tools import install
+                result = install(ngspice_source=args.ngspice_source)
             if args.rtl_source:
+                from .setup_tools import reuse_rtl
                 result['env'].update(reuse_rtl(args.rtl_source)['env'])
             saved = {**config, 'tools': {**config.get('tools', {}), **result['tools']},
                      'python_runtimes':{**config.get('python_runtimes',{}),**result['python_runtimes']},
                      'env': {**config.get('env', {}), **result['env']}}
+            if 'accelerators' in result:
+                saved['accelerators']=[p for p in config.get('accelerators',[]) if p.get('kind')!='npu']+result['accelerators']
+                saved['ascend_runtime']=result['ascend_runtime']
+                if 'ml' in config.get('python_runtimes',{}):
+                    saved['python_runtimes']['ml']=config['python_runtimes']['ml']
+            path.parent.mkdir(parents=True, exist_ok=True)
             atomic_json(path, saved, private=True)
             display(result)
             return 0
@@ -647,7 +668,10 @@ def main(argv=None):
             except OSError:
                 pass
         return 0
-    except (ValueError, OSError, RuntimeError, StopIteration, TypeError, MemoryError) as error:
+    except Exception as error:
+        expected_error = isinstance(error, (ValueError, OSError, RuntimeError, StopIteration, TypeError, MemoryError))
+        if not expected_error and (args.url or args.action is not None or args.test or args.test_native or args.check):
+            raise
         print("操作失败:", error, file=sys.stderr)
         if not args.url and args.action is None and not (args.test or args.test_native or args.check):
             diagnostic = ROOT / '.local/diagnostics/startup-error.log'
@@ -657,6 +681,8 @@ def main(argv=None):
                 print('详细错误：' + str(diagnostic), file=sys.stderr)
             except OSError:
                 pass
+        if not expected_error:
+            raise
         if args.url and ('10061' in str(error) or 'Connection refused' in str(error)):
             print('调度中心未启动。本机请运行 start.cmd（Windows）、./start.sh（Linux）或 python main.py；统一连接地址 http://127.0.0.1:26133。', file=sys.stderr)
         # Python can report Windows commit/resource exhaustion as OSError,

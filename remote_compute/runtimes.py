@@ -5,11 +5,37 @@ from functools import lru_cache
 from .policy import canonical_capability, canonical_capabilities, select_accelerator_units
 
 
-EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','layout','rtl','onnx')
+EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','npu','layout','rtl','onnx')
 CHISEL_TOOLS = {'java', 'scala-cli', 'firtool', 'circt', 'verilator', 'cxx', 'make'}
 LAYOUT_TOOLS = {'layout', 'magic', 'netgen'}
 _TOOLS = re.compile(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}')
 _SHARED = re.compile(r'\$\{shared:([\w-]+)\}')
+
+
+def native_architecture(value):
+    name = (value or '').lower()
+    return {'arm64': 'aarch64', 'amd64': 'x86_64', 'x64': 'x86_64'}.get(name, name)
+
+
+def validate_native_cache(value):
+    """A native artifact depends on one shared storage namespace and ABI."""
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {'storage', 'platform', 'architecture'}
+            or not all(isinstance(item, str) for item in value.values())
+            or not re.fullmatch('[0-9a-f]{64}', value['storage'])
+            or any(not re.fullmatch('[a-z0-9_]{1,32}', value[key]) for key in ('platform', 'architecture'))):
+        raise ValueError('native_cache requires storage SHA256, platform and architecture')
+    return dict(value, architecture=native_architecture(value['architecture']))
+
+
+def supports_native_cache(health, requirement, configured_architecture=None):
+    if requirement is None:
+        return True
+    architecture = health.get('architecture') or configured_architecture
+    return (health.get('shared_asset_cache') == requirement['storage']
+            and health.get('platform') == requirement['platform']
+            and native_architecture(architecture) == requirement['architecture'])
 
 
 def execution_capabilities(tags):

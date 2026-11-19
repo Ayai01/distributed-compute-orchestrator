@@ -1,7 +1,15 @@
 """Bounded operator notifications and recent authenticated peer addresses."""
 from collections import deque
+import re
 import threading
 import time
+
+
+_SAMPLING_NOTICE = re.compile(r'(?:Campus control (?:sample|receipt|science|batch|object_status|member|projection_page) \[[0-9a-f]{4,32}\]|External observations: \d+)\Z')
+
+
+def sampling_notice(message):
+    return isinstance(message, str) and _SAMPLING_NOTICE.fullmatch(message) is not None
 
 
 class Activity:
@@ -19,6 +27,8 @@ class Activity:
             self.peers = dict(sorted(self.peers.items(), key=lambda x: x[1])[-8:])
 
     def notify(self, message, address='terminal'):
+        if sampling_notice(message):
+            return
         with self.lock:
             self.events.append(dict(time=time.time(), ip=address, message=message))
 

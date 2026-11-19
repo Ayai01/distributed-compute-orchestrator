@@ -11,6 +11,7 @@ import uuid
 import json
 import math
 import subprocess
+import sys
 import time
 
 MIB = 1024 * 1024
@@ -154,6 +155,145 @@ def _cached_cpu_benchmark(cpus, executable, environment):
 cpu_benchmark.cache_clear = _cached_cpu_benchmark.cache_clear
 
 
+# cgroup mount and membership files are read on demand, since a running
+# container can be moved or its limits changed without restarting the worker.
+_CGROUP_MEMBERSHIP = Path('/proc/self/cgroup')
+_CGROUP_MOUNTINFO = Path('/proc/self/mountinfo')
+
+
+def _cgroup_locations():
+    """Map controllers to (process directory, visible mount root, version)."""
+    try:
+        memberships = _CGROUP_MEMBERSHIP.read_text().splitlines()
+        mounts = _CGROUP_MOUNTINFO.read_text().splitlines()
+    except OSError:
+        return {}
+    groups = {}
+    for line in memberships:
+        parts = line.split(':', 2)
+        if len(parts) == 3:
+            for controller in parts[1].split(','):
+                groups[controller] = parts[2]
+    locations = {}
+    for line in mounts:
+        fields = line.split()
+        try:
+            separator = fields.index('-')
+            kind = fields[separator + 1]
+            if kind not in ('cgroup', 'cgroup2'):
+                continue
+            # mountinfo escapes spaces, tabs, newlines and backslashes as octal.
+            def unescape(value):
+                import re
+                return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), value)
+            root, mount = unescape(fields[3]), Path(unescape(fields[4]))
+            controllers = [''] if kind == 'cgroup2' else fields[separator + 3].split(',')
+            for controller in controllers:
+                group = groups.get(controller)
+                if group is None:
+                    continue
+                base = root.rstrip('/') or '/'
+                if base != '/' and group != base and not group.startswith(base + '/'):
+                    continue
+                relative = group[len(base):].lstrip('/') if base != '/' else group.lstrip('/')
+                locations[controller] = (mount / relative, mount, 2 if kind == 'cgroup2' else 1)
+        except (ValueError, IndexError):
+            continue
+    return locations
+
+
+def _ancestors(location):
+    current, mount, version = location
+    while True:
+        yield current, version
+        if current == mount:
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+
+def _read(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ''
+
+
+def _cpu_set_count(value):
+    cpus = set()
+    try:
+        for item in value.split(','):
+            parts = item.split('-')
+            first, last = int(parts[0]), int(parts[-1])
+            if len(parts) > 2 or first < 0 or last < first or last > 1000000:
+                return None
+            cpus.update(range(first, last + 1))
+    except ValueError:
+        return None
+    return len(cpus) or None
+
+
+def cpu_capacity():
+    """Effective integer CPU capacity, respecting Linux cgroup and affinity."""
+    capacity = max(1, os.cpu_count() or 1)
+    if os.name == 'nt' or not sys.platform.startswith('linux'):
+        return capacity
+    try:
+        capacity = min(capacity, max(1, len(os.sched_getaffinity(0))))
+    except (AttributeError, OSError):
+        pass
+    locations = _cgroup_locations()
+    for controller in ('', 'cpu'):
+        if controller not in locations:
+            continue
+        for path, version in _ancestors(locations[controller]):
+            try:
+                if version == 2:
+                    quota, period = _read(path / 'cpu.max').split()
+                    if quota == 'max':
+                        continue
+                else:
+                    quota, period = _read(path / 'cpu.cfs_quota_us'), _read(path / 'cpu.cfs_period_us')
+                quota, period = int(quota), int(period)
+                if quota > 0 and period > 0:
+                    capacity = min(capacity, max(1, quota // period))
+            except (ValueError, TypeError):
+                pass
+    for controller in ('', 'cpuset'):
+        if controller not in locations:
+            continue
+        for path, version in _ancestors(locations[controller]):
+            names = ('cpuset.cpus.effective', 'cpuset.cpus') if version == 2 else ('cpuset.effective_cpus', 'cpuset.cpus')
+            count = next((n for n in (_cpu_set_count(_read(path / name)) for name in names) if n), None)
+            if count:
+                capacity = min(capacity, count)
+    return capacity
+
+
+def _cgroup_memory(total, available):
+    locations = _cgroup_locations()
+    for controller in ('', 'memory'):
+        if controller not in locations:
+            continue
+        for path, version in _ancestors(locations[controller]):
+            limit_name, usage_name = (('memory.max', 'memory.current') if version == 2
+                                      else ('memory.limit_in_bytes', 'memory.usage_in_bytes'))
+            try:
+                limit = int(_read(path / limit_name))
+                # v1 represents unlimited with a near-LONG_MAX sentinel.
+                if limit <= 0 or limit >= (1 << 60):
+                    continue
+                total = min(total, limit // MIB)
+                available = min(available, total)
+                usage = int(_read(path / usage_name))
+                available = min(available, max(0, limit - usage) // MIB)
+            except ValueError:
+                continue
+    return total, available
+
+
 def memory():
     if os.name == "nt":
         class Memory(c.Structure):
@@ -169,7 +309,8 @@ def memory():
     for line in Path("/proc/meminfo").read_text().splitlines():
         key, value = line.split(":", 1)
         values[key] = int(value.split()[0]) // 1024
-    return values["MemTotal"], values["MemAvailable"]
+    total, available = values["MemTotal"], values["MemAvailable"]
+    return _cgroup_memory(total, available) if sys.platform.startswith("linux") else (total, available)
 
 
 def commit_memory():
@@ -258,7 +399,7 @@ class Host:
                 if elapsed:
                     self.cpu_percent = round(max(0, min(100, 100 * (1 - idle / elapsed))), 2)
                 self.previous, self.sampled = current, time.monotonic()
-        result = {"machine_id": MACHINE_ID, "logical_cpus": os.cpu_count() or 1,
+        result = {"machine_id": MACHINE_ID, "logical_cpus": cpu_capacity(),
                 "cpu_percent": self.cpu_percent, "temperature_c": None,
                 "memory_total_mb": total_mb, "host_memory_available_mb": available_mb}
         if commit is not None:

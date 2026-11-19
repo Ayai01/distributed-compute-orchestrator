@@ -31,7 +31,8 @@ def python_task(function, *, kwargs=None, **options):
 def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
-            accelerator=None, platform=None, cache_ref=None):
+            accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True):
+    if type(resource_recovery) is not bool:raise ValueError("resource_recovery must be a boolean")
     platform = validate_platform(platform)
     model=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
     if model:
@@ -56,6 +57,9 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
     if cache_ref is not None:
         from .cache_refs import reference_id
         task['cache_ref']=reference_id(cache_ref)
+    if native_cache is not None:
+        from .runtimes import validate_native_cache
+        task['native_cache'] = validate_native_cache(native_cache)
     if single_thread_weight != 1.0 or isinstance(single_thread_weight, bool):
         task['single_thread_weight'] = single_thread_weight
     if cwd is not None:
@@ -63,6 +67,7 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
     if stdin is not None:
         task["stdin"] = str(stdin)
     if retries!=2:task['retries']=retries
+    if not resource_recovery:task['resource_recovery']=False
     return task
 
 

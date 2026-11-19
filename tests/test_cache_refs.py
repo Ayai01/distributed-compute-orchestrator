@@ -1,6 +1,7 @@
 """Public producer references constrain cache consumers without exposing devices."""
 import json
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,22 @@ from test_compute import provider,scratch
 
 
 class CacheReferenceTests(unittest.TestCase):
+    def test_native_cache_routes_by_storage_and_abi_without_exposing_devices(self):
+        with scratch() as folder:
+            root = Path(folder)
+            env = {'DCO_SHARED_ASSET_CACHE': str(root/'shared')}
+            with provider(root/'one', env=env) as (wrong, first), provider(root/'two', env=env) as (right, second):
+                wrong.architecture, right.architecture = 'x86_64', 'aarch64'
+                with Pool([first, second]) as pool, center(pool,root/'center') as (state, operator):
+                    client = Client(operator.url,operator.token)
+                    attachment = dict(storage=right.shared_assets.identity, platform=sys.platform, architecture='arm64')
+                    task = command(['${tool:python}','-c','print("retained")'],max_cpus=1,native_cache=attachment)
+                    with patch.object(wrong,'submit',wraps=wrong.submit) as wrong_submit:
+                        result = client.run(task)
+                    self.assertEqual(result['status'],'succeeded',result.get('error'))
+                    wrong_submit.assert_not_called()
+                    self.assertNotIn('assigned_node',result)
+
     def test_reference_is_durable_immutable_and_redacted(self):
         with scratch()as root:
             row=register(root,'a'*32,project='P',provider='private-machine',content_id='b'*64)

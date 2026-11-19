@@ -1,10 +1,35 @@
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
+from remote_compute.runtimes import EXECUTION_CAPABILITIES
 from remote_compute.task_tags import compact_tag
 from remote_compute.view import format_status,_width
 
 
 class TagColumnTests(unittest.TestCase):
+    def test_scheduler_renders_a_capability_without_a_display_label(self):
+        node = dict(name='school', capacity=32, tags=['rtl','hdl-cache'])
+        health = dict(role='scheduler', nodes=[node])
+        with patch('remote_compute.runtimes.EXECUTION_CAPABILITIES', (*EXECUTION_CAPABILITIES, 'hdl-cache')):
+            for width in (54, 110, 180):
+                rows = format_status(health, width=width).fit(25)
+                self.assertIn('hdl-cache', '\n'.join(rows))
+
+    def test_semantic_scope_and_cycle_progress_keep_the_project_readable(self):
+        job=dict(id='4640'+'f'*28,project='ARH-DSE',status='running',cpus=1,max_cpus=1,
+            label='YOLOv8n / 独立验证 / ffaad47e / r202611157001 i:coco:000263 μ16384',
+            progress=dict(schema='dco.progress.v1',source='business',completed=7145683,unit='cycles'))
+        before=deepcopy(job)
+        for width in (54,80,110,150):
+            rows=format_status(dict(role='worker',node='PC',cpus=8,active_jobs=[job]),width=width)
+            row=next(r for r in rows if '4640'in r)
+            self.assertTrue('YOLOv8n'in row or 'YOLO 'in row,(width,row))
+            self.assertTrue('曲线'in row or 'CUR'in row,(width,row))
+            self.assertIn('Mcy',row,(width,row));self.assertNotIn('YOLOv ',row)
+        self.assertEqual(job,before)
+        tag=compact_tag(dict(label='YOLOv8n | L1快评 | n4 1i 2r 2μ | #aabb'),36)
+        self.assertIn('YOLOv8n',tag);self.assertIn('L1',tag);self.assertIn('n4',tag)
+
     def test_progress_does_not_become_the_subject_or_invent_question_mark_identity(self):
         self.assertEqual(compact_tag(dict(label='1/2 RACER ladder block-170')),'1/2 RACER LDR b170')
         self.assertNotIn('?',compact_tag(dict(label='A long operation without an assigned identity')))
@@ -34,7 +59,7 @@ class TagColumnTests(unittest.TestCase):
         job=dict(id='abcd'+'f'*28,label='BGR PSL s26 ev:10k',cpus=4,max_cpus=128,status='running')
         rows=format_status(dict(role='worker',node='test',cpus=8,active_jobs=[job]),width=110)
         text='\n'.join(rows)
-        self.assertIn('CPU/max',text);self.assertIn('4/128',text)
+        self.assertIn('CPU/上限',text);self.assertIn('4/128',text)
         self.assertNotIn('1/4',text)
 
     def test_long_native_label_has_real_short_seed_and_work(self):

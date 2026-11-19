@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0.7'
+PUBLISHER_VERSION = '1.0.10'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -58,12 +58,39 @@ def reported_memory(job):
     return number(job.get('memory_mb'))
 
 
+def project_sample(jobs, limit):
+    """Fill a bounded activity snapshot one job per project per pass."""
+    if len(jobs) <= limit:
+        return jobs
+    groups = {}
+    for job in jobs:
+        groups.setdefault(job['project'], []).append(job)
+    streams = [iter(group) for group in groups.values()]
+    selected = []
+    while streams and len(selected) < limit:
+        next_pass = []
+        for stream in streams:
+            job = next(stream, None)
+            if job is not None:
+                selected.append(job)
+                if len(selected) == limit:
+                    break
+                next_pass.append(stream)
+        streams = next_pass
+    return selected
+
+
 def snapshot(health, nodes, *, now=None):
     """Allowlist fields; never copy source dictionaries or error messages."""
     now = time.time() if now is None else now
     rows, jobs, projects, machines, machine_rows, alerts = [], [], {}, {}, {}, []
+    # Disabled historical registrations still appear in the resource control API.
+    nodes = [n for n in nodes if n.get('enabled', True) or n.get('reserved')
+             or n.get('external_cpus') or (n.get('memory_reserved_mb') or 0) > 0
+             or any(j.get('status') in ('running', 'queued', 'dispatching') for j in n.get('active_jobs') or ())]
     for n in nodes:
-        name = text(n.get('name'), 48)
+        identity = text(n.get('name'), 48)
+        name = text(n.get('display_name') or n.get('name'), 48)
         status = ('offline' if n.get('error') else 'disabled' if not n.get('enabled', True)
                   else 'paused' if n.get('paused') else 'online')
         total, free = number(n.get('memory_total_mb')), number(n.get('host_memory_available_mb'))
@@ -71,7 +98,7 @@ def snapshot(health, nodes, *, now=None):
         base,factor=number(n.get('base_capacity')),number(n.get('cpu_overcommit_factor'))
         active=[j for j in n.get('active_jobs')or()if j.get('status')in('running','dispatching')]
         reported=[reported_memory(j)for j in active]
-        rows.append(dict(id=name, name=name, status=status,
+        rows.append(dict(id=identity, name=name, status=status,
                          cpu_used=number(n.get('reserved', 0)+n.get('external_cpus', 0)),
                          cpu_capacity=number(n.get('capacity')), cpu_base=number(n.get('base_capacity')),
                          cpu_total=number(n.get('logical_cpus')),
@@ -110,17 +137,19 @@ def snapshot(health, nodes, *, now=None):
                              memory_reserved_mb=number(j.get('memory_reservation_mb')),
                              elapsed_seconds=int(max(0, now-started)) if started is not None else None,
                              progress=progress,diagnostic=diagnose(j,now=now,offline=status=='offline')))
+            if j.get('observe_only'):
+                if j.get('phase'):
+                    jobs[-1]['phase'] = text(j['phase'], 80)
+                for key in ('measured_cpus', 'cpu_seconds'):
+                    value = number(j.get(key))
+                    if value is not None:
+                        jobs[-1][key] = round(value, 2)
     for j in health.get('queued_jobs')or():
         project=text(j.get('project')or'default',80)
         projects.setdefault(project,dict(name=project,running=0,queued=None,cpu_used=0,completed=None,failed=None))
         jobs.append(dict(id=text(j.get('id'),64),identity_scope='task',tag=text(j.get('label'),96),
             project=project,node=None,status='queued',cpus=0,max_cpus=number(j.get('max_cpus')),
             progress=None,diagnostic=diagnose(dict(j,status='queued'),now=now)))
-    for j in health.get('recent_failures')or():
-        jobs.append(dict(id=text(j.get('id'),64),identity_scope='task',tag=text(j.get('label'),96),
-            project=text(j.get('project')or'default',80),node=text(j.get('assigned_node'),48),status=text(j.get('status'),16),
-            cpus=0,max_cpus=number(j.get('max_cpus')),elapsed_seconds=number(j.get('elapsed')),
-            progress=display_progress(j),diagnostic=diagnose(j,now=now)))
     for name,p in projects.items():
         resource=(health.get('projects')or{}).get(name,{})
         p['queued']=number(resource.get('queued'))
@@ -142,8 +171,8 @@ def snapshot(health, nodes, *, now=None):
     mode = 'hybrid' if any(str(n.get('url', '')).startswith('local://') for n in nodes) else 'scheduler'
     all_jobs = len(jobs)
     running=sorted((j for j in jobs if j['status']in('running','dispatching')),key=lambda j:(-(j['cpus']or 0),j['id']))
-    queued=[j for j in jobs if j['status']=='queued'];failed=[j for j in jobs if j['status']in('failed','timed_out','interrupted')]
-    display_jobs=running[:max(16,32-min(8,len(queued))-min(8,len(failed)))]+failed[:8]+queued[:8]
+    queued=[j for j in jobs if j['status']=='queued']
+    display_jobs=project_sample(running,32-min(8,len(queued)))+project_sample(queued,8)
     from .progress import LABELS
     for job in jobs:
         d=job.get('diagnostic',{})
@@ -168,11 +197,11 @@ def snapshot(health, nodes, *, now=None):
                                memory_reserved_mb=display_memory_sum('memory_reserved_mb'),
                                memory_reserve_mb=display_memory_sum('memory_reserve_mb'),
                                host_memory_floor_mb=display_memory_sum('host_memory_floor_mb')),
-                  nodes=rows[:16], projects=sorted(projects.values(), key=lambda p: (-p['cpu_used'], p['name']))[:16],
+                  nodes=rows, projects=sorted(projects.values(), key=lambda p: (-p['cpu_used'], p['name']))[:16],
                   jobs=display_jobs[:32],
                   alerts=alerts[:8],
                   coverage=dict(nodes_total=len(rows), projects_active_total=len(projects), jobs_active_total=all_jobs,
-                                queued_job_details=bool(queued), recent_failure_limit=8,history=False))
+                                queued_job_details=bool(queued), history=False))
     # Bound the complete upload, including its JSON envelope and UTF-8 labels.
     for field in ('jobs', 'projects', 'nodes'):
         while len(encode(dict(data=result))) > MAX_BYTES and result[field]:
@@ -255,12 +284,14 @@ def collect(config):
     # This existing endpoint waits behind scheduler planning. Allow the normal
     # loaded response while keeping the wait isolated in this bounded sidecar.
     health = read_json(opener, Request(url+'/health',headers={
-        'Authorization':'Bearer '+token,'X-DCO-Role':'operator'}), 5, MAX_SOURCE_BYTES)
+        'Authorization':'Bearer '+token,'X-DCO-Role':'operator','X-DCO-Health-Display':'1'}), 5, MAX_SOURCE_BYTES)
     if not isinstance(health, dict) or not isinstance(health.get('nodes'), list):
         raise ValueError('Invalid display source response')
     if not all(isinstance(n, dict) for n in health['nodes']):
         raise ValueError('Invalid display source nodes')
     value = snapshot(health, health['nodes'])
+    if number(health.get('health_sampled_at')) is not None:
+        value['sampled_at'] = datetime.fromtimestamp(health['health_sampled_at'],timezone.utc).isoformat().replace('+00:00','Z')
     return value, dict(collect_ms=round((time.perf_counter()-started)*1000, 3),
                        source_bytes=len(encode(health)),source_queries=1)
 
@@ -277,7 +308,35 @@ def backoff(failures):
     return min(300, 5 * 2**min(max(0, failures-1), 6))
 
 
-def upload(config, value):
+def compact_update(previous, value, sequence):
+    if previous.keys() != value.keys() or value.get('schema') != 'dco.live.v1':
+        return None
+    fields, maps, rows = {}, {}, {}
+    for key, item in value.items():
+        before = previous[key]
+        if item == before:
+            continue
+        if key in ('summary', 'source', 'coverage') and item.keys() == before.keys():
+            maps[key] = {name: field for name, field in item.items() if field != before[name]}
+        elif key in ('nodes', 'projects', 'jobs') and len(item) == len(before) and all(
+                old.keys() == new.keys() for old, new in zip(before, item)):
+            rows[key] = {str(i): {name: field for name, field in new.items() if field != old[name]}
+                         for i, (old, new) in enumerate(zip(before, item)) if old != new}
+        else:
+            fields[key] = item
+    return {'patch': {'base': sequence, 'set': fields, 'maps': maps, 'rows': rows}}
+
+
+def upload_body(envelope, transport):
+    if transport == 'json':
+        return encode(envelope), {'Content-Type': 'application/json'}
+    stream = io.BytesIO()
+    with gzip.GzipFile(fileobj=stream, mode='wb', compresslevel=3, mtime=0) as compressor:
+        compressor.write(encode_cbor(envelope))
+    return stream.getvalue(), {'Content-Type': 'application/cbor', 'Content-Encoding': 'gzip'}
+
+
+def upload(config, value, *, baseline=None):
     private = json.loads(Path(config['upload_file']).read_text(encoding='utf-8-sig'))
     url, token = private['url'], private['token']
     target = urlsplit(url)
@@ -290,20 +349,47 @@ def upload(config, value):
         raise ValueError('Display upload exceeds size budget')
     transport=config.get('transport','json')
     if transport not in ('json','cbor-gzip'):raise ValueError('Unsupported display transport')
-    data=encode(envelope)
-    if transport=='cbor-gzip':
-        stream=io.BytesIO()
-        with gzip.GzipFile(fileobj=stream,mode='wb',compresslevel=3,mtime=0)as compressor:
-            compressor.write(encode_cbor(envelope))
-        data=stream.getvalue()
-    headers={'Content-Type':'application/json'if transport=='json'else'application/cbor',
-             'Authorization':'Bearer '+token}
-    if transport=='cbor-gzip':headers['Content-Encoding']='gzip'
-    request = Request(url, data=data, headers=headers, method='POST')
-    reply = read_json(build_opener(ProxyHandler({}), NoRedirect()), request, 4, 16384)
+    full = upload_body(envelope, transport)
+    selected, kind = full, 'full'
+    destination = (url, token)
+    if baseline and baseline.get('destination') == destination and type(baseline.get('sequence')) is int:
+        delta = compact_update(baseline['value'], value, baseline['sequence'])
+        if delta is not None:
+            plain = upload_body(delta, 'json')
+            compressed = upload_body(delta, transport)
+            candidate = min((plain, compressed), key=lambda variant: len(variant[0]))
+            if len(candidate[0]) < len(full[0]):
+                selected = candidate
+                kind = 'heartbeat' if baseline['signature'] == fingerprint(value) else 'delta'
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+
+    def send(variant):
+        data, headers = variant
+        request = Request(url, data=data, headers={**headers, 'Authorization': 'Bearer '+token,
+                          'X-DCO-Liveboard-Compact': '1'}, method='POST')
+        return read_json(opener, request, 4, 16384)
+
+    size = len(selected[0])
+    try:
+        reply = send(selected)
+    except HTTPError as error:
+        if kind == 'full' or error.code not in (400, 409):
+            raise
+        error.close()
+        # A lost reply, a restarted server, or another publisher can invalidate
+        # the base. Re-send the complete current sample once without a backlog.
+        reply = send(full)
+        size += len(full[0])
+        kind = 'resync'
     if not isinstance(reply, dict) or not isinstance(reply.get('instance'), dict):
         raise ValueError('Invalid display upload response')
-    return len(data), number(reply['instance'].get('sequence')), reply.get('viewer_active') is True
+    sequence = number(reply['instance'].get('sequence'))
+    if baseline is not None:
+        baseline.clear()
+        baseline.update(kind=kind)
+        if reply.get('compact') == 1 and type(sequence) is int:
+            baseline.update(destination=destination, sequence=sequence, value=value, signature=fingerprint(value))
+    return size, sequence, reply.get('viewer_active') is True
 
 
 class Owner:
@@ -342,6 +428,7 @@ def run(config_path, *, owner_pid=None, once=False, send=True):
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopped.set())
     state, previous, last = dict(publisher_version=PUBLISHER_VERSION, pid=os.getpid(), owner_pid=owner_pid, posts=0, failures=0), None, float('-inf')
+    baseline = {}
     try:
         with single_instance('liveboard:'+str(config_path), wait=5):
             while owner.alive() and not stopped.is_set():
@@ -364,10 +451,10 @@ def run(config_path, *, owner_pid=None, once=False, send=True):
                     wait = ACTIVE_SECONDS if state.get('viewer_active') else IDLE_SECONDS
                     if send and due(signature, previous, time.monotonic(), last):
                         started = time.perf_counter()
-                        size, sequence, viewer_active = upload(config, value)
+                        size, sequence, viewer_active = upload(config, value, baseline=baseline)
                         state.update(posts=state['posts']+1, last_uploaded_at=stamp(), upload_bytes=size,
                                      upload_ms=round((time.perf_counter()-started)*1000, 3), server_sequence=sequence,
-                                     viewer_active=viewer_active)
+                                     viewer_active=viewer_active, upload_kind=baseline.get('kind'))
                         wait = ACTIVE_SECONDS if viewer_active else IDLE_SECONDS
                         previous, last = signature, time.monotonic()
                     state.update(status='online', failures=0, error=None)

@@ -934,19 +934,22 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('节点详情',text)
 
     def test_live_overview_shows_twenty_registered_nodes_and_health_with_output(self):
-        from remote_compute.view import CONSOLE_VERSION, StatusRows
+        from remote_compute import __version__
+        from remote_compute.view import StatusRows
         nodes = [dict(name=f'worker-{index}', display_name=f'node-{index:02}', capacity=32,
-                      memory_total_mb=65536, host_memory_available_mb=61440)
+                      memory_total_mb=65536, host_memory_available_mb=61440, tags=['ng47','chisel','rtl'])
                  for index in range(20)]
         nodes[15]['error'] = 'Remote worker disconnected'
         nodes[16]['paused'] = True
         nodes[17]['enabled'] = False
         nodes[19]['active_jobs'] = [dict(id='68fc'+'a'*28, status='running', label='RTL', cpus=4)]
-        status = StatusRows(dict(role='scheduler', version='1.0.1', nodes=nodes), width=204, viewport=True)
+        nodes[0]['tags'] += ['ml','cuda','layout','onnx']
+        status = StatusRows(dict(role='scheduler', version=__version__, nodes=nodes), width=204, viewport=True)
         displayed = _layout(status, ['task accepted'], ['ping succeeded'], 60, reserved=5)
         text = '\n'.join(displayed)
         self.assertEqual(status.device_page_count, 1)
-        self.assertIn(f'DCO 面板 {CONSOLE_VERSION} | 中心 1.0.1', displayed[0])
+        self.assertIn(f'DCO {__version__}', displayed[0])
+        self.assertEqual(displayed[0].count(__version__),1)
         self.assertIn('设备资源', displayed[2])
         self.assertIn('ping succeeded', displayed[-2])
         self.assertTrue(all(not row or _width(row) == 204 for row in displayed))
@@ -954,26 +957,33 @@ class ConsoleTests(unittest.TestCase):
             self.assertIn(f'node-{index:02}', text)
         for text_fragment in ('失联 1', '暂停 1', '禁用 1', '68fc', 'ping succeeded'):
             self.assertIn(text_fragment, text)
+        self.assertIn('能力',displayed[3])
+        device_row=next(row for row in displayed if 'node-00' in row)
+        self.assertIn('ng47 Chisel ML CUDA Layout RTL ONNX',device_row)
+        self.assertIn('可调度能力',text)
+        status.resize(159)
+        rows=status.fit(40)
+        self.assertIn('ng47 Chisel ML CUDA Layout RTL ONNX',next(row for row in rows if 'node-00' in row))
 
-    def test_console_release_tag_matches_the_versioned_renderer(self):
+    def test_release_tag_matches_the_versioned_runtime(self):
         from pathlib import Path
         import shutil
         import subprocess
-        from remote_compute.view import CONSOLE_VERSION
+        from remote_compute import __version__
 
         git = shutil.which('git')
         if not git:
             self.skipTest('Git metadata is unavailable')
         root = Path(__file__).resolve().parents[1]
-        tag = f'refs/tags/console-v{CONSOLE_VERSION}'
+        tag = f'refs/tags/v{__version__}'
         tagged = subprocess.run([git, 'show-ref', '--verify', '--quiet', tag], cwd=root)
         if tagged.returncode:
-            self.skipTest('This console version has no release tag in this checkout')
+            self.skipTest('This DCO version has no release tag in this checkout')
         cut = subprocess.run([git, 'diff', '--name-only', tag, '--',
-                              'remote_compute/console.py', 'remote_compute/view.py'],
+                              'remote_compute'],
                              cwd=root, capture_output=True, text=True, check=True)
         self.assertEqual(cut.stdout.strip(), '',
-                         f'Change the console version before changing released files: {cut.stdout.strip()}')
+                         f'Change the DCO version before changing released files: {cut.stdout.strip()}')
 
     def test_live_node_details_repeat_node_identity_on_each_narrow_page(self):
         from remote_compute.view import StatusRows

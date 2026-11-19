@@ -488,8 +488,14 @@ class Shell(cmd.Cmd):
     def loop(self, health=None, url='', alive=lambda: True):
         if health and sys.stdin.isatty() and sys.stdout.isatty():
             from .console import Dashboard
-            if Dashboard(self, health, url, alive).run():
-                return
+            try:
+                if Dashboard(self, health, url, alive).run():
+                    return
+            except Exception as error:
+                # The interactive display owns no computing state.
+                print(f'面板异常，已返回命令模式（{type(error).__name__}: {error}）', file=sys.stderr)
+                if not alive():
+                    return
         while True:
             try:
                 if health and os.name != 'nt' and sys.stdin.isatty():
@@ -625,7 +631,10 @@ class SchedulerShell(Shell):
             identity=line.strip()
             if 4<=len(identity)<=32 and all(c in '0123456789abcdef' for c in identity):
                 if len(identity)<32:
-                    matches=[j for j in self.center.status(brief=True) if j['id'].startswith(identity)]
+                    if len(identity) >= 8:
+                        matches = self.center.status_page(prefix=identity, limit=5, brief=True)['items']
+                    else:
+                        matches=[j for j in self.center.status(brief=True) if j['id'].startswith(identity)]
                     if len(matches)!=1:
                         if not matches:
                             raise ValueError('未找到任务ID: '+identity)
@@ -852,8 +861,13 @@ class SchedulerShell(Shell):
                     node['host_ip'] = addresses[row['name']]
                 if row.get('timeout',10)!=10:
                     node['timeout']=row['timeout']
-                for key in ('ca_file','aliases','reconnect','relay_url','peer_id'):
-                    setting = row.get(key, saved.get(key) if key in ('relay_url','peer_id') else None)
+                bulk_limit=row.get('bulk_limit',saved.get('bulk_limit',7))
+                if bulk_limit!=7:
+                    node['bulk_limit']=bulk_limit
+                if row.get('display_name') and row['display_name']!=row['name']:
+                    node['display_name']=row['display_name']
+                for key in ('ca_file','aliases','reconnect','relay_url','peer_id','architecture'):
+                    setting = row.get(key, saved.get(key) if key in ('relay_url','peer_id','architecture') else None)
                     if setting:node[key]=setting
                 token = tokens.get(row["url"], saved.get('token', ''))
                 if token:
