@@ -815,7 +815,7 @@ class Client:
                     offset=offset, limit=limit, has_more=False,
                     legacy_center=True)
 
-    def statuses(self, identities):
+    def statuses(self, identities, *, compact=False):
         """Brief states of known original IDs; never list the global job table."""
         identities = list(identities)
         for offset in range(0, len(identities), MAX_STATUS_BATCH):
@@ -829,13 +829,16 @@ class Client:
         for offset in range(0, len(identities), MAX_STATUS_BATCH):
             batch = identities[offset:offset+MAX_STATUS_BATCH]
             if 'batch_status' in self._capabilities:
+                body = {'ids': batch}
+                if compact:
+                    body['compact'] = True
                 try:
-                    states=self.request('/jobs/status', {'ids': batch})
+                    states=self.request('/jobs/status', body)
                 except RemoteError as error:
                     if error.status_code!=404:raise
                     # Older centers can lose a cold terminal file to concurrent
                     # collection. Re-read this batch after retirement finishes.
-                    states=self.request('/jobs/status', {'ids': batch})
+                    states=self.request('/jobs/status', body)
                 values.update(states)
             else:
                 for identity in batch:
@@ -845,6 +848,9 @@ class Client:
                         if getattr(error, 'status_code', None) != 404:
                             raise
                         values[identity] = dict(id=identity, status='unknown', status_code=404)
+        if compact:
+            from .bundle import batch_status
+            return {identity: batch_status(row, compact=True) for identity, row in values.items()}
         return values
 
     def wait_any(self, identities, *, poll=.5, max_poll=5, wait_timeout=None, cancel=None):

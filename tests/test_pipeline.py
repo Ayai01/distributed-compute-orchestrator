@@ -588,8 +588,8 @@ class PipelineTests(unittest.TestCase):
             with Pool([worker])as pool:
                 state=Path(root)/'center'
                 with center(pool,state)as(_,operator):operator.control(accepting=False)
-                with center(pool,state)as(_,operator):
-                    client=Client(operator.url,state_dir=operator.state_dir)
+                with center(pool,state)as(scheduler,operator):
+                    client=Client(operator.url,scheduler.token,state_dir=operator.state_dir)
                     self.assertFalse(client.admission('pipeline-test')['accepting'])
                     with self.assertRaisesRegex(Exception,'new task admissions'):
                         client.submit(task(1)['task'])
@@ -706,8 +706,8 @@ class PipelineTests(unittest.TestCase):
 
     def test_maintenance_gate_defers_new_work_and_keeps_original_id_recovery(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
-            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,operator):
-                client=Client(operator.url,state_dir=operator.state_dir)
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(scheduler,operator):
+                client=Client(operator.url,scheduler.token,state_dir=operator.state_dir)
                 original=client.submit(task(1)['task'])['id']
                 operator.control(accepting=False)
                 requests={'new':task(2)};out=Path(root)/'delivery'
@@ -730,8 +730,9 @@ class PipelineTests(unittest.TestCase):
 
     def test_closed_admissions_still_drain_recovered_ids_and_defer_new_work(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
-            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,operator):
-                client=Client(operator.url,state_dir=operator.state_dir);identity=client.submit(task(1)['task'])['id']
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(scheduler,operator):
+                client=Client(operator.url,scheduler.token,state_dir=operator.state_dir)
+                identity=client.submit(task(1)['task'])['id']
                 operator.control(accepting=False)
                 plan={'original':dict(job_id=identity),'new':dict(spec=2,after=['original'])}
                 with patch.object(client,'submit_bundle',side_effect=AssertionError('Maintenance must not submit')):
@@ -745,9 +746,9 @@ class PipelineTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 original=client.statuses;interrupted=[]
-                def interrupt_once(identities):
+                def interrupt_once(identities, **options):
                     if not interrupted:interrupted.append(True);raise KeyboardInterrupt
-                    return original(identities)
+                    return original(identities, **options)
                 with patch.object(client,'statuses',side_effect=interrupt_once):
                     with self.assertRaises(ExecutionPaused)as paused:
                         client.execute({'one':task(1),'next':dict(spec=2,after=['one'])},

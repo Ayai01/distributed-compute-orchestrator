@@ -6,7 +6,7 @@ from urllib.parse import unquote
 
 from .client import Client, RemoteError, _check_cancelled
 from .worker import Conflict
-from .bundle import progress
+from .bundle import batch_status, progress
 from .policy import validate_status_ids
 
 
@@ -39,9 +39,10 @@ class LocalClient(Client):
             if parts == ['jobs','status'] and method == 'POST':
                 values={}
                 for identity in validate_status_ids(data.get('ids')):
-                    try:values[identity]=progress(worker.get(identity))
+                    try:result=worker.get(identity)
                     except (KeyError,FileNotFoundError):
-                        values[identity]=dict(id=identity,status='unknown',status_code=404)
+                        result=dict(id=identity,status='unknown',status_code=404)
+                    values[identity]=batch_status(result,compact=data.get('compact') is True)
                 return values
             if len(parts) == 2 and parts[0] == 'assets':
                 job_id = (extra_headers or {}).get('X-DCO-Asset-Job')

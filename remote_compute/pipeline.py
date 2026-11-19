@@ -130,6 +130,8 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
     results=ExecutionResults();failures=[];completed=set();failed=set();blocked=set()
     ready=_ReadyQueue(catalog)
     paused=False;next_poll=next_gate=0.
+    poll_interval=.5
+    previous_statuses={}
     cancellation=threading.Event();cancel_attempted=set();state_lock=threading.RLock()
 
     def save(row,**changes):
@@ -373,8 +375,14 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                         paused=True;preparing[prep_pool.submit(stage,row['key'],row)]=row
                     except BaseException as error:
                         failure(row,'submit',error);call.release(row)
-                if pending and time.monotonic()>=next_poll:
-                    states=client._read_reconnecting(lambda:client.statuses(pending))
+                cancel_due = any(row.get('cancel_requested') and ident not in cancel_attempted
+                                 for ident,row in pending.items())
+                if pending and (time.monotonic()>=next_poll or cancel_due):
+                    states=client._read_reconnecting(lambda:client.statuses(pending,compact=True))
+                    snapshot={ident:state['status'] for ident,state in states.items()}
+                    changed=any(status!=previous_statuses.get(ident) for ident,status in snapshot.items())
+                    poll_interval=.5 if changed else min(5.,poll_interval*2)
+                    previous_statuses=snapshot
                     for job_id,state in states.items():
                         row=pending[job_id]
                         if state['status']!='unknown':
@@ -384,7 +392,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                             pending.pop(job_id);collecting[queue_collection(row)]=row
                         elif state['status']=='unknown':
                             failure(row,'recovery','Accepted original ID missing');pending.pop(job_id)
-                    next_poll=time.monotonic()+.5
+                    next_poll=time.monotonic()+poll_interval
                 for future in [f for f in collecting if f.done()]:
                     progressed=True
                     row=collecting.pop(future)

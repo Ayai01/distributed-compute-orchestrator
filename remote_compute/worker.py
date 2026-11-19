@@ -25,7 +25,7 @@ import zipfile
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_bytes, pack,native_path,
-                     tree, unpack, progress, progress_fields)
+                     tree, unpack, batch_status, progress, progress_fields)
 from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS,
                        python_backend, python_accelerator, supports_python, uses_python, execution_tool,
                        validate_native_cache, native_architecture)
@@ -1912,9 +1912,8 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
                     except (KeyError, FileNotFoundError):
-                        value[identity] = dict(id=identity, status='unknown', status_code=404)
-                    else:
-                        value[identity] = progress(result)
+                        result = dict(id=identity, status='unknown', status_code=404)
+                    value[identity] = batch_status(result, compact=request.get('compact') is True)
             elif parts == ["jobs"] and self.command == "GET":
                 query = parse_qs(urlsplit(self.path).query)
                 prefixes = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get('prefix')

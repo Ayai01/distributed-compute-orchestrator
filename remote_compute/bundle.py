@@ -84,6 +84,12 @@ def progress(value):
     return result
 
 
+def batch_status(value, compact=False):
+    if compact:
+        return {key: value[key] for key in ('status', 'status_code') if key in value}
+    return value if value.get('status') == 'unknown' else progress(value)
+
+
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
 

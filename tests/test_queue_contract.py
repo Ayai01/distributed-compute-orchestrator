@@ -186,7 +186,7 @@ class BatchCollectionTests(unittest.TestCase):
                 Pool([worker]) as pool, centers.center(pool, Path(root)/'center') as (scheduler, operator):
             identity = operator.submit(python("print('retained-original')"))['id']
             operator.wait(identity)
-            project = Client(operator.url)
+            project = Client(operator.url, scheduler.token, state_dir=Path(root)/'project-client')
             project.health(brief=True)
             original_path = scheduler.root/'jobs'/identity/'result.json'
             before = original_path.stat().st_mtime_ns
@@ -206,6 +206,10 @@ class BatchCollectionTests(unittest.TestCase):
             self.assertNotIn('assigned_node', values[identity])
             self.assertNotIn('stdout', values[identity])
             self.assertTrue(all(values[value]['status'] == 'unknown' for value in ids[1:]))
+            compact = project.request('/jobs/status', {'ids': ids, 'compact': True})
+            self.assertEqual(compact[identity], {'status': 'succeeded'})
+            self.assertEqual(compact[ids[1]], {'status': 'unknown', 'status_code': 404})
+            self.assertEqual(project.statuses(ids, compact=True), compact)
             self.assertEqual(original_path.stat().st_mtime_ns, before)
             self.assertEqual(len(scheduler.jobs), 1)
             with self.assertRaises(RemoteError) as caught:
