@@ -156,7 +156,7 @@ def _task_memory(job):
 
 
 def _capabilities(names):
-    labels = {'python': 'Python', 'rtl': 'RTL/Chisel', 'onnx': 'ONNX'}
+    labels = {'python': 'Python', 'rtl': 'Chisel', 'onnx': 'ONNX'}
     return ' '.join(labels.get(name, name) for name in PACKAGES if name in names) or '-'
 
 

@@ -325,7 +325,29 @@ class Client:
                 with pool.lock:pool.idle.append(connection)
             pool.release(bulk=bulk, short_job=short_job)
 
-    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None, _reuse=True):
+    def _confirm_asset_publication(self, path, extra_headers, cancel):
+        """Give a fully sent archive time to publish before replaying its body."""
+        identity = path.rsplit('/', 1)[-1]
+        misses = 0
+        for delay in (0, .25, 1):
+            if delay:
+                time.sleep(delay)
+            _check_cancelled(cancel)
+            try:
+                receipt = self._request(path, method='GET', extra_headers=extra_headers, cancel=cancel, _asset_probe=True)
+            except RequestCancelled:
+                raise
+            except RemoteError:
+                misses = 0
+                continue
+            if receipt.get('id') == identity and receipt.get('exists') is True:
+                return receipt
+            misses = misses + 1 if receipt.get('id') == identity and receipt.get('exists') is False else 0
+        if misses >= 2:
+            return dict(id=identity, exists=False)
+        return None
+
+    def _request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None, _reuse=True, _asset_probe=False):
         if self.endpoint.scheme not in {'http', 'https'}:
             raise RemoteError('Private worker is available only inside its owning hybrid scheduler')
         if self.endpoint.scheme == 'http':
@@ -338,6 +360,8 @@ class Client:
             re.fullmatch(r'/jobs/[0-9a-f]{32}/resize', path)
             or 'request_id' not in data and re.fullmatch(r'/jobs/[0-9a-f]{32}/lease', path)))
         network_timeout = getattr(self, 'lease_timeout', max(self.timeout, 130)) if resource_wait else self.timeout
+        if _asset_probe:
+            network_timeout = min(2, network_timeout)
         headers = {"Content-Type": "application/zip" if isinstance(data, bytes) else "application/json",
                    'Accept-Encoding': 'identity' if binary else 'gzip','X-DCO-Keepalive':'1'}
         auth_token = (self.operator_token or self.token) if self.operator else self.token
@@ -381,10 +405,11 @@ class Client:
             partial.seek(0,os.SEEK_END);etag=headers['If-Range']
         else:
             partial.seek(0);partial.truncate()
-        attempts = 4 if binary and method == 'GET' else 2
+        attempts = 1 if _asset_probe else 4 if binary and method == 'GET' else 2
         retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status') or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
+        large_asset = asset_upload and len(data) >= 1024 * 1024
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
         # Bulk streams tolerate relay stalls without resetting a paid prefix.
         # Control requests keep their short socket deadline.
@@ -428,6 +453,7 @@ class Client:
             if connection.sock is not None:
                 connection.sock.settimeout(attempt_timeout)
             sent=False
+            asset_body_sent = False
             try:
                 if partial.tell() and etag:
                     headers.update(Range='bytes='+str(partial.tell())+'-', **{'If-Range':etag})
@@ -440,6 +466,9 @@ class Client:
                 if connection.sock is None:connection.connect()
                 sent=True
                 connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
+                asset_body_sent = large_asset
+                if asset_body_sent and connection.sock is not None:
+                    connection.sock.settimeout(min(attempt_timeout, max(15, self.timeout)))
                 artifact_socket = connection.sock if relayed_artifact and attempt==0 else None
                 if artifact_socket is not None:
                     # Retry a silent relay promptly. A fresh retry still allows
@@ -552,6 +581,16 @@ class Client:
                 self.connections.connection = None
                 if not etag:
                     partial.seek(0);partial.truncate()
+                if asset_body_sent:
+                    receipt = self._confirm_asset_publication(path, extra_headers, cancel)
+                    if receipt is None:
+                        # The caller can reconcile on the original provider.
+                        # A route fallback must not replay an unconfirmed body.
+                        error = RemoteError(f'{self.url}{path}: asset publication acknowledgement pending')
+                        error.request_may_have_been_sent = True
+                        raise error from None
+                    if receipt['exists']:
+                        return json_bytes(receipt) if binary else receipt
                 if job_upload:
                     # Acceptance can finish before its HTTP reply is lost, or
                     # an old service's post-acceptance notice can return 404.

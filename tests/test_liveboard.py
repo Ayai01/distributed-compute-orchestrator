@@ -94,11 +94,18 @@ class LiveboardTests(unittest.TestCase):
         value=live.snapshot(self.health(),nodes)
         self.assertLessEqual(len(value['jobs']),32)
         self.assertLessEqual(len(value['projects']),16)
-        self.assertLessEqual(len(value['nodes']),16)
+        self.assertEqual(len(value['nodes']),len(nodes))
         self.assertLessEqual(len(value['alerts']),8)
         self.assertLessEqual(len(live.encode(dict(data=value))),65536)
         self.assertEqual(value['coverage']['jobs_active_total'],4000)
         self.assertFalse(value['coverage']['history'])
+
+    def test_display_collapses_complete_rtl_and_chisel_to_one_tag(self):
+        both = self.node(tags=['rtl', 'chisel', 'ng47'], packages=['rtl', 'ng47'])
+        incomplete = self.node(name='incomplete', tags=['rtl'], packages=[])
+        legacy = self.node(name='legacy', tags=['rtl', 'chisel'])
+        value = live.snapshot(self.health(), [both, incomplete, legacy])
+        self.assertEqual([n['capabilities'] for n in value['nodes']], [['ng47', 'chisel'], [], ['chisel']])
 
     def test_missing_metrics_and_invalid_progress_stay_unknown(self):
         n=self.node(memory_total_mb=None,cpu_percent=float('nan'),active_jobs=[

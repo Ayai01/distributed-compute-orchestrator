@@ -1056,6 +1056,49 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(worker.asset_handoffs[owner][0],frozenset({identity}))
             self.assertEqual((worker.root/'assets'/identity/'model.npz').read_bytes(),bytes(range(256))*8192)
 
+    def test_large_asset_waits_for_late_publication_instead_of_replaying(self):
+        payload = pack({'model': os.urandom(1024 * 1024)})
+        identity = hashlib.sha256(payload).hexdigest()
+        route = '/assets/' + identity
+        responses = Handler._reply
+        requests = []
+
+        def reply(handler, value, status=200):
+            if handler.path == route:
+                requests.append(handler.command)
+                if handler.command == 'POST':
+                    handler.close_connection = True
+                    return
+                if requests == ['POST', 'GET']:
+                    value = dict(id=identity, exists=False)
+            return responses(handler, value, status)
+
+        with scratch() as root, provider(Path(root)/'worker') as (_, client):
+            with patch.object(Handler, '_reply', reply):
+                result = client.request(route, payload)
+            self.assertEqual(result, dict(id=identity, exists=True))
+            self.assertEqual(requests, ['POST', 'GET', 'GET'])
+
+    def test_large_asset_with_unreadable_receipts_suppresses_body_replay(self):
+        payload = pack({'model': os.urandom(1024 * 1024)})
+        route = '/assets/' + hashlib.sha256(payload).hexdigest()
+        responses = Handler._reply
+        requests = []
+
+        def reply(handler, value, status=200):
+            if handler.path == route:
+                requests.append(handler.command)
+                handler.close_connection = True
+                return
+            return responses(handler, value, status)
+
+        with scratch() as root, provider(Path(root)/'worker') as (_, client):
+            with patch.object(Handler, '_reply', reply):
+                with self.assertRaisesRegex(RemoteError, 'publication acknowledgement pending'):
+                    client.request(route, payload)
+            self.assertEqual(requests, ['POST', 'GET', 'GET', 'GET'])
+            self.assertTrue(client.has_asset(route.rsplit('/', 1)[-1]))
+
     def test_connection_slots_are_fifo_and_timeout_never_sends_a_request(self):
         pool=_ConnectionPool()
         for _ in range(8):self.assertTrue(pool.acquire(0))

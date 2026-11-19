@@ -80,6 +80,16 @@ def project_sample(jobs, limit):
     return selected
 
 
+def _display_capabilities(node):
+    tags = set(node.get('tags') or ())
+    packages = node.get('packages')
+    chisel = 'rtl' in packages if packages is not None else bool(tags & {'rtl', 'chisel'})
+    tags.difference_update({'rtl', 'chisel'})
+    if chisel:
+        tags.add('chisel')
+    return [name for name in EXECUTION_CAPABILITIES if name in tags]
+
+
 def snapshot(health, nodes, *, now=None):
     """Allowlist fields; never copy source dictionaries or error messages."""
     now = time.time() if now is None else now
@@ -113,7 +123,7 @@ def snapshot(health, nodes, *, now=None):
                          memory_reserve_mb=number(n.get('memory_reserve_mb')),
                          memory_headroom_mb=number(n.get('memory_headroom_mb')),
                          host_memory_floor_mb=number((n.get('memory_pressure_state')or{}).get('physical_threshold_mb')),
-                         capabilities=[x for x in EXECUTION_CAPABILITIES if x in n.get('tags', ())]))
+                         capabilities=_display_capabilities(n)))
         if status == 'offline':
             alerts.append(dict(code='node_offline', level='warning', node=name, text='设备离线'))
         if status != 'offline':

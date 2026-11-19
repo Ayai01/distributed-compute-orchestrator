@@ -31,6 +31,7 @@ from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_
 from .compat import unlink
 from .cleanup import AssetCache, AssetMaintenance, TransportRetirement, prune_asset_caches, remove_owned, retire_job
 from .acceptance import SubmissionAssets, SubmissionLocks
+from .asset_variants import bind_asset_variants, freeze_asset_variants, load_asset_variants
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .observations import Observations, observation_batch, terminal_observation
 from .receipts import read_center_receipt as read_receipt
@@ -108,6 +109,7 @@ class Coordinator:
         self.pool, self.token = pool, token
         self.activity = Activity()
         self.root = Path(root).resolve()
+        self.asset_variants = load_asset_variants(self.root / 'asset-variants.json')
         self.root_lock = lock_root(self.root, "scheduler")
         (self.root / "jobs").mkdir(parents=True, exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
@@ -637,7 +639,7 @@ class Coordinator:
         hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd',
                   'tool_root', 'root', 'home', 'worker_root',
                   'shared_paths', 'unavailable_shared', 'resource_request',
-                  'observe_only', 'source', 'revision'}
+                  'observe_only', 'source', 'revision', '_asset_variants'}
 
         def clean_mapping(mapping):
             cleaned = {key: item for key, item in mapping.items() if key not in hidden}
@@ -1104,6 +1106,10 @@ class Coordinator:
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
                 if task.get('cache_ref'):job['result']['cache_ref']=task['cache_ref']
+                if task['assets'] and self.asset_variants:
+                    variants = freeze_asset_variants(task, self.asset_variants)
+                    if variants:
+                        job['result']['_asset_variants'] = variants
                 admission = {
                     key: job['result'][key] for key in ('id', 'status', 'request_sha256', 'assets', 'label',
                         'project', 'cpus', 'memory_mb', 'submitted', 'total_steps')}
@@ -1422,13 +1428,15 @@ class Coordinator:
                         started=None,finished=time.time(),steps=[],stdout='',stderr='')
                     with self.condition:self._update(job,result)
                     return
-                if (job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task
+                variants = job['result'].get('_asset_variants', ())
+                dispatch_task = bind_asset_variants(task, variants, node.health) if variants else task
+                if (dispatch_task is not task or job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task
                         or 'retries' in task or task.get('node') is not None
                         or 'requested_accelerator' in job['result']):
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                         files = {name: archive.read(name) for name in archive.namelist()}
-                    worker_task = dict(task)
-                    worker_task['env'] = provider_environment(task, node.health)
+                    worker_task = dict(dispatch_task)
+                    worker_task['env'] = provider_environment(dispatch_task, node.health)
                     # Placement hints belong to the dispatcher, not the executable.
                     worker_task.pop('node',None)
                     worker_task.pop('cache_ref',None)
@@ -1452,7 +1460,9 @@ class Coordinator:
                     payload = pack(files)
                 callback=self._callback(node) if 'resize' in node.health.get('capabilities',[]) else None
                 if callback:callback={**callback,'job_id':job['result']['id']}
-                if not self._submit(job, identity, payload, callback):
+                job['result']['dispatch_zip_bytes'] = len(payload)
+                dispatch_options = {'assets': dispatch_task['assets']} if dispatch_task is not task else {}
+                if not self._submit(job, identity, payload, callback, **dispatch_options):
                     result=dict(status='cancelled',finished=time.time(),cancelled_before_submit=True,cpu_seconds=0)
                     with self.condition:self._update(job,result)
                     return
@@ -1584,16 +1594,17 @@ class Coordinator:
             node.dispatch_interval=interval
             return True
 
-    def _submit(self, job, identity, payload, callback):
+    def _submit(self, job, identity, payload, callback, *, assets=None):
         node, force, uncertain = job['node'], False, False
+        assets = job['task']['assets'] if assets is None else assets
         while True:
             if not uncertain and job['cancel'].is_set():return False
             submitting=False
             try:
-                with self._asset_handoff(node,identity,job['task']['assets'].values(),enabled=bool(job['task']['assets'])):
+                with self._asset_handoff(node,identity,assets.values(),enabled=bool(assets)):
                     started = time.monotonic()
                     try:
-                        self._ensure_assets(node, job['task']['assets'].values(), force=force,
+                        self._ensure_assets(node, assets.values(), force=force,
                                             cancel=None if uncertain else job['cancel'].is_set)
                     finally:
                         job['result']['asset_preparation_seconds'] = (
@@ -1881,6 +1892,8 @@ class Coordinator:
         if 'resource_request' not in remote:job['result'].pop('resource_request',None)
         submitted = job["result"].get("center_submitted", job["result"]["submitted"])
         assigned = {key: job["result"][key] for key in ('id',"assigned_node", "worker_url", "dispatched", 'request_sha256') if key in job["result"]}
+        if job['result'].get('_asset_variants'):
+            assigned['assets'] = job['result']['assets']
         if remote.get('request_sha256') and remote['request_sha256']!=assigned.get('request_sha256'):
             assigned['worker_request_sha256']=remote['request_sha256']
         assigned.pop('resource_request',None)
