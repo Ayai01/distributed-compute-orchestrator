@@ -1,17 +1,17 @@
 # DCO 当前状态
 
-2026-11-19（PST），**1.0.12** 修复大估值阶段的内存校准和核宽扩张。生产中心和本次在线采样的 worker 运行 **1.0.8**，生产切换按现有任务排空流程另行进行。
+2026-11-19（PST），中心、终端及 **18 台 worker 全部运行 1.0.12**，正常接单。总预算 **559 核／约 1281 GiB**。实时可用量由 `admission(activity=True)` 返回。[生产验收](../.local/migration/dco-1012-production-current.json) · [逐台更新](../.local/migration/dco-1012-remote-rollout-current.json)
 
-2026-11-18 晚（PST），中心、终端与 19 台 worker 均运行 **1.0.8**，全部在线接单。总预算 **591 核／约 1345 GiB**，空闲采样可用 **591 核／约 1218 GiB**。实时容量由 `admission(activity=True)` 返回。[中心](../.local/migration/dco-108-production-current.json) · [滚动更新](../.local/migration/dco-108-remote-rollout-current.json)
+106 项定向回归通过。学校节点的精确四核 SDK 执行、结果领取和 SPICE 分压仿真均成功。固定内存保持整任务标量报价，实测工作集与已授予预算分别记账。新节点使用的源码包指针已更新到 1.0.12。
 
 | 能力 | 可用核数 |
 | --- | ---: |
-| ng47、Chisel、ML、RTL、ONNX | 各 591 |
+| ng47、Chisel、ML、RTL、ONNX | 各 559 |
 | HSP | 96 |
 | Layout | 63 |
 | CUDA | 31 |
 | NPU | 0 |
 
-校内 AR 的上一实例曾接入 H，通过真实 RTL、Chisel 和 SPICE 验收。本次 AR 重建申请仍在 Scheduling。旧 AK 和旧 E 的 Terminated 环境已移除，原任务与费用已归档。[学校接入](../../../st-platform/docs/STATUS.md)
+原 H 对应的 AR 容器退出后，frpc 监听消失。AR 重建申请仍在 Scheduling，H 的失效注册已从持久配置与运行中心移除，七笔原任务回执保留。旧 AK 和旧 E 的 Terminated 环境已删除。[H 注销回执](../.local/migration/school-h-unregister-20261119.json) · [学校状态](../../../st-platform/docs/STATUS.md)
 
 **待处理运维项**。学校 CPU 扩容。32 核／64 GiB 和 24 核／48 GiB 的提交校验均显示零台可放置宿主。等有实际位置后按标准规格补位。
