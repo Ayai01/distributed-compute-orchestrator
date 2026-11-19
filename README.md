@@ -8,6 +8,8 @@ Distributed Compute Orchestrator：一个调度中心，统一 SDK、终端和�
 
 Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读取 `.local/worker.json`，中心同时读取 `.local/nodes.json`。独立worker可显式运行 `start.cmd --mode worker --config .local\worker.json`。服务保留原生终端，关闭Codex会话不结束计算；终端是人工停止入口。远程资源控制使用 [nurikoi控制页](https://nurikoi.com/manage/live/)。
 
+无图形界面的设备可用 `./start.sh --mode worker --no-dashboard` 运行纯文本服务。日志输出到标准输出和标准错误，可由系统服务收集。调度中心也可用同一选项运行。
+
 终端总览显示各台能力与当前可调度能力。F6/F7 翻节点，F8 切换总览与完整单节点详情，PgUp/PgDn 翻任务，Ctrl+PgUp/PgDn 翻命令输出。
 
 ## 安装位置

@@ -275,23 +275,29 @@ def check_tools(config):
     return 0 if all(x["ready"] for x in result) else 1
 
 
-def supervise(argv):
-    """Keep the service terminal alive across requested code/config reloads."""
+def supervise(argv, *, stopping=None):
+    """Keep the service alive across requested code/config reloads."""
     from .liveboard import supervised_publisher
     with supervised_publisher(ROOT):
-        return _supervise(argv)
+        return _supervise(argv, stopping=stopping)
 
 
-def _supervise(argv):
+def _supervise(argv, *, stopping=None):
     while True:
         process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv],
                                    env=dict(os.environ,DCO_SUPERVISOR_REVISION='memory31'))
         while True:
             try:
-                code = process.wait()
+                code = process.wait(timeout=.5 if stopping is not None else None)
                 break
+            except subprocess.TimeoutExpired:
+                if stopping.is_set():
+                    process.terminate()
+                    return process.wait()
             except KeyboardInterrupt:
                 continue  # the child receives the same console signal
+        if stopping is not None and stopping.is_set():
+            return code
         if code in (76,-9,0xC0000017,0xC000009A,-1073741801,-1073741670):
             from .memory import PressureGuard
             from .resources import memory,commit_memory
@@ -300,6 +306,8 @@ def _supervise(argv):
             print('内存中断：等待实际RAM和提交余量恢复后自动重启。',flush=True)
             stable=None
             while True:
+                if stopping is not None and stopping.is_set():
+                    return code
                 total,free=memory();commit=commit_memory()
                 host=dict(memory_total_mb=total,host_memory_available_mb=free,memory_headroom_mb=config.get('memory_headroom_mb',0))
                 if commit is not None:host.update(host_commit_available_mb=commit[1])
@@ -357,7 +365,7 @@ def main(argv=None):
     parser.add_argument("--root", help="持久任务/资产目录；默认工程内 .local/state，临时物单独使用RAM盘")
     parser.add_argument("--headless", "--no-browser", dest="no_browser", action="store_true",
                         help="不弹浏览器；DCO为终端服务，该选项不关闭看板或服务")
-    parser.add_argument("--no-dashboard", action="store_true", help="关闭交互看板；仍在可见终端前台运行并输出日志")
+    parser.add_argument("--no-dashboard", action="store_true", help="以纯文本模式运行本地服务，允许无窗口和重定向输出")
     parser.add_argument("--start-paused", action="store_true", default=None,
                         help="中心以暂停派发状态启动，保留原任务与成果供维护领取；完成后用control(paused=False)恢复")
     parser.add_argument("--service-child", action="store_true", help=argparse.SUPPRESS)
@@ -416,8 +424,10 @@ def main(argv=None):
     stopping = threading.Event()
     try:
         if args.action is None and not (args.test or args.test_native or args.check):
-            require_visible()
-            if args.service_child or args.url:
+            text_service = args.no_dashboard and not args.url
+            if not text_service:
+                require_visible()
+            if (text_service and os.name != 'nt') or (not text_service and (args.service_child or args.url)):
                 lifetime.enter_context(console_close(stopping))
         if (args.service_child and not args.url and args.action is None and
                 not (args.test or args.test_native or args.check) and handoff_python(invocation)):
@@ -548,6 +558,8 @@ def main(argv=None):
             # stay covered, and a directly launched child works independently.
             lifetime.enter_context(keep_awake())
         if not args.service_child and not args.url and args.action is None:
+            if args.no_dashboard and os.name != 'nt':
+                return supervise(invocation, stopping=stopping)
             return supervise(invocation)
         if getattr(args, "detach", False) and not args.url:
             raise ValueError("--detach 使用 --url 连接持续运行的中心或提供者")
@@ -581,6 +593,8 @@ def main(argv=None):
                                           reuse_role='worker',ca_file=config.get('ca_file') or config.get('certfile'),
                                           tls=bool(config.get('certfile')))
                 if existing_worker:
+                    if args.no_dashboard:
+                        raise Cancelled('DCO 已在运行：' + existing_worker)
                     from .commands import RemoteWorker
                     client=Client(existing_worker,args.local_token,ca_file=config.get('ca_file') or config.get('certfile'),operator=True)
                     WorkerShell(RemoteWorker(client)).loop(client.health,client.url)

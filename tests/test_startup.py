@@ -239,7 +239,7 @@ raise SystemExit(main())
     def test_all_service_entry_modes_reject_redirects_before_startup_side_effects(self):
         from remote_compute.cli import main
         for mode in ('scheduler', 'hybrid', 'worker'):
-            for extra in ([], ['--headless'], ['--no-dashboard'], ['--service-child'], ['--service-child', '--headless']):
+            for extra in ([], ['--headless'], ['--service-child'], ['--service-child', '--headless']):
                 with self.subTest(mode=mode, extra=extra), \
                         patch.object(terminal.sys.stdin, 'isatty', return_value=False), \
                         patch('remote_compute.cli.Worker') as worker, \
@@ -249,6 +249,18 @@ raise SystemExit(main())
                     self.assertIn('可见终端', output.getvalue())
                     for action in (worker, resolve):
                         action.assert_not_called()
+
+    def test_local_text_mode_does_not_require_a_visible_terminal(self):
+        from remote_compute import cli
+        with scratch() as directory, patch.object(cli, 'ROOT', Path(directory)):
+            config = str(Path(directory) / 'absent-device.json')
+            for mode in ('scheduler', 'hybrid', 'worker'):
+                with self.subTest(mode=mode), patch.object(cli, 'require_visible') as visible, \
+                        io.StringIO() as output, redirect_stderr(output):
+                    result = cli.main(['--mode', mode, '--no-dashboard', '--config', config])
+                    self.assertEqual(result, 2)
+                    visible.assert_not_called()
+                    self.assertIn('Missing worker config', output.getvalue())
 
     def test_real_detached_launch_refuses_before_creating_root(self):
         with scratch() as directory:
