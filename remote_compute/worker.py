@@ -29,7 +29,7 @@ from .bundle import (MAX_BODY, PROTOCOL, TERMINAL, atomic_json, inside, json_byt
 from .runtimes import (EXECUTION_CAPABILITIES, CHISEL_TOOLS, LAYOUT_TOOLS,
                        python_backend, python_accelerator, supports_python, uses_python, execution_tool,
                        validate_native_cache, native_architecture)
-from .runtime_profiles import check_onnx_int8, pe64_available
+from .runtime_profiles import check_onnx_int8, elf_aapcs64_available, pe64_available
 from . import __version__
 from .process import Process, low_integrity_directory
 from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, service_usage,
@@ -551,6 +551,8 @@ class Worker:
             info[name]=dict(argv=argv,available=executable is not None)
             if name == 'pe64':
                 info[name]['available'] = bool(executable and pe64_available())
+            if name == 'elf-aapcs64':
+                info[name]['available'] = bool(executable and elf_aapcs64_available())
             if name == 'onnx-int8' and executable:
                 contract = check_onnx_int8(argv, {**os.environ, **self.env})
                 info[name]['available'] = contract is not None

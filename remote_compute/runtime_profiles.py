@@ -12,6 +12,11 @@ def pe64_available():
     return sys.platform == 'win32' and architecture.lower() == 'amd64'
 
 
+def elf_aapcs64_available():
+    """Whether this worker has a native AArch64 Linux ELF execution ABI."""
+    return sys.platform.startswith('linux') and platform.machine().lower() == 'aarch64'
+
+
 def probe_onnx_int8():
     """Check the CPU integer inference contract with signed values and offsets."""
     if sys.platform == 'win32' and hasattr(platform, '_wmi_query'):

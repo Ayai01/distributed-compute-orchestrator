@@ -5,7 +5,7 @@ from functools import lru_cache
 from .policy import canonical_capability, canonical_capabilities, select_accelerator_units
 
 
-EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','npu','layout','rtl','onnx','onnx-int8','pe64')
+EXECUTION_CAPABILITIES = ('ng47','hsp','chisel','ml','cuda','npu','layout','rtl','onnx','onnx-int8','pe64','elf-aapcs64')
 CHISEL_TOOLS = {'java', 'scala-cli', 'firtool', 'circt', 'verilator', 'cxx', 'make'}
 LAYOUT_TOOLS = {'layout', 'magic', 'netgen'}
 _TOOLS = re.compile(r'\$\{tool:([A-Za-z_][A-Za-z0-9_+.-]*)\}')
