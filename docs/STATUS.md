@@ -1,6 +1,6 @@
 # DCO 当前状态
 
-2026-11-19（PST），18 台 worker 在线。生产中心仍是 **1.0.12** 进程，已在线应用 **1.0.16** 的中转、缓存和面板修复。学校 xjtu-az 结清在途任务后已切换到 **1.0.16** 并恢复接单。实时用量由 `admission(activity=True)` 返回。[生产回执](../.local/migration/relay-cache-1016/deployment-current.json) · [学校试点](../.local/migration/relay-cache-1016/school-worker-rollout.json)
+2026-11-19（PST），生产中心与 **18 台 worker 均运行 1.0.16**。中心排空在途计算后重启，60 个排队任务按原 ID 续派，均已核对。实时用量由 `admission(activity=True)` 返回。[滚动升级回执](../.local/migration/relay-cache-1016/fleet-center-rollout.json)
 
 学校节点的精确四核 SDK 执行、结果领取和 SPICE 分压仿真均成功。固定内存保持整任务标量报价，实测工作集与已授予预算分别记账。[新节点源码包](../.local/migration/school-cpu-source-current.json)
 
@@ -23,3 +23,7 @@
 **中转与缓存**。学校上传和下载各设 768 KiB/s，上限相互独立。每台学校 worker 有三条普通大包连接、独立短派发和结果通道。资产缓存每十分钟检查，按七天未命中和 64 GiB 回收。实际 SPICE 冷发 1.1 KB 输入，算力端生成 246 KB 网表，两个节点返回相同结果。[冷启动与复用](../.local/migration/relay-cache-1016/native-cache-proof.json) · [本机清理](../.local/migration/relay-cache-1016/gc-live.json) · [共享盘验收](../.local/migration/relay-cache-1016/school-shared-policy.json)
 
 **面板**。弹性资源调整持续占用调度锁时，面板继续显示最近快照并排队刷新。生产修复后 6.3 秒内读到四个新样本，中心 PID 保持一致。[面板回执](../.local/migration/relay-cache-1016/view-after.json)
+
+**公网路径**。同一校内结果经 VPS 本机 Nginx WSS 为约 3.9 MiB/s，经本机公网链路为约 0.38 MiB/s。独立 SSH 流重现大量 TCP 重传，物理网卡直出及经 ku26s 绕行均未改善。[分段回执](../.local/migration/relay-cache-1016/segmented-az.json) · [公网传输](../.local/migration/relay-cache-1016/az-public-path.json)
+
+**CPU 归还**。ARH MAC 尾部已请求只保留 1 核，内存缩减拒绝后 worker 仍保留旧核数。通用归还重试与容器配额采样修复已作为 `v1.0.17` 源码通过定向验收，生产版本为 1.0.16。[尾段证据](../.local/migration/relay-cache-1016/cpu-live-tail-worker.json) · [容器采样](../.local/migration/relay-cache-1016/cpu-cgroup-live-validation.json)
