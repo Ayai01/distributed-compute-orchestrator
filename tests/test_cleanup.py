@@ -203,13 +203,14 @@ class CleanupTests(unittest.TestCase):
                 one, two = '3'*32, '4'*32
                 first = client.sync_files({'data':b'cancelled preparation'}, job_id=one)
                 client.release_assets(one)
-                self.assertFalse((state.root/'assets'/(first+'.zip')).exists())
+                self.assertNotIn(one, state.asset_handoffs)
+                until(lambda: not (state.root/'assets'/(first+'.zip')).exists())
                 second = client.sync_files({'data':b'abandoned preparation'}, job_id=two)
                 assets, _ = state.asset_handoffs[two]
                 state.asset_handoffs[two] = (assets, time.monotonic()-1)
                 # Ordinary later upload is sufficient; no timer or extra GC loop.
                 client.sync_files({'data':b'current preparation'}, job_id='5'*32)
-                self.assertFalse((state.root/'assets'/(second+'.zip')).exists())
+                until(lambda: not (state.root/'assets'/(second+'.zip')).exists())
                 self.assertEqual(len(state.jobs), 0)
                 self.assertNotIn(two, state.asset_handoffs)
 

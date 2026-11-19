@@ -65,6 +65,36 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(RemoteError,'operator/debug-only'):
                 client.submit_bundle(uuid.uuid4().hex,task_bundle(command(['echo'],platform=sys.platform)))
 
+    def test_public_activity_reads_during_dispatch_lock_contention(self):
+        with scratch() as folder, provider(Path(folder) / 'worker', cpus=2) as (_, remote), Pool([remote]) as pool:
+            with center(pool, Path(folder) / 'center') as (state, operator):
+                operator.control(paused=True)
+                client = Client(operator.url, operator.token, timeout=1)
+                a = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='A'))['id']
+                b = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='B'))['id']
+                with state.condition, pool.condition:
+                    result = client.request('/admission', dict(project='A', activity=True))
+                self.assertEqual(result['cpu']['capacity'], 2)
+                self.assertEqual(result['project_active_tasks'], 1)
+                self.assertEqual([job['id'] for job in result['activity']['jobs']], [a])
+                self.assertNotIn(b, json.dumps(result))
+
+    def test_abandoned_handoff_release_does_not_wait_for_cache_or_dispatch(self):
+        with scratch() as folder, provider(Path(folder) / 'worker', cpus=2) as (_, remote), Pool([remote]) as pool:
+            with center(pool, Path(folder) / 'center') as (state, operator):
+                client = Client(operator.url, operator.token, timeout=1)
+                identity = uuid.uuid4().hex
+                asset = client.sync_files({'input.txt': b'fixture'}, job_id=identity)
+                self.assertIn(asset, state._protected_assets())
+                another = uuid.uuid4().hex
+                with state.condition:
+                    self.assertTrue(client.has_asset(asset, job_id=another))
+                with state.asset_cache.lock, state.condition:
+                    self.assertEqual(client.release_assets(identity), {'id': identity})
+                    self.assertEqual(client.release_assets(identity), {'id': identity})
+                self.assertNotIn(identity, state.asset_handoffs)
+                self.assertTrue(client.has_asset(asset))
+
     def test_project_view_and_advice_have_no_target_quota(self):
         state=AdmissionPlanningTests().center([4,4]);state.queue=[]
         state.jobs={'A':dict(task=dict(steps=[['echo']],cpus=0,max_cpus=64,memory_mb=64,project='A'),

@@ -10,6 +10,8 @@ import sys
 import tempfile
 from urllib.request import urlopen
 
+from .torch_runtime import TORCH_BUILDS, TORCH_VERSION, torch_pip_args
+
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGES = ('numpy', 'scipy', "numba>=0.65.1; python_version >= '3.14'", "numba; python_version < '3.14'",
@@ -51,7 +53,7 @@ def preferred_python():
     return Path(sys.executable)
 
 
-def _python(temporary):
+def _python(temporary, *, torch_build='cpu'):
     # A Linux setup invoked inside a venv must install into that exact venv.
     executable = Path(sys.executable) if sys.platform.startswith('linux') else preferred_python()
     env = dict(os.environ, PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1',
@@ -61,7 +63,13 @@ def _python(temporary):
     _run([executable, '-B', '-m', 'ensurepip'], env=env, capture_output=True)
     _run([executable, '-B', '-m', 'pip', 'install', '--disable-pip-version-check',
           '--no-cache-dir', '--no-compile', '--only-binary=:all:', *PACKAGES], env=env)
-    probe = ('import json,sys; import numpy,scipy,numba,pymoo,moocore,sklearn,umap,cv2,onnx,onnxruntime as ort; '
+    env['PIP_CONFIG_FILE'] = os.devnull
+    env['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
+    _run([executable, '-B', '-m', 'pip', 'install', *torch_pip_args(torch_build)], env=env)
+    probe = ('import json,sys; import numpy,scipy,numba,pymoo,moocore,sklearn,umap,cv2,onnx,onnxruntime as ort,torch; '
+             f'assert torch.__version__.split("+",1)[0]=={TORCH_VERSION!r}; '
+             f'assert torch.version.cuda=={TORCH_BUILDS[torch_build]!r}; '
+             'assert torch.tensor([2., 3.]).dot(torch.tensor([4., 5.])).item()==23.; '
              'f=numba.njit(lambda x: x*x); assert f(7)==49; '
              'assert cv2.resize(numpy.zeros((2,2),numpy.uint8),(4,4)).shape==(4,4); '
              'h=onnx.helper; t=onnx.TensorProto.FLOAT; '
@@ -76,7 +84,7 @@ def _python(temporary):
              '{n:getattr(m,"__version__","unknown") for n,m in '
              '[("numpy",numpy),("scipy",scipy),("numba",numba),("pymoo",pymoo),'
              '("moocore",moocore),("scikit-learn",sklearn),("umap-learn",umap),'
-             '("opencv-python-headless",cv2),("onnx",onnx),("onnxruntime",ort)]}}))')
+             '("opencv-python-headless",cv2),("onnx",onnx),("onnxruntime",ort),("torch",torch)]}}))')
     return executable, json.loads(_run([executable, '-B', '-c', probe], env=env,
                                       capture_output=True, text=True).stdout)
 
@@ -143,7 +151,7 @@ def _native_ngspice(source=None):
                                         if 'ngspice-' in line.lower()), version.strip()), 'reused':True}
 
 
-def _install_linux(root, ngspice_source=None, temporary_root=None):
+def _install_linux(root, ngspice_source=None, temporary_root=None, *, torch_build='cpu'):
     """Use the invoking venv and a preinstalled native simulator."""
     root = Path(root).resolve()
     config_path = root/'.local/worker.json'
@@ -162,7 +170,7 @@ def _install_linux(root, ngspice_source=None, temporary_root=None):
         scratch = Path(tempfile.gettempdir())
     with tempfile.TemporaryDirectory(prefix='install-science-', dir=scratch) as directory:
         try:
-            python, runtime = _python(Path(directory))
+            python, runtime = _python(Path(directory), torch_build=torch_build)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError('Science package setup failed in the current Python environment; '
                                'activate an isolated venv and run python -m pip install '
@@ -189,10 +197,10 @@ def _merge_tree(source, destination):
             shutil.copy2(path,target)
 
 
-def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
+def install(root=ROOT, *, ngspice_source=None, temporary_root=None, torch_build='cpu'):
     """Return tools/env using system Python and project-local native tools."""
     if sys.platform.startswith('linux'):
-        return _install_linux(root, ngspice_source, temporary_root)
+        return _install_linux(root, ngspice_source, temporary_root, torch_build=torch_build)
     if os.name != 'nt':
         raise ValueError('Science setup supports Windows and Linux')
     from .ramdisk import scratch
@@ -210,7 +218,7 @@ def install(root=ROOT, *, ngspice_source=None, temporary_root=None):
     temporary_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='install-science-', dir=temporary_root) as directory:
         temporary = Path(directory)
-        python, runtime = _python(temporary)
+        python, runtime = _python(temporary, torch_build=torch_build)
         ngspice, simulator = _ngspice(tools/'ngspice', temporary, ngspice_source)
     result = {'tools':{'python':python.as_posix()}, 'python_runtimes':{'cpu':[python.as_posix()]},
               'env':{'PYTHONNOUSERSITE':'1'},

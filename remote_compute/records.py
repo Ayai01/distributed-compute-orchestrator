@@ -336,8 +336,9 @@ def load_job(records, condition, identity):
         return records[identity]
 
 
-def active_values(records):
-    return (records.active if isinstance(records, JobRecords) else records).values()
+def active_values(records, *, snapshot=False):
+    active = records.active if isinstance(records, JobRecords) else records
+    return (active.copy() if snapshot else active).values()
 
 
 def archive_job(records, job, *, startup=False):

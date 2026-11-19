@@ -10,6 +10,8 @@ Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读�
 
 无图形界面的设备可用 `./start.sh --mode worker --no-dashboard` 运行纯文本服务。日志输出到标准输出和标准错误，可由系统服务收集。调度中心也可用同一选项运行。
 
+首次部署先执行 `python -B main.py setup`。默认任务使用的 Python 会安装并验证 PyTorch 2.14.1。CPU 为默认构建，确认 CUDA 13.0 驱动兼容的环境可用 `setup --torch-build cu130`。任务直接 `import torch`。
+
 运维终端显示节点能力与聚合容量。任务标签按栏宽显示，完整标签保存在原任务。F6/F7 翻节点，F8 切换总览与完整单节点详情，PgUp/PgDn 翻任务，Ctrl+PgUp/PgDn 翻命令输出。
 
 ## 安装位置

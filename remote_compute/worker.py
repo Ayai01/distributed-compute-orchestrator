@@ -81,21 +81,32 @@ def asset_handoff(service, identity, assets=None):
     """Hold an original request's inputs across a slow resynchronization."""
     if not _ID.fullmatch(identity):
         raise ValueError('Job id requires 32 lowercase hex characters')
-    with service.asset_cache.lock, service.condition:
-        if assets is None:
-            service.asset_handoffs.pop(identity,None)
-        else:
-            if service.stopping:
-                raise Conflict('Worker is stopping')
-            if not isinstance(assets,list) or any(not isinstance(a,str) or not _ASSET.fullmatch(a) for a in assets):
-                raise ValueError('Asset handoff requires synchronized SHA256 ids')
-            # This is only a cache reference, never a task or CPU grant.
-            # Abandoned transfers expire; each input check/upload renews it.
-            now=time.monotonic()
-            service.asset_handoffs={key:value for key,value in service.asset_handoffs.items() if value[1]>now}
-            if identity not in service.jobs:
-                service.asset_handoffs[identity]=(frozenset(assets),now+3600)
-        return {'id':identity}
+    if assets is None:
+        with service.asset_handoffs_lock:
+            service.asset_handoffs.pop(identity, None)
+        return {'id': identity}
+    if not isinstance(assets,list) or any(not isinstance(a,str) or not _ASSET.fullmatch(a) for a in assets):
+        raise ValueError('Asset handoff requires synchronized SHA256 ids')
+    with service.asset_cache.lock, service.asset_handoffs_lock:
+        if service.stopping:
+            raise Conflict('Worker is stopping')
+        # Abandoned transfers expire; each input check/upload renews the hold.
+        now = time.monotonic()
+        if identity not in service.jobs:
+            service.asset_handoffs[identity] = (frozenset(assets), now + 3600)
+    return {'id': identity}
+
+
+def handoff_references(service):
+    now = time.monotonic()
+    held = set()
+    with service.asset_handoffs_lock:
+        for identity, (assets, expires) in tuple(service.asset_handoffs.items()):
+            if expires <= now:
+                service.asset_handoffs.pop(identity)
+            else:
+                held.update(assets)
+    return held
 
 
 def retire_asset(service, identity):
@@ -106,9 +117,7 @@ def retire_asset(service, identity):
         if service.stopping:raise Conflict('Service is stopping')
         references=asset_references(service.jobs)
         references.update(getattr(service,'accepting_assets',()))
-        now=time.monotonic()
-        for assets,expires in service.asset_handoffs.values():
-            if expires>now:references.update(assets)
+        references.update(handoff_references(service))
         transfer=service.asset_writes.get(identity)
         if identity in references or transfer is not None:
             raise Conflict('Asset is still referenced by a task, producer or upload')
@@ -358,6 +367,7 @@ class Worker:
         self.work_reclaimer = Reclaimer(self.root/'jobs'/'.trash',source_root=self.root/'jobs')
         self.retirement = TransportRetirement(self.root / 'retirements', self._reclaim_retired)
         self.asset_handoffs = {}
+        self.asset_handoffs_lock = threading.Lock()
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
         phase=time.monotonic();indexed = self.jobs.load_index()
@@ -1016,7 +1026,8 @@ class Worker:
                     if task['cpus'] > int(self.capacity*self.cpu_overcommit_factor) or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
                     self.jobs[identity] = job
-                    self.asset_handoffs.pop(identity,None)
+                    with self.asset_handoffs_lock:
+                        self.asset_handoffs.pop(identity, None)
                     self.queue.append(identity)
                     self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
                     self.condition.notify_all()
@@ -1474,12 +1485,7 @@ class Worker:
             now = time.time()
             protected = {identity for identity, (_size, used) in self.asset_cache.entries.items()
                          if recent and now-used<5}
-            deadline = time.monotonic()
-            for identity, (assets, expires) in tuple(self.asset_handoffs.items()):
-                if deadline >= expires:
-                    self.asset_handoffs.pop(identity, None)
-                else:
-                    protected.update(assets)
+            protected.update(handoff_references(self))
             protected.update(asset_references(self.jobs))
             return protected
 
@@ -1663,14 +1669,14 @@ class Worker:
             exists = directory.is_dir()
             if exists:
                 self.asset_cache.touch(identity)
-            with self.condition:
+            with self.asset_handoffs_lock:
                 now=time.monotonic()
                 for key,(assets,expires) in tuple(self.asset_handoffs.items()):
                     if identity in assets and expires>started:
                         self.asset_handoffs[key]=(assets,now+3600)
-                if job_id is not None:
-                    held = self.asset_handoffs.get(job_id, (set(), 0))[0]
-                    self.asset_handoff(job_id, list(set(held) | {identity}))
+                held = self.asset_handoffs.get(job_id, (set(), 0))[0]
+            if job_id is not None:
+                self.asset_handoff(job_id, list(set(held) | {identity}))
             return {"id": identity, "exists": exists}
         with self.asset_cache.lock:
             if directory.is_dir() or (payload is None and self.shared_assets is None):

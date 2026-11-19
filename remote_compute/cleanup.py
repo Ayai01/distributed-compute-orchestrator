@@ -25,9 +25,14 @@ class AssetMaintenance:
 
     def __init__(self, sweep, report_error, *, interval=ASSET_SWEEP_SECONDS):
         self.stop = threading.Event()
+        self.pending = threading.Event()
 
         def run():
-            while not self.stop.wait(interval):
+            while not self.stop.is_set():
+                self.pending.wait(interval)
+                self.pending.clear()
+                if self.stop.is_set():
+                    break
                 try:
                     sweep()
                 except (OSError, ValueError) as error:
@@ -36,8 +41,12 @@ class AssetMaintenance:
         self.thread = threading.Thread(target=run, name='dco-asset-maintenance', daemon=True)
         self.thread.start()
 
+    def request(self):
+        self.pending.set()
+
     def close(self):
         self.stop.set()
+        self.pending.set()
         self.thread.join()
 
 
@@ -57,16 +66,22 @@ def evict_unused(entries, protected, limit, max_idle, discard, *, now):
     return errors
 
 
-def prune_asset_caches(owners):
+def prune_asset_caches(owners, *, wait=True):
     """Apply one quota to DCO asset stores owned by the same hybrid service."""
     caches = [owner.asset_cache for owner in owners]
     with ExitStack() as locks:
         for cache in caches:
             locks.enter_context(cache.lock)
         entries, protected = {}, set()
-        for owner, cache in zip(owners, caches):
-            entries.update({(cache, key): value for key, value in cache.entries.items()})
-            protected.update((cache, key) for key in owner._protected_assets())
+        with ExitStack() as state_locks:
+            for owner in owners:
+                if not owner.condition.acquire(blocking=wait):
+                    # Leave the cache lock available to producer lookups.
+                    return []
+                state_locks.callback(owner.condition.release)
+            for owner, cache in zip(owners, caches):
+                entries.update({(cache, key): value for key, value in cache.entries.items()})
+                protected.update((cache, key) for key in owner._protected_assets())
         return evict_unused(entries, protected, caches[0].limit,
                             caches[0].max_idle, lambda item: item[0].retire(item[1]),
                             now=time.time())

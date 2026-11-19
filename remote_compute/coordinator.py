@@ -16,7 +16,8 @@ import zipfile
 from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
 from . import client as transport
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
-from .worker import Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff, retire_asset, missing_task_assets
+from .worker import (Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff,
+                     handoff_references, retire_asset, missing_task_assets)
 from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
                      MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
@@ -124,6 +125,7 @@ class Coordinator:
         self.observation_probe = None
         self.observation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='observed-receipts')
         self.asset_handoffs = {}
+        self.asset_handoffs_lock = threading.Lock()
         self.legacy_assets = set()
         self.stopping = False
         self.paused = bool(paused)
@@ -214,10 +216,10 @@ class Coordinator:
         self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
                             seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
         atomic_json(self.root/'startup-current.json',self.startup)
+        self.asset_maintenance = AssetMaintenance(lambda: self._maintain_assets(wait=False), self._report_asset_cleanup)
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
         self.retirement.start()
-        self.asset_maintenance = AssetMaintenance(self._maintain_assets, self._report_asset_cleanup)
 
     def _load_operator_token(self, supplied):
         path = self.root / 'operator.token'
@@ -443,34 +445,38 @@ class Coordinator:
         if ready_tasks is not None:
             # Queue depth is transport preparation, not another CPU reservation.
             # All producers of a project share this outstanding-work bound.
-            with self.condition:
-                active = sum((job.get('task', {}).get('project') or 'default') == project
-                             and job['result']['status'] not in TERMINAL for job in active_values(self.jobs))
+            active = sum((job.get('task', {}).get('project') or 'default') == project
+                         and job['result']['status'] not in TERMINAL
+                         for job in active_values(self.jobs, snapshot=True))
             running = min(ready_tasks, value['running_tasks'])
             value.update(ready_tasks=ready_tasks, ready_source='center', queue_scope='project',
                          project_active_tasks=active, running_tasks=running,
                          queued_tasks=ready_tasks-running, in_flight=ready_tasks, max_in_flight=ready_tasks)
         if request.get('activity') is True:
-            with self.condition, self.pool.condition:
-                online = [node for node in self.pool.nodes if node.health and node.enabled and
-                          not node.error and not node.health.get('paused')]
-                value.update(self._cpu_availability(online))
-                value['activity'] = self._project_activity(project)
+            # Telemetry reads the published worker samples and active records.
+            # A CPU resize or dispatch must not hold up project producers.
+            nodes = tuple(self.pool.nodes)
+            online = [node for node in nodes if node.health and node.enabled and
+                      not node.error and not node.health.get('paused')]
+            value.update(self._cpu_availability(online))
+            value['activity'] = self._project_activity(project, nodes)
         return value
 
-    def _project_activity(self, project):
+    def _project_activity(self, project, nodes):
         """Expose each original's CPU sample without revealing its worker."""
-        reported = {sample['id']: sample for node in self.pool.nodes if not node.error
+        reported = {sample['id']: sample for node in nodes if not node.error
                     for sample in node.health.get('active_jobs') or ()}
         rows = []
-        for job in active_values(self.jobs):
-            result = job['result']
+        for job in active_values(self.jobs, snapshot=True):
+            result = job['result'].copy()
             if (job['task'].get('project') or 'default') != project or result['status'] in TERMINAL:
                 continue
             rows.append((result, reported.get(job.get('worker_id') or result['id'], {})))
-        for identity in self.observations.active:
-            row = self.observations.rows[identity]
-            if row['project'] == project:
+        observed = self.observations.active.copy()
+        observed_rows = self.observations.rows
+        for identity in observed:
+            row = observed_rows.get(identity)
+            if row and row['status'] not in TERMINAL and row['project'] == project:
                 rows.append((row, reported.get(row['id'], {})))
         jobs = []
         for result, sample in rows:
@@ -486,12 +492,13 @@ class Coordinator:
         capacity = available = 0
         labels = {}
         for node in nodes:
-            free = max(0, node.capacity - node.reserved - node.external)
-            capacity += node.capacity
+            width = node.capacity
+            free = max(0, width - node.reserved - node.external)
+            capacity += width
             available += free
             for label in execution_capabilities(node.health.get('tags', ())):
                 entry = labels.setdefault(label, {'capacity': 0, 'available': 0})
-                entry['capacity'] += node.capacity
+                entry['capacity'] += width
                 entry['available'] += free
         return {'cpu': {'capacity': capacity, 'available': available, 'unit': 'logical_threads'},
                 'capability_cpus': dict(sorted(labels.items()))}
@@ -1076,7 +1083,8 @@ class Coordinator:
                         except ValueError as error:rejected=error
                         else:
                             self.jobs[identity] = job
-                            self.asset_handoffs.pop(identity, None)
+                            with self.asset_handoffs_lock:
+                                self.asset_handoffs.pop(identity, None)
                             self.queue.append(identity)
                             self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
                             self.condition.notify_all()
@@ -2544,7 +2552,7 @@ class Coordinator:
                         raise OSError(str(error)) from error
             with self.condition:
                 self.jobs.record_retired(identity)
-        self._prune_assets()
+        self.asset_maintenance.request()
 
     def delete(self, identity):
         with self.submission_lock.hold(identity):
@@ -2562,12 +2570,7 @@ class Coordinator:
             protected = {asset for asset in self.legacy_assets
                          if recent and now - self.asset_cache.entries.get(asset, (0, 0))[1] < 3600}
             self.legacy_assets.intersection_update(protected)
-            deadline = time.monotonic()
-            for identity, (assets, expires) in tuple(self.asset_handoffs.items()):
-                if deadline >= expires:
-                    self.asset_handoffs.pop(identity, None)
-                else:
-                    protected.update(assets)
+            protected.update(handoff_references(self))
             protected.update(asset_references(self.jobs))
             protected.update(self.accepting_assets)
             return protected
@@ -2581,18 +2584,15 @@ class Coordinator:
             for error in self.asset_cache.prune(protected):
                 self._report_asset_cleanup(error)
 
-    def _maintain_assets(self):
-        if not self.local_asset_workers:
-            self._prune_assets()
-            return
-        for error in prune_asset_caches((self, *self.local_asset_workers)):
+    def _maintain_assets(self, *, wait=True):
+        for error in prune_asset_caches((self, *self.local_asset_workers), wait=wait):
             self._report_asset_cleanup(error)
 
     def asset_handoff(self, identity, assets=None):
         # The same original-ID handoff is understood by center and worker.
         value = asset_handoff(self, identity, assets)
         if assets is None:
-            self._prune_assets()
+            self.asset_maintenance.request()
         return value
 
     def asset(self, identity, payload=None, *, job_id=None):
@@ -2608,7 +2608,7 @@ class Coordinator:
                 if job_id is None:
                     self.legacy_assets.add(identity)
             if job_id is not None:
-                with self.condition:
+                with self.asset_handoffs_lock:
                     held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                 self.asset_handoff(job_id, list(set(held) | {identity}))
             return {"id": identity, "exists": exists}
@@ -2631,7 +2631,7 @@ class Coordinator:
                         value=published()
                 finally:
                     unlink(temporary)
-        self._prune_assets()
+                self.asset_maintenance.request()
         return value
 
     def close(self, *, preserve_queued=False):

@@ -386,6 +386,7 @@ def main(argv=None):
     item = sub.add_parser('setup', help='复用系统Python安装科学包；原生工具存放于.tools')
     item.add_argument('--ascend', action='store_true', help='探测现有昇腾镜像，登记NPU后端和挂载设备；不安装软件')
     item.add_argument('--cann-env', help='昇腾镜像的CANN set_env.sh路径')
+    item.add_argument('--torch-build', choices=('cpu', 'cu130'), default='cpu', help='默认 Python 的 PyTorch 构建')
     item.add_argument('--ngspice-source', help='复用已有ngspice目录，省去下载')
     item.add_argument('--rtl-source', help='原位复用已有MSYS2的GCC/Verilator，不复制安装')
     item = sub.add_parser('setup-https', help='配置本设备公网HTTPS和认证；空闲时在原终端重载')
@@ -525,7 +526,7 @@ def main(argv=None):
             else:
                 if args.cann_env:raise ValueError('--cann-env requires --ascend')
                 from .setup_tools import install
-                result = install(ngspice_source=args.ngspice_source)
+                result = install(ngspice_source=args.ngspice_source, torch_build=args.torch_build)
             if args.rtl_source:
                 from .setup_tools import reuse_rtl
                 result['env'].update(reuse_rtl(args.rtl_source)['env'])
