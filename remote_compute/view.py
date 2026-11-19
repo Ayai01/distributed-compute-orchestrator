@@ -163,11 +163,6 @@ def _capabilities(tags):
 
 
 
-def _project(name):
-    return {'Analog-Opt-Bench':'Bench','ARH-DSE':'ARH','rocket-nn-host':'NCNN',
-            'yolov8-quant-lab':'YOLO'}.get(name,name or '-')
-
-
 def _loopback_route(node, center_host):
     endpoint=urlsplit(node.get('url') or '')
     if endpoint.scheme not in ('http','https') or endpoint.hostname not in ('127.0.0.1','localhost','::1'):
@@ -241,136 +236,6 @@ def _network_text(network, loopback=None):
     if rtt is None and loss is None:
         return '--'
     return f"{rtt:.1f}ms/{loss:.0f}%" if isinstance(rtt,(int,float)) and isinstance(loss,(int,float)) else '--'
-
-
-def _tag_name(text):
-    names={'classab':'AB','class_ab':'AB','class-ab':'AB','classab-warm':'AB-warm',
-           'fiber_mo':'FIBER','fiber-mo':'FIBER','face-mo':'FACE','iicmo':'IICMO',
-           'rde26_cmop':'RDE26','maoea_hap':'MaOEA-HAP','agemoea2':'AGE2',
-           'nsga2':'NSGA2','nsga3':'NSGA3','disconnected-corridor':'split-cor',
-           'narrow-corridor':'narrow','evidence-folded-open':'fold-open'}
-    return names.get(text.casefold(),text)
-
-
-def _label(job):
-    project = (job.get('project') or '').casefold()
-    text=job.get('label','')
-    if ' | ' in text:return text
-    text=re.sub(r'\b(\d+) (?:new )?real designs\b',r'ng:\1',text,flags=re.I)
-    text=re.sub(r'\b(\d+) evaluations\b',r'ev:\1',text,flags=re.I)
-    if project in {'rgcn','arh-dse','bench','analog-opt-bench','aop'}:
-        text=re.sub(r'\b[0-9a-f]{12,64}\b',lambda m:m[0][-4:],text,flags=re.I)
-    if project=='rgcn':
-        legacy=re.fullmatch(r'(LDO|FSA|AB|BGR) paper_prediction fast \w+ f\d+ s',text)
-        if legacy:return legacy[1]+' PRED :'+job.get('id','????')[-4:]
-        if re.match(r'^(LDO|FSA|AB|BGR) \S+ s\d+(?:b\d+|:[0-9a-f]{4})?(?: |$)',text):
-            return text
-    parts = text.replace('\\','/').split('/')
-    positions = [i for i,part in enumerate(parts) if project and part.casefold()==project]
-    if positions:
-        parts = parts[positions[-1]+1:]
-    if not parts:
-        return '-'
-    if project=='aop':
-        qualified=re.fullmatch(r'(ClassAB|TSA|FSA|LDO|BGR) targeted qualification(\d+) s(\d+) (\S+) (\S+)',
-                               '/'.join(parts),re.I)
-        if qualified:
-            circuit,count,seed,method,corner=qualified.groups()
-            circuit='AB' if circuit.casefold()=='classab' else circuit.upper()
-            budget=str(int(count)//1000)+'k' if int(count)>=1000 and int(count)%1000==0 else count
-            return f'{circuit} s{int(seed)%100:02d} {_tag_name(method)} Q{budget} {corner}'
-    if project == 'aop' and len(parts)>=2:
-        circuit=parts[-2].split('_',1)[0]
-        if circuit.upper() in {'BGR','TSA','FSA','LDO','CLASSAB'}:
-            return circuit+'/'+parts[-1]
-    if project=='rocket-nn-host':
-        names={'rocket':'Rocket','boom':'BOOM','shufflenet_v2_x0_5':'ShuffleV2-0.5',
-               'mobilenet_v2':'MobileV2','yolov8n':'YOLOv8n','resnet18':'ResNet18'}
-        tokens=[]
-        for part in re.split(r'[/\s]+',' '.join(parts)):
-            if not part or part.casefold() in {'rocket-nn-host','rocket'}:
-                continue
-            if re.fullmatch(r'[0-9a-f]{12,64}',part,re.IGNORECASE):
-                continue
-            match=re.fullmatch(r'(.+?)[_-](dog|kitten|cat|car|person)',part,re.IGNORECASE)
-            if match and match[1].casefold() in names:
-                tokens.extend((names[match[1].casefold()],match[2].lower()))
-            else:
-                tokens.append(names.get(part.casefold(),part))
-        compact=[]
-        for token in tokens:
-            if token not in compact:
-                compact.append(token)
-        return ' '.join(compact[-4:]) or '-'
-    if project=='rgcn':
-        text=re.sub(r'^rgcn-', '', '/'.join(parts[-3:]), flags=re.IGNORECASE)
-        for before,after in (('-frozen-model',''),('-fresh',''),('analytic_previous_control','ana-prev'),
-                             ('neural_previous_control','nn-prev'),('neural_shared_gate_control','nn-gate'),
-                             ('analytic','ana'),('neural','nn'),('-seed','-s')):
-            text=text.replace(before,after)
-        tokens=text.split('/',1)
-        head,sep,tail=tokens[0].partition('-')
-        head={'ldo':'LDO','tsa':'TSA','fsa':'FSA','bgr':'BGR','classab':'ClassAB'}.get(head,head)
-        tokens[0]=head+(' '+tail if sep else '')
-        text='/'.join(tokens)
-        text=re.sub(r'\bcomplete PVT\b','PVT',text,flags=re.IGNORECASE)
-        text=re.sub(r'\bphysics (False|True)\b',lambda m:'phy'+str(int(m[1].lower()=='true')),text)
-        text=re.sub(r'\b(\d+) PVT\b',r'\1PVT',text)
-        words={'rgcn':'nn','pre':'PRE','post':'POST'}
-        return '/'.join(words.get(word.casefold(),_tag_name(word))
-                        for word in re.split(r'[/\s]+',text) if word)
-    if project in ('analog-opt-bench','bench') or parts and parts[0]=='Analog':
-        if parts[0]=='Analog':parts=parts[1:]
-        flat=re.fullmatch(r'(?:(\S+) )?(\S+) (\d+) (\d+)',' '.join(parts))
-        if flat:
-            method,scenario,budget,seed=flat.groups()
-            case=re.fullmatch(r'(?:panda-)?(.+)-(\d{4})',scenario)
-            name,number=(case[1],str(int(case[2]))) if case else (scenario,'')
-            name={'bookshelf_tall':'shelfT','bookshelf_wide':'shelfW','bookshelf':'shelf',
-                  'classab-warm':'ABw','classab':'AB','class_ab':'AB'}.get(name,_tag_name(name))
-            method=re.sub(r'^FIBER(\d+)$',r'F\1',method or '',flags=re.I)
-            budget=str(int(budget)//1000)+'k' if int(budget)>=1000 and int(budget)%1000==0 else budget
-            return ' '.join(t for t in (name+number,f's{int(seed)%100:02d}',_tag_name(method),budget) if t)
-        # This parent label repeats the total NFE after its count x budget.
-        # Keep the scenario and per-arm budget; the request retains full text.
-        if parts:
-            match=re.fullmatch(r'(\d+)x(\d+)=(\d+) NFE budget',parts[-1])
-            if match and int(match[1])*int(match[2])==int(match[3]):
-                budget=int(match[2])
-                parts[-1]=match[1]+'x'+(format(budget/1000,'g')+'k' if budget%1000==0 else str(budget))
-            if len(parts)>=2:
-                scenario=re.fullmatch(r'panda-(.+)-(\d+)',parts[-2])
-                if scenario:parts[-2]=scenario[1]+'#'+str(int(scenario[2]))
-        compact=[]
-        for part in parts:
-            # The ID distinguishes replicas; CPUs have their own column. Keep
-            # the actual scenario, which used to disappear before this suffix.
-            if re.fullmatch(r'seed=\d+',part):continue
-            scenario=re.fullmatch(r'panda-(.+)-(\d+)',part)
-            if scenario:part=scenario[1]+'#'+str(int(scenario[2]))
-            parallel=re.fullmatch(r'(\d+) parallel methods on \d+ CPUs',part)
-            if parallel:part=parallel[1]+'alg'
-            part=re.sub(r'\bb(\d{4,})(?: each)?\b',lambda m:'b'+format(int(m[1])/1000,'g')+'k',part)
-            compact.append(_tag_name(part))
-        return '/'.join(compact)
-    if project=='arh-dse':
-        text='/'.join(parts)
-        text=re.sub(r'controller revision: immutable worker source comparison only','src-check',text)
-        text=re.sub(r'\bselected design\b','',text)
-        text=re.sub(r'\bunrolled native gate\b','unroll-check',text)
-        text=re.sub(r'\bnative gate\b','check',text)
-        names={'rocket_dma':'Rocket','rocket':'Rocket','boom_dma':'BOOM','boom':'BOOM',
-               'fir_stream':'FIR','mac':'MAC','conv_pool':'ConvPool','rv_dma_yolo':'RV-YOLO',
-               'evaluate':'eval','prepare':'prep','verify':'verify','directed':'dir',
-               'gsim':'GSIM','verilator':'VLT','engine':'NCNN','rtl':'RTL','isolated':''}
-        compact=[]
-        for word in re.split(r'[/\s·]+',text):
-            word=names.get(word.casefold(),word)
-            if word and (not compact or compact[-1]!=word):compact.append(word)
-        return '/'.join(compact) or '-'
-    if project=='yolov8-quant-lab' and parts[-1]=='integer-range-and-cost':
-        return 'INT4 range/cost'
-    return '/'.join(parts[-2:]) or job.get('label','-')
 
 
 def _show_node(node):
@@ -470,7 +335,7 @@ class StatusRows(list):
         if center:
             for name,a in value.get('projects',{}).items():
                 count=sum(job.get('project')==name for _,job in self.jobs)
-                self.projects.append([_project(name),str(float(a['resource_share'])),f"{count}/{a['used']}",a['queued']])
+                self.projects.append([name or '-',str(float(a['resource_share'])),f"{count}/{a['used']}",a['queued']])
             self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
@@ -485,7 +350,7 @@ class StatusRows(list):
             diagnostic=diagnose(job,now=now,offline=name in offline_nodes)
             state_label=LABELS.get(diagnostic['code'],{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state))
             started=job.get('started')
-            label = _label(job)
+            label = str(job.get('label') or '-')
             if job.get('observe_only'):
                 details = []
                 if job.get('phase'):
@@ -494,7 +359,7 @@ class StatusRows(list):
                     details.append(f"实耗 {job['measured_cpus']:.2f} 核")
                 if details:
                     label = ' · '.join([*details, label])
-            self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
+            self.records.append([job.get('id','-')[:4],name,job.get('project') or '-',f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
                                  _task_memory(job),state_label,label,
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",

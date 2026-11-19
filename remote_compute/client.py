@@ -263,15 +263,15 @@ class Client:
     def _routed_request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
         authority = self.endpoint.geturl()
         paced = _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint)
-        artifact_get = (paced and binary and data is None and method in (None, 'GET')
-                        and re.fullmatch(r'/jobs/[0-9a-f]{32}/artifacts', path))
+        artifact_get = (binary and data is None and method in (None, 'GET')
+                        and re.fullmatch(r'/jobs/[0-9a-f]{32}/(?:artifacts|files/.+)', path))
         pools=self.__dict__.setdefault('_transports',{})
         if artifact_get:
             # Keep completed jobs clear of uploads, and let a second receipt
             # advance while the first one is waiting on a slow archive.
-            # Both directions share the byte budget in _request.
+            # Configured relays share a byte budget in _request.
             pool = self.__dict__.setdefault('_artifact_transports', {}).setdefault(authority, _ConnectionPool())
-            limit = 2
+            limit = 2 if paced else getattr(self, 'bulk_limit', 7)
         else:
             pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if authority==self.url
                   else pools.setdefault(authority,_ConnectionPool()))

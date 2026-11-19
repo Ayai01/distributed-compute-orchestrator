@@ -1,25 +1,18 @@
 import threading
 import unittest
 
-from remote_compute.view import _label, format_status
+from remote_compute.task_tags import compact_tag
+from remote_compute.view import format_status
 import test_center as center_fixtures
 
 
 class CompactTaskDisplayTests(unittest.TestCase):
-    def test_tag_keeps_short_identity_and_work_without_changing_request(self):
-        job = {'project': 'ARH-DSE', 'label': 'FIR seed=4101 1234567890abcdef 4 real designs'}
-        before = dict(job); tag = _label(job)
-        self.assertIn('ng:4', tag)
-        self.assertIn('cdef', tag)
-        self.assertNotIn('12345678', tag)
-        self.assertEqual(job, before)
-
-    def test_compact_rgcn_is_preserved_and_old_truncated_labels_are_distinct(self):
-        label = 'FSA -KCL s19b2 ep:96 ~600s'
-        self.assertEqual(_label({'project': 'RGCN', 'label': label}), label)
-        old = {'project': 'RGCN', 'label': 'FSA paper_prediction fast fsa f100 s'}
-        self.assertEqual(_label({**old, 'id': '1'*28+'abcd'}), 'FSA PRED :abcd')
-        self.assertEqual(_label({**old, 'id': '1'*28+'2345'}), 'FSA PRED :2345')
+    def test_task_label_output_is_independent_of_project(self):
+        text = 'design check | s4101 | 4 samples'
+        for project in ('project-a', 'project-b'):
+            job = {'project': project, 'label': text}
+            self.assertEqual(compact_tag(job, 48), text)
+            self.assertEqual(job['label'], text)
 
     def test_task_table_spends_the_removed_share_priority_width_on_tag(self):
         job = {'id': '1234'+'a'*28, 'project': 'RGCN', 'label': 'FSA -KCL s19b2 ep:96 ~600s',
@@ -29,7 +22,7 @@ class CompactTaskDisplayTests(unittest.TestCase):
             with self.subTest(width=width):
                 text = '\n'.join(format_status(value, width=width).fit(36))
                 self.assertNotIn('Share/Pri', text)
-                self.assertIn('CPU/max',text)
+                self.assertIn('CPU/上限',text)
                 self.assertIn('4/128',text)
                 if width >= 140:
                     self.assertIn('ep:96', text)

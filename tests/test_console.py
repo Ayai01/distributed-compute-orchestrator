@@ -717,17 +717,15 @@ class ConsoleTests(unittest.TestCase):
                             if 'opaque' in painted:self.assertNotIn('\x1b[',painted[painted.index('opaque'):])
                             self.assertEqual(re.sub(r'\x1b\[[0-9;]*m','',painted),row)
 
-    def test_current_long_producer_labels_are_short_display_only(self):
-        from remote_compute.view import _label
-        cases=[('AOP','ClassAB targeted qualification256 s23 FACE tt27','AB s23 FACE Q256 tt27'),
-               ('AOP','FSA targeted qualification12000 s2026102217 FACE ff-40','FSA s17 FACE Q12k ff-40'),
-               ('Bench','bookshelf_tall-0004 16000 3561671','shelfT4 s71 16k'),
-               ('Bench','FIBER356 classab-warm 4000 3571009','ABw s09 F356 4k')]
-        for project,label,expected in cases:
-            job=dict(project=project,label=label)
-            self.assertEqual(_label(job),expected)
-            self.assertEqual(job['label'],label)
-            self.assertLessEqual(_width(expected),23)
+    def test_task_tags_are_clipped_without_rewriting_the_request(self):
+        from remote_compute.task_tags import compact_tag
+        label = '验证工程 assembly stage output'
+        for width in (8, 14, 24, 40):
+            job = dict(project='custom-project', label=label)
+            visible = compact_tag(job, width, measure=_width)
+            self.assertTrue(label.startswith(visible))
+            self.assertEqual(job['label'], label)
+            self.assertLessEqual(_width(visible), width)
 
     def test_jobs_prefix_selects_one_record_and_lists_colliding_ids(self):
         from remote_compute.commands import SchedulerShell
@@ -776,10 +774,8 @@ class ConsoleTests(unittest.TestCase):
                 self.assertIn('ss27','\n'.join(output))
 
     def test_framed_columns_fit_chinese_and_long_labels_at_multiple_widths(self):
-        from remote_compute.view import _label
         job=dict(id='a'*32,project='AOP',label='check/AOP/aop/ngspice/BGR_SKY130_SSFF_m40_p125_4corners/ss27',
                  cpus=1,memory_mb=256,status='running')
-        self.assertEqual(_label(job),'BGR/ss27')
         value=dict(role='scheduler',node='Aya1-PC',cpus=54,used_cpus=24,
             nodes=[dict(node='Aya1-PC',capacity=24,logical_cpus=28,active_jobs=[job]*24)],projects={})
         for width in (44,64,80,110,140):
@@ -788,43 +784,18 @@ class ConsoleTests(unittest.TestCase):
             for row in rows:
                 self.assertEqual(_width(row),width)
             text='\n'.join(rows)
-            self.assertIn('BGR/ss27',text)
+            self.assertIn('check/AOP',text)
             self.assertIn('当前任务 24 个',text)
             self.assertIn('aaaa',text)
             self.assertNotIn('aaaaaaaa',text)
-            self.assertNotIn('m40_p125',text)
 
-    def test_project_and_task_descriptions_are_compact_without_changing_request_labels(self):
-        from remote_compute.view import _label, _project
-        cases=[('rocket-nn-host','rocket-nn-host/boom/shufflenet_v2_x0_5/kitten/f4d61bbf5462da2d','NCNN','BOOM ShuffleV2-0.5 kitten'),
-               ('rocket-nn-host','BOOM yolov8n-dog d9bc25af61428879','NCNN','BOOM YOLOv8n dog'),
-               ('RGCN','RGCN/fsa-online-frozen-model-seed42','RGCN','FSA/online-s42'),
-               ('RGCN','RGCN/tsa-neural_previous_control-fresh','RGCN','TSA/nn-prev'),
-               ('RGCN','rgcn-tsa-pre','RGCN','TSA/PRE'),
-               ('RGCN','RGCN/tsa/nn-prev/s42','RGCN','TSA/nn-prev/s42'),
-               ('RGCN','FSA train complete PVT physics False','RGCN','FSA/train/PVT/phy0'),
-               ('RGCN','CLASSAB PRE 9 PVT','RGCN','AB/PRE/9PVT'),
-               ('Analog-Opt-Bench','Analog/class_ab/FACE-MO/b96000','Bench','AB/FACE/b96k'),
-               ('Analog-Opt-Bench','Analog/classab-warm/seed=3281671/4 parallel methods on 4 CPUs/b24000 each','Bench','AB-warm/4alg/b24k'),
-               ('Analog-Opt-Bench','Analog/evidence-folded-open/FACE-MO/b12000','Bench','fold-open/FACE/b12k'),
-               ('Analog-Opt-Bench','Analog/panda-cage-0003/FIBER-MO/b12000','Bench','cage#3/FIBER/b12k'),
-               ('Analog-Opt-Bench','Analog/panda-bookshelf_tall-0005/3x12000=36000 NFE budget','Bench','bookshelf_tall#5/3x12k'),
-               ('Analog-Opt-Bench','Analog/panda-cage-0003/3x48000=144000 NFE budget','Bench','cage#3/3x48k'),
-               ('Analog-Opt-Bench','Analog/native-mw11/6x12000=72000 NFE budget','Bench','native-mw11/6x12k'),
-               ('AOP','aop/ngspice/LDO_SKY130_SSFF_m40_p125_4corners/ss125','AOP','LDO/ss125'),
-               ('ARH-DSE','ARH-DSE/mac','ARH','MAC'),
-               ('ARH-DSE','BOOM NCNN unrolled native gate','ARH','BOOM/NCNN/unroll-check'),
-               ('ARH-DSE','BOOM NCNN native gate','ARH','BOOM/NCNN/check'),
-               ('ARH-DSE','rocket_dma · prepare prepare','ARH','Rocket/prep'),
-               ('ARH-DSE','Rocket selected design · rtl/native/directed','ARH','Rocket/RTL/native/dir'),
-               ('ARH-DSE','Rocket controller revision: immutable worker source comparison only','ARH','Rocket/src-check'),
-               ('yolov8-quant-lab','YOLO/integer-range-and-cost','YOLO','INT4 range/cost'),
-               ('RGCN','RGCN','RGCN','-')]
-        for project,label,source,description in cases:
-            job=dict(project=project,label=label)
-            self.assertEqual((_project(project),_label(job)),(source,description))
-            self.assertEqual(job['label'],label)
-            self.assertLessEqual(_width(description),26)
+    def test_project_and_label_render_as_submitted_when_they_fit(self):
+        job = dict(id='abcd'+'f'*28, project='Custom', label='pipeline stage #1234',
+                   cpus=1, status='running')
+        value = dict(role='scheduler', nodes=[dict(name='worker', capacity=4, active_jobs=[job])])
+        text = '\n'.join(format_status(value, width=175).fit(25))
+        self.assertIn('Custom', text)
+        self.assertIn(job['label'], text)
 
     def test_resource_headers_and_parent_labels_fit_without_midword_elision(self):
         job=dict(id='abcd'+'f'*28,project='Bench',cpus=1,memory_mb=1024,status='running',
@@ -840,7 +811,7 @@ class ConsoleTests(unittest.TestCase):
                 self.assertNotIn('进程...留',text)
                 self.assertNotIn('已用...辑)',text)
                 self.assertTrue(all(_width(row)==width for row in rows))
-                if width>=100:self.assertIn('bookshelf_tall#5/3x12k',text)
+                if width>=100:self.assertIn('Analog/panda-',text)
         self.assertEqual(job['label'],'Analog/panda-bookshelf_tall-0005/3x12000=36000 NFE budget')
 
     def test_all_table_headers_remain_complete_at_each_layout_width(self):

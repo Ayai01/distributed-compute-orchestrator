@@ -37,9 +37,23 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
                 with self.assertRaises(RemoteError):client.request('/control',dict(paused=True))
                 with self.assertRaises(RemoteError):client.request('/restart',{})
                 self.assertNotIn('target_cpus',client.admission('A'))
-                activity = client.admission('A', queue_ratio=0, activity=True)['activity']
+                view = client.admission('A', queue_ratio=0, activity=True)
+                self.assertEqual(view['cpu'], {'capacity': 2, 'available': 2, 'unit': 'logical_threads'})
+                self.assertIn('capability_cpus', view)
+                self.assertTrue({'platform', 'nodes', 'worker_url', 'node'}.isdisjoint(view))
+                activity = view['activity']
                 self.assertEqual(set(activity), {'sampled_at', 'jobs'})
                 self.assertEqual(activity['jobs'], [])
+                operator.control(paused=True)
+                a = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='A'))['id']
+                b = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='B'))['id']
+                pending = client.admission('A', activity=True)['activity']['jobs']
+                self.assertEqual([row['id'] for row in pending], [a])
+                self.assertEqual(pending[0]['status'], 'queued')
+                self.assertNotIn(b, json.dumps(pending))
+                client.cancel(a)
+                client.cancel(b)
+                operator.control(paused=False)
                 result=operator.run(command(['${tool:python}','-c','import sys;print(sys.platform)'],
                     platform=sys.platform,max_cpus=2,memory_mb=128,project='debug'))
                 self.assertEqual(result['status'],'succeeded',result)

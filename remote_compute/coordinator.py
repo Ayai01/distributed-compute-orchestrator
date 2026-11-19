@@ -353,8 +353,8 @@ class Coordinator:
                 or (node_name is not None and not isinstance(node_name,str))
                 or (maximum_cpus is not None and (type(maximum_cpus) is not int or maximum_cpus<max(1,cpus)))):
             raise ValueError(f'project, resource_share <= {MAX_RESOURCE_SHARE:g}, queue_ratio <= {MAX_QUEUE_RATIO:g} and cpus required')
-        resources = self.project_resources()
         paused={node.name for node in self.pool.nodes if node.health.get('paused')}
+        resources = self.project_resources() if paused or job_id is not None else {}
         held={name:cpus for name,cpus in resources.get(project,{}).get('node_demands',{}).items() if name in paused}
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')
                   and n.capacity>=max(1,cpus)
@@ -377,7 +377,6 @@ class Coordinator:
                 if (job['task'].get('project') or 'default')!=project:
                     raise ValueError('admission project differs from the running task')
                 node=job['node'];old=job['task']['cpus'];old_memory=job['task']['memory_mb']
-                resource=self.project_resources()[project]
                 # Advice must describe the new phase's opportunity. Using the
                 # previous one-CPU demand here prevents an idle pool reborrowing.
                 advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
@@ -422,10 +421,12 @@ class Coordinator:
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         value = dict(project=project,resource_share=share,queue_ratio=ratio,capable_cpus=capable,accepting=getattr(self,'accepting',True),
-                    accelerator=accelerator,platform=platform,fallback_capable_cpus=fallback_capable,
+                    accelerator=accelerator,fallback_capable_cpus=fallback_capable,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
+        if operator and platform is not None:
+            value['platform'] = platform
         if ready_tasks is None and ratio > 0:
             ready_tasks = min(MAX_READY_TASKS, max(READY_QUEUE_FLOOR, maximum + 1, value['in_flight']))
         if ready_tasks is not None:
@@ -439,24 +440,50 @@ class Coordinator:
                          project_active_tasks=active, running_tasks=running,
                          queued_tasks=ready_tasks-running, in_flight=ready_tasks, max_in_flight=ready_tasks)
         if request.get('activity') is True:
-            value['activity'] = self._project_activity(project)
+            with self.condition, self.pool.condition:
+                online = [node for node in self.pool.nodes if node.health and node.enabled and
+                          not node.error and not node.health.get('paused')]
+                value.update(self._cpu_availability(online))
+                value['activity'] = self._project_activity(project)
         return value
 
     def _project_activity(self, project):
         """Expose each original's CPU sample without revealing its worker."""
-        snapshot = self.health()
-        sampled_at = time.time()
-        samples = {}
-        for node in snapshot['nodes']:
-            for job in node.get('active_jobs') or ():
-                if job.get('project') != project:
-                    continue
-                runtime = job.get('runtime') or {}
-                samples[job['id']] = dict(id=job['id'], status=job.get('status'),
-                    cpus=job.get('cpus'), active_cpus=job.get('active_cpus'),
-                    cpu_seconds=runtime.get('cpu_seconds'),
-                    sampled_at=runtime.get('sampled_at'), process_alive=runtime.get('process_alive'))
-        return dict(sampled_at=sampled_at, jobs=list(samples.values()))
+        reported = {sample['id']: sample for node in self.pool.nodes if not node.error
+                    for sample in node.health.get('active_jobs') or ()}
+        rows = []
+        for job in active_values(self.jobs):
+            result = job['result']
+            if (job['task'].get('project') or 'default') != project or result['status'] in TERMINAL:
+                continue
+            rows.append((result, reported.get(job.get('worker_id') or result['id'], {})))
+        for identity in self.observations.active:
+            row = self.observations.rows[identity]
+            if row['project'] == project:
+                rows.append((row, reported.get(row['id'], {})))
+        jobs = []
+        for result, sample in rows:
+            runtime = sample.get('runtime') or result.get('runtime') or {}
+            jobs.append(dict(id=result['id'], status=result['status'], cpus=result.get('cpus'),
+                active_cpus=sample.get('active_cpus', result.get('active_cpus')),
+                cpu_seconds=runtime.get('cpu_seconds'), sampled_at=runtime.get('sampled_at'),
+                process_alive=runtime.get('process_alive')))
+        return dict(sampled_at=time.time(), jobs=jobs)
+
+    @staticmethod
+    def _cpu_availability(nodes):
+        capacity = available = 0
+        labels = {}
+        for node in nodes:
+            free = max(0, node.capacity - node.reserved - node.external)
+            capacity += node.capacity
+            available += free
+            for label in execution_capabilities(node.health.get('tags', ())):
+                entry = labels.setdefault(label, {'capacity': 0, 'available': 0})
+                entry['capacity'] += node.capacity
+                entry['available'] += free
+        return {'cpu': {'capacity': capacity, 'available': available, 'unit': 'logical_threads'},
+                'capability_cpus': dict(sorted(labels.items()))}
 
     def restart_node(self, name):
         node = next((n for n in self.pool.nodes if n.name == name), None)
@@ -508,15 +535,13 @@ class Coordinator:
         validate_operator_fields(dict(platform=platform),operator)
         platform = validate_platform(platform)
         with self.condition, self.pool.condition:
-            online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled
+            online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled and not n.health.get('paused')
                       and (platform is None or n.health.get('platform') == platform)]
             tags = set()
             accelerator_profiles = []
             for node in online:
                 tags.update(execution_capabilities(node.health.get('tags', ())))
                 accelerator_profiles.extend(node.health.get('accelerators', ()))
-            cpu_capacity = sum(n.capacity for n in online)
-            cpu_available = sum(max(0, n.capacity - n.reserved - n.external) for n in online)
             memory_capacity = sum(n.memory_capacity for n in online)
             memory_available = sum(max(0, n.memory_free) for n in online)
             return {
@@ -528,30 +553,34 @@ class Coordinator:
                 'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
                 'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],
                 'accelerators': aggregate_accelerators(accelerator_profiles),
-                'cpu': {'capacity': cpu_capacity, 'available': cpu_available, 'unit': 'logical_threads'},
+                **self._cpu_availability(online),
                 'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
             }
 
-    @staticmethod
-    def public_result(result):
+    def public_error(self, value):
+        """Return a diagnostic without exposing a provider address or path."""
+        value = re.sub(r'https?://[^\s\])}]+', '<remote>', str(value))
+        value = re.sub(r'(?i)(?:[A-Za-z]:[\\/]|/(?:home|tmp|var|mnt)/)[^\s\])}]+', '<remote-path>', value)
+        names = {name for node in self.pool.nodes for name in
+                 (node.name, node.display_name, node.health.get('node'), node.host_ip, node.health.get('host_ip'))
+                 if isinstance(name, str) and len(name) > 2}
+        if names:
+            pattern = '|'.join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+            value = re.sub(r'(?<![\w.-])(?:'+pattern+r')(?![\w.-])', '<remote>', value, flags=re.I)
+        return value
+
+    def public_result(self, result):
         """Return a project result without placement or worker-local paths."""
         hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd',
                   'tool_root', 'root', 'home', 'worker_root',
-                  'shared_paths', 'unavailable_shared', 'resource_request'}
-
-        def clean_text(text):
-            if not isinstance(text, str):
-                return text
-            # Errors are useful to the project, but transport URLs and local
-            # worker paths are private scheduler details.
-            text = re.sub(r'https?://[^\s\])}]+', '<remote>', text)
-            return re.sub(r'(?i)(?:[A-Za-z]:[\\/]|/(?:home|tmp|var|mnt)/)[^\s\])}]+', '<remote-path>', text)
+                  'shared_paths', 'unavailable_shared', 'resource_request',
+                  'observe_only', 'source', 'revision'}
 
         def clean_mapping(mapping):
             cleaned = {key: item for key, item in mapping.items() if key not in hidden}
             for key in ('error', 'connection_error'):
-                if key in cleaned:
-                    cleaned[key] = clean_text(cleaned[key])
+                if isinstance(cleaned.get(key), str):
+                    cleaned[key] = self.public_error(cleaned[key])
             # Keep per-step timing and return codes without argv/path data.
             if isinstance(mapping.get('steps'), list):
                 cleaned['steps'] = [{key: step[key] for key in ('started', 'finished', 'returncode') if key in step}
@@ -651,7 +680,7 @@ class Coordinator:
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
                                      + sum(row['status'] in TERMINAL for row in observation_rows.values()),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),

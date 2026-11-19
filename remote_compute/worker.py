@@ -1994,9 +1994,9 @@ class Handler(BaseHTTPRequestHandler):
         except KeyError as exc:
             self._reply({"error": "Unknown job, tool or path variable: " + str(exc)}, 404)
         except Conflict as exc:
-            self._reply({"error": str(exc)}, 409)
+            self._reply({"error": worker.public_error(exc) if scheduler and not operator else str(exc)}, 409)
         except RemoteError as exc:
-            self._reply({"error": str(exc)}, 502)
+            self._reply({"error": worker.public_error(exc) if scheduler and not operator else str(exc)}, 502)
         except FileNotFoundError as exc:
             self._reply({"error": str(exc)}, 404)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:

@@ -10,14 +10,14 @@ Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读�
 
 无图形界面的设备可用 `./start.sh --mode worker --no-dashboard` 运行纯文本服务。日志输出到标准输出和标准错误，可由系统服务收集。调度中心也可用同一选项运行。
 
-终端总览显示各台能力与当前可调度能力。F6/F7 翻节点，F8 切换总览与完整单节点详情，PgUp/PgDn 翻任务，Ctrl+PgUp/PgDn 翻命令输出。
+运维终端显示节点能力与聚合容量。任务标签按栏宽显示，完整标签保存在原任务。F6/F7 翻节点，F8 切换总览与完整单节点详情，PgUp/PgDn 翻任务，Ctrl+PgUp/PgDn 翻命令输出。
 
 ## 安装位置
 
 - Windows：`D:\Projects\#4-Arclight\DCO_v1`；没有 D 盘时为 `C:\Projects\#4-Arclight\DCO_v1`。
 - Linux：`~/Projects/#4-Arclight/DCO_v1`。
 - `.local/` 保存设备配置、身份、状态和有界运维回执；`.tools/` 保存本机工具；可重建临时物使用设备 RAM 盘或系统临时目录中的所属任务目录。
-- 科研输入、结果、优化器及科学缓存归 AOP、RGCN、ARH-DSE、DCBFS 各工程管理。
+- 科研输入、结果、优化器及科学缓存由调用工程管理。
 
 ## FRP 与火绒信任
 
@@ -35,15 +35,13 @@ Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读�
 
 CPU总线程硬限额＝基础预算×超发倍率向下取整，硬限额和倍率双向联动。看板有人观看时每15秒发布，无人观看时每60秒发布；页面隐藏后停止轮询。
 
-任务Tag显示工程、任务类型、规模和实际进度，例如 `YOLOv8n 曲线 n2 7.15Mcy`。L1/L2/L3标明评价层级，n为调用工程声明的条件数，Mcy为百万周期；完整标签另带输入/源根/剂量数量和四位方案。源覆盖标为src，与实际完成量分开。窄终端优先保留这些字段；原任务ID和冻结label不因显示调整而改变。
 
-任务可设置 `resource_recovery=False`，关闭内存压力引起的资源重入及其泛重试；默认 `True`，普通 worker 丢失恢复保持原合同。Aya1-PC 的 ONNX 工具指向 DCO 本地运行时，保留原 Python、ONNX 和 ONNX Runtime 版本。
 
 现有 `Client.execute`、`python_map/python_call/python_task`、`map_items/iter_items/run_call`、内容资产及进度接口作为迁移合同。接口与资源语义见 [DESIGN](docs/DESIGN.md)；协作与验证见 [AGENTS](AGENTS.md)。
 
 ## 昇腾容器
 
-学校常驻 ARM64 CPU 节点显示为 xjtu-A 至 O。节点身份证明、原 ID 和费用按稳定路由名保留。学校开通、实例映射和已知阻碍见[本机学校接入目录](../../st-platform/README.md)。
+学校开通、实例映射与接入验收见[学校接入入口](../../st-platform/README.md)。普通 SDK 按能力发单。
 
 学校平台先分配 CPU/RAM/NPU，再在该容器内启动 worker。Linux 标准 `setup` 已在学校 ARM 隔离 venv 验证科学依赖及 ONNX 推理。Linux 的 CPU/RAM 读取按 cgroup 有效限额裁定；容器模板为 `examples/worker-ascend.json`，关闭 CPU 超发并使用适合小容器的内存保留线。
 
