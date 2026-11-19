@@ -1727,6 +1727,7 @@ class Pool:
                  "reserved": n.reserved, "external_cpus": n.external,
                  "used_cpus": n.health.get("used_cpus", 0), "queued": n.health.get("queued", 0),
                  "cpu_percent": n.health.get("cpu_percent"), "logical_cpus": n.health.get("logical_cpus"),
+                 "cpu_scope": n.health.get("cpu_scope"), "host_cpu_percent": n.health.get("host_cpu_percent"),
                  "benchmark": n.health.get("benchmark"), "benchmark_state": n.health.get("benchmark_state", "ready"), "asset_cache": n.health.get("asset_cache"),
                  "service": n.health.get("service"), "scratch_disk": n.health.get("scratch_disk"),
                  "memory_capacity_mb": n.memory_capacity, "memory_available_mb": max(0, int(n.memory_free)),

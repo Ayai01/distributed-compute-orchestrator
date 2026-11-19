@@ -235,8 +235,8 @@ def _cpu_set_count(value):
     return len(cpus) or None
 
 
-def cpu_capacity():
-    """Effective integer CPU capacity, respecting Linux cgroup and affinity."""
+def _effective_cpu_capacity(locations=None):
+    """Effective CPU budget before rounding it to whole scheduling slots."""
     capacity = max(1, os.cpu_count() or 1)
     if os.name == 'nt' or not sys.platform.startswith('linux'):
         return capacity
@@ -244,7 +244,8 @@ def cpu_capacity():
         capacity = min(capacity, max(1, len(os.sched_getaffinity(0))))
     except (AttributeError, OSError):
         pass
-    locations = _cgroup_locations()
+    if locations is None:
+        locations = _cgroup_locations()
     for controller in ('', 'cpu'):
         if controller not in locations:
             continue
@@ -258,7 +259,7 @@ def cpu_capacity():
                     quota, period = _read(path / 'cpu.cfs_quota_us'), _read(path / 'cpu.cfs_period_us')
                 quota, period = int(quota), int(period)
                 if quota > 0 and period > 0:
-                    capacity = min(capacity, max(1, quota // period))
+                    capacity = min(capacity, quota / period)
             except (ValueError, TypeError):
                 pass
     for controller in ('', 'cpuset'):
@@ -270,6 +271,11 @@ def cpu_capacity():
             if count:
                 capacity = min(capacity, count)
     return capacity
+
+
+def cpu_capacity():
+    """Effective integer CPU capacity, respecting Linux cgroup and affinity."""
+    return max(1, int(_effective_cpu_capacity()))
 
 
 def _cgroup_memory(total, available):
@@ -383,25 +389,61 @@ def cpu_ticks():
     return sum(values[:8]), values[3] + values[4]
 
 
+def _cgroup_cpu_counter(locations):
+    """Read the cumulative CPU time charged to the worker's group."""
+    if '' in locations:
+        path = locations[''][0] / 'cpu.stat'
+        for line in _read(path).splitlines():
+            name, separator, value = line.partition(' ')
+            if separator and name == 'usage_usec' and value.strip().isdigit():
+                return path, int(value) * 1000
+    if 'cpuacct' in locations:
+        path = locations['cpuacct'][0] / 'cpuacct.usage'
+        value = _read(path)
+        if value.isdigit():
+            return path, int(value)
+    return None
+
+
 class Host:
     def __init__(self):
         self.previous = cpu_ticks()
         self.sampled = 0.0
         self.cpu_percent = None
+        self.host_cpu_percent = None
+        self.cpu_scope = 'host'
+        self.group_cpu_sample = None
         self.lock = threading.Lock()
+
     def sample(self):
         total_mb, available_mb = memory()
         commit = commit_memory()
+        locations = _cgroup_locations() if sys.platform.startswith('linux') else {}
+        capacity = _effective_cpu_capacity(locations)
         with self.lock:
-            if time.monotonic() - self.sampled >= 0.5:
+            now = time.monotonic()
+            if now - self.sampled >= 0.5:
                 current = cpu_ticks()
                 elapsed, idle = current[0] - self.previous[0], current[1] - self.previous[1]
                 if elapsed:
-                    self.cpu_percent = round(max(0, min(100, 100 * (1 - idle / elapsed))), 2)
-                self.previous, self.sampled = current, time.monotonic()
-        result = {"machine_id": MACHINE_ID, "logical_cpus": cpu_capacity(),
-                "cpu_percent": self.cpu_percent, "temperature_c": None,
-                "memory_total_mb": total_mb, "host_memory_available_mb": available_mb}
+                    self.host_cpu_percent = round(max(0, min(100, 100 * (1 - idle / elapsed))), 2)
+                self.previous, self.sampled = current, now
+                group = _cgroup_cpu_counter(locations) if capacity < (os.cpu_count() or 1) else None
+                if group is None:
+                    self.group_cpu_sample = None
+                    self.cpu_scope, self.cpu_percent = 'host', self.host_cpu_percent
+                else:
+                    source, counter = group
+                    previous = self.group_cpu_sample
+                    self.group_cpu_sample = (source, capacity, counter, now)
+                    self.cpu_scope, self.cpu_percent = 'cgroup', None
+                    if previous and previous[:2] == (source, capacity) and counter >= previous[2]:
+                        cpu_seconds = (counter - previous[2]) / 1e9
+                        self.cpu_percent = round(min(100, 100 * cpu_seconds / ((now - previous[3]) * capacity)), 2)
+            result = {"machine_id": MACHINE_ID, "logical_cpus": max(1, int(capacity)),
+                      "cpu_percent": self.cpu_percent, "cpu_scope": self.cpu_scope,
+                      "host_cpu_percent": self.host_cpu_percent, "temperature_c": None,
+                      "memory_total_mb": total_mb, "host_memory_available_mb": available_mb}
         if commit is not None:
             result.update(host_commit_limit_mb=commit[0], host_commit_available_mb=commit[1])
         return result

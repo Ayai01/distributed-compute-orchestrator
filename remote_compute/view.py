@@ -287,7 +287,7 @@ class StatusRows(list):
             self.title+=' | 采样 '+time.strftime('%H:%M:%S',time.localtime(sample_time))
             if value.get('health_stale'):
                 self.title+=f"（{value['health_age_seconds']:.1f} 秒前）"
-        self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
+        self.summary=f"线程预留 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))
             if not value.get('accepting',True):self.summary+=' | 停止新增，收齐在途'
@@ -567,10 +567,11 @@ class StatusRows(list):
         route = _network_text(node.get('network'), _loopback_route(node, center) if center is not None else None)
         key = node.get('name') or node.get('node') or record[0]
         name = f'#{record[10]} {record[0]}' + (f' · {key}' if key != record[0] else '')
+        cpu_scope = '容器配额' if node.get('cpu_scope') == 'cgroup' else '整机'
         details = [
             name,
             f'状态 {_node_state(node)} | 任务 {len(node.get("active_jobs") or ())}',
-            f'线程 已占/配额(逻辑) {record[1]} | CPU {record[2]} | 基准 单核/整机 {record[7]} Miter/s',
+            f'线程 预留/配额(逻辑) {record[1]} | CPU {record[2]}（{cpu_scope}） | 基准 单核/整机 {record[7]} Miter/s',
             f'内存 已用/总 {record[3]} | 可派 {record[4]} | 进程/预留 {record[5]} GiB',
             (f'节点 IP {record[9]} | 中转入口 {record[14]} | 链路 {route}' if self.viewport
              else f'IP {record[9]} | 链路 {route}'),

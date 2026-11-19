@@ -28,6 +28,7 @@ class CpuLease:
         self.min_cpus = None
         self.confirmed = None
         self.phase_pending = False
+        self.resize_pending = False
         self.memory_calibrating = False
 
     def refresh(self, *, active_cpus=0, ready_cpus=None, min_cpus=0):
@@ -47,7 +48,7 @@ class CpuLease:
         unchanged = desired == self.demand and active_cpus == self.active_cpus and min_cpus==self.min_cpus
         # No slot can grow or be returned in a stable fully occupied phase.
         # Other phases still poll: the same demand can borrow a peer's release.
-        if unchanged and not self.phase_pending and self.cpus == desired == active_cpus:
+        if unchanged and not self.phase_pending and not self.resize_pending and self.cpus == desired == active_cpus:
             return self.cpus
         if (not unchanged
                 or time.monotonic() - self.updated >= (.1 if self.memory_calibrating else 1)):
@@ -61,6 +62,9 @@ class CpuLease:
                             'Center resource reply timed out; existing grant retained',
                             RESOURCE_TRANSPORT_RETAINED))):
                     raise
+                # A smaller usable width inferred from a retained grant is
+                # not confirmation that the worker returned the unused slots.
+                self.resize_pending = True
                 # A refused or unanswered resize leaves paid CPU/RAM usable. Re-read that
                 # grant: a new phase may need more memory than it can fund.
                 inherited=(self.identity==os.environ.get('REMOTE_COMPUTE_JOB_ID')
@@ -115,6 +119,8 @@ class CpuLease:
                         grant=self._wait_for_phase(target)
                     else:raise error
                 else:grant={**grant,'cpus':funded}
+            else:
+                self.resize_pending = False
             self.cpus = grant['cpus']
             self.phase_pending = bool(grant.get('_phase_pending'))
             self.memory_calibrating = bool(grant.get('memory_calibrating'))

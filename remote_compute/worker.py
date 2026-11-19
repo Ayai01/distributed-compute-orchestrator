@@ -784,6 +784,7 @@ class Worker:
             requested_memory={k:v for k,v in model.items()if v is not None}
             previous_memory=result.get('memory_phase')or job.get('memory_phase_model',task.get('memory_model'))
             if not requested_memory:requested_memory=previous_memory or {}
+            cpu_return=granted<old and same_phase(requested_memory,previous_memory)
             physical,commit=measured_memory(job)
             observation=job.get('memory_observation')
             observed_cpus=getattr(observation,'active_cpus',0)
@@ -801,25 +802,33 @@ class Worker:
             adaptive_model=model
             available=max(credit,min(self.memory_capacity,credit+max(0,self._memory_state()['memory_available_mb'])))
             if memory_budget_mb is not None:available=min(available,memory_budget_mb)
+            retain_memory=False
             if memory_budget_mb is not None and calibrated and same_phase(requested_memory,previous_memory):
                 field='memory_mb'if model.get('memory_mb')is not None else'base_memory_mb'if model.get('memory_per_cpu_mb')==0 else None
                 actual=max(job.get('rss_mb',0),job.get('private_mb')or 0)
-                if actual>available:
+                if actual>available and not cpu_return:
                     raise Conflict('Insufficient RAM for active workers; existing grant retained')
+                retain_memory=actual>available
                 # This width-independent phase already has funded growth room.
                 # A newer padded sample must not charge that margin twice.
                 if field and 0<actual<=available:
                     model={**model,field:min(model[field],int(available))}
-            if granted==0:memory=old_memory
+            if granted==0 or retain_memory:memory=old_memory
             else:
                 granted,memory=plan_memory(granted,available,
                     floor=max(floor,min(min_cpus or 1,granted)),**model)
                 if min_cpus is not None and granted<min_cpus:granted,memory=floor,old_memory
-            if granted<floor:raise Conflict('Insufficient RAM for active workers; existing grant retained')
             memory=old_memory if memory is None else memory
             extra=max(0,memory-credit)
-            if memory>self.memory_capacity and memory>old_memory or (extra and extra>self._memory_state()['memory_available_mb']):
-                raise Conflict('Insufficient memory for resource resize; existing grant retained')
+            if (granted<floor or (memory>self.memory_capacity and memory>old_memory)
+                    or (extra and extra>self._memory_state()['memory_available_mb'])):
+                if not cpu_return:
+                    if granted<floor:
+                        raise Conflict('Insufficient RAM for active workers; existing grant retained')
+                    raise Conflict('Insufficient memory for resource resize; existing grant retained')
+                # A smaller CPU grant can keep its incumbent RAM. Reclaim
+                # memory only as the working-set observation and budget permit.
+                granted,memory=cpu_ready_limit,old_memory
             active_changed=result.get('active_cpus',0)!=(active_cpus or 0)
             result.update(active_cpus=active_cpus or 0,requested_cpus=requested_cpus)
             if min_cpus is not None:result['min_cpus']=min_cpus
