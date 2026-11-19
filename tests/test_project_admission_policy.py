@@ -74,6 +74,7 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
                 b = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='B'))['id']
                 with state.condition, pool.condition:
                     result = client.request('/admission', dict(project='A', activity=True))
+                    self.assertEqual(client.health()['cpu']['capacity'], 2)
                 self.assertEqual(result['cpu']['capacity'], 2)
                 self.assertEqual(result['project_active_tasks'], 1)
                 self.assertEqual([job['id'] for job in result['activity']['jobs']], [a])

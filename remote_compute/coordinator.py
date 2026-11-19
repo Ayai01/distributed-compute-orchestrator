@@ -125,7 +125,6 @@ class Coordinator:
         self.observation_probe = None
         self.observation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='observed-receipts')
         self.asset_handoffs = {}
-        self.asset_handoffs_lock = threading.Lock()
         self.legacy_assets = set()
         self.stopping = False
         self.paused = bool(paused)
@@ -574,28 +573,27 @@ class Coordinator:
         """
         validate_operator_fields(dict(platform=platform),operator)
         platform = validate_platform(platform)
-        with self.condition, self.pool.condition:
-            online = [n for n in self.pool.nodes if n.health and not n.error and n.enabled and not n.health.get('paused')
-                      and (platform is None or n.health.get('platform') == platform)]
-            tags = set()
-            accelerator_profiles = []
-            for node in online:
-                tags.update(execution_capabilities(node.health.get('tags', ())))
-                accelerator_profiles.extend(node.health.get('accelerators', ()))
-            memory_capacity = sum(n.memory_capacity for n in online)
-            memory_available = sum(max(0, n.memory_free) for n in online)
-            return {
-                'protocol': PROTOCOL,
-                'role': 'scheduler',
-                'version': __version__,
-                **({'platforms':sorted({n.health['platform'] for n in online if n.health.get('platform')})} if operator else {}),
-                'capabilities': public_capabilities(),
-                'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
-                'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],
-                'accelerators': aggregate_accelerators(accelerator_profiles),
-                **self._cpu_availability(online),
-                'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
-            }
+        online = [node for node in tuple(self.pool.nodes) if node.health and not node.error and node.enabled
+                  and not node.health.get('paused') and (platform is None or node.health.get('platform') == platform)]
+        tags = set()
+        accelerator_profiles = []
+        for node in online:
+            tags.update(execution_capabilities(node.health.get('tags', ())))
+            accelerator_profiles.extend(node.health.get('accelerators', ()))
+        memory_capacity = sum(node.memory_capacity for node in online)
+        memory_available = sum(max(0, node.memory_free) for node in online)
+        return {
+            'protocol': PROTOCOL,
+            'role': 'scheduler',
+            'version': __version__,
+            **({'platforms': sorted({node.health.get('platform') for node in online} - {None, ''})} if operator else {}),
+            'capabilities': public_capabilities(),
+            'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
+            'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],
+            'accelerators': aggregate_accelerators(accelerator_profiles),
+            **self._cpu_availability(online),
+            'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
+        }
 
     def public_error(self, value):
         """Return a diagnostic without exposing a provider address or path."""
@@ -642,16 +640,15 @@ class Coordinator:
         return value
 
     def public_health(self, *, brief=False):
-        value = self.capabilities()
         if brief:
-            return {key: value[key] for key in ('protocol', 'role', 'version', 'capabilities')}
-        with self.condition:
-            value.update({
-                'used_cpus': sum(n.reserved + n.external for n in self.pool.nodes if not n.error and n.enabled),
-                'queued': len(self.queue),
-                'paused': self.paused,
-                'accepting':getattr(self,'accepting',True),
-            })
+            return dict(protocol=PROTOCOL, role='scheduler', version=__version__, capabilities=public_capabilities())
+        value = self.capabilities()
+        value.update({
+            'used_cpus': sum(n.reserved + n.external for n in tuple(self.pool.nodes) if not n.error and n.enabled),
+            'queued': len(self.queue),
+            'paused': self.paused,
+            'accepting': getattr(self, 'accepting', True),
+        })
         return value
 
     def _health(self):
@@ -1041,8 +1038,7 @@ class Coordinator:
                     if not (self.root/'assets'/(asset+'.zip')).is_file():
                         raise ValueError('Synchronize missing asset first: '+asset)
                     self.asset_cache.touch(asset)
-                with self.condition:
-                    self.accepting_assets.update(task['assets'].values())
+                self.accepting_assets.update(task['assets'].values())
             # Durable request writes must not serialize unrelated cache hits.
             # This reference belongs to acceptance, independently of the caller
             # releasing its preparation handoff before publication finishes.
@@ -1083,8 +1079,7 @@ class Coordinator:
                         except ValueError as error:rejected=error
                         else:
                             self.jobs[identity] = job
-                            with self.asset_handoffs_lock:
-                                self.asset_handoffs.pop(identity, None)
+                            self.asset_handoffs.pop(identity, None)
                             self.queue.append(identity)
                             self.queue.sort(key=lambda key: -self.jobs[key]["task"]["priority"])
                             self.condition.notify_all()
@@ -1096,8 +1091,7 @@ class Coordinator:
             finally:
                 # The published job now owns its assets. Releasing the
                 # acceptance reference must not wait behind cache I/O.
-                with self.condition:
-                    self.accepting_assets.clear()
+                self.accepting_assets.clear()
 
     def _queued_candidates(self,budgets):
         """Least occupied weighted project first; priority orders its own work."""
@@ -2608,14 +2602,13 @@ class Coordinator:
                 if job_id is None:
                     self.legacy_assets.add(identity)
             if job_id is not None:
-                with self.asset_handoffs_lock:
-                    held = self.asset_handoffs.get(job_id, (set(), 0))[0]
+                held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                 self.asset_handoff(job_id, list(set(held) | {identity}))
             return {"id": identity, "exists": exists}
         if payload is None:
             with self.asset_cache.lock:
                 return published()
-        with self.condition:
+        with self.asset_cache.lock:
             transfer=self.asset_writes.setdefault(identity,threading.Lock())
         with transfer:
             with self.asset_cache.lock:

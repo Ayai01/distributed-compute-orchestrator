@@ -82,30 +82,30 @@ def asset_handoff(service, identity, assets=None):
     if not _ID.fullmatch(identity):
         raise ValueError('Job id requires 32 lowercase hex characters')
     if assets is None:
-        with service.asset_handoffs_lock:
-            service.asset_handoffs.pop(identity, None)
+        service.asset_handoffs.pop(identity, None)
         return {'id': identity}
     if not isinstance(assets,list) or any(not isinstance(a,str) or not _ASSET.fullmatch(a) for a in assets):
         raise ValueError('Asset handoff requires synchronized SHA256 ids')
-    with service.asset_cache.lock, service.asset_handoffs_lock:
+    with service.asset_cache.lock:
         if service.stopping:
             raise Conflict('Worker is stopping')
         # Abandoned transfers expire; each input check/upload renews the hold.
         now = time.monotonic()
         if identity not in service.jobs:
             service.asset_handoffs[identity] = (frozenset(assets), now + 3600)
+            if identity in service.jobs:
+                service.asset_handoffs.pop(identity, None)
     return {'id': identity}
 
 
 def handoff_references(service):
     now = time.monotonic()
     held = set()
-    with service.asset_handoffs_lock:
-        for identity, (assets, expires) in tuple(service.asset_handoffs.items()):
-            if expires <= now:
-                service.asset_handoffs.pop(identity)
-            else:
-                held.update(assets)
+    for identity, (assets, expires) in service.asset_handoffs.copy().items():
+        if expires <= now:
+            service.asset_handoffs.pop(identity, None)
+        else:
+            held.update(assets)
     return held
 
 
@@ -367,7 +367,6 @@ class Worker:
         self.work_reclaimer = Reclaimer(self.root/'jobs'/'.trash',source_root=self.root/'jobs')
         self.retirement = TransportRetirement(self.root / 'retirements', self._reclaim_retired)
         self.asset_handoffs = {}
-        self.asset_handoffs_lock = threading.Lock()
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
         phase=time.monotonic();indexed = self.jobs.load_index()
@@ -1026,8 +1025,7 @@ class Worker:
                     if task['cpus'] > int(self.capacity*self.cpu_overcommit_factor) or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
                     self.jobs[identity] = job
-                    with self.asset_handoffs_lock:
-                        self.asset_handoffs.pop(identity, None)
+                    self.asset_handoffs.pop(identity, None)
                     self.queue.append(identity)
                     self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
                     self.condition.notify_all()
@@ -1664,18 +1662,12 @@ class Worker:
         if job_id is not None and not _ID.fullmatch(job_id):
             raise ValueError('Job id requires 32 lowercase hex characters')
         directory = self.root / "assets" / identity
-        started = time.monotonic()
         def published():
             exists = directory.is_dir()
             if exists:
                 self.asset_cache.touch(identity)
-            with self.asset_handoffs_lock:
-                now=time.monotonic()
-                for key,(assets,expires) in tuple(self.asset_handoffs.items()):
-                    if identity in assets and expires>started:
-                        self.asset_handoffs[key]=(assets,now+3600)
-                held = self.asset_handoffs.get(job_id, (set(), 0))[0]
             if job_id is not None:
+                held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                 self.asset_handoff(job_id, list(set(held) | {identity}))
             return {"id": identity, "exists": exists}
         with self.asset_cache.lock:

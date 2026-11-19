@@ -22,7 +22,7 @@ class AssetInterfaceTests(unittest.TestCase):
         state=Coordinator.__new__(Coordinator)
         state.condition=threading.Condition(threading.RLock())
         state.asset_cache=SimpleNamespace(lock=threading.RLock())
-        state.asset_handoffs={};state.asset_handoffs_lock=threading.Lock();state.stopping=False;state.paused=False
+        state.asset_handoffs={};state.stopping=False;state.paused=False
         state.jobs={str(i):dict(task=dict(project='P',cpus=1,priority=0),
             result=dict(status='queued'))for i in range(120)}
         state.queue=list(state.jobs);entered=threading.Event();errors=[]
