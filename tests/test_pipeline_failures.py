@@ -12,6 +12,35 @@ from test_pipeline import task
 
 
 class PipelineFailureTests(unittest.TestCase):
+    def test_status_transport_errors_keep_accepted_ids_and_resume_collection(self):
+        with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
+            with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
+                sent=[];outages=[]
+                submit,statuses=client.submit_bundle,client.statuses
+
+                def submit_once(identity,data,**options):
+                    self.assertNotIn(identity,sent)
+                    sent.append(identity)
+                    return submit(identity,data,**options)
+
+                def intermittent(identities,*,compact=False):
+                    if compact and len(outages)<2:
+                        outages.append(tuple(identities))
+                        error=RemoteError('Status temporarily unavailable');error.status_code=503
+                        raise error
+                    return statuses(identities,compact=compact)
+
+                with patch.object(client,'statuses',side_effect=intermittent), \
+                        patch.object(client,'submit_bundle',side_effect=submit_once), \
+                        patch.object(client,'_read_reconnecting',side_effect=lambda read,**options:read()):
+                    results=client.execute({'first':task(1),'second':task(2)},project='status-recovery',
+                        output_dir=Path(root)/'delivery',ready_tasks=2)
+                self.assertEqual(len(outages),2)
+                self.assertIn(outages[0][0],outages[1])
+                self.assertEqual({row['id'] for row in results},set(sent))
+                self.assertEqual(len(sent),2)
+                self.assertTrue(all(row['status']=='succeeded' for row in results))
+
     def test_prepare_failure_releases_credit_and_resumes_original_identity(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):

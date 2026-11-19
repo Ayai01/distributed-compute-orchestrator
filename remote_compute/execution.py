@@ -177,7 +177,7 @@ class _Grants:
             self.active,self.ready=active,ready
             if changed:self.condition.notify_all()
 
-    def close(self,*,task_finished=False):
+    def close(self,*,task_finished=False,release=True):
         with self.condition:
             self.stopping=True;pending=self.pending;self.condition.notify_all()
         # A whole-task map exits immediately after publishing its results.
@@ -187,8 +187,13 @@ class _Grants:
             if self.thread and not pending:self.thread.join()
             return
         if self.thread:self.thread.join()
-        if self.lease and not self.error:
+        if release and self.lease and not self.error:
             self.lease.refresh(active_cpus=0,ready_cpus=0)
+
+
+def _confirmed_width(lease, width):
+    return (lease is not None and lease.cpus == width and lease.confirmed is not None
+            and not lease.phase_pending and not lease.resize_pending)
 
 
 def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,collect=True,stop=None,ready_slots=None,on_start=None,on_capacity=None,ready_demand=None,limits=None,item_max_cpus=1,owns_task=False):
@@ -219,7 +224,11 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             if collect:values.append(value)
             if on_result:on_result(index,value,None)
         return values if collect else position
-    maximum=min(len(items)*item_max_cpus,max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',os.cpu_count()or 1))))
+    task_maximum = max(1, int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS', os.cpu_count() or 1)))
+    maximum = min(len(items) * item_max_cpus, task_maximum)
+    keep_single_slot = (task_maximum == item_max_cpus == 1 and not owns_task
+                        and stop is None and ready_slots is None and ready_demand is None)
+    _local.single_slot = False
     grants=_Grants(maximum,limits);maximum=grants.maximum
     resources=None
     if item_max_cpus>1:
@@ -237,6 +246,7 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
         torch=sys.modules.get('torch')
         if torch is not None:torch.set_num_threads(1)
     pool=ThreadPoolExecutor(max_workers=min(len(items),maximum),thread_name_prefix='dco-item')
+    succeeded = False
     try:
         while active or position<len(items):
             from remote_compute.memory import memory_waiting,memory_boundary
@@ -284,15 +294,23 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
                     failures.append(error)
                     if on_result:on_result(index,None,str(error))
             if grants.error:failures.append(grants.error)
+            if keep_single_slot and not failures and position == len(items) and not active:
+                # The next phase of this one-CPU original can reuse its slot.
+                # Do not publish a drained allocation between finite stages.
+                break
             if resources:resources.report(ready())
             else:grants.report(len(active),ready())
         if failures:raise RuntimeError('DCO execution failed: '+str(failures[0]))from failures[0]
         if grants.error:raise grants.error
+        succeeded = True
         return values if collect else position
     finally:
         pool.shutdown(wait=True)
         if resources:resources.close()
         if resources and owns_task:grants.close(task_finished=True)
+        elif succeeded and keep_single_slot:
+            grants.close(release=False)
+            _local.single_slot = _confirmed_width(grants.lease, 1)
         else:grants.report(0,0);grants.close()
 
 
@@ -469,6 +487,9 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
         cpus=min(maximum,max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1')))),**model)
     # No kernel is active during admission. Keep the complete ready demand
     # visible until the provider can fund this indivisible numerical stage.
+    keep_single_slot = int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS', '1')) == 1
+    retained = keep_single_slot and getattr(_local, 'single_slot', False)
+    _local.single_slot = False
     actual=0
     try:
         try:
@@ -476,26 +497,34 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
                 check_deadline();memory_boundary()
                 while True:
                     check_deadline()
-                    actual=lease.refresh(active_cpus=0,ready_cpus=maximum,min_cpus=maximum)
-                    if actual>=maximum and lease.confirmed is not None and not lease.phase_pending:
+                    # A held single slot can commit the new phase directly.
+                    # Both branches still require the provider's phase acknowledgement.
+                    actual=lease.refresh(active_cpus=maximum if retained else 0,
+                                         ready_cpus=0 if retained else maximum,min_cpus=maximum)
+                    if _confirmed_width(lease, maximum):
+                        if retained:break
                         actual=lease.refresh(active_cpus=maximum,ready_cpus=0,min_cpus=maximum)
-                        if actual>=maximum and lease.confirmed is not None and not lease.phase_pending:break
+                        if _confirmed_width(lease, maximum):break
+                    if actual < maximum:retained = False
                     time.sleep(min(.1,check_deadline()or .1))
                 _kernel_threads(maximum);check_deadline()
         except TimeoutError as error:
             raise TimeoutError('Fixed kernel needs %d CPUs; obtained %d; startup wait expired before execution'%(maximum,actual))from error
         check_deadline()
         _local.kernel=True
-        return _function(function)(**kwargs)
+        value = _function(function)(**kwargs)
+        _local.single_slot = keep_single_slot and _confirmed_width(lease, 1)
+        return value
     finally:
         _local.kernel=False
         try:_kernel_threads(1,reset=True)
         finally:
             # A late release reply must not replace a paid result or its
             # primary startup error. Final task cleanup also returns the grant.
-            try:
-                with resource_window(1):lease.refresh(active_cpus=0,ready_cpus=0)
-            except (RemoteError,TimeoutError):pass
+            if not _local.single_slot:
+                try:
+                    with resource_window(1):lease.refresh(active_cpus=0,ready_cpus=0)
+                except (RemoteError,TimeoutError):pass
 
 
 def run_call(function,*,limits=None,**kwargs):
@@ -548,9 +577,10 @@ def run_call(function,*,limits=None,**kwargs):
         stream.thread.join()
         if stream.error:raise stream.error
     lease=None;actual=max(1,int(os.environ.get('REMOTE_COMPUTE_CPUS','1')))
-    maximum=max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',actual)))
-    maximum,model=_phase_resources(maximum,limits)
+    task_maximum=max(1,int(os.environ.get('REMOTE_COMPUTE_MAX_CPUS',actual)))
+    maximum,model=_phase_resources(task_maximum,limits)
     if exact is not None:return _run_exact_kernel(function,kwargs,maximum,model,start_timeout)
+    _local.single_slot = False
     actual=min(actual,maximum)
     if os.environ.get('REMOTE_COMPUTE_URL')and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
         from remote_compute import Client
@@ -580,11 +610,13 @@ def run_call(function,*,limits=None,**kwargs):
     try:
         _local.kernel=True
         target=_function(function);_kernel_threads(actual)
-        return target(**kwargs)
+        value = target(**kwargs)
+        _local.single_slot = task_maximum == 1 and _confirmed_width(lease, 1)
+        return value
     finally:
         _local.kernel=False
         _kernel_threads(1,reset=True)
-        if lease:lease.refresh(active_cpus=0,ready_cpus=0)
+        if lease and not _local.single_slot:lease.refresh(active_cpus=0,ready_cpus=0)
 
 
 def finish_execution(path,status,error=None,*,spec=None):

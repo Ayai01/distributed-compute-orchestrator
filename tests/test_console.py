@@ -1017,7 +1017,8 @@ class ConsoleTests(unittest.TestCase):
                      active_jobs=[job])
         text = '\n'.join(format_status(value, width=200).fit(30))
         self.assertIn('进度', text)
-        self.assertIn('2/4', text)
+        self.assertIn('50%', text)
+        self.assertNotIn('2/4', text)
 
     def test_page_keys_change_task_pages_while_preserving_input_and_output_history(self):
         keyboard=Keyboard(['\x00','Q','\x00','Q',*'ping\rquit\r'])

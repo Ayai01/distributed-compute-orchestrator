@@ -6,7 +6,7 @@ from heapq import heappush,heappop
 from pathlib import Path
 import json,time,uuid,re,pickle,threading
 from .bundle import atomic_json,task_bundle,TERMINAL,native_path
-from .client import RemoteError
+from .client import PoolBusy,RemoteError
 from .worker import lock_root
 from .pipeline_control import project_call
 
@@ -129,7 +129,7 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
     pending={};preparing={};submitting={};collecting={};deferred=[];rows={}
     results=ExecutionResults();failures=[];completed=set();failed=set();blocked=set()
     ready=_ReadyQueue(catalog)
-    paused=False;next_poll=next_gate=0.
+    paused=False;next_poll=next_gate=status_retry_at=0.
     poll_interval=.5
     previous_statuses={}
     cancellation=threading.Event();cancel_attempted=set();state_lock=threading.RLock()
@@ -377,8 +377,22 @@ def _execute(client,requests,project,root,prepare,publish,stop_when,cancel_when,
                         failure(row,'submit',error);call.release(row)
                 cancel_due = any(row.get('cancel_requested') and ident not in cancel_attempted
                                  for ident,row in pending.items())
-                if pending and (time.monotonic()>=next_poll or cancel_due):
-                    states=client._read_reconnecting(lambda:client.statuses(pending,compact=True))
+                now=time.monotonic()
+                if pending and (now>=next_poll or cancel_due and now>=status_retry_at):
+                    try:
+                        states=client.statuses(pending,compact=True)
+                    except RemoteError as error:
+                        if not (error.transport_retryable or error.status_code in (502,503,504)
+                                or isinstance(error,PoolBusy)):
+                            raise
+                        # Keep accepted originals while preparation and collection continue.
+                        poll_interval=min(5.,poll_interval*2)
+                        next_poll=status_retry_at=time.monotonic()+poll_interval
+                        states=None
+                else:
+                    states=None
+                if states is not None:
+                    status_retry_at=0.
                     snapshot={ident:state['status'] for ident,state in states.items()}
                     changed=any(status!=previous_statuses.get(ident) for ident,status in snapshot.items())
                     poll_interval=.5 if changed else min(5.,poll_interval*2)

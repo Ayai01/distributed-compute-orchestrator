@@ -74,7 +74,11 @@ class ProgressTests(unittest.TestCase):
         p=normalize(dict(phase='replay',completed=200,unit='cycles',counters={'MAC':900}))
         fields=progress_fields(dict(progress=p,total_steps=1,steps=[]))
         self.assertNotIn('ratio',p);self.assertNotIn('total',fields)
-        self.assertEqual(_progress_label(fields),'200cycles')
+        self.assertEqual(_progress_label(fields),'replay')
+
+    def test_percentage_and_phase_use_the_same_view_for_legacy_reports(self):
+        self.assertEqual(_progress_label(dict(progress=dict(completed=1,total=4))),'25%')
+        self.assertEqual(_progress_label(dict(progress=dict(phase='compile',completed=7))),'compile')
 
     def test_invalid_work_reports_are_rejected_and_local_use_is_optional(self):
         with patch.dict(os.environ,{},clear=True):self.assertFalse(report_progress(phase='local'))

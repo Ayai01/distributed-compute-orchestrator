@@ -1957,13 +1957,17 @@ class Handler(BaseHTTPRequestHandler):
             elif parts == ['jobs','status'] and self.command == 'POST':
                 request = json.loads(body)
                 identities = validate_status_ids(request.get('ids') if isinstance(request, dict) else None)
+                compact = request.get('compact') is True
                 value = {}
                 for identity in identities:
                     try:
+                        if scheduler and compact:
+                            value[identity] = worker.compact_status(identity)
+                            continue
                         result = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
                     except (KeyError, FileNotFoundError):
                         result = dict(id=identity, status='unknown', status_code=404)
-                    value[identity] = batch_status(result, compact=request.get('compact') is True)
+                    value[identity] = batch_status(result, compact=compact)
             elif parts == ["jobs"] and self.command == "GET":
                 if scheduler and not operator:
                     return self._reply({'error': 'Job listing is operator-only; query original IDs with /jobs/status'}, 403)

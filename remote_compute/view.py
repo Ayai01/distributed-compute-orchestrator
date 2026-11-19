@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from . import ABBREVIATION, __version__
 from .policy import canonical_capabilities
 from .runtimes import execution_capabilities
-from .task_tags import compact_tag, quantity
+from .task_tags import compact_tag
 from .telemetry import sampling_notice
 
 
@@ -69,11 +69,9 @@ def _progress_label(job):
     progress = job.get('progress')
     if isinstance(progress,dict) and progress.get('schema')=='dco.progress.v1':
         done,total=progress.get('completed'),progress.get('total')
-        if progress.get('source')=='executor' and total==1:return '—'
-        if isinstance(done,(int,float)) and isinstance(total,(int,float)) and total>0:
+        if isinstance(done,(int,float)) and isinstance(total,(int,float)) and 0<=done<=total and total>0:
             return f'{done/total*100:.0f}%'
-        if isinstance(done,(int,float)):return quantity(done,progress.get('unit')or'done')
-        return progress.get('phase')or '—'
+        return progress.get('phase') or job.get('phase') or '—'
     if isinstance(progress, dict):
         for key in ('ratio', 'fraction', 'percent'):
             value = progress.get(key)
@@ -85,7 +83,7 @@ def _progress_label(job):
                                 ('nfe', 'budget')):
         done, total = job.get(done_key), job.get(total_key)
         if isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
-            return f'{max(0, min(total, done)):g}/{total:g}'
+            return f'{max(0, min(total, done))/total*100:.0f}%'
     total = job.get('total_steps')
     if isinstance(total, int) and total > 0:
         steps = job.get('steps') or ()
@@ -93,12 +91,12 @@ def _progress_label(job):
                    if isinstance(step, dict)
                    and (step.get('finished') is not None
                         or step.get('returncode') is not None))
-        return f'{min(done, total)}/{total}'
+        return f'{min(done, total)/total*100:.0f}%'
     value = job.get('progress')
     if isinstance(value, (int, float)):
         ratio = float(value) / (100 if value > 1 else 1)
         return f'{max(0, min(1, ratio)) * 100:.0f}%'
-    return '—'
+    return job.get('phase') or '—'
 
 
 def _cell(text, width, right=False):
@@ -614,7 +612,7 @@ class StatusRows(list):
         ram_width=max([9]+[_width(r[4])for r in records])
         state_width=max([4]+[_width(r[5])for r in records])
         def tag(record):
-            return record[6] if record[9] in ('—','0/1','1/1') else f'{record[9]} {record[6]}'
+            return record[6] if record[9]=='—' else f'{record[9]} {record[6]}'
         # The full progress column appears only when the task panel has room
         # for it.  Narrow panes retain every existing identity/resource field;
         # the same ratio remains available in the status/API payload.

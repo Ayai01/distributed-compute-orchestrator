@@ -13,7 +13,7 @@ import time
 import weakref
 import zipfile
 
-from .bundle import PROTOCOL, TERMINAL, atomic_json, json_bytes, pack, progress_fields
+from .bundle import PROTOCOL, TERMINAL, atomic_json, batch_status, json_bytes, pack, progress_fields
 from . import client as transport
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import (Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff,
@@ -2278,6 +2278,22 @@ class Coordinator:
 
     def public_get(self, identity):
         return self.public_result(self.get(identity))
+
+    def compact_status(self, identity):
+        """Read the published state without recalculating queue diagnostics."""
+        row = self.observations.rows.get(identity)
+        if row is not None:
+            if row['status'] == 'queued':
+                node = next((n for n in self.pool.nodes if n.name == row['node'] and not n.error), None)
+                if node and any(item['id'] == identity and item.get('status') == 'running'
+                                for item in node.health.get('active_jobs') or ()):
+                    return {'status': 'running'}
+            return batch_status(row, compact=True)
+        job = self.jobs.cached(identity)
+        snapshot = job.get('read_result') if job is not None else None
+        if snapshot is None:
+            snapshot = self.jobs.read_result(identity)
+        return batch_status(snapshot, compact=True)
 
     def logs(self, identity):
         job = load_job(self.jobs, self.condition, identity)

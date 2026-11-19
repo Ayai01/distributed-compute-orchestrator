@@ -222,6 +222,26 @@ class BatchCollectionTests(unittest.TestCase):
             project.delete(identity)
             self.assertEqual(project.statuses([identity])[identity]['status'], 'unknown')
 
+    def test_compact_batch_reads_originals_while_scheduler_and_pool_are_busy(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, worker), \
+                Pool([worker]) as pool, centers.center(pool, Path(root)/'center') as (scheduler, operator):
+            project = Client(operator.url, scheduler.token, timeout=1, state_dir=Path(root)/'project-client')
+            completed = operator.submit(python("print('retained')"))['id']
+            operator.wait(completed)
+            scheduler.control({'paused': True})
+            original = project.submit(python("print('queued')"))['id']
+            missing = 'a'*32
+            ids = [original, completed, missing]
+            project.health(brief=True)
+            with scheduler.condition, pool.condition:
+                self.assertEqual(project.statuses(ids, compact=True), {
+                    original: {'status': 'queued'}, completed: {'status': 'succeeded'},
+                    missing: {'status': 'unknown', 'status_code': 404},
+                })
+            scheduler.control({'paused': False})
+            project.wait(original)
+            self.assertEqual(project.fetch(original, delete=False)['id'], original)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -14,7 +14,7 @@ from test_compute import provider,scratch,python,until
 
 SOURCE='''import os,time
 from pathlib import Path
-from remote_compute import run_call
+from remote_compute import map_items,run_call
 def kernel():
     p=Path('calls');p.write_text(str(int(p.read_text())+1 if p.exists()else 1))
     return dict(cpus=int(os.environ['REMOTE_COMPUTE_CPUS']),calls=int(p.read_text()))
@@ -28,10 +28,51 @@ def entry(wait=5):
         value['next_stage']=run_call(lambda:int(os.environ['REMOTE_COMPUTE_CPUS']),limits=dict(max_cpus=1))
     value.update(waited=time.monotonic()-started,deadline_preserved=deadline==os.environ['REMOTE_COMPUTE_DEADLINE'])
     return value
+def prepare(value):
+    if value == 1:
+        Path('preparing').touch()
+        while not Path('resume').exists():time.sleep(.02)
+    return value
+def single():
+    prepared=map_items(prepare,[1,2],backend='thread',limits={'memory_mb':2304})
+    linked=run_call(lambda:sum(prepared),limits={'max_cpus':1,'memory_mb':2304})
+    result=run_call(kernel,limits={'exact_cpus':1,'memory_mb':512,'start_timeout':5})
+    result.update(prepared=prepared,linked=linked)
+    return result
 '''
 
 
 class ExactKernelTests(unittest.TestCase):
+    def test_single_slot_survives_map_link_and_fixed_commit_with_a_peer_queued(self):
+        with scratch() as folder, provider(Path(folder)/'worker',cpus=1,memory_mb=4096,memory_headroom_mb=0) as (worker,remote):
+            with Pool([remote]) as pool, center(pool,Path(folder)/'center') as (_,client):
+                resize=worker.resize
+                requests=[]
+
+                def record(identity,cpus,**options):
+                    result=resize(identity,cpus,**options)
+                    requests.append((identity, cpus, options.get('active_cpus'), options.get('min_cpus'), result['cpus']))
+                    return result
+
+                with patch.object(worker,'resize',side_effect=record):
+                    identity=client.submit(python_task('business:single',max_cpus=1,memory_mb=512,timeout=20,retries=0),
+                                           files={'business.py':SOURCE})['id']
+                    until(lambda:(worker.root/'jobs'/identity/'input'/'preparing').exists())
+                    peer=client.submit(python("print('one released core')",max_cpus=1,project='peer',timeout=12))['id']
+                    self.assertEqual(client.status(peer)['status'],'queued')
+                    client.write_job_file(identity,'resume','yes')
+                    self.assertEqual(client.wait(identity)['status'],'succeeded')
+                    result=client.fetch(identity,delete=False)
+                    self.assertGreaterEqual(client.wait(peer)['started'],result['finished'])
+                value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
+                self.assertEqual(value,dict(cpus=1,calls=1,prepared=[1,2],linked=3))
+                original=[entry[1:] for entry in requests if entry[0]==identity]
+                self.assertTrue(original)
+                self.assertTrue(all(asked==granted==1 for asked,_active,_min,granted in original),original)
+                self.assertEqual([entry for entry in original if entry[2]==1],[(1,1,1,1)])
+                self.assertEqual(client.fetch(peer,delete=False)['id'],peer)
+                self.assertEqual(worker.used,0)
+
     def test_waiting_fixed_width_returns_all_idle_cpus_until_the_group_is_funded(self):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=4,memory_mb=4096,memory_headroom_mb=0)as(worker,remote):
             with Pool([remote])as pool,center(pool,Path(folder)/'center')as(_,client):
