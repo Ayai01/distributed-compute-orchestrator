@@ -4,7 +4,7 @@ Distributed Compute Orchestrator：一个调度中心，统一 SDK、终端和�
 
 ## 当前入口
 
-本仓库当前分支为 `v1`。重构以已发布的 0.11.42 有效实现为基础；当前部署事实见 [STATUS](docs/STATUS.md)，实施顺序见 [ROADMAP](docs/ROADMAP.md)。在途计算沿原服务完成或在原生边界接续，原 ID、已付结果和检查点连续。
+本仓库当前分支为 `v1`。终端标题分别显示面板版本和当前连接的中心或节点版本，健康接口报告实际运行的服务版本。面板源码对应同版本的 `console-v*` Git 标签。各设备的部署情况见 [STATUS](docs/STATUS.md)，变更见 [HISTORY](docs/HISTORY.md)。
 
 Windows从当前目录运行 `start.cmd`，Linux运行 `./start.sh`；统一读取 `.local/worker.json`，中心同时读取 `.local/nodes.json`。独立worker可显式运行 `start.cmd --mode worker --config .local\worker.json`。服务保留原生终端，关闭Codex会话不结束计算；终端是人工停止入口。远程资源控制使用 [nurikoi控制页](https://nurikoi.com/manage/live/)。
 

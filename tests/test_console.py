@@ -658,6 +658,22 @@ class ConsoleTests(unittest.TestCase):
         worker['host_ip']=None
         self.assertIn('等待连接','\n'.join(format_status(worker,url='http://0.0.0.0:26133',width=159)))
 
+    def test_visitor_loopback_displays_remote_worker_as_relay(self):
+        value=dict(role='scheduler',node='Aya1-PC',nodes=[
+            dict(name='Aya1-PC',url='local://Aya1-PC',network={'local':True}),
+            dict(name='localRPC',node='aya1-pc',url='http://localhost:26133',network={'local':True}),
+            dict(name='school',display_name='xjtu-A',node='dev-school',url='http://127.0.0.1:27105',network={'local':True}),
+            dict(name='pending',url='http://[::1]:27106',network={'local':True}),
+            dict(name='direct',node='another-host',url='https://203.0.113.42:26133')])
+        lines=format_status(value,width=159)._resources(105)[1][1]
+        rows={cells[0]:cells for cells in ([part.strip() for part in line.split('|')[1:-1]]
+                                           for line in lines if line.startswith('|'))}
+        self.assertEqual(rows['Aya1-PC'][-2:],['本机','本机'])
+        self.assertEqual(rows['localRPC'][-2:],['本机','本机'])
+        self.assertEqual(rows['xjtu-A'][-2:],['本机中转','本机中转'])
+        self.assertEqual(rows['pending'][-2:],['回环','回环'])
+        self.assertEqual(rows['direct'][-2:],['203.0.113.42','--'])
+
     def test_center_and_worker_notices_merge_by_operation_and_keep_executing_device(self):
         from remote_compute.view import format_notices
         center=[dict(time=10,ip='127.0.0.1',message='upload main.py [aafe1122]'),
@@ -819,8 +835,8 @@ class ConsoleTests(unittest.TestCase):
             with self.subTest(width=width):
                 rows=format_status(value,width=width).fit(42)
                 text='\n'.join(rows)
-                self.assertIn('RSS/Res',text)
-                self.assertIn('CPU U/B',text)
+                self.assertIn('进程/预留',text)
+                self.assertIn('线程占/配',text)
                 self.assertNotIn('进程...留',text)
                 self.assertNotIn('已用...辑)',text)
                 self.assertTrue(all(_width(row)==width for row in rows))
@@ -868,6 +884,124 @@ class ConsoleTests(unittest.TestCase):
             if width>=120:
                 self.assertTrue(any('设备资源' in row and '当前任务' in row for row in first))
 
+    def test_node_pages_keep_all_twenty_nodes_and_task_pages_independent(self):
+        nodes=[dict(name=f'school-{i}',display_name=f'校方{i:02d}',reserved=1,base_capacity=64,
+                    logical_cpus=64,tags=['rtl'],host_ip=f'10.0.0.{i+1}') for i in range(15)]
+        nodes.extend(dict(name=f'host-{i}',capacity=16) for i in range(5))
+        nodes[0]['active_jobs']=[dict(id=f'{i:04x}'+'b'*28,label=f'task-{i}',cpus=1,
+                                     status='running') for i in range(32)]
+        for width,height in ((44,18),(75,24),(120,22),(160,18)):
+            with self.subTest(width=width,height=height):
+                status=format_status(dict(role='scheduler',nodes=nodes),width=width)
+                status.fit(height)
+                self.assertGreater(status.device_page_count,1)
+                status.task_page=1
+                pages=[]
+                for page in range(status.device_page_count):
+                    status.device_page=page
+                    frame=status.fit(height)
+                    self.assertTrue(all(_width(row)==width for row in frame))
+                    self.assertTrue(any('当前任务' in row for row in frame))
+                    self.assertEqual(status.task_page,1)
+                    pages.extend(re.findall(r'#(\d+) ', '\n'.join(frame)))
+                self.assertCountEqual(pages,[str(i) for i in range(1,21)])
+                status.detail=True
+                status.device_page=0
+                status.fit(height)
+                details=[]
+                for page in range(status.device_page_count):
+                    status.device_page=page
+                    details.extend(status.fit(height))
+                text='\n'.join(details)
+                self.assertIn('school-0',text)
+                self.assertIn('10.0.0.15',text)
+                self.assertIn('能力 RTL',text)
+
+    def test_node_keys_change_page_and_open_full_width_detail(self):
+        keyboard=Keyboard(['\x00','A','\x00','B',*'quit\r'])
+        nodes=[dict(name=f'host-{i}',capacity=16) for i in range(20)]
+        with redirect_stdout(io.StringIO()) as stream:
+            shell=OperatorShell()
+            dashboard=Dashboard(shell,lambda: dict(node='center',role='scheduler',nodes=nodes))
+            with patch.dict(sys.modules,msvcrt=keyboard), \
+                    patch('remote_compute.console._enable_ansi',return_value=lambda: None), \
+                    patch('remote_compute.console.time.sleep'), \
+                    patch('remote_compute.console.shutil.get_terminal_size',return_value=os.terminal_size((81,22))):
+                dashboard.run()
+        text=stream.getvalue()
+        self.assertRegex(text,r'设备资源 20 台 1/\d+页')
+        self.assertRegex(text,r'设备资源 20 台 2/\d+页')
+        self.assertIn('节点详情',text)
+
+    def test_live_overview_shows_twenty_registered_nodes_and_health_with_output(self):
+        from remote_compute.view import CONSOLE_VERSION, StatusRows
+        nodes = [dict(name=f'worker-{index}', display_name=f'node-{index:02}', capacity=32,
+                      memory_total_mb=65536, host_memory_available_mb=61440)
+                 for index in range(20)]
+        nodes[15]['error'] = 'Remote worker disconnected'
+        nodes[16]['paused'] = True
+        nodes[17]['enabled'] = False
+        nodes[19]['active_jobs'] = [dict(id='68fc'+'a'*28, status='running', label='RTL', cpus=4)]
+        status = StatusRows(dict(role='scheduler', version='1.0.1', nodes=nodes), width=204, viewport=True)
+        displayed = _layout(status, ['task accepted'], ['ping succeeded'], 60, reserved=5)
+        text = '\n'.join(displayed)
+        self.assertEqual(status.device_page_count, 1)
+        self.assertIn(f'DCO 面板 {CONSOLE_VERSION} | 中心 1.0.1', displayed[0])
+        self.assertIn('设备资源', displayed[2])
+        self.assertIn('ping succeeded', displayed[-2])
+        self.assertTrue(all(not row or _width(row) == 204 for row in displayed))
+        for index in range(20):
+            self.assertIn(f'node-{index:02}', text)
+        for text_fragment in ('失联 1', '暂停 1', '禁用 1', '68fc', 'ping succeeded'):
+            self.assertIn(text_fragment, text)
+
+    def test_console_release_tag_matches_the_versioned_renderer(self):
+        from pathlib import Path
+        import shutil
+        import subprocess
+        from remote_compute.view import CONSOLE_VERSION
+
+        git = shutil.which('git')
+        if not git:
+            self.skipTest('Git metadata is unavailable')
+        root = Path(__file__).resolve().parents[1]
+        tag = f'refs/tags/console-v{CONSOLE_VERSION}'
+        tagged = subprocess.run([git, 'show-ref', '--verify', '--quiet', tag], cwd=root)
+        if tagged.returncode:
+            self.skipTest('This console version has no release tag in this checkout')
+        cut = subprocess.run([git, 'diff', '--name-only', tag, '--',
+                              'remote_compute/console.py', 'remote_compute/view.py'],
+                             cwd=root, capture_output=True, text=True, check=True)
+        self.assertEqual(cut.stdout.strip(), '',
+                         f'Change the console version before changing released files: {cut.stdout.strip()}')
+
+    def test_live_node_details_repeat_node_identity_on_each_narrow_page(self):
+        from remote_compute.view import StatusRows
+        status = StatusRows(dict(role='scheduler', nodes=[
+            dict(name='first', display_name='xjtu-A', tags=['rtl'], error='Offline while transferring inputs'),
+            dict(name='second', display_name='xjtu-B', tags=['ng47'])
+        ]), width=42, viewport=True)
+        status.detail = True
+        status.fit(10)
+        titles, bodies = [], []
+        for page in range(status.device_page_count):
+            status.device_page = page
+            rows = status.fit(10)
+            titles.append(rows[2])
+            bodies.extend(rows[3:])
+        self.assertTrue(all('xjtu-A' in title or 'xjtu-B' in title for title in titles))
+        self.assertIn('Offline while transferring inputs', '\n'.join(bodies))
+
+    def test_live_render_failure_leaves_the_command_viewport_available(self):
+        from remote_compute.view import StatusRows
+        status = StatusRows(dict(role='scheduler', nodes=[]), width=100, viewport=True)
+        with patch.object(status, 'fit', side_effect=ValueError('invalid snapshot')):
+            with self.assertLogs('remote_compute.view', level='ERROR'):
+                frame = _layout(status, [], ['DCO command result'], 24, reserved=5)
+        self.assertIn('面板显示异常', '\n'.join(frame))
+        self.assertIn('DCO command result', '\n'.join(frame))
+        self.assertIn('设备资源', '\n'.join(_layout(status, [], [], 24)))
+
     def test_task_progress_uses_recorded_steps_without_extra_sampling(self):
         job = dict(id='abcd'+'a'*28, project='Bench', label='progress-task', cpus=2,
                    memory_mb=512, status='running', total_steps=4,
@@ -875,7 +1009,7 @@ class ConsoleTests(unittest.TestCase):
         value = dict(role='worker', node='Aya1-PC', cpus=8, used_cpus=2,
                      active_jobs=[job])
         text = '\n'.join(format_status(value, width=200).fit(30))
-        self.assertIn('Prog', text)
+        self.assertIn('进度', text)
         self.assertIn('2/4', text)
 
     def test_page_keys_change_task_pages_while_preserving_input_and_output_history(self):
@@ -913,7 +1047,7 @@ class ConsoleTests(unittest.TestCase):
                     status.task_page=page
                     rows=status.fit(22)
                     self.assertTrue(all(_width(row)==width for row in rows))
-                    self.assertIn('Sec','\n'.join(rows))
+                    self.assertIn('秒','\n'.join(rows))
                     for row in rows:
                         seen.extend(record[0] for record in status.records
                                     if any(prefix+record[0]+' |' in row for prefix in ('| ','+ ')))

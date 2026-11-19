@@ -1,5 +1,6 @@
 """Cell-aligned terminal tables; one snapshot in, bounded visible rows out."""
 
+import logging
 import math
 import re
 import shutil
@@ -10,8 +11,11 @@ from urllib.parse import urlsplit
 from . import ABBREVIATION
 from .policy import canonical_capabilities
 from .runtimes import execution_capabilities
-from .task_tags import compact_tag
+from .task_tags import compact_tag, quantity
+from .telemetry import sampling_notice
 
+
+CONSOLE_VERSION = '1.0.2'
 
 _ambiguous_width = None
 
@@ -66,9 +70,10 @@ def _progress_label(job):
     progress = job.get('progress')
     if isinstance(progress,dict) and progress.get('schema')=='dco.progress.v1':
         done,total=progress.get('completed'),progress.get('total')
+        if progress.get('source')=='executor' and total==1:return '—'
         if isinstance(done,(int,float)) and isinstance(total,(int,float)) and total>0:
             return f'{done/total*100:.0f}%'
-        if isinstance(done,(int,float)):return f"{done:g}{progress.get('unit','')}"
+        if isinstance(done,(int,float)):return quantity(done,progress.get('unit')or'done')
         return progress.get('phase')or '—'
     if isinstance(progress, dict):
         for key in ('ratio', 'fraction', 'percent'):
@@ -131,7 +136,7 @@ def _table(headers, records, widths, width, right=()):
     def row(values):
         cells=[]
         for index,(value,size) in enumerate(zip(values,widths)):
-            if headers[index]=='Tag':value=compact_tag({'label':value,'id':values[0]if values is not headers else''},size,measure=_width)
+            if headers[index]=='任务标签':value=compact_tag({'label':value,'id':values[0]if values is not headers else''},size,measure=_width)
             cells.append(_cell(value,size,index in right))
         return ' | '.join(cells)
     divider = '+' + '+'.join('-'*(size+2) for size in widths) + '+'
@@ -154,8 +159,8 @@ def _task_memory(job):
 
 
 def _capabilities(tags):
-    labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','layout':'Layout','rtl':'RTL','onnx':'ONNX'}
-    return ' '.join(labels[name]for name in execution_capabilities(tags or ())) or '-'
+    labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','npu':'NPU','layout':'Layout','rtl':'RTL','onnx':'ONNX'}
+    return ' '.join(labels.get(name,name) for name in execution_capabilities(tags or ())) or '-'
 
 
 
@@ -164,12 +169,25 @@ def _project(name):
             'yolov8-quant-lab':'YOLO'}.get(name,name or '-')
 
 
-def _device_address(node, url=''):
+def _loopback_route(node, center_host):
+    endpoint=urlsplit(node.get('url') or '')
+    if endpoint.scheme not in ('http','https') or endpoint.hostname not in ('127.0.0.1','localhost','::1'):
+        return None
+    worker_host=node.get('node')
+    if not worker_host:
+        return '回环'
+    return '本机' if worker_host.casefold()==center_host.casefold() else '本机中转'
+
+
+def _device_address(node, url='', *, center_host=None):
     address=node.get('url') or url
     if address.startswith('local://'):
         return '本机'
     if node.get('host_ip'):
         return node['host_ip']
+    if center_host is not None:
+        route=_loopback_route(node,center_host)
+        if route is not None:return route
     host=urlsplit(address).hostname if address else None
     if host in ('127.0.0.1','localhost','::1'):
         return '本机'
@@ -192,10 +210,10 @@ def _accelerator_summary(node):
     return f'{used}/{sum(int(p.get("count",0) or 0) for p in profiles)} ' + ','.join(parts)
 
 
-def _network_text(network):
+def _network_text(network, loopback=None):
     network=network or {}
     if network.get('local'):
-        return '本机'
+        return loopback or '本机'
     rtt=network.get('rtt_ms')
     loss=network.get('packet_loss_pct')
     if rtt is None and loss is None:
@@ -215,6 +233,7 @@ def _tag_name(text):
 def _label(job):
     project = (job.get('project') or '').casefold()
     text=job.get('label','')
+    if ' | ' in text:return text
     text=re.sub(r'\b(\d+) (?:new )?real designs\b',r'ng:\1',text,flags=re.I)
     text=re.sub(r'\b(\d+) evaluations\b',r'ev:\1',text,flags=re.I)
     if project in {'rgcn','arh-dse','bench','analog-opt-bench','aop'}:
@@ -337,18 +356,34 @@ def _show_node(node):
             or node.get('external_cpus', 0) or node.get('active_jobs'))
 
 
+def _node_state(node):
+    if node.get('detached'):
+        return '失联'
+    if not node.get('enabled', True):
+        return '禁用'
+    if node.get('error'):
+        return '失联'
+    if node.get('paused'):
+        return '暂停'
+    return '运行' if node.get('active_jobs') else '就绪'
+
+
 class StatusRows(list):
-    def __init__(self, value, url='', width=110):
+    def __init__(self, value, url='', width=110, *, viewport=False):
         self.value,self.url,self.width = value,url,max(20,width)
+        self.viewport=viewport
         self.task_page,self.page_count = 0,1
+        self.device_page,self.device_page_count = 0,1
+        self.detail = False
         self._build()
-        super().__init__(self._render(None))
+        super().__init__([] if viewport else self._render(None))
 
     def resize(self, width):
         if self.width != max(20,width):
             self.width=max(20,width)
             self._build()
-            self[:]=self._render(None)
+            if not self.viewport:
+                self[:]=self._render(None)
 
     def _build(self):
         value,width=self.value,self.width
@@ -358,6 +393,14 @@ class StatusRows(list):
         version_label = ' | ' + str(value['version']) if value.get('version') else ''
         role='混合模式' if center and value.get('mode')=='hybrid' else '调度中心' if center else '算力提供者'
         self.title=f"{ABBREVIATION} | {value.get('node','')} | {role}{port_label}{version_label}"
+        if self.viewport:
+            service = ('中心' if center else '节点') + ' ' + str(value['version']) if value.get('version') else ''
+            releases = f'{ABBREVIATION} 面板 {CONSOLE_VERSION}' + (f' | {service}' if service else '')
+            self.title = f"{releases} | {value.get('node', '')} | {role}{port_label}"
+            sample_time=value.get('health_sampled_at') or time.time()
+            self.title+=' | 采样 '+time.strftime('%H:%M:%S',time.localtime(sample_time))
+            if value.get('health_stale'):
+                self.title+=f"（{value['health_age_seconds']:.1f} 秒前）"
         self.summary=f"线程 {value.get('used_cpus',0)}/{value.get('cpus',0)} | 排队 {value.get('queued',0)} | RAM预留 {_gb(value.get('memory_reserved_mb'))} GiB"
         if center:
             self.summary+=' | '+str(value.get('policy','adaptive'))
@@ -365,9 +408,9 @@ class StatusRows(list):
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
         self.devices,self.jobs=[],[]
         for number,node in enumerate(nodes,1):
-            if not _show_node(node):
+            if not self.viewport and not _show_node(node):
                 continue
-            name=node.get('node') or node.get('name') or '-'
+            name=node.get('display_name') or node.get('name') or node.get('node') or '-'
             allocated=(node.get('reserved',0)+node.get('external_cpus',0) if 'reserved' in node else node.get('used_cpus',0))
             budget=node.get('base_capacity',node.get('base_cpus',node.get('capacity',0)))
             threads=f"{allocated}/{budget}({node.get('logical_cpus','?')})"
@@ -392,7 +435,8 @@ class StatusRows(list):
             self.devices.append((node,[name,threads,f"{node.get('cpu_percent') or 0:.1f}%",memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
-                                       benchmark.get('threads','-'),_device_address(node,'' if center else self.url),
+                                       benchmark.get('threads','-'),_device_address(node,'' if center else self.url,
+                                           center_host=(value.get('node') or '') if center else None),
                                        number,_accelerator_summary(node),
                                        node.get('benchmark_state','ready')]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
@@ -405,7 +449,7 @@ class StatusRows(list):
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
         now=time.time()
-        offline_nodes={n.get('name')for n in value.get('nodes',[])if n.get('error')}
+        offline_nodes={n.get('display_name')or n.get('name')for n in value.get('nodes',[])if n.get('error')}
         self.records=[]
         for name,job in self.jobs:
             state=job.get('status','running')
@@ -413,8 +457,17 @@ class StatusRows(list):
             diagnostic=diagnose(job,now=now,offline=name in offline_nodes)
             state_label=LABELS.get(diagnostic['code'],{'running':'运行','dispatching':'派发','queued':'排队'}.get(state,state))
             started=job.get('started')
+            label = _label(job)
+            if job.get('observe_only'):
+                details = []
+                if job.get('phase'):
+                    details.append(job['phase'])
+                if job.get('measured_cpus') is not None:
+                    details.append(f"实耗 {job['measured_cpus']:.2f} 核")
+                if details:
+                    label = ' · '.join([*details, label])
             self.records.append([job.get('id','-')[:4],name,_project(job.get('project')),f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
-                                 _task_memory(job),state_label,compact_tag(job,preferred=_label(job),measure=_width),
+                                 _task_memory(job),state_label,label,
                                  str(max(0,int(now-started))) if started is not None else '-',
                                  f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
                                  _progress_label(job)])
@@ -435,11 +488,11 @@ class StatusRows(list):
         records=[r for _,r in self.devices]
         cpu_width=max([10]+[_width(r[1])for r in records])
         if width>=100:
-            table=_table(['Node','CPU U/B','CPU%','1T/All','RAM U/T','Admit','GPU','RSS/Res'],
+            table=_table(['节点','线程占/配','CPU%','单核/整机','内存用/总','可派','加速器','进程/预留'],
                          [[f'#{r[10]} {r[0]}',*r[1:3],r[7],*r[3:5],r[11],r[5]] for r in records],
                          [max([11]+[_width(f'#{r[10]} ')+self.node_width for r in records]),cpu_width,6,11,10,5,13,None],width,right=(1,2,3,4,5,6,7))
         elif width>=54:
-            table=_table(['Node','CPU U/B','CPU%','RAM U/T','Admit'],[r[:5] for r in records],
+            table=_table(['节点','线程占/配','CPU%','内存用/总','可派'],[r[:5] for r in records],
                          [self.node_width,cpu_width,6,None,5],width,right=(1,2,3,4))
         else:
             table=[_line(f'{r[0]}  {r[1]}  CPU {r[2]}',width) for r in records]
@@ -448,14 +501,16 @@ class StatusRows(list):
                 table.append(_line(r[0]+': '+node['error'],width))
             elif node.get('paused') or not node.get('enabled',True):
                 table.append(_line(r[0]+': 暂停分配',width))
-        sections=[('设备资源 | RAM物理 U/T | Admit可派 GiB',table,0)]
+        sections=[('设备资源 | 内存 GiB',table,0)]
         if width>=100:
-            details=_table(['Node','1T/All','RSS/Res','IP','Net'],
+            center_host=(self.value.get('node') or '') if self.value.get('role')=='scheduler' else None
+            details=_table(['节点','单核/整机','进程/预留','IP','链路'],
                            [[r[0],r[7],r[5],r[9],
-                             _network_text(node.get('network'))] for node,r in self.devices],
+                             _network_text(node.get('network'),_loopback_route(node,center_host)
+                                           if center_host is not None else None)] for node,r in self.devices],
                            [self.node_width,11,9,15,None],width,right=(1,2,3,4))
         elif width>=54:
-            details=_table(['Node','1T/All','RSS/Res','IP'],
+            details=_table(['节点','单核/整机','进程/预留','IP'],
                            [[r[0],r[7],r[5],r[9]] for _,r in self.devices],
                            [self.node_width,11,9,None],width,right=(1,2,3))
         else:
@@ -464,11 +519,11 @@ class StatusRows(list):
             for r in records:
                 details.append(_line(f'{r[0]} RSS/Res {r[5]} GiB',width))
                 details.append(_line(f'{r[0]} IP {r[9]}',width))
-        sections.append(('启动基准 1T/All Miter/s | RSS/Res GiB',details,1))
+        sections.append(('启动基准 Miter/s | 进程/预留 GiB',details,1))
         if self.value.get('role')=='scheduler':
             if width>=42:
-                table=_table(['Proj','Share','Jobs/CPU','Q'],self.projects,
-                             [None,5,8,4],width,right=(1,2,3))
+                table=_table(['工程','份额','任务/线程','排队'],self.projects,
+                             [None,5,9,4],width,right=(1,2,3))
             else:
                 table=[_line(' '.join(map(str,r)),width) for r in self.projects]
             sections.append(('工程份额',table if self.projects else [_line('等待工程任务',width)],0))
@@ -486,28 +541,173 @@ class StatusRows(list):
             sections.append(('加速器可用性',accelerators,2))
         return sections
 
+    def _device_slice(self, size):
+        self.device_page_count=max(1,math.ceil(len(self.devices)/size))
+        self.device_page%=self.device_page_count
+        start=self.device_page*size
+        return self.devices[start:start+size]
+
+    def _fleet(self, limit, columns):
+        """Give the overview one row per registered node."""
+        width = self.width
+        table = limit >= 5 and width >= 58
+        rows_per_column = max(1, limit - (4 if table else 2))
+        page = self._device_slice(rows_per_column * columns)
+        active_columns = min(columns, max(1, math.ceil(len(page) / rows_per_column)))
+        column_height = max(1, math.ceil(len(page) / active_columns))
+        inner_width = width + active_columns - 1
+        widths = [inner_width // active_columns + int(i < inner_width % active_columns)
+                  for i in range(active_columns)]
+        blocks = []
+        for index, pane_width in enumerate(widths):
+            entries = page[index * column_height:(index + 1) * column_height]
+            rows = []
+            for node, record in entries:
+                health = _node_state(node)
+                reachable = health not in ('禁用', '失联')
+                rows.append([f'#{record[10]} {record[0]}', health, record[1].split('(')[0],
+                             record[2] if reachable else '-',
+                             record[3] if reachable and node.get('memory_total_mb') else '-'])
+            if table:
+                block = _table(['节点', '状态', '线程', 'CPU%', '内存 GiB'], rows,
+                               [None, 4, 7, 6, 11], pane_width, right=(2, 3, 4))
+            else:
+                block = [_line(f'{state} {name} {threads}', pane_width)
+                         for name, state, threads, _, _ in rows]
+            blocks.append(block + [_line('', pane_width)] *
+                          max(0, column_height + 2 * table - len(block)))
+        present = [_node_state(node) for node, _ in self.devices]
+        title = f'设备资源 {len(present)} 台 {self.device_page+1}/{self.device_page_count}页'
+        if width >= 54:
+            title += f" | 失联 {present.count('失联')} | 暂停 {present.count('暂停')} | 禁用 {present.count('禁用')}"
+        lines = [parts[0][:-1] + ''.join(part[:-1] for part in parts[1:]) + parts[-1][-1]
+                 for parts in zip(*blocks)] if active_columns > 1 else blocks[0]
+        if not page:
+            lines = [_line('没有节点', width)]
+        return [_rule(title, width), *lines, _rule('', width)][:limit]
+
+    def _overview(self, limit):
+        width = self.width
+        columns = min(3, max(1, (width+1)//61), max(1, math.ceil(len(self.devices)/6)))
+        projects = []
+        if self.projects and limit >= 15:
+            summary = '  '.join(f'{name} {running} 排{queued}'
+                                for name, _, running, queued in self.projects)
+            projects = [_line('工程  '+summary, width)]
+        remaining = limit - len(projects)
+        # At ordinary window sizes, spend only as many rows as the fleet needs.
+        # In a short terminal both panes keep at least one data row.
+        fleet_height = min(4 + math.ceil(len(self.devices) / columns),
+                           max(1, remaining - min(7, max(4, remaining//2))))
+        if fleet_height < 5 or width < 58:
+            fleet_height = min(fleet_height, max(0, remaining - 4))
+        devices = self._fleet(fleet_height, columns) if fleet_height else []
+        task_height = max(0, remaining - len(devices))
+        tasks = self._tasks(width, max(1, task_height - 4))[:task_height]
+        return [*devices, *projects, *tasks]
+
+    def _paged_resources(self, width, limit, *, bottom):
+        footer=int(bottom)
+        show_table=width>=34 and limit>=5
+        size=max(1,limit-1-footer-2*show_table)
+        page=self._device_slice(size)
+        title=f'设备资源 {len(self.devices)} 台 {self.device_page+1}/{self.device_page_count}页'
+        if show_table and width>=54:
+            records=[[f'#{r[10]} {r[0]}',r[1],r[2],r[3],r[4]] for _,r in page]
+            table=_table(['节点','线程占/配','CPU%','内存用/总','可派'],
+                         records,[None,10,5,10,4],width,right=(1,2,3,4))
+        elif show_table:
+            table=_table(['节点','线程占/配','CPU%'],
+                         [[f'#{r[10]} {r[0]}',r[1],r[2]] for _,r in page],
+                         [None,10,5],width,right=(1,2))
+        else:
+            table=[_line(f'#{r[10]} {r[0]} {r[1]} {r[2]}',width) for _,r in page]
+        rows=[_rule(title,width),*table]
+        if bottom:
+            rows.append(_rule('',width))
+        return rows[:limit]
+
     def _resource_rows(self, sections, width, limit=None, *, bottom=False):
         selected=[section for section in sections if section[2]==0]
+        required=sum(1+len(s[1]) for s in selected)+int(bottom)
+        if limit is not None and required>limit and limit>=len(self.devices)+3+int(bottom):
+            rows=[_rule('设备资源',width)]
+            rows.extend(_line(f'{r[0]} {r[1]} CPU {r[2]} 内存 {r[3]}',width) for _,r in self.devices)
+            rows.extend([_rule('工程份额',width),_line(' | '.join(f'{r[0]} {r[2]} Q{r[3]}'
+                         for r in self.projects) or '等待工程任务',width)])
+            if bottom:
+                rows.append(_rule('',width))
+            self.device_page,self.device_page_count=0,1
+            return rows
+        if limit is not None and required>limit and len(self.devices)>1:
+            return self._paged_resources(width,limit,bottom=bottom)
+        self.device_page,self.device_page_count=0,1
         for section in sorted(sections,key=lambda item:item[2]):
             if section[2] and (limit is None or sum(1+len(s[1]) for s in selected)+1+len(section[1])+int(bottom)<=limit):
                 selected.append(section)
-        selected=[s for s in sections if s in selected]
-        if limit is not None and sum(1+len(s[1]) for s in selected)+int(bottom)>limit:
-            # Short windows keep every device and a compact quota summary.
-            result=[_rule('设备资源',width)]
-            result.extend(_line(f'{r[0]} {r[1]} CPU {r[2]} RAM {r[3]}',width) for _,r in self.devices)
-            if self.value.get('role')=='scheduler':
-                result.extend([_rule('工程份额',width),_line(' | '.join(f'{r[0]} {r[2]} Q{r[3]}'
-                               for r in self.projects) or '等待工程任务',width)])
-        else:
-            result=[]
-            for title,rows,_priority in selected:
+        result=[]
+        for title,rows,_ in sections:
+            if any(title==section[0] for section in selected):
                 result.extend([_rule(title,width),*rows])
         if limit is not None:
             result=result[:max(0,limit-int(bottom))]
         if bottom and (limit is None or limit>0):
             result.append(_rule('',width))
         return result
+
+    def _details(self, width, limit):
+        lines=[]
+        for node,r in self.devices:
+            details=self._node_details(node,r)
+            lines.extend(line for item in details for line in wrap_lines(item,width-4))
+            lines.append('')
+        size=max(1,len(lines) if limit is None else limit-2)
+        self.device_page_count=max(1,math.ceil(len(lines)/size))
+        self.device_page%=self.device_page_count
+        start=self.device_page*size
+        return _panel(f'节点详情 {self.device_page+1}/{self.device_page_count}页',
+                      lines[start:start+size] or ['没有节点'],width)
+
+    def _node_details(self, node, record):
+        center = (self.value.get('node') or '') if self.value.get('role') == 'scheduler' else None
+        route = _network_text(node.get('network'), _loopback_route(node, center) if center is not None else None)
+        key = node.get('name') or node.get('node') or record[0]
+        name = f'#{record[10]} {record[0]}' + (f' · {key}' if key != record[0] else '')
+        details = [
+            name,
+            f'状态 {_node_state(node)} | 任务 {len(node.get("active_jobs") or ())}',
+            f'线程 已占/配额(逻辑) {record[1]} | CPU {record[2]} | 基准 单核/整机 {record[7]} Miter/s',
+            f'内存 已用/总 {record[3]} | 可派 {record[4]} | 进程/预留 {record[5]} GiB',
+            f'IP {record[9]} | 链路 {route}',
+            f'来源 {record[6]} | 加速器 {record[11]}',
+            '能力 ' + _capabilities(node.get('tags')),
+        ]
+        if node.get('error'):
+            details.insert(2, '连接 ' + str(node['error']))
+        elif node.get('paused') or not node.get('enabled',True):
+            details.insert(2, '暂停分配')
+        return details
+
+    def _node_view(self, limit):
+        width = self.width
+        if not self.devices:
+            self.device_page, self.device_page_count = 0, 1
+            return _panel('节点详情', ['没有节点'], width)[:limit]
+        size = max(1, limit-2)
+        pages = []
+        for index, (node, record) in enumerate(self.devices, 1):
+            details = self._node_details(node, record)
+            lines = [line for item in details for line in wrap_lines(item, width-4)]
+            chunks = [lines[start:start+size] for start in range(0, len(lines), size)]
+            for part, chunk in enumerate(chunks, 1):
+                title = f'节点详情 {index}/{len(self.devices)} {record[0]}'
+                if len(chunks) > 1:
+                    title += f' | {part}/{len(chunks)}页'
+                pages.append((title, chunk))
+        self.device_page_count = len(pages)
+        self.device_page %= self.device_page_count
+        title, lines = pages[self.device_page]
+        return _panel(title, lines, width)[:limit]
 
     def _tasks(self, width, size=None):
         size=max(1,size or len(self.records))
@@ -523,30 +723,30 @@ class StatusRows(list):
         # for it.  Narrow panes retain every existing identity/resource field;
         # the same ratio remains available in the status/API payload.
         show_progress = width >= 140
-        if width>=110 and not show_progress:
-            table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Tag'],
-                         [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,state_width,None],width,right=(3,4,5))
-        elif width>=110:
-            table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Prog','Tag'],
+        if show_progress:
+            table=_table(['ID','节点','工程','CPU/上限','内存实/报','秒','状态','进度','任务标签'],
                          [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,state_width,6,None],width,right=(3,4,5,6))
+                         [4,self.node_width,6,9,ram_width,6,state_width,8,None],width,right=(3,4,5,6))
         elif width>=100:
-            table=_table(['ID','Node','Proj','CPU/max','RAM实/报','Sec','St','Tag'],
+            table=_table(['ID','节点','工程','CPU/上限','内存实/报','秒','状态','任务标签'],
                          [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
                          [4,self.node_width,6,9,ram_width,6,state_width,None],width,right=(3,4,5))
         elif width>=80:
-            table=_table(['ID','Node','CPU/max','RAM实/报','Sec','St','Tag'],
+            table=_table(['ID','节点','CPU/上限','内存实/报','秒','状态','任务标签'],
                          [[r[i]for i in (0,1,3,4,7,5)]+[tag(r)]for r in records],
-                         [4,self.node_width,9,ram_width,6,state_width,None],width,right=(2,3,4))
+                         [4,self.node_width,9,ram_width,5,state_width,None],width,right=(2,3,4))
+        elif width>=64:
+            table=_table(['ID','节点','CPU/上限','秒','任务标签'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
+                         [4,self.node_width,9,5,None],width,right=(2,3))
         elif width>=54:
-            table=_table(['ID','Node','CPU/max','Sec','Tag'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
-                         [4,self.node_width,9,6,None],width,right=(2,3))
+            table=_table(['ID','节点','CPU/上限','任务标签'],
+                         [[r[i] for i in (0,1,3)]+[tag(r)] for r in records],
+                         [4,self.node_width,9,None],width,right=(2,))
         elif width>=38:
-            table=_table(['ID','CPU/max','Sec','Tag'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
-                         [4,9,6,None],width,right=(1,2))
+            table=_table(['ID','CPU/上限','秒','任务标签'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
+                         [4,8,4,None],width,right=(1,2))
         else:
-            table=[_line('ID CPU Tag',width)]
+            table=[_line('ID CPU 任务',width)]
             for r in records:
                 prefix=f'{r[0]} {r[3]} '
                 fitted=compact_tag({'label':tag(r),'id':r[0]},max(1,width-4-_width(prefix)),measure=_width)
@@ -559,6 +759,13 @@ class StatusRows(list):
     def _render(self, limit):
         width=self.width
         result=[_rule(self.title,width),_line(self.summary,width)]
+        if self.viewport:
+            available = max(0, limit-2)
+            content = self._node_view(available) if self.detail else self._overview(available)
+            return [*result, *content][:limit]
+        if self.detail:
+            result.extend(self._details(width,None if limit is None else max(0,limit-2)))
+            return result[:limit] if limit is not None else result
         if width>=120:
             left_width=56
             right_width=width-left_width+1
@@ -574,7 +781,7 @@ class StatusRows(list):
                 result.append(lrow[:-1]+junction+rrow[1:])
         else:
             sections=self._resources(width)
-            non_limit=None if limit is None else max(len(sections),limit-5-min(2,len(self.records)))
+            non_limit=None if limit is None else max(1,limit-6-min(2,len(self.records)))
             result.extend(self._resource_rows(sections,width,non_limit))
             result.extend(self._tasks(width,None if limit is None else max(1,limit-len(result)-4)))
         return result[:limit] if limit is not None else result
@@ -594,9 +801,11 @@ def format_notices(value):
     for source in sources:
         if source is not value and not _show_node(source):
             continue
-        name=source.get('node') or source.get('name') or '-'
+        name=source.get('display_name') or source.get('name') or source.get('node') or '-'
         for event in source.get('events') or []:
             message=event['message']
+            if sampling_notice(message):
+                continue
             key=message if re.search(r'\[[0-9a-f]{8,32}\]',message) else (event['time'],event['ip'],message)
             notices[key]=dict(event,node=name)
     return [time.strftime('%H:%M:%S',time.localtime(e['time']))+' '+e['node']+' '+e['ip']+' '+
@@ -610,6 +819,36 @@ def _layout(status, events, output, height, *, reserved=2):
         return []
     sections=int(bool(events))+int(bool(output))
     if isinstance(status,StatusRows):
+        if status.viewport:
+            panes = []
+            if events and (not output or budget >= 16):
+                panes.append(('最近通知', events))
+            if output:
+                panes.append(('命令输出', output))
+            count = min(4 if status.detail else 3, max(0, (budget-10)//max(1,len(panes))-2))
+            notices, command_output = [], []
+            for title, data in panes if count else ():
+                rows = _panel(title, data[-count:], status.width)
+                if title == '命令输出':
+                    command_output = rows
+                else:
+                    notices = rows
+            try:
+                head = status.fit(budget - len(notices) - len(command_output))
+            except Exception as error:
+                # Keep the command prompt and computations alive if a snapshot
+                # cannot be drawn. The next health sample gets a fresh renderer.
+                message = f'{type(error).__name__}: {error}'
+                if _layout.last_error != message:
+                    logging.getLogger(__name__).exception('Dashboard render failed')
+                _layout.last_error = message
+                head = [_line('面板显示异常，输入 status 或 nodes 查看资源',status.width)]
+            else:
+                _layout.last_error = None
+            # Anchor status and recent notifications at the top; keep command
+            # feedback beside the editable prompt. Spare rows belong between.
+            content = (head + notices)[:budget - len(command_output)]
+            return content + [''] * (budget - len(content) - len(command_output)) + command_output
         reserve=max(6,min(25,budget-3*sections))
         count=min(6,max(1,(budget-reserve-2*sections)//sections)) if sections else 0
         def footer_rows(count):
@@ -630,3 +869,6 @@ def _layout(status, events, output, height, *, reserved=2):
     if len(status)>remaining and head:
         head[-1]='… status 查看完整资源；help 查看操作'
     return (head+footer)[-budget:]
+
+
+_layout.last_error = None

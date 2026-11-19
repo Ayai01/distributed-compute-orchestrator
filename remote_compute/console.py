@@ -37,27 +37,33 @@ def _paint_row(row, device_names=()):
     title_pattern = re.compile(r'\+ .+?(?:-+(?=\+)|(?=\+$))')
     hash_pattern = re.compile(r'(?<![\w])(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|(?=[0-9a-f]{0,3}[a-f][0-9a-f]{0,3}(?![0-9a-f]))[0-9a-f]{4})(?![\w])', re.I)
     number_pattern = re.compile(r'(?<![\w.])(?:\d+(?:\.\d+)?)(?![\w.])')
-    state_pattern = re.compile(r'CPU活跃|进度停滞|心跳丢失|进程丢失|连接中断|采样陈旧|进度无效|等资源|推进|准备|运行(?!秒)|排队|等待(?!工程任务)|暂停|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
+    state_pattern = re.compile(r'CPU活跃|进度停滞|心跳丢失|进程丢失|连接中断|采样陈旧|进度无效|等资源|推进|准备|就绪|运行(?!秒)|排队|等待(?!工程任务)|暂停|禁用|失联|派发|完成|成功|校准中|失败|错误|异常|blocked|error|failed|succeeded|online', re.I)
     names = sorted(set(device_names) - {'', '-'}, key=lambda name: (-len(name), name))
     device_pattern = (re.compile(r'(?<![\w])(?:' + '|'.join(re.escape(name) for name in names) + r')(?![\w])')
                       if names else None)
     state_colors = {
         '运行':'\x1b[32m', '完成':'\x1b[32m', '成功':'\x1b[32m', 'succeeded':'\x1b[32m', 'online':'\x1b[32m',
         '排队':'\x1b[33m', '等待':'\x1b[33m', '暂停':'\x1b[33m',
+        '就绪':'\x1b[32m', '禁用':'\x1b[90m', '失联':'\x1b[31;1m',
         'CPU活跃':'\x1b[32m', '推进':'\x1b[32m', '准备':'\x1b[36m', '等资源':'\x1b[33m',
         **{key:'\x1b[33m'for key in ('进度停滞','心跳丢失','进程丢失','连接中断','采样陈旧','进度无效')},
         '派发':'\x1b[36m', '校准中':'\x1b[36m',
         '失败':'\x1b[31;1m', '错误':'\x1b[31;1m', '异常':'\x1b[31;1m',
         'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
-    # Locate fields in the wide, reduced-column and compact task layouts.
-    # Numeric IDs are identifiers; the trailing label is opaque user text.
-    task = re.search(
-        r'[|+] (?P<id>[0-9a-f]{4}) (?:'
-        r'\| (?:(?:[^|]*\| ){2,3} *\d+/(?:\d+|\?) *\|[^|]*\|[^|]*\|[^|]*\|'
-        r'|[^|]*\| *\d+/(?:\d+|\?) *\| *(?:-|\d+\.\d+)/(?:-|\d+\.\d+) *\|[^|]*\|[^|]*\|'
-        r'|(?:[^|]*\| )? *\d+/(?:\d+|\?) *\|[^|]*\|)'
-        r'|\d+/(?:\d+|\?)(?: +(?:\d+|-))?)(?P<label>.*)', row, re.I)
-    paint_end = task.start('label') if task else len(row)
+    # The task label can contain pipes, hashes and status words. Count
+    # separators only through the known table fields before styling the row.
+    task = re.search(r'[|+] (?P<id>[0-9a-f]{4})(?: \| | +\d+/(?:\d+|\?))', row, re.I)
+    paint_end = len(row)
+    if task:
+        panel_width = _width(row[task.start():])
+        if panel_width < 38:
+            paint_end = task.end()
+        else:
+            separators = (8 if panel_width >= 140 else 7 if panel_width >= 100 else
+                          6 if panel_width >= 80 else 4 if panel_width >= 64 else 3)
+            fields = row[task.start()+1:].split('|', separators)
+            if len(fields) == separators+1:
+                paint_end = len(row)-len(fields[-1])
     matches = [(match.start(), match.end()+1, '\x1b[34;1m')
                for match in title_pattern.finditer(row, 0, paint_end)]
     if task:
@@ -133,9 +139,9 @@ class CommandCompletion:
 
 
 def _command_rows(shell, line, cursor, width, context, completion):
-    usage = context['usage'] or ('Tab 补全命令 | PgUp/PgDn 翻任务 | Enter 执行 | Esc 清空 | help 命令'
+    usage = context['usage'] or ('Tab 补全 | Enter 执行 | Esc 清空 | help 命令'
                                  if line.strip() else
-                                 'Tab 补全命令 | PgUp/PgDn 翻任务 | Ctrl+PgUp/PgDn 翻输出 | 上下键 历史 | help 命令')
+                                 'F8 总览/节点详情 | F6/F7 翻节点 | PgUp/PgDn 翻任务 | Ctrl+PgUp/PgDn 翻输出')
     matches = completion.matches if completion.last == (line, cursor) else context['matches']
     selected = completion.index if completion.last == (line, cursor) else -1
     candidates = []
@@ -207,11 +213,19 @@ def _enable_ansi():
         return None
     if not kernel.SetConsoleMode(handle, mode.value | 4):
         return None
+    input_handle = kernel.GetStdHandle(-10 & 0xffffffff)
+    input_mode = wintypes.DWORD()
+    # Classic conhost suspends writes while a mouse click selects text.
+    quick_edit = (kernel.GetConsoleMode(input_handle, ctypes.byref(input_mode))
+                  and input_mode.value & 0x0040
+                  and kernel.SetConsoleMode(input_handle, (input_mode.value | 0x0080) & ~0x0040))
     _COLOR_ENABLED = allowed
     def restore_windows():
         global _COLOR_ENABLED
         _COLOR_ENABLED = False
         kernel.SetConsoleMode(handle, mode.value)
+        if quick_edit:
+            kernel.SetConsoleMode(input_handle, input_mode.value)
     return restore_windows
 
 
@@ -249,15 +263,20 @@ class RowPainter:
     """Paint changed rows with absolute addresses, without scrolling the buffer."""
     def __init__(self):
         self.rows=()
+        self.raw_rows=()
         self.size=None
         self.cursor=None
         self.device_names=()
 
     def frame(self, rows, columns, height, cursor, *, device_names=(),cursor_row=None):
         device_names=tuple(sorted(set(device_names)))
-        rows=tuple(_clip(row,max(0,columns-1)) for row in rows[:height])
-        rows+=('',)*max(0,height-len(rows))
-        previous=self.rows if self.size==(columns,height) and self.device_names==device_names else ()
+        raw=tuple(rows[:height])
+        raw+=('',)*max(0,height-len(raw))
+        same_size=self.size==(columns,height)
+        rows=tuple(self.rows[i] if same_size and self.raw_rows[i]==row else _clip(row,max(0,columns-1))
+                   for i,row in enumerate(raw))
+        self.raw_rows=raw
+        previous=self.rows if same_size and self.device_names==device_names else ()
         changes=[f'\x1b[{i+1};1H'+_paint_row(row,device_names)+'\x1b[K' for i,row in enumerate(rows)
                  if i>=len(previous) or row!=previous[i]]
         row=height if cursor_row is None else max(1,min(height,cursor_row))
@@ -430,6 +449,7 @@ class _PosixKeyboard:
         self.decoder=codecs.getincrementaldecoder('utf-8')();self.buffer=''
         self.keys={'\x1b[A':'H','\x1b[B':'P','\x1b[C':'M','\x1b[D':'K','\x1b[H':'G','\x1b[F':'O',
                    '\x1b[3~':'S','\x1b[5~':'I','\x1b[6~':'Q','\x1b[Z':'\x0f',
+                   '\x1b[17~':'@','\x1b[18~':'A','\x1b[19~':'B',
                    # Plain PageUp/PageDown change task pages.  Modified page
                    # keys keep the output-history viewport independent.
                    '\x1b[5;3~':'\x95','\x1b[6;3~':'\x96',
@@ -507,6 +527,7 @@ class Dashboard:
         line, cursor = state.get('line', ''), state.get('cursor', 0)
         history, selected = state.get('history', []), state.get('selected', 0)
         last, offset, page_size, task_page = 0, state.get('offset', 0), 6, state.get('task_page', 0)
+        device_page, detail = state.get('device_page', 0), state.get('detail', False)
         completion = CommandCompletion()
         painter=state.get('painter') or RowPainter()
         rows, events, value = ['正在获取状态…'], [], {}
@@ -532,14 +553,15 @@ class Dashboard:
                         try:
                             if error is not None:
                                 raise RuntimeError(error)
-                            status = format_status(snapshot, self.url)
-                            value, rows = snapshot, status
-                            events = format_notices(value)
-                        except (OSError, RuntimeError, ValueError) as failure:
+                            status = StatusRows(snapshot, self.url, size()[0]-1, viewport=True)
+                            notices = format_notices(snapshot)
+                            value, rows, events = snapshot, status, notices
+                        except Exception as failure:
                             notice = '连接状态: ' + str(failure)
                             if not value:
                                 rows = [notice]
-                            events = format_notices(value)+[notice]
+                            if not events or events[-1] != notice:
+                                events = events[-5:]+[notice]
                         revision += 1
                     if refresh.due(now, focus(), force=last == 0):
                         if not first_refresh and reader.request():
@@ -558,7 +580,7 @@ class Dashboard:
                     # scroll and clip that prompt.
                     reserved = min(5, height)
                     with self.output_lock:
-                        key = (revision,self.output_revision,offset,task_page,columns,height)
+                        key = (revision,self.output_revision,offset,task_page,device_page,detail,columns,height)
                         if key != cached_key:
                             output = list(self.output) + ([self.pending] if self.pending else [])
                             offset = min(offset,max(0,len(output)-1))
@@ -566,18 +588,18 @@ class Dashboard:
                                 output = output[:-offset]
                             if isinstance(rows,StatusRows):
                                 rows.resize(columns-1)
-                                rows.task_page=task_page
+                                rows.task_page, rows.device_page, rows.detail = task_page, device_page, detail
                             notices = events+(['状态读取中，显示最近快照'] if waiting else [])
                             visible = _layout(rows,notices,output,height,reserved=reserved)
                             if isinstance(rows,StatusRows):
-                                task_page=rows.task_page
+                                task_page, device_page = rows.task_page, rows.device_page
                             for index,text in enumerate(visible):
                                 if text.startswith('+ 命令输出'):
                                     page_size=max(1,len(visible)-index-2)
                             body_height=max(0, height-reserved)
-                            body = visible[-body_height:] if body_height else []
-                            body = ([''] * max(0, body_height-len(body))) + body
-                            cached_key = (revision,self.output_revision,offset,task_page,columns,height)
+                            body = visible[:body_height]
+                            body += [''] * (body_height - len(body))
+                            cached_key = (revision,self.output_revision,offset,task_page,device_page,detail,columns,height)
                     if context_key != (line, cursor, revision):
                         context = self.shell.suggest(line, cursor, value)
                         context_key = (line, cursor, revision)
@@ -612,6 +634,11 @@ class Dashboard:
                             elif key == 'G': cursor = 0
                             elif key == 'O': cursor = len(line)
                             elif key == 'S': line = line[:cursor] + line[cursor + 1:]
+                            elif key in ('@', 'A'):
+                                device_page += -1 if key == '@' else 1
+                            elif key == 'B':
+                                detail = not detail
+                                device_page = 0
                             elif key == 'I':
                                 task_page -= 1
                                 offset = 0
