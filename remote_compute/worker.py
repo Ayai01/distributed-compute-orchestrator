@@ -1922,6 +1922,8 @@ class Handler(BaseHTTPRequestHandler):
                         result = dict(id=identity, status='unknown', status_code=404)
                     value[identity] = batch_status(result, compact=request.get('compact') is True)
             elif parts == ["jobs"] and self.command == "GET":
+                if scheduler and not operator:
+                    return self._reply({'error': 'Job listing is operator-only; query original IDs with /jobs/status'}, 403)
                 query = parse_qs(urlsplit(self.path).query)
                 prefixes = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get('prefix')
                 prefix = None

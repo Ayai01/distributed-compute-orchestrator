@@ -81,7 +81,7 @@ class PlatformRoutingTests(unittest.TestCase):
     def test_worker_rejects_mismatch_before_materializing_or_executing(self):
         wrong = 'linux' if sys.platform != 'linux' else 'win32'
         with scratch() as directory, provider(directory) as (worker, client):
-            client=Client(client.url,operator=True)
+            client=Client(client.url, client.token, operator=True)
             identity = uuid.uuid4().hex
             with self.assertRaisesRegex(RemoteError, 'platform differs'):
                 client.submit(command(['${tool:python}', '-c', 'raise RuntimeError("executed")'],
@@ -98,9 +98,10 @@ class PlatformRoutingTests(unittest.TestCase):
             root = Path(directory)
             with provider(root/'worker', cpus=2) as (_, remote), Pool([remote]) as pool:
                 with center(pool, root/'center') as (state, operator):
-                    client = Client(operator.url)
+                    client = Client(operator.url, state.token)
                     self.assertNotIn('platforms',client.capabilities())
                     with self.assertRaises(RemoteError):client.capabilities(platform=sys.platform)
+                    project = client
                     client=operator
                     self.assertEqual(client.capabilities()['platforms'], [sys.platform])
                     self.assertEqual(client.capabilities(platform=sys.platform)['cpu']['capacity'], 2)
@@ -119,7 +120,7 @@ class PlatformRoutingTests(unittest.TestCase):
                     self.assertEqual(result['stdout'].strip(), sys.platform)
                     self.assertEqual(state.jobs[identity]['task']['platform'], sys.platform)
                     self.assertEqual(result['request_sha256'], accepted['request_sha256'])
-                    self.assertNotIn('assigned_node',Client(operator.url).status(identity))
+                    self.assertNotIn('assigned_node', project.status(identity))
                     # No provider is an explicit routing failure, never execution on another OS.
                     unmatched = client.submit(dict(task, platform='darwin'), job_id=uuid.uuid4().hex)['id']
                     rejected = client.wait(unmatched)
