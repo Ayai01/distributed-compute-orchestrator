@@ -32,6 +32,7 @@ from .policy import (normalize_accelerator_requirement, select_accelerator_units
 from .auth import lan_endpoint
 from .allocation import elastic_cpus,cpu_capacity
 from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
+from .packages import package_names, provider_has_package
 
 
 from .runtimes import (supports_python, execution_bindings, execution_tool_set, capability_set,
@@ -1743,6 +1744,7 @@ class Pool:
                      'private_mb','memory_unallocated_mb','commit_unallocated_mb','memory_budget_mb')},
                  "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
+                 "packages": package_names(n.health),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
                  "accelerators": n.health.get("accelerators", []),
                  "accelerator_reserved": len({unit[:2] for items in n.accelerator_reservations.values() for unit in items}),
@@ -1761,14 +1763,19 @@ class Pool:
         cpus=task.get('cpus',1) or 1
         required_tools,required_shared,python,backend=execution_bindings(task)
         required=capability_set(task.get('requires',()))
+        package = task.get('_capability_package')
         result=[]
         for node in self.nodes:
             health=node.health
             if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
                     or task.get('platform') is not None and health.get('platform') != task['platform']
                     or not supports_native_cache(health, task.get('native_cache'), getattr(node,'native_architecture',None))
-                    or node.memory_capacity<node.startup_memory(task)
-                    or not required.issubset(capability_set(health.get('tags',())))
+                    or node.memory_capacity<node.startup_memory(task)):
+                continue
+            if package:
+                if not provider_has_package(health, package):
+                    continue
+            elif (not required.issubset(capability_set(health.get('tags',())))
                     or not required_shared.issubset(health.get('shared',()))
                     or not required_tools.issubset(execution_tool_set(tuple(name
                         for name,info in health.get('tools',{}).items()if info.get('available'))))):
@@ -1799,6 +1806,9 @@ class Pool:
                     return None
                 matching = self._matching(task)
                 if not matching:
+                    if task.get('_capability_package'):
+                        raise RemoteError('No worker offers the ' + task['_capability_package']
+                                          + ' capability package for these resource requirements')
                     raise RemoteError("No matching online node for task platform, CPU count, tools, shared paths, node name and tags")
                 def needed(node):
                     # Automatic jobs can start with a partial grant. Waiting for

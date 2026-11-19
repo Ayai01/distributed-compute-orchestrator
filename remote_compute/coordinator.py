@@ -44,6 +44,7 @@ from urllib.parse import urlsplit
 from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python, execution_bindings, capability_set
 from . import __version__
 from .policy import validate_operator_fields
+from .packages import DEFAULT_PACKAGE, PACKAGES, package_names, package_task, project_package, provider_has_package
 
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
@@ -59,7 +60,8 @@ def _matching_pass(pool):
     cache={}
     def matching(task):
         accelerator=task.get('accelerator')
-        key=(task.get('node'),task.get('platform'),task.get('cpus',1)or 1,task.get('memory_mb',256),
+        key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
+             task.get('cpus',1)or 1,task.get('memory_mb',256),
              execution_bindings(task),capability_set(task.get('requires',())),
              json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
         if key not in cache:cache[key]=tuple(pool._matching(task))
@@ -150,8 +152,7 @@ class Coordinator:
             self.jobs.active[value["id"]] = job
             with zipfile.ZipFile(path.parent/'request.zip') as archive:
                 task=json.loads(archive.read('task.json'))
-            task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
-            task=self._cache_placement(task)
+            task=self._restored_task(task, value)
             if 'dispatch_priority'in value:
                 task['priority']=value['dispatch_priority']
             self._restore_accelerator(task, value)
@@ -350,10 +351,17 @@ class Coordinator:
         cpus = request.get('cpus', 1)
         maximum_cpus = request.get('max_cpus')
         ready_tasks = validate_ready_tasks(request.get('ready_tasks'))
-        requires = canonical_capabilities(request.get('requires', []))
         platform = validate_platform(request.get('platform'))
-        accelerator = normalize_accelerator_requirement(request.get('accelerator'))
         validate_operator_fields(request,operator)
+        raw_requires = request.get('requires', [])
+        raw_accelerator = request.get('accelerator')
+        if operator:
+            package = None
+            requires = canonical_capabilities(raw_requires)
+            accelerator = normalize_accelerator_requirement(raw_accelerator)
+        else:
+            package, accelerator = project_package(raw_requires, raw_accelerator)
+            requires = PACKAGES[package].requirements
         node_name=request.get('node') if operator else None
         if (not isinstance(project, str) or isinstance(share, bool) or not isinstance(share, (int,float))
                 or not math.isfinite(share) or not 0 < share <= MAX_RESOURCE_SHARE or isinstance(ratio, bool)
@@ -372,11 +380,14 @@ class Coordinator:
                   and n.capacity>=max(1,cpus)
                   and (not node_name or n.name==node_name)
                   and (platform is None or n.health.get('platform') == platform)
-                  and set(requires).issubset(canonical_capabilities(n.health.get('tags',())))
+                  and (provider_has_package(n.health, package) if package is not None else
+                       set(requires).issubset(canonical_capabilities(n.health.get('tags',()))))
                   ]
-        fallback_capable = (sum(n.capacity for n in eligible)
-                            if accelerator is not None and 'fallback_after_seconds' in accelerator else 0)
         execution=dict(requires=requires,accelerator=accelerator)
+        fallback_capable = (sum(n.capacity for n in eligible
+                                if supports_python(dict(execution, accelerator=None),
+                                                   n.health.get('python_backends', ['cpu'])))
+                            if accelerator is not None and 'fallback_after_seconds' in accelerator else 0)
         eligible = [n for n in eligible if n.supports_accelerator(n.execution_accelerator(execution))
                     and supports_python(dict(execution,accelerator=n.execution_accelerator(execution)),n.health.get('python_backends',['cpu']))]
         capable=sum(n.capacity for n in eligible)
@@ -439,6 +450,8 @@ class Coordinator:
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
         if operator and platform is not None:
             value['platform'] = platform
+        if package is not None:
+            value['capability_package'] = package
         if ready_tasks is None and ratio > 0:
             ready_tasks = min(MAX_READY_TASKS, max(READY_QUEUE_FLOOR, maximum + 1, value['in_flight']))
         if ready_tasks is not None:
@@ -457,8 +470,10 @@ class Coordinator:
             nodes = tuple(self.pool.nodes)
             online = [node for node in nodes if node.health and node.enabled and
                       not node.error and not node.health.get('paused')]
-            value.update(self._cpu_availability(online))
+            value.update(self._cpu_availability(online, operator=operator))
             value['activity'] = self._project_activity(project, nodes)
+        if package is not None and not capable and not fallback_capable:
+            value.update(running_tasks=0, queued_tasks=0, in_flight=0, max_in_flight=0)
         return value
 
     def _project_activity(self, project, nodes):
@@ -487,15 +502,22 @@ class Coordinator:
         return dict(sampled_at=time.time(), jobs=jobs)
 
     @staticmethod
-    def _cpu_availability(nodes):
+    def _cpu_availability(nodes, *, operator=False):
         capacity = available = 0
-        labels = {}
+        labels = {} if operator else {name: {'capacity': 0, 'available': 0} for name in PACKAGES}
         for node in nodes:
             width = node.capacity
             free = max(0, width - node.reserved - node.external)
             capacity += width
             available += free
-            for label in execution_capabilities(node.health.get('tags', ())):
+            tags = node.health.get('tags', ())
+            names = execution_capabilities(tags) if operator else package_names(node.health)
+            for label in names:
+                if not operator:
+                    package = PACKAGES[label]
+                    if package.accelerator and not node.supports_accelerator(
+                            normalize_accelerator_requirement({'kind': package.accelerator})):
+                        continue
                 entry = labels.setdefault(label, {'capacity': 0, 'available': 0})
                 entry['capacity'] += width
                 entry['available'] += free
@@ -575,23 +597,25 @@ class Coordinator:
         platform = validate_platform(platform)
         online = [node for node in tuple(self.pool.nodes) if node.health and not node.error and node.enabled
                   and not node.health.get('paused') and (platform is None or node.health.get('platform') == platform)]
-        tags = set()
-        accelerator_profiles = []
-        for node in online:
-            tags.update(execution_capabilities(node.health.get('tags', ())))
-            accelerator_profiles.extend(node.health.get('accelerators', ()))
         memory_capacity = sum(node.memory_capacity for node in online)
         memory_available = sum(max(0, node.memory_free) for node in online)
+        detail = {'default_package': DEFAULT_PACKAGE}
+        if operator:
+            tags = {tag for node in online for tag in execution_capabilities(node.health.get('tags', ()))}
+            detail = {
+                'platforms': sorted({node.health.get('platform') for node in online} - {None, ''}),
+                'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
+                'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],
+                'accelerators': aggregate_accelerators(profile for node in online
+                                                       for profile in node.health.get('accelerators', ())),
+            }
         return {
             'protocol': PROTOCOL,
             'role': 'scheduler',
             'version': __version__,
-            **({'platforms': sorted({node.health.get('platform') for node in online} - {None, ''})} if operator else {}),
+            **detail,
             'capabilities': public_capabilities(),
-            'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
-            'tools': [name for name in EXECUTION_CAPABILITIES if name in tags],
-            'accelerators': aggregate_accelerators(accelerator_profiles),
-            **self._cpu_availability(online),
+            **self._cpu_availability(online, operator=operator),
             'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
         }
 
@@ -623,7 +647,9 @@ class Coordinator:
             if isinstance(mapping.get('steps'), list):
                 cleaned['steps'] = [{key: step[key] for key in ('started', 'finished', 'returncode') if key in step}
                                    for step in mapping['steps'] if isinstance(step, dict)]
-            if isinstance(mapping.get('tools'), dict):
+            if result.get('capability_package'):
+                cleaned.pop('tools', None)
+            elif isinstance(mapping.get('tools'), dict):
                 cleaned['tools'] = {}
                 for name, info in mapping['tools'].items():
                     if not isinstance(info, dict):
@@ -970,6 +996,14 @@ class Coordinator:
             raise ValueError('Cache reference conflicts with explicit placement')
         return dict(task,node=reference['provider'])
 
+    def _restored_task(self, raw_task, result):
+        task = validate_task(raw_task, max(1, raw_task.get('cpus', 1)), allow_auto=True)
+        package = result.get('capability_package')
+        if package is None:
+            return self._cache_placement(task)
+        _, accelerator = project_package(raw_task.get('requires', []), raw_task.get('accelerator'))
+        return package_task(task, package, accelerator)
+
     def cache_reference(self,identity,request=None):
         from .cache_refs import read,register,public,reference_id
         reference_id(identity)
@@ -1028,9 +1062,12 @@ class Coordinator:
                 if 'cpus'in raw_task:raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')
                 if not self.accepting and not operator:raise Conflict('DCO maintenance: new task admissions are paused')
                 validate_operator_fields(raw_task,operator)
+                package = None
+                if not operator:
+                    package, accelerator = project_package(raw_task.get('requires', []), raw_task.get('accelerator'))
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
-                task=self._cache_placement(task)
+                task = self._cache_placement(task) if operator else package_task(task, package, accelerator)
             with self.condition:
                 self._validate_project_share(task)
             with self.asset_cache.lock:
@@ -1058,6 +1095,8 @@ class Coordinator:
                                   "stdout": "", "stderr": "", "steps": [],
                                   "total_steps": len(task["steps"]), "assets": task["assets"]}})
                 _restore_phase_demand(job)
+                if package is not None:
+                    job['result']['capability_package'] = package
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
                 if task.get('cache_ref'):job['result']['cache_ref']=task['cache_ref']
@@ -1065,6 +1104,8 @@ class Coordinator:
                     key: job['result'][key] for key in ('id', 'status', 'request_sha256', 'assets', 'label',
                         'project', 'cpus', 'memory_mb', 'submitted', 'total_steps')}
                 admission['initial_cpus'] = task['cpus']
+                if package is not None:
+                    admission['capability_package'] = package
                 atomic_json(directory / 'admission.json', admission)
                 self._save(job)
                 with self.condition:
@@ -1313,8 +1354,7 @@ class Coordinator:
                 remote=next((r for r in node.health.get('active_jobs') or [] if r['id']==worker_id),None)
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
-                task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
-                task=self._cache_placement(task)
+                task=self._restored_task(task, job['result'])
                 if 'dispatch_priority'in job['result']:
                     task['priority']=job['result']['dispatch_priority']
                 self._restore_accelerator(task, job['result'])
@@ -1388,6 +1428,7 @@ class Coordinator:
                     worker_task.pop('node',None)
                     worker_task.pop('cache_ref',None)
                     worker_task.pop('native_cache',None)
+                    worker_task.pop('_capability_package', None)
                     worker_task.pop('single_thread_weight',None)
                     worker_task.pop('retries',None)
                     if worker_task.get('accelerator') is not None:
@@ -1664,8 +1705,7 @@ class Coordinator:
         identity=job['result']['id']
         with zipfile.ZipFile(job['directory']/'request.zip') as archive:
             task=json.loads(archive.read('task.json'))
-        task=validate_task(task,max(1,task.get('cpus',1)),allow_auto=True)
-        task=self._cache_placement(task)
+        task=self._restored_task(task, job['result'])
         self._restore_accelerator(task, job['result'])
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
         job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task),node=None,worker_id=worker_id)

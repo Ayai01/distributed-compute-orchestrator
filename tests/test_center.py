@@ -207,12 +207,15 @@ class AdmissionPlanningTests(unittest.TestCase):
     def center(self, capacities):
         from types import SimpleNamespace
         from remote_compute.client import Node
+        from remote_compute.packages import PACKAGES
         pool=Pool.__new__(Pool)
         pool.condition=threading.Condition()
         pool.nodes=[]
         for index,capacity in enumerate(capacities):
             node=Node(str(index),SimpleNamespace(url=str(index)))
-            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=['ngspice47'],
+            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=PACKAGES['spice'].requirements,
+                             python_backends=['cpu', 'ml'],
+                             tools={name: {'available': True} for name in PACKAGES['spice'].tools},
                              memory_capacity_mb=8192,memory_available_mb=8192,host_memory_available_mb=8192)
             pool.nodes.append(node)
         state=Coordinator.__new__(Coordinator)

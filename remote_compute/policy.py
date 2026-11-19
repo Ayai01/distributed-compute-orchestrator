@@ -265,8 +265,8 @@ def aggregate_accelerators(profiles):
 def public_capabilities():
     """Names of the stable project-facing capability concepts."""
     return [
+        "capability_packages",
         "cache_references",
-        "native_cache",
         "admission",
         "admission_ready_tasks",
         "batch_status",
@@ -279,7 +279,6 @@ def public_capabilities():
         "resize_memory_model",
         "resize_active_cpus",
         "resize_min_cpus",
-        "semantic_requires",
 
         "single_thread_weight",
         "asset_cache",
@@ -292,6 +291,6 @@ def public_capabilities():
 def validate_operator_fields(value, operator=False):
     """Placement and external host paths belong to explicit debugging."""
     if not operator:
-        for field in ('node','platform','cwd'):
+        for field in ('node', 'platform', 'cwd', 'cache_ref', 'native_cache'):
             if value.get(field) is not None:
                 raise ValueError(field+' selection is operator/debug-only; ordinary tasks must omit '+field)

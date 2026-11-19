@@ -49,6 +49,6 @@ CPU总线程硬限额＝基础预算×超发倍率向下取整，硬限额和倍
 
 复用已有 PyTorch 昇腾镜像，在私有 worker 配置上执行 `python main.py --config <配置.json> setup --ascend`。命令加载镜像内 CANN 环境、验证实际设备和反向传播，并登记 `python_runtimes.npu`、设备 ID、容量和语义标签，不安装软件。可用 `--cann-env` 指定镜像的 set_env.sh。
 
-普通任务使用既有 SDK：`accelerator={"kind":"npu","count":1,"requires":["npu:pytorch"]}`；任务代码使用 PyTorch 的 `npu:0`。DCO 按授予的 runtime ID 设置 `ASCEND_RT_VISIBLE_DEVICES`，保留外层容器的设备挂载设置。CPU 任务的 Ascend runtime 设备列表为空。
+普通任务以 `requires=["npu"]` 使用昇腾能力包。需要多个设备时另声明 `accelerator={"count":2}`。任务代码使用 PyTorch 的 `npu:0`。DCO 按授予的 runtime ID 设置 `ASCEND_RT_VISIBLE_DEVICES`，保留外层容器的设备挂载设置。
 
 独立资格入口为 `python -m examples.ascend_qualification --config <配置.json> --smoke <ascend_smoke.py> --output <结果.json>`；只启动回环 worker，完成 CPU/NPU 任务、原 ID 与费用回执、结果回传后退出。平台资料和基础实测位于 `D:/Projects/st-platform`；长期节点沿现有私网中转接入，不改本地 VPN、TUN、DNS。

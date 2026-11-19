@@ -263,19 +263,15 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertTrue(all(_width(line)<=width for line in lines))
                 self.assertIn('1.23/56.8','\n'.join(lines))
 
-    def test_capabilities_group_aliases_without_folding_or_changing_protocol_tags(self):
-        tags=['python','python','python','python','python',
-              'cpu','win32','ngspice','python','rtl','verilator']
-        self.assertEqual(_capabilities(tags),'RTL')
-        self.assertEqual(len(tags),11)
-        self.assertEqual(_capabilities([*tags,'ngspice47','java','scala-cli','firtool','shared:arh']),'ng47 RTL')
-        self.assertEqual(_capabilities([*tags,'long-custom-tag'*8]),'RTL')
-        self.assertIn('HSP',_capabilities([*tags,'hspice','python']))
-        value=dict(role='worker',node='Aya1-TX',cpus=30,tags=tags)
+    def test_capability_column_uses_only_public_packages(self):
+        packages=['cpu','rtl','long-custom-tag'*8]
+        self.assertEqual(_capabilities(packages),'cpu rtl')
+        self.assertEqual(_capabilities([*packages,'spice','hspice']),'cpu spice hspice rtl')
+        value=dict(role='worker',node='Aya1-TX',cpus=30,packages=packages)
         for width in (56,80,110,160):
             lines=format_status(value,width=width)
             self.assertTrue(all(_width(line)<=width for line in lines))
-            self.assertIn('RTL','\n'.join(lines))
+            self.assertIn('rtl','\n'.join(lines))
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):
         with patch('remote_compute.benchmark.measure') as kernel:

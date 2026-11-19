@@ -12,6 +12,7 @@ from remote_compute import Client, Pool
 from remote_compute.benchmark import calibrated, NAME
 from test_compute import provider, python, scratch, until
 from test_center import center
+from test_capability_packages import packaged_worker
 
 
 class ContractTests(unittest.TestCase):
@@ -35,8 +36,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                 with provider(root / 'worker', tools={'magic': prefix}) as (worker, remote):
                     selected = LocalClient(worker) if mode == 'hybrid' else remote
                     with Pool([selected]) as pool, center(pool, root / 'center') as (_, operator):
-                        client = Client(operator.url)
-                        receipt = client.run(python(code, outputs=['context.json'], requires=['magic'], memory_mb=64))
+                        receipt = operator.run(python(code, outputs=['context.json'], requires=['magic'], memory_mb=64))
                         self.assertEqual(receipt['status'], 'succeeded', receipt.get('stderr'))
                         result = json.loads(receipt['files']['context.json'])
                         self.assertEqual(result['tools']['magic']['argv'], prefix)
@@ -49,21 +49,20 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                             self.assertEqual(result['public_tools']['magic']['argv'], prefix)
 
     def test_project_view_is_aggregate_and_rejects_node_selection(self):
-        with scratch() as directory, provider(Path(directory) / 'worker', cpus=2,
-                tools={'verilator': sys.executable}, tags=['rtl']) as (_, remote):
+        with scratch() as directory, packaged_worker(Path(directory) / 'worker', 'rtl', cpus=2) as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
-                project = Client(operator.url)
+                project = Client(operator.url, operator.token)
                 capabilities = project.capabilities()
                 self.assertNotIn('nodes', capabilities)
                 self.assertNotIn('node', capabilities)
                 self.assertEqual(capabilities['cpu']['capacity'], 2)
-                self.assertIn('rtl', capabilities['tags'])
+                self.assertEqual(capabilities['capability_cpus']['rtl']['capacity'], 2)
                 public_health = project.health()
                 self.assertNotIn('nodes', public_health)
                 self.assertNotIn('projects', public_health)
                 with self.assertRaisesRegex(Exception, 'operator-only'):
                     project.nodes()
-                forged = Client(operator.url, operator=True)
+                forged = Client(operator.url, operator.token, operator=True)
                 with self.assertRaisesRegex(Exception, 'Operator token'):
                     forged.nodes()
                 with self.assertRaisesRegex(Exception, 'node selection'):
@@ -76,23 +75,25 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
     def test_project_view_bounds_optional_scheduler_hints(self):
         with scratch() as directory, provider(Path(directory) / 'worker') as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
-                project = Client(operator.url)
+                project = Client(operator.url, operator.token)
                 with self.assertRaisesRegex(Exception, 'queue_ratio'):
                     project.admission('bounded', queue_ratio=5)
                 with self.assertRaisesRegex(Exception, 'resource_share'):
                     project.admission('bounded', resource_share=17)
 
     def test_accelerator_request_uses_aggregate_profiles_and_serializes_gpu_jobs(self):
-        with scratch() as directory, provider(
-                Path(directory) / 'gpu', cpus=2,
+        with scratch() as directory, packaged_worker(
+                Path(directory) / 'gpu', 'cuda', cpus=2,
                 accelerators=[dict(kind='cuda', count=1, memory_mb=8192,
                                    tags=['gpu', 'gpu:training'], ids=['0'])]) as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
-                project = Client(operator.url)
+                project = Client(operator.url, operator.token)
                 capabilities = project.capabilities()
-                self.assertEqual(capabilities['accelerators'], [
+                self.assertNotIn('accelerators', capabilities)
+                self.assertEqual(capabilities['capability_cpus']['cuda']['capacity'], 2)
+                self.assertEqual(operator.capabilities()['accelerators'], [
                     dict(kind='cuda', count=1, memory_mb=8192, tags=['gpu', 'gpu:shared', 'gpu:training'])])
-                request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
+                request = dict(kind='cuda', memory_mb=4096)
                 self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 2)
                 first = project.submit(python('import time; time.sleep(.35)', project='gpu', accelerator=request))['id']
                 until(lambda: project.status(first, brief=True)['status'] == 'running')
@@ -101,8 +102,7 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                 self.assertEqual(project.wait(first)['status'], 'succeeded')
                 result = project.wait(second)
                 self.assertEqual(result['status'], 'succeeded')
-                self.assertIn('tools', result)
-                self.assertTrue(all('argv' not in info for info in result['tools'].values()))
+                self.assertNotIn('tools', result)
                 self.assertNotIn('D:\\', json.dumps(result))
                 self.assertNotIn('cwd', result)
                 self.assertNotIn('assigned_node', result)
@@ -122,8 +122,8 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
     def test_accelerator_requirement_does_not_fallback_to_cpu(self):
         with scratch() as directory, provider(Path(directory) / 'cpu', cpus=2) as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory) / 'center') as (_, operator):
-                project = Client(operator.url)
-                request = dict(kind='cuda', memory_mb=4096, requires=['gpu:training'])
+                project = Client(operator.url, operator.token)
+                request = dict(kind='cuda', memory_mb=4096)
                 self.assertEqual(project.admission('gpu', accelerator=request)['capable_cpus'], 0)
 
     def test_optional_accelerator_wait_is_validated(self):
@@ -156,9 +156,9 @@ Path('context.json').write_text(json.dumps(dict(tools=record['tools'],public_too
                 DCO_ACCELERATOR_MEMORY_MB='8192', DCO_ACCELERATOR_IDS='0', CUDA_VISIBLE_DEVICES='0'))
 
     def test_optional_accelerator_without_gpu_runs_cpu_under_original_identity(self):
-        with scratch() as directory, provider(Path(directory)/'cpu', cpus=2) as (_, remote):
+        with scratch() as directory, packaged_worker(Path(directory)/'cpu', 'rtl', cpus=2) as (_, remote):
             with Pool([remote]) as pool, center(pool, Path(directory)/'center') as (_, operator):
-                project = Client(operator.url)
+                project = Client(operator.url, operator.token)
                 request = dict(kind='cuda', fallback_after_seconds=30)
                 self.assertIn('accelerator_fallback', project.capabilities()['capabilities'])
                 grant = project.admission('optional', accelerator=request)

@@ -121,22 +121,23 @@ class CapabilityTests(unittest.TestCase):
                          ['ng47','python'])
 
     def test_shared_runtime_profiles_use_every_compatible_provider(self):
+        from test_capability_packages import packaged_worker
         with scratch() as directory:
             root = Path(directory)
-            with provider(root/'legacy', cpus=1, tools={'python':sys.executable}) as (_, legacy), \
-                    provider(root/'canonical', cpus=2, tools={'python':sys.executable}) as (_, canonical):
+            with packaged_worker(root/'legacy', 'cpu') as (_, legacy), \
+                    packaged_worker(root/'canonical', 'cpu', cpus=2) as (_, canonical):
                 with Pool([legacy, canonical]) as pool, center(pool, root/'center') as (_, operator):
-                    project = Client(operator.url)
+                    project = Client(operator.url, operator.token)
                     self.assertEqual(project.admission('runtime', requires=['rgcn_python'])['capable_cpus'], 3)
-                    public = operator.request('/capabilities')
-                    self.assertNotIn('python', public['tags'])
-                    self.assertNotIn('python', public['tools'])
-                    self.assertFalse({'arh_python','rgcn_python'} & set(public['tools']))
+                    public = project.capabilities()
+                    self.assertNotIn('tags', public)
+                    self.assertNotIn('tools', public)
+                    self.assertEqual(public['capability_cpus']['cpu']['capacity'], 3)
                     task = command(['${tool:aop_python}', '-c',
                                     'import os,pathlib,time;assert pathlib.Path(os.environ["PY"]).is_file();'
                                     'time.sleep(.35);print("ready")'],
                                    env={'PY':'${tool:rgcn_python}'}, requires=['python_numpy'], project='runtime')
-                    ids = [operator.submit(task)['id'] for _ in range(3)]
+                    ids = [project.submit(task)['id'] for _ in range(3)]
                     results = [operator.wait(identity) for identity in ids]
                     self.assertTrue(all(r['status']=='succeeded' and r['stdout'].strip()=='ready' for r in results), results)
                     self.assertEqual(len({r['assigned_node'] for r in results}), 2)

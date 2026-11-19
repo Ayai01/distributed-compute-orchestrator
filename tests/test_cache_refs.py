@@ -1,4 +1,4 @@
-"""Public producer references constrain cache consumers without exposing devices."""
+"""Retained producer references stay usable for operator-managed native work."""
 import json
 from pathlib import Path
 import sys
@@ -12,7 +12,7 @@ from test_compute import provider,scratch
 
 
 class CacheReferenceTests(unittest.TestCase):
-    def test_native_cache_routes_by_storage_and_abi_without_exposing_devices(self):
+    def test_native_cache_routes_by_storage_and_abi_only_as_operator(self):
         with scratch() as folder:
             root = Path(folder)
             env = {'DCO_SHARED_ASSET_CACHE': str(root/'shared')}
@@ -22,11 +22,12 @@ class CacheReferenceTests(unittest.TestCase):
                     client = Client(operator.url,operator.token)
                     attachment = dict(storage=right.shared_assets.identity, platform=sys.platform, architecture='arm64')
                     task = command(['${tool:python}','-c','print("retained")'],max_cpus=1,native_cache=attachment)
+                    with self.assertRaisesRegex(RemoteError, 'operator/debug-only'):
+                        client.run(task)
                     with patch.object(wrong,'submit',wraps=wrong.submit) as wrong_submit:
-                        result = client.run(task)
+                        result = operator.run(task)
                     self.assertEqual(result['status'],'succeeded',result.get('error'))
                     wrong_submit.assert_not_called()
-                    self.assertNotIn('assigned_node',result)
 
     def test_reference_is_durable_immutable_and_redacted(self):
         with scratch()as root:
@@ -53,7 +54,7 @@ class CacheReferenceTests(unittest.TestCase):
             self.assertEqual(post.call_count,2)
             self.assertEqual(post.call_args_list[0],post.call_args_list[1])
 
-    def test_real_http_deleted_producer_keeps_cache_and_public_client_placement(self):
+    def test_real_http_deleted_producer_keeps_operator_cache_placement(self):
         with scratch()as folder,provider(Path(folder)/'one')as(a,ca),provider(Path(folder)/'two')as(b,cb),Pool([dict(name='producer',client=ca),dict(name='other',client=cb)])as pool:
             root=Path(folder)/'center'
             with center(pool,root)as(state,op):
@@ -65,24 +66,26 @@ class CacheReferenceTests(unittest.TestCase):
                 op.delete(identity)
                 self.assertEqual(client.cache_ref(identity),reference)
                 consumer=command(['${tool:python}','-c','print(2)'],max_cpus=1,project='P',cache_ref=reference['id'])
+                with self.assertRaisesRegex(RemoteError, 'operator/debug-only'):
+                    client.submit(consumer)
                 with patch.object(a,'submit',wraps=a.submit)as first,patch.object(b,'submit',wraps=b.submit)as second:
-                    used=client.run(consumer)
+                    used=op.run(consumer)
                     self.assertEqual(used['status'],'succeeded',used.get('stderr'))
                     self.assertEqual(used['cache_ref'],reference['id'])
                     self.assertEqual(first.call_count,1)
                     self.assertEqual(second.call_count,0)
                 published=[]
-                client.execute({'consume':consumer},project='P',output_dir=Path(folder)/'pipeline',publish=published.append)
+                op.execute({'consume':consumer},project='P',output_dir=Path(folder)/'pipeline',publish=published.append)
                 self.assertEqual(len(published),1)
                 self.assertEqual(published[0]['cache_ref'],reference['id'])
-                with self.assertRaises(RemoteError):client.submit(dict(consumer,project='Q'))
-                with self.assertRaises(RemoteError):client.submit(dict(consumer,node='other'))
+                with self.assertRaises(RemoteError):op.submit(dict(consumer,project='Q'))
+                with self.assertRaises(RemoteError):op.submit(dict(consumer,node='other'))
                 with self.assertRaises(RemoteError):client.submit(dict(consumer,platform='linux'))
                 with self.assertRaises(RemoteError):client.request('/cache-references/'+identity,{'node':'other'})
                 with self.assertRaises(RemoteError):client.cache_ref(identity,content_id='e'*64)
                 pool.nodes[0].enabled=False
                 with patch.object(b,'submit',wraps=b.submit)as second:
-                    waiting=client.submit(consumer)['id']
+                    waiting=op.submit(consumer)['id']
                     try:outcome=client.wait(waiting,wait_timeout=.3)
                     except RemoteError:
                         outcome=client.status(waiting);client.cancel(waiting);client.wait(waiting)
@@ -96,7 +99,7 @@ class CacheReferenceTests(unittest.TestCase):
             with center(pool,root)as(_,op):
                 client=Client(op.url,op.token)
                 self.assertEqual(client.cache_ref(identity),reference)
-                self.assertEqual(client.run(consumer)['status'],'succeeded')
+                self.assertEqual(op.run(consumer)['status'],'succeeded')
 
     def test_running_and_failed_producers_and_direct_worker_are_rejected(self):
         with scratch()as folder,provider(Path(folder)/'worker')as(worker,remote),Pool([remote])as pool,center(pool,Path(folder)/'center',paused=True)as(state,op):

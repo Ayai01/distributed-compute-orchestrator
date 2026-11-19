@@ -11,7 +11,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 from . import ABBREVIATION, __version__
 from .policy import canonical_capabilities
-from .runtimes import execution_capabilities
+from .packages import PACKAGES, package_names
 from .task_tags import compact_tag
 from .telemetry import sampling_notice
 
@@ -155,10 +155,12 @@ def _task_memory(job):
     return number(job.get('rss_mb'))+'/'+number(declared)
 
 
-def _capabilities(tags):
-    labels={'ng47':'ng47','hsp':'HSP','chisel':'Chisel','ml':'ML','cuda':'CUDA','npu':'NPU','layout':'Layout','rtl':'RTL','onnx':'ONNX','onnx-int8':'ONNX INT8','pe64':'PE64','elf-aapcs64':'ARM64 ELF',
-            'single-core-phase-handoff':'单核交接'}
-    return ' '.join(labels.get(name,name) for name in execution_capabilities(tags or ())) or '-'
+def _capabilities(names):
+    return ' '.join(name for name in PACKAGES if name in names) or '-'
+
+
+def _device_packages(node):
+    return node['packages'] if 'packages' in node else package_names(node)
 
 
 
@@ -328,7 +330,7 @@ class StatusRows(list):
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
                                        benchmark.get('threads','-'),node_ip,
                                        number,_accelerator_summary(node),
-                                       node.get('benchmark_state','ready'),_capabilities(node.get('tags')),relay_entry]))
+                                       node.get('benchmark_state','ready'),_capabilities(_device_packages(node)),relay_entry]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
         self.projects=[]
         if center:
@@ -338,8 +340,8 @@ class StatusRows(list):
             self.jobs.extend(('-',job) for job in value.get('queued_jobs',[]))
         self.jobs.sort(key=lambda item:(item[1].get('started') or math.inf,item[1].get('id','')))
         self.node_width=max([8]+[_width(r[0]) for _,r in self.devices if len(r[0])<=8])
-        self.available_capabilities = _capabilities(tag for node, _ in self.devices
-            if _node_state(node) in ('运行','就绪') for tag in node.get('tags') or ())
+        self.available_capabilities = _capabilities({name for node, _ in self.devices
+            if _node_state(node) in ('运行','就绪') for name in _device_packages(node)})
         now=time.time()
         offline_nodes={n.get('display_name')or n.get('name')for n in value.get('nodes',[])if n.get('error')}
         self.records=[]
@@ -422,7 +424,7 @@ class StatusRows(list):
         capabilities=[]
         for node,r in self.devices:
             prefix=r[0]+': ';line=prefix
-            for word in _capabilities(node.get('tags')).split():
+            for word in _capabilities(_device_packages(node)).split():
                 if _width(line+' '+word)>width-4 and line!=prefix:
                     capabilities.append(_line(line,width));line='  '+word
                 else:line+=('' if line==prefix else ' ')+word
