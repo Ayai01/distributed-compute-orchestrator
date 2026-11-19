@@ -63,11 +63,14 @@ class AdaptiveMemoryTests(unittest.TestCase):
         self.assertEqual(quote,dict(base_memory_mb=200,memory_per_cpu_mb=200))
         self.assertEqual(plan_memory(64,13000,**quote),(64,13000))
 
-    def test_fixed_estimate_also_learns_actual_process_growth(self):
+    def test_fixed_memory_quotes_a_whole_task_at_every_width(self):
         model=dict(memory_mb=8192)
-        quote=calibrated_model(model,model,4,1000,900,True,points=[(1,400),(4,1000)])
-        self.assertEqual(quote,dict(base_memory_mb=200,memory_per_cpu_mb=200))
-        self.assertEqual(plan_memory(64,13000,**quote),(64,13000))
+        slope=dict(base_memory_mb=200,memory_per_cpu_mb=200)
+        quote=calibrated_model(model,model,4,1000,900,True,learned=slope,points=[(1,400),(4,1000)])
+        self.assertEqual(quote,dict(memory_mb=1000))
+        self.assertEqual(plan_memory(64,1100,**quote),(64,1000))
+        cold=calibrated_model(model,model,1,0,0,False,learned=slope)
+        self.assertEqual(cold,model)
 
     def test_a_single_width_quotes_whole_observed_slots_until_shared_baseline_is_measured(self):
         model=dict(base_memory_mb=256,memory_per_cpu_mb=768)

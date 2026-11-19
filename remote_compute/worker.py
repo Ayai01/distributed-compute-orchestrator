@@ -38,11 +38,12 @@ from .telemetry import Activity
 from .network import local_node_ip
 from .progress import sample as sample_progress, diagnose
 from .client import RemoteError
-from .cleanup import AssetCache, Reclaimer, remove_owned
+from .cleanup import AssetCache, Reclaimer, TransportRetirement, remove_owned, retire_job
 from .shared_assets import SharedAssets
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .compat import unlink
 from .receipts import read_receipt
+from .deadline import PREPARATION_TIMEOUT, execution_remaining, preparation_elapsed
 from .paths import cache_environment
 from .allocation import plan_resize,cpu_capacity,validate_cpu_overcommit,validate_cpu_utilization
 from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
@@ -354,16 +355,20 @@ class Worker:
         self.threads = set()
         self.cleanup_pending = set()
         self.work_reclaimer = Reclaimer(self.root/'jobs'/'.trash',source_root=self.root/'jobs')
+        self.retirement = TransportRetirement(self.root / 'retirements', self._reclaim_retired)
         self.asset_handoffs = {}
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
         phase=time.monotonic();indexed = self.jobs.load_index()
+        self.retirement.restore(self.jobs)
         self.startup['index_seconds']=round(time.monotonic()-phase,4)
         phase=time.monotonic()
         candidates = tuple(self.jobs.pending) if indexed else None
         paths = ((self.root / 'jobs' / identity / 'result.json') for identity in candidates) if candidates is not None else (self.root / "jobs").glob("*/result.json")
         self.startup_recoveries = []
         for path in paths:
+            if path.parent.name in self.jobs.deleted:
+                continue
             saved = read_receipt(path, assets=self.jobs.pending_assets.get(path.parent.name, ()))
             if clean_tool_snapshot(saved):
                 atomic_json(path, saved)
@@ -386,7 +391,8 @@ class Worker:
             archive_job(self.jobs, job, startup=True)
         if not indexed:
             self.jobs.write_index()
-        self.jobs.compact_index()
+        if not self.retirement.pending:
+            self.jobs.compact_index()
         if self.temp_reclaimer:
             for path in self.temp_root.iterdir():
                 if _ID.fullmatch(path.name)and path.name not in self.startup_recoveries:
@@ -406,6 +412,7 @@ class Worker:
         self.memory_watchdog=threading.Thread(target=self._memory_watchdog,name='memory-emergency',daemon=True)
         self.memory_watchdog.start()
         self.scheduler.start()
+        self.retirement.start()
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
@@ -768,7 +775,8 @@ class Worker:
             samples=job.get('memory_width_samples',[])
             sampled_at=job.get('memory_width_sampled_at',time.monotonic())
             if time.monotonic()-sampled_at>=10:samples=[];sampled_at=time.monotonic()
-            if calibrated and observed_cpus and same_phase(requested_memory,previous_memory):
+            if (calibrated and observed_cpus and requested_memory.get('memory_mb') is None
+                    and same_phase(requested_memory,previous_memory)):
                 points=dict(samples);width=observed_cpus
                 points.pop(width,None);points[width]=max(physical,commit)
                 samples=list(points.items())[-8:]
@@ -879,6 +887,8 @@ class Worker:
             with self.condition:
                 if self.stopping:
                     raise Conflict("Worker is stopping")
+                if identity in self.jobs.deleted:
+                    raise Conflict('Job transport has already been retired')
                 existing = identity in self.jobs
             if existing:
                 job = load_job(self.jobs, self.condition, identity)
@@ -931,7 +941,9 @@ class Worker:
                 raise Conflict('Original job directory already exists; retain it and recover the original id') from None
             try:
                 low_integrity_directory(directory)
+                unpack_started = time.monotonic()
                 unpack(payload, directory)
+                unpack_seconds = time.monotonic() - unpack_started
                 work.mkdir(exist_ok=True)
                 if "stdin" in task and not inside(work, task["stdin"]).is_file():
                     raise ValueError("Missing stdin input file: " + task["stdin"])
@@ -954,7 +966,7 @@ class Worker:
                               'python':dict(argv=self._tool_argv('python',task),available=True)}
                               if uses_python(task) else self.tool_info),
                           "assets": task["assets"], "cwd": cwd.as_posix(),
-                          "accelerator": task.get('accelerator')}
+                          "accelerator": task.get('accelerator'), "bundle_unpack_seconds": unpack_seconds}
                 job = Job({"result": result, "cancel": threading.Event(), "task": task,
                        "commands": commands, "directory": directory, "cwd": cwd,
                        'callback':dict(self.callback if callback is None else callback),
@@ -1058,10 +1070,14 @@ class Worker:
                         continue
                 self.condition.wait(0.5)
 
-    def _start_process(self, job, *args, **kwargs):
+    def _start_process(self, job, *args, before_spawn=None, **kwargs):
         # Serialize only initial OS process creation, outside the scheduler
         # condition. Cancellation wakes the pacing wait without starting it.
-        with self.start_lock:
+        expires = job.get('preparation_deadline', math.inf)
+        while not self.start_lock.acquire(timeout=.05):
+            if self.stopping or job['cancel'].is_set() or time.monotonic() >= expires:
+                return None
+        try:
             # Serialize probes whose declared RAM is not fully funded yet.
             # Small tasks and declared phase floors already reserve their full
             # startup footprint, so their calibration can run concurrently.
@@ -1072,15 +1088,19 @@ class Worker:
                              min(reservation(j))<j['task']['memory_mb']
                              for j in self.pressure_processes.values())
                 if not cold and not self.pressure_guard.state['limited']:break
-                if time.time()>=job['result'].get('deadline',float('inf')):return None
+                if time.monotonic() >= expires:
+                    job['result']['preparation_stage'] = 'memory_calibration' if cold else 'host_memory_pressure'
+                    return None
                 job['cancel'].wait(.05)
             interval=1. if job.get('cpu_overcommit')else .5
             deadline=self.next_start+max(0,interval-self.start_interval)
-            if self.stopping or job['cancel'].wait(max(0,deadline-time.monotonic())):
+            if self.stopping or job['cancel'].wait(max(0,min(deadline,expires)-time.monotonic())):
                 return None
-            if self.stopping or job['cancel'].is_set():
+            if self.stopping or job['cancel'].is_set() or time.monotonic() >= expires:
                 return None
             try:
+                if before_spawn is not None:
+                    before_spawn()
                 process=Process(*args, **kwargs)
                 with self.pressure_process_lock:
                     job['process']=process
@@ -1089,13 +1109,24 @@ class Worker:
             finally:
                 self.next_start = time.monotonic() + interval
                 self.start_interval=interval
+        finally:
+            self.start_lock.release()
 
     def _execute(self, job):
         task, result, directory = job["task"], job["result"], job["directory"]
         job['parent_memory_mb']=task['memory_mb']
         work = directory / "input"
-        deadline = time.monotonic() + task["timeout"]
-        result['deadline']=time.time()+max(0,deadline-time.monotonic())
+        preparing = time.monotonic()
+        preparation_deadline = job['preparation_deadline'] = preparing + PREPARATION_TIMEOUT
+        deadline = None
+        clock = directory / 'preparation-clock.json' if 'execution' in task else None
+        result['preparation_stage'] = 'environment'
+        pressure_wait = 0.0
+        def expired():
+            now = time.monotonic()
+            if deadline is None:
+                return now >= preparation_deadline
+            return now >= deadline and execution_remaining(deadline, clock) <= 0
         state, error = "succeeded", None
         cpu_seconds = 0.0
         accounting = None
@@ -1131,8 +1162,10 @@ class Worker:
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
                                REMOTE_COMPUTE_JOB_TEMP=str(temporary),
-                               REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'],
-                               REMOTE_COMPUTE_DEADLINE=str(deadline))
+                               REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
+            environment.pop('REMOTE_COMPUTE_PREPARATION_CLOCK', None)
+            if clock is not None:
+                environment['REMOTE_COMPUTE_PREPARATION_CLOCK'] = str(clock)
             callback=job.get('callback',{})
             polling=callback.get('mode')=='poll'
             if polling:callback={**self.callback,**callback}
@@ -1151,15 +1184,23 @@ class Worker:
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 templates=job.get('templates',{})
                 for frozen in job['commands']:
+                    initial = deadline is None
+                    waiting_since = time.monotonic() if initial and self.pressure_guard.state['waiting'] else None
+                    if waiting_since is not None:
+                        result['preparation_stage'] = 'host_memory_pressure'
                     with self.condition:
                         while (self.pressure_guard.state['waiting'] and not self.stopping
-                               and not job['cancel'].is_set() and time.monotonic()<deadline):
+                               and not job['cancel'].is_set() and not expired()):
                             self.condition.wait(.1)
+                    if waiting_since is not None:
+                        pressure_wait += time.monotonic() - waiting_since
                     if job["cancel"].is_set():
                         state = "cancelled"
                         break
-                    if time.monotonic()>=deadline:
+                    if expired():
                         state='timed_out';break
+                    if initial:
+                        result['preparation_stage'] = 'resource_grant'
                     with self.condition:
                         job['rss_sampled']=False;job['rss_mb']=0
                         for key in ('private_mb','memory_adaptive_model','memory_width_samples','memory_width_sampled_at'):job.pop(key,None)
@@ -1183,30 +1224,41 @@ class Worker:
                             return value
                         atomic_json(work/'.dco-execution.json',expand(job['execution']))
                     argv=[value.replace('${cpus}',str(task['cpus']))for value in frozen]
-                    if time.monotonic()>=deadline:
+                    if expired():
                         state='timed_out'
                         break
-                    step = {"argv": argv, "started": time.time(), "returncode": None}
-                    with self.condition:
-                        result["steps"].append(step)
-                        self._save(job)
+                    step = {"argv": argv, "returncode": None}
+                    def begin_execution():
+                        nonlocal deadline
+                        started = time.monotonic()
+                        step['started'] = time.time()
+                        deadline = started + task['timeout']
+                        result.update(execution_started=step['started'], deadline=step['started']+task['timeout'])
+                        result['preparation_seconds'] = started - preparing
+                        result['preparation_stage'] = 'complete'
+                        environment['REMOTE_COMPUTE_DEADLINE'] = str(deadline)
                     source = inside(work, task["stdin"]).open("rb") if "stdin" in task else nullcontext(None)
                     with source as stdin:
-                        if len(result['steps']) == 1:
-                            process = self._start_process(job, argv, job["cwd"], environment, stdout, stderr, stdin=stdin)
+                        if initial:
+                            result['preparation_stage'] = 'launch'
+                            process = self._start_process(job, argv, job["cwd"], environment, stdout, stderr,
+                                                          stdin=stdin, before_spawn=begin_execution)
                         else:
+                            step['started'] = time.time()
                             process = Process(argv, job["cwd"], environment, stdout, stderr, stdin=stdin)
                     if process is None:
-                        state = 'cancelled'
+                        state = 'cancelled' if self.stopping or job['cancel'].is_set() else 'timed_out'
                         break
                     with self.pressure_process_lock:
                         job['process']=process
                         self.pressure_processes[result['id']]=job
-                    with self.condition:
-                        job['process'] = process
-                        # Cancellation may arrive between Popen and registration.
-                        if job['cancel'].is_set():process.kill()
                     try:
+                        with self.condition:
+                            job['process'] = process
+                            result["steps"].append(step)
+                            self._save(job)
+                            # Cancellation may arrive between Popen and registration.
+                            if job['cancel'].is_set():process.kill()
                         while process.child.poll() is None:
                             usage = process_usage(process)
                             total_cpu = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
@@ -1236,7 +1288,7 @@ class Worker:
                                         else:
                                             accounting_saved_cpu = total_cpu
                                         accounting_saved = time.monotonic()
-                            if job["cancel"].is_set() or time.monotonic() >= deadline:
+                            if job["cancel"].is_set() or expired():
                                 state = "failed"if job.get('memory_pressure')else "cancelled" if job["cancel"].is_set() else "timed_out"
                                 process.stop()
                                 break
@@ -1266,10 +1318,19 @@ class Worker:
         except Exception as exc:
             state, error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
+            job.pop('preparation_deadline', None)
+            if deadline is None:
+                result['preparation_seconds'] = time.monotonic() - preparing
+                if state == 'timed_out':
+                    result['error_kind'] = 'startup_timeout'
+                    error = 'Task preparation deadline reached before process launch'
+            result['preparation_pressure_seconds'] = pressure_wait
+            if clock is not None:
+                result['kernel_preparation_seconds'] = preparation_elapsed(clock)
             waiting=work/'.dco-memory-waits'
-            if (state!='succeeded'and not job['cancel'].is_set() and
+            if (deadline is not None and state!='succeeded'and not job['cancel'].is_set() and
                     (waiting.is_dir()and any(waiting.iterdir()) or
-                     self.pressure_guard.state['waiting']and time.monotonic()>=deadline)):
+                     self.pressure_guard.state['waiting']and execution_remaining(deadline, clock)<=0)):
                 job['memory_pressure']=True
                 result.update(error_kind='memory_pressure',error='Task deadline reached while waiting for host memory recovery',
                               memory_pressure={**self.host.sample(),'guard':dict(self.pressure_guard.state)})
@@ -1524,22 +1585,15 @@ class Worker:
                         files['recovery/' + name] = inside(directory, name)
             return pack(files)
 
-    def delete(self, identity):
-        job = load_job(self.jobs, self.condition, identity)
-        with self.condition:
-            if job["result"]["status"] not in TERMINAL:
-                raise Conflict("Cancel and wait for the job before deleting it")
-            result_lock = job.setdefault('artifact_lock', threading.RLock())
-        with result_lock:
+    def _reclaim_retired(self, identity, _record):
+        with self.jobs.record_lock(identity):
+            self.work_reclaimer.defer(self.root / 'jobs' / identity)
             with self.condition:
-                if self.jobs.get(identity) is not job:
-                    return {"deleted": identity}
-            self.work_reclaimer.defer(job['directory'])
-            with self.condition:
-                del self.jobs[identity]
-                self.cleanup_pending.discard(identity)
+                self.jobs.record_retired(identity)
         self._prune_assets()
-        return {"deleted": identity}
+
+    def delete(self, identity):
+        return retire_job(self, identity)
 
     def clean(self):
         from .operations import clean_pending
@@ -1615,6 +1669,7 @@ class Worker:
         self.memory_watchdog.join()
         for thread in list(self.threads):
             thread.join()
+        self.retirement.close()
         # Calibration runs in a daemon thread and observes ``stopping`` while
         # queued.  A running native helper has its own bounded timeout; do not
         # hold service shutdown open just to wait for that optional probe.
@@ -1939,7 +1994,10 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 2 and self.command == "GET":
                     value = worker.public_get(identity) if scheduler and not operator else worker.get(identity)
                 elif len(parts) == 2 and self.command == "DELETE":
-                    value = worker.delete(identity)
+                    try:
+                        value = worker.delete(identity)
+                    except OSError:
+                        return self._reply({'error': 'Transport retirement is temporarily unavailable'}, 503)
                 elif parts[2:] == ["cancel"] and self.command == "POST":
                     value = worker.cancel(identity)
                     if scheduler and not operator and isinstance(value, dict):

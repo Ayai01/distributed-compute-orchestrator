@@ -111,11 +111,17 @@ def calibrated_model(model,previous,active_cpus,physical,commit,calibrated,learn
     """Separate the shared working set from observed width-dependent growth."""
     fixed=model.get('memory_mb')is not None
     if not same_phase(model,previous)or not(fixed or model.get('base_memory_mb')is not None):return model
+    if fixed:
+        if calibrated:
+            return dict(memory_mb=math.ceil(max(physical,commit)))
+        # Ignore a width slope persisted by an older worker for this phase.
+        if learned is not None and learned.get('memory_mb') is not None:
+            return dict(memory_mb=learned['memory_mb'])
+        return model
     if not calibrated:return dict(learned)if learned is not None else model
     memory=math.ceil(max(physical,commit))
     if not active_cpus:
         if learned is not None:return dict(learned)
-        if fixed:return dict(memory_mb=memory)
         if not cold_probe:return model
         # A stable cold slot funds an unseen lane conservatively with its
         # entire measured envelope, without reporting fictitious active work.
@@ -124,12 +130,11 @@ def calibrated_model(model,previous,active_cpus,physical,commit,calibrated,learn
                     **({'memory_limit_mb':model['memory_limit_mb']}if model.get('memory_limit_mb')is not None else {}))
     samples=dict(points or ());samples[active_cpus]=memory
     samples=sorted((width,value)for width,value in samples.items()if width>0)
-    if fixed and len(samples)<2 and (learned is None or learned.get('memory_per_cpu_mb')is None):return dict(memory_mb=memory)
     if len(samples)>1:
         per=max(0,max(math.ceil((b-a)/(wb-wa))for i,(wa,a)in enumerate(samples)for wb,b in samples[i+1:]))
         base=max(0,max(math.ceil(value-per*width)for width,value in samples))
     else:
-        if (not fixed and model.get('memory_per_cpu_mb') == 0
+        if (model.get('memory_per_cpu_mb') == 0
                 or learned is not None and learned.get('memory_per_cpu_mb') == 0):
             base,per=memory,0
         else:

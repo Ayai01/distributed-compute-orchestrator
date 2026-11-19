@@ -2,6 +2,7 @@
 
 import os
 import json
+import heapq
 from collections import deque
 from pathlib import Path
 import re
@@ -9,7 +10,8 @@ import stat
 import threading
 import time
 import uuid
-from .bundle import native_path
+from .bundle import TERMINAL, atomic_json, native_path
+from .acceptance import SubmissionLocks
 
 
 def remove_owned(path, *, cancel=None):
@@ -84,6 +86,105 @@ class Reclaimer:
         if thread:thread.join(.25)
         try:self.root.rmdir()
         except OSError:pass  # Retired bytes resume in this namespace next start.
+
+
+class TransportRetirement:
+    """Persist DELETE intent before a background thread touches a transport copy."""
+
+    def __init__(self, root, reclaim):
+        self.root = Path(root)
+        self.root.mkdir(exist_ok=True)
+        if self.root.is_symlink() or getattr(self.root.lstat(), 'st_file_attributes', 0) & 1024:
+            raise ValueError('Retirement namespace must be an owned directory')
+        self.reclaim = reclaim
+        self.pending = [(0, path.stem) for path in self.root.glob('*.json')
+                        if re.fullmatch('[a-f0-9]{32}', path.stem)]
+        heapq.heapify(self.pending)
+        self.locks = SubmissionLocks()
+        self.condition = threading.Condition()
+        self.stopping = False
+        self.thread = None
+
+    def restore(self, records):
+        for _, identity in self.pending:
+            if identity in records:
+                records.forget(identity, journal=False)
+            else:
+                records.deleted.add(identity)
+
+    def mark(self, identity, record):
+        atomic_json(self.root / (identity + '.json'), record, private=True)
+
+    def schedule(self, identity):
+        with self.condition:
+            heapq.heappush(self.pending, (0, identity))
+            self._start()
+            self.condition.notify()
+
+    def start(self):
+        with self.condition:
+            self._start()
+
+    def _start(self):
+        if self.pending and self.thread is None and not self.stopping:
+            self.thread = threading.Thread(target=self._run, name='transport-retirement', daemon=True)
+            self.thread.start()
+
+    def _run(self):
+        while True:
+            with self.condition:
+                if self.stopping or not self.pending:
+                    self.thread = None
+                    return
+                due, identity = self.pending[0]
+                remaining = due - time.monotonic()
+                if remaining > 0:
+                    self.condition.wait(remaining)
+                    continue
+                heapq.heappop(self.pending)
+            path = self.root / (identity + '.json')
+            try:
+                self.reclaim(identity, json.loads(path.read_bytes()))
+                path.unlink()
+            except (OSError, ValueError):
+                # The intent still owns both the local name and any worker
+                # copies. An unavailable provider is retried independently.
+                with self.condition:
+                    heapq.heappush(self.pending, (time.monotonic() + 5, identity))
+
+    def close(self):
+        with self.condition:
+            self.stopping = True
+            thread = self.thread
+            self.condition.notify_all()
+        if thread:
+            thread.join()
+
+
+def retire_job(service, identity, describe=None):
+    """Acknowledge one terminal original without waiting for artifact I/O."""
+    from .records import load_job
+    from .worker import Conflict
+    if not re.fullmatch('[a-f0-9]{32}', identity):
+        raise ValueError('Job id requires 32 lowercase hex characters')
+    retired = {'deleted': identity}
+    with service.retirement.locks.hold(identity):
+        try:
+            job = load_job(service.jobs, service.condition, identity)
+        except KeyError:
+            return retired
+        with service.condition:
+            if job['result']['status'] not in TERMINAL:
+                raise Conflict('Cancel and wait for the job before deleting it')
+            record = describe(job) if describe else {}
+        service.retirement.mark(identity, record)
+        with service.condition:
+            job['retired'] = True
+            service.jobs.forget(identity, journal=False)
+            if hasattr(service, 'cleanup_pending'):
+                service.cleanup_pending.discard(identity)
+        service.retirement.schedule(identity)
+    return retired
 
 
 class AssetCache:

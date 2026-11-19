@@ -419,10 +419,11 @@ class CenterTests(unittest.TestCase):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
                 first=client.run(python('print("finished")'),keep=True)['id']
                 second=client.run(python('from pathlib import Path;Path("answer").write_bytes(b"ready")',outputs=['answer']),keep=True)['id']
+                first_directory = state.jobs.root / first
                 entered=threading.Event();release=threading.Event();received=threading.Event()
                 cleanup=coordinator.remove_owned;errors=[];files=[]
                 def slow(path):
-                    if path==state.jobs[first]['directory']:
+                    if path==first_directory:
                         entered.set();release.wait(5)
                     cleanup(path)
                 def delete():

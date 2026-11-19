@@ -54,7 +54,7 @@ class LaunchSpacingTests(unittest.TestCase):
 
     def test_center_spaces_dispatches_without_waiting_for_completion(self):
         with scratch()as root,provider(root+'/worker',cpus=3)as(_,worker):
-            pool=Pool([dict(name='test',url=worker.url)])
+            pool=Pool([dict(name='test',url=worker.url,token=worker.token)])
             try:
                 with center(pool,root+'/center',paused=True)as(_,client):
                     ids=[client.submit(python('import time;time.sleep(2)'))['id']for _ in range(3)]

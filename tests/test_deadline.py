@@ -4,10 +4,11 @@ import os
 from pathlib import Path
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from remote_compute import check_deadline, remaining_time, python_map
-from test_compute import provider, scratch, until
+from remote_compute import check_deadline, remaining_time, python_map, python_task
+from test_compute import provider, python, scratch, until
 
 
 BUSINESS='''import json,time
@@ -78,19 +79,53 @@ class DeadlineTests(unittest.TestCase):
             self.assertEqual([i['status']for i in manifest['item_states']],['succeeded','interrupted','not_started'])
             self.assertEqual(manifest['items'][0]['value'],0)
             self.assertEqual(worker.health()['used_cpus'],0)
-            self.assertAlmostEqual(result['deadline']-result['started'],3,delta=.2)
+            self.assertAlmostEqual(result['deadline']-result['execution_started'],3,delta=.2)
 
     def test_expired_initial_grant_does_not_start_a_command(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(worker,client):
-            task=python_map('business:evaluate',[0],max_cpus=1,timeout=.1,outputs=['completed.json'])
-            with patch.object(worker,'_automatic_grant',side_effect=lambda job:time.sleep(.2)):
+            task=python_map('business:evaluate',[0],max_cpus=1,timeout=1,outputs=['completed.json'])
+            with patch('remote_compute.worker.PREPARATION_TIMEOUT', .1), \
+                    patch.object(worker,'_automatic_grant',side_effect=lambda job:time.sleep(.2)):
                 result=client.run(task,files={'business.py':BUSINESS})
             self.assertEqual(result['status'],'timed_out')
+            self.assertEqual(result['error_kind'],'startup_timeout')
+            self.assertEqual(result['preparation_stage'],'resource_grant')
+            self.assertNotIn('execution_started',result)
             self.assertEqual(result['steps'],[])
             self.assertNotIn('completed.json',result['files'])
             manifest=json.loads(result['files']['.dco-results.json'])
             self.assertEqual(manifest['item_states'],[dict(index=0,status='not_started',finished=manifest['item_states'][0]['finished'])])
             self.assertEqual(worker.health()['used_cpus'],0)
+
+    def test_fixed_memory_short_batch_gets_full_execution_time_after_preparation(self):
+        with scratch() as root, provider(Path(root)/'worker',cpus=3) as (worker,client):
+            task=python("from pathlib import Path; Path('result.txt').write_text('ready')",
+                        max_cpus=1,memory_mb=192,timeout=.8,outputs=['result.txt'])
+            with patch.object(worker,'_automatic_grant',side_effect=lambda job:time.sleep(1.0)):
+                with ThreadPoolExecutor(9) as senders:
+                    ids=list(senders.map(lambda _:client.submit(task)['id'],range(9)))
+                results=[client.wait(i,wait_timeout=20) for i in ids]
+            self.assertEqual({r['status'] for r in results},{'succeeded'},results)
+            for identity,result in zip(ids,results):
+                self.assertGreaterEqual(result['preparation_seconds'],1.0)
+                self.assertAlmostEqual(result['deadline']-result['execution_started'],.8,delta=.02)
+                self.assertEqual(client.fetch(identity)['files']['result.txt'],b'ready')
+
+    def test_kernel_preparation_does_not_spend_execution_time(self):
+        business = """import time
+from remote_compute.deadline import check_deadline, preparation_window
+def run():
+    with preparation_window(2.5):
+        time.sleep(1.25)
+        check_deadline()
+    return 'started with an independent execution budget'
+"""
+        with scratch() as root, provider(Path(root)/'worker') as (_,client):
+            result=client.run(python_task('business:run',max_cpus=1,timeout=1),
+                              files={'business.py':business})
+            self.assertEqual(result['status'],'succeeded',result.get('stderr'))
+            self.assertGreaterEqual(result['kernel_preparation_seconds'],1.2)
+            self.assertEqual(json.loads(result['files']['.dco-results.json'])['completed'],1)
 
     def test_cooperative_boundary_publishes_paid_prefix_before_hard_limit(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(worker,client):

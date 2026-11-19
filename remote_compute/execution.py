@@ -460,7 +460,7 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
     """Start one fixed-width body only after its actual grant is committed."""
     from remote_compute import Client
     from remote_compute.client import RemoteError
-    from remote_compute.deadline import check_deadline,resource_window
+    from remote_compute.deadline import check_deadline,preparation_window,resource_window
     from remote_compute.memory import memory_boundary
     if not os.environ.get('REMOTE_COMPUTE_URL')or os.environ.get('REMOTE_COMPUTE_RESIZE')!='1':
         raise RuntimeError('exact_cpus requires a DCO CPU lease')
@@ -472,7 +472,7 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
     actual=0
     try:
         try:
-            with resource_window(start_timeout):
+            with preparation_window(start_timeout):
                 check_deadline();memory_boundary()
                 while True:
                     check_deadline()
@@ -608,7 +608,7 @@ def finish_execution(path,status,error=None,*,spec=None):
 
 def main(path):
     from remote_compute.bundle import atomic_json
-    from remote_compute.deadline import check_deadline
+    from remote_compute.deadline import check_deadline, preparation_window
     spec=json.loads(Path(path).read_text(encoding='utf8'));validate_execution(spec)
     output=Path('.dco-results.json');records={};error=None
     total=len(spec['items'])if spec['mode']=='map'else 1
@@ -640,7 +640,8 @@ def main(path):
     try:
         check_deadline()
         from remote_compute.memory import memory_boundary
-        memory_boundary()
+        with preparation_window():
+            memory_boundary()
         if spec['mode']=='call':
             started(0)
             value=run_call(spec['function'],**spec['kwargs']);publish(0,value,None)

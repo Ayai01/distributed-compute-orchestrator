@@ -265,6 +265,7 @@ class Client:
         paced = _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint)
         artifact_get = (binary and data is None and method in (None, 'GET')
                         and re.fullmatch(r'/jobs/[0-9a-f]{32}/(?:artifacts|files/.+)', path))
+        retirement = method == 'DELETE' and re.fullmatch(r'/jobs/[0-9a-f]{32}', path)
         pools=self.__dict__.setdefault('_transports',{})
         if artifact_get:
             # Keep completed jobs clear of uploads, and let a second receipt
@@ -272,6 +273,9 @@ class Client:
             # Configured relays share a byte budget in _request.
             pool = self.__dict__.setdefault('_artifact_transports', {}).setdefault(authority, _ConnectionPool())
             limit = 2 if paced else getattr(self, 'bulk_limit', 7)
+        elif retirement:
+            pool = self.__dict__.setdefault('_retirement_transports', {}).setdefault(authority, _ConnectionPool())
+            limit = getattr(self, 'bulk_limit', 7)
         else:
             pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if authority==self.url
                   else pools.setdefault(authority,_ConnectionPool()))
@@ -286,11 +290,11 @@ class Client:
         # even with tiny JSON bodies. They must leave the control slot available.
         bulk = (isinstance(data, bytes) or binary or path.startswith('/assets/')
                 or path.endswith(('/asset-handoff', '/logs'))
-                or method == 'DELETE' and path.startswith('/jobs/'))
+                or retirement)
         # A near-ready task can acquire its pins, look up assets and send a
         # small missing archive without waiting for a multi-MB result stream.
         # _request still charges the shared byte budget for these uploads.
-        short_job = (paced and not artifact_get and limit <= 2
+        short_job = (paced and not artifact_get and not retirement and limit <= 2
                      and _short_dispatch_request(path, data, method))
         bulk = bulk and not short_job
         if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, short_job=short_job, cancel=cancel):
@@ -905,14 +909,15 @@ class Client:
 
     def delete(self, identity):
         """Confirm idempotent retirement even when its reply was lost."""
+        if not isinstance(identity, str) or not re.fullmatch('[0-9a-f]{32}', identity):
+            raise ValueError('Job id requires 32 lowercase hex characters')
         for attempt in range(2):
             try:
                 return self.request("/jobs/" + identity, method="DELETE")
             except RemoteError as error:
                 if error.status_code==404:return {"deleted":identity}
                 if not error.transport_retryable and error.status_code not in (502,503,504):raise
-                # A timeout can follow completed physical retirement. Observe
-                # this original before repeating only the idempotent DELETE.
+                # The retirement marker may have committed before the reply was lost.
                 try:
                     current=self.status(identity)
                 except RemoteError as observed:

@@ -120,7 +120,7 @@ class BulkIOControlTests(unittest.TestCase):
                 second = executor.submit(concurrent) if concurrent else None
                 executor.submit(probe).result(timeout=2)
                 if second:
-                    self.assertFalse(second.done(), 'Deletion must wait for the original artifact reader')
+                    second.result(timeout=2)
             finally:
                 release.set()
             result = first.result(timeout=5)
@@ -128,7 +128,7 @@ class BulkIOControlTests(unittest.TestCase):
                 second.result(timeout=5)
             return result
 
-    def test_worker_artifact_pack_preserves_control_and_serializes_delete(self):
+    def test_worker_artifact_pack_preserves_control_during_retirement(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (_, client):
             identity = client.submit(python("from pathlib import Path;Path('answer').write_text('paid result')", outputs=['answer']))['id']
             client.wait(identity)
@@ -163,8 +163,11 @@ class BulkIOControlTests(unittest.TestCase):
                 try:
                     self.assertTrue(entered.wait(3))
                     deletion = executor.submit(client.delete, identity)
-                    self.assertEqual(executor.submit(client.status, identity).result(timeout=2)['status'], 'succeeded')
-                    self.assertFalse(deletion.done())
+                    self.assertEqual(deletion.result(timeout=2), {'deleted': identity})
+                    with self.assertRaises(RemoteError) as retired:
+                        executor.submit(client.status, identity).result(timeout=2)
+                    self.assertEqual(retired.exception.status_code, 404)
+                    self.assertTrue(target.is_file())
                 finally:
                     release.set()
                 self.assertEqual(first.result(timeout=5)['data'], b'paid result')

@@ -231,6 +231,9 @@ class JobRecords(MutableMapping):
                             'worker': job.get('worker_id', result.get('worker_id', identity))})
 
     def __delitem__(self, identity):
+        self.forget(identity)
+
+    def forget(self, identity, *, journal=True):
         if identity in self.active:
             del self.active[identity]
         else:
@@ -240,6 +243,10 @@ class JobRecords(MutableMapping):
         self.recent.pop(identity, None)
         self.live.pop(identity, None)
         self.deleted.add(identity)
+        if journal:
+            self.record_retired(identity)
+
+    def record_retired(self, identity):
         self._append_index({'id': identity, 'op': 'delete'})
 
     def __contains__(self, identity):

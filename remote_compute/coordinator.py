@@ -28,7 +28,7 @@ from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .memory import plan_memory, startup_memory, same_phase
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
-from .cleanup import AssetCache, remove_owned
+from .cleanup import AssetCache, TransportRetirement, remove_owned, retire_job
 from .acceptance import SubmissionAssets, SubmissionLocks
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .observations import Observations, observation_batch, terminal_observation
@@ -117,6 +117,7 @@ class Coordinator:
         self.shared_asset_publications = {}
         self.jobs, self.queue, self.threads = JobRecords(
             self.root / 'jobs', index_path=self.root / 'history.index.jsonl',receipt_reader=read_receipt), [], set()
+        self.retirement = TransportRetirement(self.root / 'retirements', self._reclaim_retired)
         self.observations = Observations(self.root / 'observed-jobs.json')
         self.observation_due = 0
         self.observation_retries = {}
@@ -135,6 +136,7 @@ class Coordinator:
         self.restart_available = False
         self.callback_address = None
         phase=time.monotonic();indexed = self.jobs.load_index()
+        self.retirement.restore(self.jobs)
         self.startup['index_seconds']=round(time.monotonic()-phase,4);phase=time.monotonic()
 
         def restore_live(path, value):
@@ -176,6 +178,8 @@ class Coordinator:
             # jobs recorded in the index.  Terminal receipts stay addressable
             # by ID through their original directories.
             for identity in tuple(self.jobs.pending):
+                if identity in self.jobs.deleted:
+                    continue
                 path = self.root / 'jobs' / identity / 'result.json'
                 value = read_receipt(path, assets=self.jobs.pending_assets.get(identity, ()))
                 if value.get('status') in TERMINAL and not (value.get('status') == 'interrupted' and value.get('finished') is None):
@@ -189,6 +193,8 @@ class Coordinator:
             # the established recovery semantics, then writes the compact
             # index so later starts do not rescan every terminal receipt.
             for path in (self.root / "jobs").glob("*/result.json"):
+                if path.parent.name in self.jobs.deleted:
+                    continue
                 value = read_receipt(path)
                 if value["status"] not in TERMINAL or (value['status']=='interrupted' and value.get('finished') is None):
                     restore_live(path, value)
@@ -197,7 +203,8 @@ class Coordinator:
                     self.jobs.active[value["id"]] = job
                     archive_job(self.jobs, job, startup=True)
             self.jobs.write_index()
-        self.jobs.compact_index()
+        if not self.retirement.pending:
+            self.jobs.compact_index()
         self.startup['recovery_seconds']=round(time.monotonic()-phase,4);phase=time.monotonic()
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
         self.asset_cache.reclaim_uploads()
@@ -207,6 +214,7 @@ class Coordinator:
         atomic_json(self.root/'startup-current.json',self.startup)
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
+        self.retirement.start()
 
     def _load_operator_token(self, supplied):
         path = self.root / 'operator.token'
@@ -964,6 +972,8 @@ class Coordinator:
                     raise Conflict("Scheduler is stopping")
                 if self.job_observed(identity):
                     raise Conflict('Job ID already belongs to an external observation')
+                if identity in self.jobs.deleted:
+                    raise Conflict('Job transport has already been retired')
                 existing = identity in self.jobs
             if existing:
                 job = load_job(self.jobs, self.condition, identity)
@@ -1496,8 +1506,13 @@ class Coordinator:
             submitting=False
             try:
                 with self._asset_handoff(node,identity,job['task']['assets'].values(),enabled=bool(job['task']['assets'])):
-                    self._ensure_assets(node, job['task']['assets'].values(), force=force,
-                                        cancel=None if uncertain else job['cancel'].is_set)
+                    started = time.monotonic()
+                    try:
+                        self._ensure_assets(node, job['task']['assets'].values(), force=force,
+                                            cancel=None if uncertain else job['cancel'].is_set)
+                    finally:
+                        job['result']['asset_preparation_seconds'] = (
+                            job['result'].get('asset_preparation_seconds', 0.0) + time.monotonic() - started)
                     if not uncertain and job['cancel'].is_set():return False
                     if not uncertain:
                         if not self._pace_submission(job):return False
@@ -2453,40 +2468,45 @@ class Coordinator:
             files["result.json"] = json_bytes(self.public_result(result) if public else result)
             return pack(files)
 
-    def delete(self, identity):
-        job = load_job(self.jobs, self.condition, identity)
-        with self.condition:
-            if job["result"]["status"] not in TERMINAL:
-                raise Conflict("Cancel and wait before deleting the job")
+    def _retirement_record(self, job):
+        result = job['result']
+        targets = []
+        if not (result.get('rejected_before_submit') or result.get('cancelled_before_submit')):
             client = self._client(job)
-            if job['result'].get('rejected_before_submit'):client=None
-            result_lock=job.setdefault('artifact_lock',threading.RLock())
-        with result_lock:
-            with self.condition:
-                if self.jobs.get(identity) is not job:
-                    return {"deleted": identity}
-            if client:
+            url = client.url if client is not None else result.get('worker_url')
+            if url or result.get('assigned_node'):
+                targets.append(dict(url=url, node=result.get('assigned_node'),
+                    id=job.get('worker_id') or result.get('worker_id') or result['id'],
+                    cancel=bool(result.get('remote_cancel_pending'))))
+        targets.extend(dict(url=attempt['worker_url'], id=attempt['worker_id'])
+                       for attempt in result.get('attempts', ())
+                       if attempt.get('artifact') and attempt.get('worker_url') and attempt.get('worker_id'))
+        return dict(targets=targets)
+
+    def _reclaim_retired(self, identity, record):
+        with self.jobs.record_lock(identity):
+            remove_owned(self.root / 'jobs' / identity)
+            for target in record['targets']:
+                if self.retirement.stopping:
+                    raise InterruptedError('Retirement resumes on next startup')
+                node = next((n for n in self.pool.nodes if n.client.url == target.get('url')
+                             or n.name == target.get('node') or target.get('node') in n.aliases), None)
+                if node is None or node.error or node.detached:
+                    raise OSError('Retirement provider temporarily unavailable')
                 try:
-                    if job['result'].get('remote_cancel_pending'):
-                        client.cancel(job.get('worker_id',job['result'].get('worker_id',identity)))
-                    client.delete(job.get('worker_id',job['result'].get('worker_id',identity)))
+                    if target.get('cancel'):
+                        node.client.cancel(target['id'])
+                    node.client.delete(target['id'])
                 except RemoteError as error:
-                    if getattr(error, 'status_code', None) != 404:
-                        raise
-            for attempt in job['result'].get('attempts',()):
-                source=next((n.client for n in self.pool.nodes if n.client.url==attempt.get('worker_url')),None)
-                if source is not None and attempt.get('artifact'):
-                    try:source.delete(attempt['worker_id'])
-                    except RemoteError as error:
-                        if getattr(error,'status_code',None)!=404:raise
-            # The per-ID lock fences collection and deletion. Recursive disk
-            # cleanup must leave other jobs' status, leases and files flowing.
-            remove_owned(job["directory"])
+                    if error.status_code != 404:
+                        raise OSError(str(error)) from error
             with self.condition:
-                job['retired']=True
-                del self.jobs[identity]
+                self.jobs.record_retired(identity)
         self._prune_assets()
-        return {"deleted": identity}
+
+    def delete(self, identity):
+        with self.submission_lock.hold(identity):
+            return retire_job(self, identity, describe=self._retirement_record)
 
     def clean(self):
         from .operations import clean_pending
@@ -2568,6 +2588,7 @@ class Coordinator:
         self.observation_executor.shutdown(wait=True, cancel_futures=True)
         for thread in list(self.threads):
             thread.join()
+        self.retirement.close()
         self.asset_handoffs.clear()
         self._prune_assets(recent=False)
         self.root_lock.close()

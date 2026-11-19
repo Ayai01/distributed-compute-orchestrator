@@ -1,5 +1,7 @@
 # DCO 当前状态
 
+2026-11-19（PST），**1.0.10** 源码已完成准备期、固定内存和异步退休的定向验收。生产中心仍运行 **1.0.8**，本次核对有 45 个核在用，生产切换待在途工作排空。
+
 2026-11-18 晚（PST），中心、终端与 19 台 worker 均运行 **1.0.8**，全部在线接单。总预算 **591 核／约 1345 GiB**，空闲采样可用 **591 核／约 1218 GiB**。实时容量由 `admission(activity=True)` 返回。[中心](../.local/migration/dco-108-production-current.json) · [滚动更新](../.local/migration/dco-108-remote-rollout-current.json)
 
 | 能力 | 可用核数 |
