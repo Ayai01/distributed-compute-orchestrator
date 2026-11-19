@@ -35,6 +35,7 @@ from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, servi
                         DEFAULT_MEMORY_RESERVE_MB, DEFAULT_MEMORY_HEADROOM_MB,
                         cpu_capacity as host_cpu_capacity)
 from .telemetry import Activity
+from .network import local_node_ip
 from .progress import sample as sample_progress, diagnose
 from .client import RemoteError
 from .cleanup import AssetCache, Reclaimer, remove_owned
@@ -334,6 +335,7 @@ class Worker:
         self.benchmark_thread = None
         self.architecture = native_architecture(os.uname().machine if hasattr(os,'uname')
             else os.environ.get('PROCESSOR_ARCHITEW6432') or os.environ.get('PROCESSOR_ARCHITECTURE'))
+        self.node_ip = local_node_ip()
         (self.root / "jobs").mkdir(exist_ok=True)
         (self.root / "assets").mkdir(exist_ok=True)
         shared_assets = os.environ.get('DCO_SHARED_ASSET_CACHE', self.env.get('DCO_SHARED_ASSET_CACHE'))
@@ -413,6 +415,7 @@ class Worker:
             resources = self._memory_state()
             disk = shutil.disk_usage(self.root)
             value = {**identity, "platform": sys.platform, "architecture": self.architecture,
+                    "node_ip": self.node_ip,
                     "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
                     "cpus": self._cpu_capacity(resources), "base_cpus":self.capacity,
                     "cpu_overcommit_factor":self.cpu_overcommit_factor,

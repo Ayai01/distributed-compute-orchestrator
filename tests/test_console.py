@@ -945,7 +945,7 @@ class ConsoleTests(unittest.TestCase):
         nodes[19]['active_jobs'] = [dict(id='68fc'+'a'*28, status='running', label='RTL', cpus=4)]
         nodes[0]['tags'] += ['ml','cuda','layout','onnx']
         nodes[0].update(cpu_percent=12.6,url='http://192.0.2.11:26133')
-        nodes[1].update(cpu_percent=0,node='school-worker',url='http://127.0.0.1:27141')
+        nodes[1].update(cpu_percent=0,node='school-worker',node_ip='10.96.4.15',url='http://127.0.0.1:27141')
         status = StatusRows(dict(role='scheduler',node='center',version=__version__,nodes=nodes),width=204,viewport=True)
         displayed = _layout(status, ['task accepted'], ['ping succeeded'], 60, reserved=5)
         text = '\n'.join(displayed)
@@ -966,25 +966,30 @@ class ConsoleTests(unittest.TestCase):
         status.resize(159)
         rows=_layout(status,['task accepted'],['ping succeeded'],50,reserved=5)
         self.assertEqual(status.device_page_count,1)
-        for header in ('CPU%','内存用/总 GiB','IP/入口','能力'):
+        for header in ('CPU%','内存用/总 GiB','节点 IP','中转入口','能力'):
             self.assertIn(header,rows[3])
         direct=next(row for row in rows if 'node-00' in row)
         relay=next(row for row in rows if 'node-01' in row)
         for value in ('12.6%','4.0/64.0','192.0.2.11','ng47 Chisel ML CUDA Layout RTL ONNX'):
             self.assertIn(value,direct)
-        self.assertIn('中转 127.0.0.1:27141',relay)
+        self.assertEqual([cell.strip() for cell in relay.split('|')[6:8]],['10.96.4.15','127.0.0.1:27141'])
         self.assertIn('0.0%',relay)
 
     def test_narrow_overview_keeps_cpu_memory_address_and_capabilities(self):
         from remote_compute.view import StatusRows
         value=dict(role='scheduler',node='center',nodes=[
-            dict(name='school',node='school-worker',cpu_percent=9.5,tags=['chisel','rtl'],
+            dict(name='school',node='school-worker',node_ip='10.96.4.15',cpu_percent=9.5,tags=['chisel','rtl'],
                  memory_total_mb=65536,host_memory_available_mb=32768,url='http://127.0.0.1:27141')
         ])
         view=StatusRows(value,width=64,viewport=True)
         text='\n'.join(view.fit(25))
-        for value in ('CPU% 9.5%','内存用/总 GiB 32.0/64.0','中转 127.0.0.1:27141','Chisel RTL'):
+        for value in ('CPU% 9.5%','内存用/总 GiB 32.0/64.0','节点 IP 10.96.4.15','中转入口 127.0.0.1:27141','Chisel RTL'):
             self.assertIn(value,text)
+
+    def test_overview_keeps_unknown_worker_ip_separate_from_relay(self):
+        from remote_compute.view import _node_addresses
+        worker = dict(node='school-worker',url='http://127.0.0.1:27141')
+        self.assertEqual(_node_addresses(worker,center_host='center'),('-', '127.0.0.1:27141'))
 
     def test_release_tag_matches_the_versioned_runtime(self):
         from pathlib import Path

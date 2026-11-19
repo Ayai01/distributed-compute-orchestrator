@@ -866,8 +866,8 @@ class SchedulerShell(Shell):
                     node['bulk_limit']=bulk_limit
                 if row.get('display_name') and row['display_name']!=row['name']:
                     node['display_name']=row['display_name']
-                for key in ('ca_file','aliases','reconnect','relay_url','peer_id','architecture'):
-                    setting = row.get(key, saved.get(key) if key in ('relay_url','peer_id','architecture') else None)
+                for key in ('ca_file','aliases','reconnect','relay_url','peer_id','architecture','node_ip_observation'):
+                    setting = row.get(key, saved.get(key) if key in ('relay_url','peer_id','architecture','node_ip_observation') else None)
                     if setting:node[key]=setting
                 token = tokens.get(row["url"], saved.get('token', ''))
                 if token:

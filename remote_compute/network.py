@@ -6,6 +6,7 @@ DCO device credentials remain required inside these authenticated tunnels.
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,20 @@ from urllib.request import urlopen
 import zipfile
 
 from .bundle import atomic_json
+
+
+def local_node_ip():
+    """Read the kernel's preferred source IP without sending network traffic."""
+    for family, target in ((socket.AF_INET,('192.0.2.1',9)),(socket.AF_INET6,('2001:db8::1',9))):
+        try:
+            with socket.socket(family,socket.SOCK_DGRAM) as probe:
+                probe.connect(target)
+                address = ipaddress.ip_address(probe.getsockname()[0])
+        except OSError:
+            continue
+        if not (address.is_loopback or address.is_unspecified or address.is_link_local):
+            return str(address)
+    return None
 
 
 FRP_VERSION = '0.71.1'

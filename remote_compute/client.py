@@ -1219,6 +1219,7 @@ class Node:
     live_jobs: set = field(default_factory=set)
     memory_holds: dict = field(default_factory=dict)
     host_ip: str = ""
+    node_ip_observation: dict = field(default_factory=dict)
     native_architecture: str | None = None
     aliases: list = field(default_factory=list)
     accelerator_reservations: dict = field(default_factory=dict)
@@ -1401,6 +1402,7 @@ class Pool:
                     raise ValueError('Node bulk_limit must be an integer in 1..7')
                 node.client.bulk_limit=bulk_limit
                 node.host_ip = entry.get("host_ip", "")
+                node.node_ip_observation = entry.get('node_ip_observation') or {}
                 node.native_architecture = entry.get('architecture')
                 node.aliases = entry.get('aliases',[])
                 node.display_name = entry.get('display_name','')
@@ -1471,6 +1473,8 @@ class Pool:
                     node.error = 'Reconnect worker identity differs from the accepted endpoint'
                     return
                 node.last_connected_at=time.monotonic()
+                if previous_name != value.get('node'):
+                    node.health.pop('node_ip',None)
                 node.health={**node.health,**value}
                 for identity,row in list(node.memory_holds.items()):
                     if row.get('after') is not None and probe_started>=row['after']:
@@ -1697,6 +1701,8 @@ class Pool:
                  "detached": n.detached,
                  **({'reconnect': {'attempts': n.reconnect_attempts, 'after': n.reconnect_after}} if n.detached else {}),
                  "host_ip": getattr(n,'host_ip','') or n.health.get('host_ip'),
+                 "node_ip": n.health.get('node_ip') or (
+                     n.node_ip_observation.get('ip') if n.node_ip_observation.get('worker') == n.health.get('node') else None),
                  "timeout": getattr(n.client,'timeout',10),
                  "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),
                  "relay_url":getattr(n.client,'relay_url',None),"peer_id":getattr(n.client,'peer_id',None),

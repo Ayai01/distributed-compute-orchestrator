@@ -1,5 +1,6 @@
 """Cell-aligned terminal tables; one snapshot in, bounded visible rows out."""
 
+import ipaddress
 import logging
 import math
 import re
@@ -177,25 +178,42 @@ def _loopback_route(node, center_host):
     return '本机' if worker_host.casefold()==center_host.casefold() else '本机中转'
 
 
-def _device_address(node, url='', *, center_host=None, show_entry=False):
+def _device_address(node, url='', *, center_host=None):
     address=node.get('url') or url
     if address.startswith('local://'):
-        if show_entry:
-            return node.get('host_ip') or '本机 127.0.0.1'
         return '本机'
     if node.get('host_ip'):
         return node['host_ip']
     if center_host is not None:
         route=_loopback_route(node,center_host)
         if route is not None:
-            if show_entry:
-                label='中转' if route=='本机中转' else route
-                return f"{label} {urlsplit(address).netloc.rsplit('@', 1)[-1]}"
             return route
     host=urlsplit(address).hostname if address else None
     if host in ('127.0.0.1','localhost','::1'):
-        return f'本机 {host}' if show_entry else '本机'
+        return '本机'
     return node.get('host_ip') or (host if host and host not in ('0.0.0.0','::') else '等待连接')
+
+
+def _node_addresses(node, url='', *, center_host=None):
+    """Render the worker interface separately from the configured visitor."""
+    endpoint = urlsplit(node.get('url') or url)
+    relay = urlsplit(node.get('relay_url') or '').netloc
+    loopback = _loopback_route(node,center_host) if center_host is not None else None
+    if loopback in ('本机中转','回环'):
+        relay = endpoint.netloc
+    relay = relay.rsplit('@',1)[-1] or '-'
+    candidates = (node.get('node_ip'),node.get('host_ip'),
+                  endpoint.hostname if endpoint.scheme in ('http','https') and not loopback else None)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not (address.is_loopback or address.is_unspecified):
+            return str(address),relay
+    return '-',relay
 
 
 def _accelerator_summary(node):
@@ -410,6 +428,8 @@ class StatusRows(list):
             if not value.get('accepting',True):self.summary+=' | 停止新增，收齐在途'
         nodes=value.get('nodes',[]) if center else [{**value,'name':value.get('node'),'capacity':value.get('cpus')}]
         self.devices,self.jobs=[],[]
+        center_host=(value.get('node') or '') if center else None
+        own_url='' if center else self.url
         for number,node in enumerate(nodes,1):
             if not self.viewport and not _show_node(node):
                 continue
@@ -437,13 +457,14 @@ class StatusRows(list):
                 score=(f'{single:.3g}/' if single is not None else '-/')+f'{measured:.3g}'
             else:
                 score='-/待依赖' if 'Install NumPy' in benchmark.get('reason','') else '-/待校准'
+            node_ip,relay_entry = _node_addresses(node,own_url,center_host=center_host) if self.viewport else (
+                _device_address(node,own_url,center_host=center_host),'-')
             self.devices.append((node,[name,threads,cpu_percent,memory,
                                        _gb(node.get('memory_available_mb')),
                                        _gb(node.get('rss_mb'))+'/'+_gb(node.get('memory_reserved_mb')),peers,score,
-                                       benchmark.get('threads','-'),_device_address(node,'' if center else self.url,
-                                           center_host=(value.get('node') or '') if center else None, show_entry=self.viewport),
+                                       benchmark.get('threads','-'),node_ip,
                                        number,_accelerator_summary(node),
-                                       node.get('benchmark_state','ready'),_capabilities(node.get('tags'))]))
+                                       node.get('benchmark_state','ready'),_capabilities(node.get('tags')),relay_entry]))
             self.jobs.extend((name,job) for job in node.get('active_jobs') or [])
         self.projects=[]
         if center:
@@ -557,14 +578,14 @@ class StatusRows(list):
     def _fleet(self, limit):
         """Keep the same information in the table and the narrow viewport."""
         width = self.width
-        headers = ['节点','状态','线程','CPU%','内存用/总 GiB','IP/入口','能力']
+        headers = ['节点','状态','线程','CPU%','内存用/总 GiB','节点 IP','中转入口','能力']
         records = []
         for node, record in self.devices:
             state = _node_state(node)
             sampled = state not in ('禁用','失联')
             records.append([f'#{record[10]} {record[0]}',state,record[1].split('(')[0],
                             record[2] if sampled else '-',record[3] if sampled else '-',
-                            record[9],record[13] if sampled else '-'])
+                            record[9],record[14],record[13] if sampled else '-'])
         widths = [max(_width(header),*(_width(item) for item in column))
                   for header,column in zip(headers,zip(*records))] if records else []
         pages = []
@@ -574,9 +595,10 @@ class StatusRows(list):
                 pages.append(_table(headers,records[start:start+size],[*widths[:-1],None],width,right=(2,3,4)))
         else:
             size = max(1,limit-2)
-            for name,state,threads,cpu,memory,address,capabilities in records:
+            for name,state,threads,cpu,memory,address,relay_entry,capabilities in records:
                 identity = f'{name}  {state}  线程 {threads}'
-                fields = [identity,f'CPU% {cpu}  内存用/总 GiB {memory}',f'IP/入口 {address}',f'能力 {capabilities}']
+                fields = [identity,f'CPU% {cpu}  内存用/总 GiB {memory}',
+                          f'节点 IP {address}  中转入口 {relay_entry}',f'能力 {capabilities}']
                 lines = [_line(line,width) for field in fields for line in wrap_lines(field,width-4)]
                 if len(lines) > size and size > 1:
                     heading = _line(name,width)
@@ -685,7 +707,8 @@ class StatusRows(list):
             f'状态 {_node_state(node)} | 任务 {len(node.get("active_jobs") or ())}',
             f'线程 已占/配额(逻辑) {record[1]} | CPU {record[2]} | 基准 单核/整机 {record[7]} Miter/s',
             f'内存 已用/总 {record[3]} | 可派 {record[4]} | 进程/预留 {record[5]} GiB',
-            f'IP {record[9]} | 链路 {route}',
+            (f'节点 IP {record[9]} | 中转入口 {record[14]} | 链路 {route}' if self.viewport
+             else f'IP {record[9]} | 链路 {route}'),
             f'来源 {record[6]} | 加速器 {record[11]}',
             '能力 ' + record[13],
         ]
