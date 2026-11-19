@@ -1786,21 +1786,21 @@ class CenterTests(unittest.TestCase):
         with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, worker):
             with Pool([worker], refresh=60) as pool, center(pool, Path(root)/'center') as (state, client):
                 self.assertNotIn('health_sampled_at', worker.health(display=True))
-                state.display_health_interval = .01
-                captured = client.health(display=True)
-                self.assertFalse(captured['health_stale'])
+                state.display_health_interval = .5
                 self.assertNotIn('health_sampled_at', client.health())
-                time.sleep(.02)
                 for lock in (state.condition, pool.condition):
+                    captured = client.health(display=True)
+                    self.assertFalse(captured['health_stale'])
                     with lock:
+                        _, wall, value = state._display_health_cache
+                        state._display_health_cache = (time.monotonic() - 1, wall, value)
                         display = client.health(display=True)
                         self.assertTrue(display['health_stale'])
                         self.assertEqual(display['health_sampled_at'], captured['health_sampled_at'])
                         self.assertGreater(display['health_age_seconds'], 0)
                         self.assertEqual(display['nodes'], captured['nodes'])
-                fresh = client.health(display=True)
-                self.assertGreater(fresh['health_sampled_at'], captured['health_sampled_at'])
-                self.assertFalse(fresh['health_stale'])
+                    # The queued read progresses even when the viewer doesn't poll again.
+                    until(lambda: state._display_health_cache[1] > captured['health_sampled_at'])
 
     def test_brief_polling_omits_payload_and_wait_returns_full_provenance(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):

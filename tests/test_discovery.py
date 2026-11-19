@@ -351,7 +351,7 @@ class OfflineTests(unittest.TestCase):
                     try:client.delete(identity);break
                     except RemoteError:time.sleep(.02)
                 else:self.fail('original cancellation did not finish after reconnect')
-                self.assertFalse(worker.jobs)
+                until(lambda: not worker.jobs, seconds=12)
 
     def test_restored_offline_original_keeps_health_and_cancels_before_reattachment(self):
         from test_center import center

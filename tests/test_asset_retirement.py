@@ -20,7 +20,7 @@ class AssetRetirementTests(unittest.TestCase):
                 client.wait(identity);worker.jobs.recent.clear()
                 self.assertEqual(client.fetch(identity,delete=False)['stdout'].strip(),'done')
                 with self.assertRaises(RemoteError)as denied:
-                    Client(client.url,operator=False).control(retire_asset=asset)
+                    Client(client.url, client.token, operator=False).control(retire_asset=asset)
                 self.assertEqual(denied.exception.status_code,403)
                 for call in (lambda:client.control(retire_asset=asset),
                              lambda:client.control(node=pool.nodes[0].name,worker={'retire_asset':asset})):
@@ -32,6 +32,7 @@ class AssetRetirementTests(unittest.TestCase):
                 self.assertNotIn(asset,state.legacy_assets)
                 self.assertFalse((state.root/'assets'/(asset+'.zip')).exists())
                 self.assertTrue((state.root/'assets'/(other+'.zip')).is_file())
+                until(lambda: identity not in worker.jobs)
                 reply=client.control(node=pool.nodes[0].name,worker={'retire_asset':asset})
                 self.assertTrue(reply['retired']);self.assertEqual(reply['bytes'],len(b'closed input'))
                 self.assertFalse((worker.root/'assets'/asset).exists())

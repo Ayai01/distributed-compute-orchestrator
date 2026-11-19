@@ -134,7 +134,7 @@ class _ConnectionPool:
         def eligible(kind):
             if kind == 'short_job':
                 return self.available > 1 and not getattr(self, 'short_job_active', False)
-            return not kind or self.bulk_active < getattr(self, 'bulk_limit', 7)
+            return not kind or self.available > 1 and self.bulk_active < getattr(self, 'bulk_limit', 7)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
             self.waiting.append(ticket)
@@ -294,7 +294,7 @@ class Client:
         # A near-ready task can acquire its pins, look up assets and send a
         # small missing archive without waiting for a multi-MB result stream.
         # _request still charges the shared byte budget for these uploads.
-        short_job = (paced and not artifact_get and not retirement and limit <= 2
+        short_job = (paced and not artifact_get and not retirement
                      and _short_dispatch_request(path, data, method))
         bulk = bulk and not short_job
         if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, short_job=short_job, cancel=cancel):
@@ -476,7 +476,7 @@ class Client:
                     etag=response.getheader('ETag') if response.getheader('Accept-Ranges')=='bytes' else None
                     if _output is not None:
                         self.connections.etag=etag
-                    download_budget = bulk_budget if binary_download and (
+                    download_budget = bulk_budget.download if bulk_budget is not None and binary_download and (
                         continued or response.length is None or response.length >= MIN_BULK_BYTES) else None
                     chunk_size = MIN_BULK_BYTES if download_budget is not None else 128 * 1024
                     while True:

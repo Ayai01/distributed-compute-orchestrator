@@ -39,7 +39,7 @@ from .telemetry import Activity
 from .network import local_node_ip
 from .progress import sample as sample_progress, diagnose
 from .client import RemoteError
-from .cleanup import AssetCache, Reclaimer, TransportRetirement, remove_owned, retire_job
+from .cleanup import ASSET_CACHE_BYTES, AssetCache, AssetMaintenance, Reclaimer, TransportRetirement, remove_owned, retire_job
 from .shared_assets import SharedAssets
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .compat import unlink
@@ -400,10 +400,11 @@ class Worker:
                     self.temp_reclaimer.defer(path)
         self.startup['recovery_seconds']=round(time.monotonic()-phase,4)
         phase=time.monotonic()
-        cache_mib = int(self.env.get('DCO_ASSET_CACHE_MIB', 512))
+        cache_mib = int(self.env.get('DCO_ASSET_CACHE_MIB', ASSET_CACHE_BYTES // 1024**2))
         if cache_mib <= 0:
             raise ValueError('DCO_ASSET_CACHE_MIB must be positive')
-        self.asset_cache = AssetCache(self.root / 'assets', limit=cache_mib * 1024**2)
+        self.asset_cache = AssetCache(self.root / 'assets',
+                                      limit=min(cache_mib * 1024**2, ASSET_CACHE_BYTES))
         self.asset_cache.reclaim_uploads()
         self._prune_assets()
         self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
@@ -414,6 +415,7 @@ class Worker:
         self.memory_watchdog.start()
         self.scheduler.start()
         self.retirement.start()
+        self.asset_maintenance = AssetMaintenance(self._maintain_assets, self._report_asset_cleanup)
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
@@ -1457,21 +1459,35 @@ class Worker:
             if not job['result'].get('cleanup_error'):
                 self.cleanup_pending.discard(job['result']['id'])
 
-    def _prune_assets(self, *, recent=True):
+    def _protected_assets(self, *, recent=True):
         # A check/upload and the following submit are separate LAN requests.
-        # Keep their short handoff intact even if active assets exceed the LRU target.
+        with self.condition:
+            now = time.time()
+            protected = {identity for identity, (_size, used) in self.asset_cache.entries.items()
+                         if recent and now-used<5}
+            deadline = time.monotonic()
+            for identity, (assets, expires) in tuple(self.asset_handoffs.items()):
+                if deadline >= expires:
+                    self.asset_handoffs.pop(identity, None)
+                else:
+                    protected.update(assets)
+            protected.update(asset_references(self.jobs))
+            return protected
+
+    def _report_asset_cleanup(self, error):
+        self.activity.notify('资产缓存待清理 ' + error, 'local')
+
+    def _prune_assets(self, *, recent=True):
         with self.asset_cache.lock:
-            with self.condition:
-                now = time.time()
-                protected = {identity for identity, (_size, used) in self.asset_cache.entries.items() if recent and now-used<5}
-                for identity,(assets,expires) in tuple(self.asset_handoffs.items()):
-                    if time.monotonic()>=expires:
-                        self.asset_handoffs.pop(identity,None)
-                    else:
-                        protected.update(assets)
-                protected.update(asset_references(self.jobs))
+            protected = self._protected_assets(recent=recent)
             for error in self.asset_cache.prune(protected):
-                self.activity.notify('资产缓存待清理 '+error, 'local')
+                self._report_asset_cleanup(error)
+
+    def _maintain_assets(self):
+        self._prune_assets()
+        if self.shared_assets is not None:
+            for error in self.shared_assets.prune():
+                self._report_asset_cleanup(error)
 
     def _temporary(self, job):
         base=getattr(self,'temp_root',None)
@@ -1662,14 +1678,18 @@ class Worker:
                 if payload is None:
                     with self.asset_cache.lock:
                         return published()
-            if hashlib.sha256(payload).hexdigest() != identity:
+            if not from_shared and hashlib.sha256(payload).hexdigest() != identity:
                 raise ValueError("Asset digest does not match bundle")
             temporary = directory.with_suffix(".upload")
             try:
                 temporary.mkdir(exist_ok=True)
                 unpack(payload, temporary)
                 if self.shared_assets is not None and not from_shared:
-                    self.shared_assets.publish(identity, payload)
+                    try:
+                        self.shared_assets.publish(identity, payload)
+                    except OSError as error:
+                        # The local immutable copy is sufficient for this job.
+                        self._report_asset_cleanup(str(error))
                 with self.asset_cache.lock:
                     if self.stopping:
                         raise Conflict('Worker is stopping')
@@ -1687,6 +1707,7 @@ class Worker:
         for identity, _job in pending:
             self.cancel(identity)
         self.scheduler.join()
+        self.asset_maintenance.close()
         self.pressure_stop.set()
         self.memory_watchdog.join()
         for thread in list(self.threads):

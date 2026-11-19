@@ -1,8 +1,8 @@
 # DCO 当前状态
 
-2026-11-19（PST），中心运行 **1.0.12**，18 台 worker 在线，学校代表节点已运行 **1.0.15**。中心采样容量为 **671 核**，随节点分配浮动。实时可用量由 `admission(activity=True)` 返回。[学校逐台版本](../.local/migration/school-runtime-1015-rollout.json)
+2026-11-19（PST），18 台 worker 在线。生产中心仍是 **1.0.12** 进程，已在线应用 **1.0.16** 的中转、缓存和面板修复。在途原任务继续运行。实时用量由 `admission(activity=True)` 返回。[生产回执](../.local/migration/relay-cache-1016/online-policy.json)
 
-106 项定向回归通过。学校节点的精确四核 SDK 执行、结果领取和 SPICE 分压仿真均成功。固定内存保持整任务标量报价，实测工作集与已授予预算分别记账。新节点的源码包指针已更新到 1.0.15。[源码包](../.local/migration/school-cpu-source-current.json)
+学校节点的精确四核 SDK 执行、结果领取和 SPICE 分压仿真均成功。固定内存保持整任务标量报价，实测工作集与已授予预算分别记账。[新节点源码包](../.local/migration/school-cpu-source-current.json)
 
 | 能力 | 采样容量（核） |
 | --- | ---: |
@@ -20,6 +20,6 @@
 
 **运行时验收**。13 台学校 ARM64 worker 共享已验收的 ONNX INT8 环境和 FIR 原生载体。冻结 YOLO 与已付结果一致。两台学校节点的 FIR 28 条控制和 40 项检查与 Windows 结果逐条一致。原 ID、费用与结果已保存。[学校 YOLO](../.local/migration/school-arm64-yolo-acceptance.json) · [ARM64 FIR](../.local/migration/school-arm64-fir-20261119.json) · [x86-64 验收](../.local/migration/runtime-workloads-20261119.json)
 
-**中转**。学校大包共用 384 KiB/s 的 DCO 预算，各节点普通大包连接限 1 条。完整资产冷发时，Orbit 的资产准备中位数为 266.1 秒。使用单点资产投影并命中共享缓存后，26 个学校 Conv-Pool／RV32I 续验从中心提交到开始计算为 0.21–1.05 秒。当前学校 ARH 请求包抽样中位数为 18.6 KB。[传输回执](../.local/migration/arh-device-matrix-20261119/transport-current.json)
+**中转与缓存**。学校上传和下载各设 768 KiB/s，上限相互独立。每台学校 worker 有三条普通大包连接、独立短派发和结果通道。资产缓存每十分钟检查，按七天未命中和 64 GiB 回收。一次实际 SPICE 冷发 1.1 KB 输入，算力端生成等价的 246 KB 网表，两个节点均返回相同结果。[冷启动与复用](../.local/migration/relay-cache-1016/native-cache-proof.json) · [本机盘点](../.local/migration/relay-cache-1016/disk-before.json)
 
-**版本上线**。`v1.0.15` 包含能力自检、ARM64 ELF 和任务目录权限修复。其余进程保留在途科研任务，待结清后滚动切换。普通凭据仍由工程共用，跨工程原 ID 隔离需按工程发放独立凭据。
+**面板**。弹性资源调整持续占用调度锁时，面板继续显示最近快照并排队刷新。生产修复后 6.3 秒内读到四个新样本，中心 PID 保持一致。[面板回执](../.local/migration/relay-cache-1016/view-after.json)

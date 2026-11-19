@@ -162,6 +162,7 @@ class CleanupTests(unittest.TestCase):
                 receipt=client.wait(identity)
                 job=state.jobs[identity]
                 client.fetch(identity)
+                until(lambda: not job['directory'].exists())
                 with state.condition:
                     state._update(job,receipt)
                     state._save(job)
@@ -191,7 +192,8 @@ class CleanupTests(unittest.TestCase):
                 client.release_assets(two)
                 self.assertTrue((state.root/'assets'/(asset+'.zip')).is_file(), 'Uncollected receipt owns its input')
                 self.assertEqual(client.fetch(two)['stdout'].strip(), 'original immutable input')
-                self.assertFalse((state.root/'assets'/(asset+'.zip')).exists())
+                until(lambda: (state.asset_cache.snapshot()['bytes'] == 0 and
+                               not (state.root/'assets'/(asset+'.zip')).exists()))
                 self.assertEqual(state.asset_cache.snapshot()['bytes'], 0)
 
     def test_abandoned_center_preparation_releases_or_expires_without_a_task(self):
@@ -296,7 +298,7 @@ class CleanupTests(unittest.TestCase):
                 work=worker.root/'jobs'/identity/'input'
                 self.assertEqual(sorted(p.relative_to(work).as_posix() for p in work.rglob('*')), ['metrics.json'])
                 self.assertEqual(client.fetch(identity)['files']['metrics.json'],b'{"value":7}')
-                self.assertFalse(work.parent.exists())
+                until(lambda: not work.parent.exists())
 
     def test_queue_cancellation_returns_without_scanning_inputs_and_delete_reclaims_them(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (worker, client):
@@ -306,7 +308,7 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(client.cancel(second)['status'],'cancelled')
             self.assertTrue((worker.root/'jobs'/second/'input'/'raw.bin').is_file())
             client.fetch(second)
-            self.assertFalse((worker.root/'jobs'/second).exists())
+            until(lambda: not (worker.root/'jobs'/second).exists())
             client.cancel(first);client.wait(first);client.fetch(first)
 
     def test_worker_lru_protects_uncollected_result_assets_and_center_restores_evicted_source(self):
@@ -326,6 +328,7 @@ class CleanupTests(unittest.TestCase):
                 self.assertTrue((worker.root/'assets'/first).exists())
                 self.assertTrue((worker.root/'assets'/second).exists())
                 client.fetch(one)
+                until(lambda: one not in worker.jobs and two not in worker.jobs)
                 with patch('remote_compute.worker.time.time',return_value=time.time()+60),worker.condition:
                     worker._prune_assets()
                 self.assertFalse((worker.root/'assets'/first).exists())
@@ -346,7 +349,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_recent_asset_survives_collection_between_upload_and_submit(self):
         with scratch() as directory, provider(Path(directory)/'worker',cpus=2) as (worker,client):
-            worker.asset_cache.limit=100
+            worker.asset_cache.limit=240
             active=client.sync_files({'data':b'a'*160})
             first=client.submit(python("import time;time.sleep(20)",assets={'data':active}))['id']
             until(lambda:client.status(first)['status']=='running')
@@ -403,6 +406,7 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(len(attempts),1)
                 self.assertEqual(sorted(uploads),sorted([source,model]))
                 self.assertEqual(client.fetch(identity)['stdout'].strip(),'sourcemodel')
+                until(lambda: identity not in worker.jobs)
                 self.assertFalse(worker.asset_handoffs)
                 with worker.condition:
                     for key,(size,_used) in tuple(worker.asset_cache.entries.items()):

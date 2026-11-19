@@ -7,10 +7,11 @@ import time
 
 
 MIN_BULK_BYTES = 64 * 1024
+RELAY_BULK_CONFIG = Path(__file__).resolve().parent.parent / '.local/relay-bulk.json'
 
 
 class RelayBulkBudget:
-    def __init__(self, ports, bytes_per_second):
+    def __init__(self, ports, bytes_per_second, *, download_bytes_per_second=None):
         if (not isinstance(ports, list) or not ports
                 or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)):
             raise ValueError('Relay bulk ports must be a nonempty list of TCP port numbers')
@@ -25,6 +26,10 @@ class RelayBulkBudget:
         self._next = 0.0
         self._paced_bytes = 0
         self._paced_chunks = 0
+        # Old configurations keep their combined budget. New ones can use
+        # the capacity of both directions of a full-duplex relay.
+        self.download = (self if download_bytes_per_second is None else
+                         RelayBulkBudget(ports, download_bytes_per_second))
 
     def matches(self, endpoint):
         return (endpoint.scheme == 'http' and endpoint.netloc in self._authorities and not endpoint.path.rstrip('/')
@@ -64,12 +69,19 @@ class RelayBulkBudget:
 
     def snapshot(self):
         with self._lock:
-            return {'bytes_per_second': self.bytes_per_second,
-                    'paced_bytes': self._paced_bytes, 'paced_chunks': self._paced_chunks}
+            state = {'bytes_per_second': self.bytes_per_second,
+                     'paced_bytes': self._paced_bytes, 'paced_chunks': self._paced_chunks}
+        if self.download is not self:
+            incoming = self.download.snapshot()
+            state.update(download_bytes_per_second=incoming['bytes_per_second'],
+                         upload_paced_bytes=state['paced_bytes'], download_paced_bytes=incoming['paced_bytes'])
+            state['paced_bytes'] += incoming['paced_bytes']
+            state['paced_chunks'] += incoming['paced_chunks']
+        return state
 
 
 def load_relay_bulk_budget(path=None):
-    path = Path(path) if path is not None else Path(__file__).resolve().parent.parent / '.local/relay-bulk.json'
+    path = Path(path) if path is not None else RELAY_BULK_CONFIG
     try:
         raw = path.read_text(encoding='utf-8-sig')
     except FileNotFoundError:

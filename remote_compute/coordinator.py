@@ -28,7 +28,7 @@ from .allocation import weighted_node_threads, plan_resize, elastic_cpus
 from .memory import plan_memory, startup_memory, same_phase
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
-from .cleanup import AssetCache, TransportRetirement, remove_owned, retire_job
+from .cleanup import AssetCache, AssetMaintenance, TransportRetirement, prune_asset_caches, remove_owned, retire_job
 from .acceptance import SubmissionAssets, SubmissionLocks
 from .records import Job, JobRecords, active_items, active_values, archive_job, asset_references, load_job
 from .observations import Observations, observation_batch, terminal_observation
@@ -207,14 +207,17 @@ class Coordinator:
             self.jobs.compact_index()
         self.startup['recovery_seconds']=round(time.monotonic()-phase,4);phase=time.monotonic()
         self.asset_cache = AssetCache(self.root / 'assets', archives=True)
+        self.local_asset_workers = tuple(dict.fromkeys(worker for node in self.pool.nodes
+                                                       if (worker := getattr(node.client, 'worker', None)) is not None))
         self.asset_cache.reclaim_uploads()
-        self._prune_assets()
+        self._maintain_assets()
         self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
                             seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
         atomic_json(self.root/'startup-current.json',self.startup)
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
         self.retirement.start()
+        self.asset_maintenance = AssetMaintenance(self._maintain_assets, self._report_asset_cleanup)
 
     def _load_operator_token(self, supplied):
         path = self.root / 'operator.token'
@@ -512,26 +515,48 @@ class Coordinator:
             return self._health()
 
     def _display_health(self):
-        """Let monitors read the last sample while scheduling owns either lock."""
+        """Keep the display responsive and queue a fresh sample when busy."""
         cached = getattr(self, '_display_health_cache', None)
         if cached is None or time.monotonic() - cached[0] >= self.display_health_interval:
-            if self.condition.acquire(blocking=cached is None):
+            refresh = vars(self).setdefault('_display_health_refresh', threading.Lock())
+            if refresh.acquire(blocking=cached is None):
+                handoff = False
                 try:
-                    latest = getattr(self, '_display_health_cache', None)
-                    if latest is not cached:
-                        cached = latest
-                    elif self.pool.condition.acquire(blocking=cached is None):
-                        try:
-                            value = deepcopy(self._health())
-                            cached = self._display_health_cache = (time.monotonic(), time.time(), value)
-                        finally:
-                            self.pool.condition.release()
+                    if getattr(self, '_display_health_cache', None) is cached and (
+                            not self._capture_display_health(wait=cached is None)):
+                        threading.Thread(target=self._finish_display_refresh, args=(refresh,),
+                                         name='dco-display-refresh', daemon=True).start()
+                        handoff = True
                 finally:
-                    self.condition.release()
-        sampled, wall, value = cached
+                    if not handoff:
+                        refresh.release()
+        sampled, wall, value = self._display_health_cache
         age = time.monotonic() - sampled
         return dict(value, health_sampled_at=wall, health_age_seconds=round(age, 3),
                     health_stale=age >= self.display_health_interval)
+
+    def _capture_display_health(self, *, wait):
+        if not self.condition.acquire(blocking=wait):
+            return False
+        try:
+            if not self.pool.condition.acquire(blocking=wait):
+                return False
+            try:
+                value = deepcopy(self._health())
+                self._display_health_cache = (time.monotonic(), time.time(), value)
+                return True
+            finally:
+                self.pool.condition.release()
+        finally:
+            self.condition.release()
+
+    def _finish_display_refresh(self, refresh):
+        try:
+            self._capture_display_health(wait=True)
+        except Exception as error:
+            self.activity.notify('面板采样失败 ' + str(error), 'local')
+        finally:
+            refresh.release()
 
     def capabilities(self, *, platform=None, operator=False):
         """Return the scheduler's aggregate project-facing capability view.
@@ -685,6 +710,7 @@ class Coordinator:
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
+                    'relay_bulk': (transport._RELAY_BULK_BUDGET.snapshot() if transport._RELAY_BULK_BUDGET else None),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
                                      + sum(row['status'] in TERMINAL for row in observation_rows.values()),
@@ -758,6 +784,17 @@ class Coordinator:
     def control(self, changes):
         if isinstance(changes, dict) and set(changes) == {'observations'}:
             return self.observe(changes['observations'])
+        if isinstance(changes, dict) and set(changes) == {'relay_bulk'}:
+            from .relay_bulk import RELAY_BULK_CONFIG, RelayBulkBudget
+            config = changes['relay_bulk']
+            if not isinstance(config, dict) or not {'ports', 'bytes_per_second'} <= config.keys() or (
+                    config.keys() - {'ports', 'bytes_per_second', 'download_bytes_per_second'}):
+                raise ValueError('Relay bulk control requires ports and validated byte rates')
+            budget = RelayBulkBudget(**config)
+            with self.condition:
+                atomic_json(RELAY_BULK_CONFIG, config)
+                transport._RELAY_BULK_BUDGET = budget
+            return budget.snapshot()
         if isinstance(changes,dict)and set(changes)=={'retire_asset'}:
             return retire_asset(self,changes['retire_asset'])
         if isinstance(changes,dict)and 'job'in changes:
@@ -2514,22 +2551,39 @@ class Coordinator:
         from .operations import clean_pending
         return clean_pending(self)
 
+    def _protected_assets(self, *, recent=True):
+        with self.condition:
+            # Compatibility clients without an original ID have the same
+            # preparation window as an explicit handoff, instead of pinning forever.
+            now = time.time()
+            protected = {asset for asset in self.legacy_assets
+                         if recent and now - self.asset_cache.entries.get(asset, (0, 0))[1] < 3600}
+            self.legacy_assets.intersection_update(protected)
+            deadline = time.monotonic()
+            for identity, (assets, expires) in tuple(self.asset_handoffs.items()):
+                if deadline >= expires:
+                    self.asset_handoffs.pop(identity, None)
+                else:
+                    protected.update(assets)
+            protected.update(asset_references(self.jobs))
+            protected.update(self.accepting_assets)
+            return protected
+
+    def _report_asset_cleanup(self, error):
+        self.activity.notify('资产缓存待清理 ' + error, 'local')
+
     def _prune_assets(self, *, recent=True):
         with self.asset_cache.lock:
-            with self.condition:
-                # Legacy callers have no producer identity. Keep their uploads
-                # until shutdown; an arbitrary delay is not a transfer of ownership.
-                protected = set(self.legacy_assets) if recent else set()
-                now = time.monotonic()
-                for identity, (assets, expires) in tuple(self.asset_handoffs.items()):
-                    if now >= expires:
-                        self.asset_handoffs.pop(identity, None)
-                    else:
-                        protected.update(assets)
-                protected.update(asset_references(self.jobs))
-                protected.update(self.accepting_assets)
+            protected = self._protected_assets(recent=recent)
             for error in self.asset_cache.prune(protected):
-                self.activity.notify('资产缓存待清理 '+error, 'local')
+                self._report_asset_cleanup(error)
+
+    def _maintain_assets(self):
+        if not self.local_asset_workers:
+            self._prune_assets()
+            return
+        for error in prune_asset_caches((self, *self.local_asset_workers)):
+            self._report_asset_cleanup(error)
 
     def asset_handoff(self, identity, assets=None):
         # The same original-ID handoff is understood by center and worker.
@@ -2587,10 +2641,12 @@ class Coordinator:
                 self.cancel(identity)
             self.condition.notify_all()
         self.scheduler.join()
+        self.asset_maintenance.close()
         self.observation_executor.shutdown(wait=True, cancel_futures=True)
         for thread in list(self.threads):
             thread.join()
         self.retirement.close()
         self.asset_handoffs.clear()
         self._prune_assets(recent=False)
+        self.asset_cache.reclaimer.close()
         self.root_lock.close()

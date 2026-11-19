@@ -1,5 +1,6 @@
 """Reclaim owned job files and bounded, reconstructible worker assets."""
 
+from contextlib import ExitStack
 import os
 import json
 import heapq
@@ -12,6 +13,63 @@ import time
 import uuid
 from .bundle import TERMINAL, atomic_json, native_path
 from .acceptance import SubmissionLocks
+
+
+ASSET_CACHE_BYTES = 64 * 1024**3
+ASSET_CACHE_IDLE_SECONDS = 7 * 24 * 3600
+ASSET_SWEEP_SECONDS = 600
+
+
+class AssetMaintenance:
+    """Run owned cache cleanup outside scheduling and HTTP request threads."""
+
+    def __init__(self, sweep, report_error, *, interval=ASSET_SWEEP_SECONDS):
+        self.stop = threading.Event()
+
+        def run():
+            while not self.stop.wait(interval):
+                try:
+                    sweep()
+                except (OSError, ValueError) as error:
+                    report_error(str(error))
+
+        self.thread = threading.Thread(target=run, name='dco-asset-maintenance', daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+
+
+def evict_unused(entries, protected, limit, max_idle, discard, *, now):
+    """Remove expired entries first, then the least recently hit until within budget."""
+    total = sum(size for size, _ in entries.values())
+    errors = []
+    for key in sorted(entries.keys() - protected, key=lambda key: entries[key][1]):
+        size, used = entries[key]
+        if now - used <= max_idle and total <= limit:
+            break
+        try:
+            if discard(key) is not False:
+                total -= size
+        except OSError as error:
+            errors.append(str(error))
+    return errors
+
+
+def prune_asset_caches(owners):
+    """Apply one quota to DCO asset stores owned by the same hybrid service."""
+    caches = [owner.asset_cache for owner in owners]
+    with ExitStack() as locks:
+        for cache in caches:
+            locks.enter_context(cache.lock)
+        entries, protected = {}, set()
+        for owner, cache in zip(owners, caches):
+            entries.update({(cache, key): value for key, value in cache.entries.items()})
+            protected.update((cache, key) for key in owner._protected_assets())
+        return evict_unused(entries, protected, caches[0].limit,
+                            caches[0].max_idle, lambda item: item[0].retire(item[1]),
+                            now=time.time())
 
 
 def remove_owned(path, *, cancel=None):
@@ -189,9 +247,11 @@ def retire_job(service, identity, describe=None):
 
 class AssetCache:
     """LRU metadata is collected once; ordinary health polls never scan files."""
-    def __init__(self, root, limit=512 * 1024**2, *, archives=False):
+    def __init__(self, root, limit=ASSET_CACHE_BYTES, *, archives=False,
+                 max_idle=ASSET_CACHE_IDLE_SECONDS):
         self.root, self.limit = Path(root).absolute(), limit
         self.archives = archives
+        self.max_idle = max_idle
         # File operations share this lock; health reads only the short metadata lock.
         self.lock = threading.RLock()
         self.metadata_lock = threading.Lock()
@@ -276,7 +336,8 @@ class AssetCache:
     def snapshot(self):
         with self.metadata_lock:
             return dict(bytes=sum(size for size, _ in self.entries.values()),
-                        limit_bytes=self.limit, count=len(self.entries),reclaim=self.reclaimer.snapshot())
+                        limit_bytes=self.limit, max_idle_seconds=self.max_idle,
+                        count=len(self.entries), reclaim=self.reclaimer.snapshot())
 
     def retire(self, identity):
         """Retire one explicitly released asset without evicting its neighbours."""
@@ -295,25 +356,7 @@ class AssetCache:
 
     def prune(self, protected):
         with self.lock:
-            return self._prune(protected)
-
-    def _prune(self, protected):
-        # Live inputs do not evict the bounded warm set needed by the next stage.
-        idle = [(identity, size, used) for identity, (size, used) in self.entries.items()
-                if identity not in protected]
-        total = sum(size for _identity, size, _used in idle)
-        errors = []
-        for identity, size, _used in sorted(idle, key=lambda item: item[2]):
-            if total <= self.limit:
-                break
-            try:
-                self.reclaimer.defer(self._path(identity))
-            except OSError as error:
-                errors.append(str(error))
-            else:
-                with self.metadata_lock:
-                    self.entries.pop(identity)
-                    self.revision += 1
-                total -= size
-        self._compact_sizes()
-        return errors
+            errors = evict_unused(self.entries, protected, self.limit, self.max_idle,
+                                  self.retire, now=time.time())
+            self._compact_sizes()
+            return errors
