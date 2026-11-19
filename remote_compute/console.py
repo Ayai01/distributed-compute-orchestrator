@@ -215,18 +215,40 @@ def _enable_ansi():
         return None
     input_handle = kernel.GetStdHandle(-10 & 0xffffffff)
     input_mode = wintypes.DWORD()
-    # Classic conhost suspends writes while a mouse click selects text.
-    quick_edit = (kernel.GetConsoleMode(input_handle, ctypes.byref(input_mode))
-                  and input_mode.value & 0x0040
-                  and kernel.SetConsoleMode(input_handle, (input_mode.value | 0x0080) & ~0x0040))
+    input_changed = False
+    if kernel.GetConsoleMode(input_handle, ctypes.byref(input_mode)):
+        selectable = input_mode.value | 0x0080 | 0x0040  # EXTENDED_FLAGS | QUICK_EDIT_MODE
+        if selectable != input_mode.value:
+            input_changed = kernel.SetConsoleMode(input_handle, selectable)
     _COLOR_ENABLED = allowed
     def restore_windows():
         global _COLOR_ENABLED
         _COLOR_ENABLED = False
         kernel.SetConsoleMode(handle, mode.value)
-        if quick_edit:
+        if input_changed:
             kernel.SetConsoleMode(input_handle, input_mode.value)
     return restore_windows
+
+
+def _console_selection_probe():
+    """Defer classic console drawing while the user selects text."""
+    if os.name != 'nt':
+        return lambda: False
+    import ctypes as c
+    from ctypes import wintypes as w
+
+    class Selection(c.Structure):
+        _fields_ = [('flags',w.DWORD),('anchor',w.SHORT*2),('rect',w.SHORT*4)]
+
+    query = c.WinDLL('kernel32').GetConsoleSelectionInfo
+    query.argtypes = [c.POINTER(Selection)]
+    query.restype = w.BOOL
+    info = Selection()
+
+    def selected():
+        return bool(query(c.byref(info)) and info.flags & 0x0003)
+
+    return selected
 
 
 def _console_width_probe():
@@ -523,6 +545,7 @@ class Dashboard:
         width_probe,close_probe=_console_width_probe() if os.name=='nt' and self.stream.isatty() else (None,lambda: None)
         set_width_probe(width_probe)
         focus, refresh = _focus_probe(), FocusRefresh()
+        selected_text = _console_selection_probe()
         state = _state or {}
         line, cursor = state.get('line', ''), state.get('cursor', 0)
         history, selected = state.get('history', []), state.get('selected', 0)
@@ -546,6 +569,9 @@ class Dashboard:
                 try:
                     if not self.alive():
                         break
+                    if selected_text():
+                        time.sleep(0.08)
+                        continue
                     now = time.monotonic()
                     source_revision, snapshot, error = reader.snapshot()
                     if source_revision != received:

@@ -1289,22 +1289,37 @@ class ConsoleTests(unittest.TestCase):
     def test_windows_console_handle_is_pointer_sized_and_mode_is_restored(self):
         handle = 2 ** 40 + 7
         def mode(_handle, value):
-            self.assertEqual(_handle, handle)
+            self.assertIn(_handle,(handle,handle+1))
             value._obj.value = 3
             return True
         kernel = Mock()
-        kernel.GetStdHandle.return_value = handle
+        kernel.GetStdHandle.side_effect = lambda number: handle if number == (-11 & 0xffffffff) else handle+1
         kernel.GetConsoleMode.side_effect = mode
         kernel.SetConsoleMode.return_value = True
         with patch('remote_compute.console.os.name','nt'),patch.object(ctypes, 'WinDLL', create=True, return_value=kernel):
             restore = _enable_ansi()
             self.assertEqual(kernel.GetConsoleMode.argtypes[0], wintypes.HANDLE)
             self.assertEqual(kernel.SetConsoleMode.argtypes[0], wintypes.HANDLE)
-            kernel.SetConsoleMode.assert_called_with(handle, 7)
+            kernel.SetConsoleMode.assert_any_call(handle,7)
+            kernel.SetConsoleMode.assert_called_with(handle+1,0x00c3)
             restore()
-            kernel.SetConsoleMode.assert_called_with(handle, 3)
+            kernel.SetConsoleMode.assert_any_call(handle,3)
+            kernel.SetConsoleMode.assert_called_with(handle+1,3)
             kernel.SetConsoleMode.return_value = False
             self.assertIsNone(_enable_ansi())
+
+    def test_windows_selection_probe_tracks_the_active_region(self):
+        from remote_compute.console import _console_selection_probe
+        statuses=iter(((True,0),(True,1),(True,2),(False,2)))
+        kernel=Mock()
+        def select(info):
+            success,flags=next(statuses)
+            info._obj.flags=flags
+            return success
+        kernel.GetConsoleSelectionInfo.side_effect=select
+        with patch('remote_compute.console.os.name','nt'),patch.object(ctypes,'WinDLL',create=True,return_value=kernel):
+            selecting=_console_selection_probe()
+            self.assertEqual([selecting() for _ in range(4)],[False,True,True,False])
 
 
 if __name__ == '__main__':
