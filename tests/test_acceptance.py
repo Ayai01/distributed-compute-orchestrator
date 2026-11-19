@@ -12,6 +12,8 @@ from remote_compute.bundle import pack, task_bundle
 from remote_compute import command
 from remote_compute.cleanup import AssetCache
 from remote_compute.coordinator import Coordinator
+from remote_compute.observations import Observations
+from remote_compute.records import JobRecords
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -27,7 +29,8 @@ class AcceptanceTests(unittest.TestCase):
         center.accepting = True
         center.accepting_assets = SubmissionAssets()
         center.asset_handoffs = {}
-        center.jobs, center.queue = {}, []
+        center.jobs, center.queue = JobRecords(root/'jobs'), []
+        center.observations = Observations(root/'observations.json')
         center.asset_cache = AssetCache(root/'assets', archives=True)
         return center
 

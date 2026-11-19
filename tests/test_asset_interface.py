@@ -30,6 +30,7 @@ class AssetInterfaceTests(unittest.TestCase):
             entered.set();time.sleep(.005)
         state.pool=SimpleNamespace(nodes=[],_matching=lambda task:[],_acquire=acquire)
         state._recover_running=lambda:None
+        state._poll_observations=lambda:None
         state._fallback_accelerator=lambda job:None
         state.project_resources=lambda:dict(P=dict(used=0,resource_share=1))
         state._growth_headroom=lambda *a,**k:{}
