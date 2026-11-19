@@ -1299,9 +1299,11 @@ class Node:
     def resize_memory_model(self,identity,model):
         from .memory import calibrated_model
         row=next((j for j in self.health.get('active_jobs',())if j['id']==identity),{})
-        return calibrated_model(model,row.get('memory_phase')or row.get('memory_phase_model'),row.get('memory_sample_cpus')or row.get('active_cpus',0),
-            row.get('memory_reservation_mb',0),row.get('memory_commit_reservation_mb',0),row.get('memory_calibrated',False),row.get('memory_adaptive_model'),row.get('memory_width_samples'),
-            cold_probe=row.get('memory_sample_cpus')==0 and not row.get('active_cpus'))
+        return calibrated_model(model,row.get('memory_phase')or row.get('memory_phase_model'),row.get('memory_sample_cpus',row.get('active_cpus',0)),
+            row.get('memory_observed_mb',row.get('memory_reservation_mb',0)),
+            row.get('memory_commit_observed_mb',row.get('memory_commit_reservation_mb',0)),
+            row.get('memory_calibrated',False),row.get('memory_adaptive_model'),row.get('memory_width_samples'),
+            cold_probe=row.get('memory_sample_cpus')==0)
 
     @property
     def memory_accounted(self):

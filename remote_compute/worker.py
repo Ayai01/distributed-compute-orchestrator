@@ -46,7 +46,7 @@ from .receipts import read_receipt
 from .deadline import PREPARATION_TIMEOUT, execution_remaining, preparation_elapsed
 from .paths import cache_environment
 from .allocation import plan_resize,cpu_capacity,validate_cpu_overcommit,validate_cpu_utilization
-from .memory import MemoryObservation, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
+from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
@@ -457,6 +457,8 @@ class Worker:
                                      'memory_width_samples':j.get('memory_width_samples'),
                                      'memory_sample_cpus':getattr(j.get('memory_observation'),'active_cpus',0),
                                      'memory_calibrated':bool(j.get('memory_observation')and j['memory_observation'].envelope is not None),
+                                     'memory_observed_mb':measured_memory(j)[0],
+                                     'memory_commit_observed_mb':measured_memory(j)[1],
                                      'memory_reservation_mb':reservation(j)[0],
                                      'memory_commit_reservation_mb':reservation(j)[1], **progress_fields(j['result']),
                                      **({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
@@ -739,7 +741,7 @@ class Worker:
             if self.stopping or job['cancel'].is_set() or result['status']!='running':
                 raise Conflict('Only a running task can change its CPU grant')
             old=task['cpus']
-            old_memory=task['memory_mb']
+            old_memory=result.get('memory_mb',task['memory_mb'])
             if all(value is None for value in (memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb)):
                 current=job.get('memory_phase_model',task.get('memory_model'))or result.get('memory_phase')or dict(memory_mb=old_memory)
                 if 'base_memory_mb' in current:
@@ -768,9 +770,9 @@ class Worker:
             requested_memory={k:v for k,v in model.items()if v is not None}
             previous_memory=result.get('memory_phase')or job.get('memory_phase_model',task.get('memory_model'))
             if not requested_memory:requested_memory=previous_memory or {}
-            physical,commit=reservation(job)
+            physical,commit=measured_memory(job)
             observation=job.get('memory_observation')
-            observed_cpus=getattr(observation,'active_cpus',0)or result.get('active_cpus',0)
+            observed_cpus=getattr(observation,'active_cpus',0)
             calibrated=bool(observation and observation.envelope is not None)
             samples=job.get('memory_width_samples',[])
             sampled_at=job.get('memory_width_sampled_at',time.monotonic())
@@ -821,22 +823,25 @@ class Worker:
             # forever and blocks unrelated process starts behind the cold gate.
             if phase_changed or granted!=old and phase_model is None:
                 job['memory_observation']=MemoryObservation()
-                job.pop('startup_memory_mb',None)
             job['memory_phase_model']=phase_model
+            job.pop('startup_memory_mb',None)
+            task['memory_mb']=memory
             if granted!=old or memory!=old_memory or active_changed or phase_changed:
                 self.used+=granted-old
                 task['cpus']=result['cpus']=granted
-                task['memory_mb']=result['memory_mb']=memory
+                result['memory_mb']=memory
                 result['peak_cpus']=max(result.get('peak_cpus',old),granted)
                 result['resize_count']=result.get('resize_count',0)+1
                 self._save(job)
                 self.condition.notify_all()
             memory_limited=granted<cpu_ready_limit
+            reserved_physical,reserved_commit=reservation(job)
             return dict(id=identity,node=socket.gethostname(),cpus=granted,memory_mb=memory,requested_cpus=requested_cpus,memory_phase=requested_memory,
                         cpu_ready_limit=cpu_ready_limit,cpu_available=max(floor,capacity-self.used+granted),
                         memory_calibrated=calibrated and not phase_changed,memory_guard_limited=self.pressure_guard.state['limited'],
                         memory_calibrating=memory_limited and not(calibrated and not phase_changed)and not self.pressure_guard.state['limited'],
-                        memory_calibration=(dict(phase=requested_memory,model=adaptive_model,physical_mb=physical,commit_mb=commit,sample_cpus=observed_cpus)
+                        memory_calibration=(dict(phase=requested_memory,model=adaptive_model,physical_mb=reserved_physical,commit_mb=reserved_commit,
+                                                 observed_physical_mb=physical,observed_commit_mb=commit,sample_cpus=observed_cpus)
                                             if calibrated and not phase_changed else None))
 
     def lease(self, identity, request):
@@ -1062,7 +1067,8 @@ class Worker:
                         self.used += job["task"]["cpus"]
                         job['startup_memory_mb']=startup_memory(job['task'])
                         self.accelerator_reservations[job['result']['id']]=self._match_accelerator(job['task'].get('accelerator')) or []
-                        job["result"].update(status="running", started=time.time(),cpu_overcommit=job['cpu_overcommit'])
+                        job["result"].update(status="running", started=time.time(),cpu_overcommit=job['cpu_overcommit'],
+                                             memory_mb=job['startup_memory_mb'])
                         self._save(job)
                         thread = threading.Thread(target=self._execute, args=(job,), name="compute-job", daemon=True)
                         self.threads.add(thread)
@@ -1205,7 +1211,8 @@ class Worker:
                         job['rss_sampled']=False;job['rss_mb']=0
                         for key in ('private_mb','memory_adaptive_model','memory_width_samples','memory_width_sampled_at'):job.pop(key,None)
                         job['memory_observation']=MemoryObservation()
-                        result['memory_phase']=None
+                        job['memory_phase_model']=task.get('memory_model')
+                        result['memory_phase']=task.get('memory_model') or dict(memory_mb=job['parent_memory_mb'])
                     self._automatic_grant(job)
                     environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
                     self._accelerator_environment(result['id'],environment)

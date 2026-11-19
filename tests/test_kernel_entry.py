@@ -78,10 +78,10 @@ class KernelEntryTests(unittest.TestCase):
     def test_a_small_host_keeps_one_core_without_waiting_for_four(self):
         value,requests=self.run_entry(cpus=1)
         self.assertEqual(value['cpus'],1)
-        self.assertEqual([r['cpus']for r in requests],[1,1,1,1])
+        self.assertEqual([r['cpus']for r in requests],[1,1,1,0])
         self.assertEqual(len(requests),4)
 
     def test_fully_funded_kernel_keeps_the_existing_handshake(self):
         value,requests=self.run_entry()
         self.assertEqual(value['cpus'],4)
-        self.assertEqual([(r['cpus'],r['active'])for r in requests],[(4,0),(4,4),(1,0)])
+        self.assertEqual([(r['cpus'],r['active'])for r in requests],[(4,0),(4,4),(0,0)])

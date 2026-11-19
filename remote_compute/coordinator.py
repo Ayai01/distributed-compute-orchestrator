@@ -2170,6 +2170,8 @@ class Coordinator:
                     if sample is not None:
                         sample.update(memory_phase=quote['phase'],memory_adaptive_model=quote['model'],memory_calibrated=True,
                                       memory_reservation_mb=quote['physical_mb'],memory_commit_reservation_mb=quote['commit_mb'],
+                                      memory_observed_mb=quote.get('observed_physical_mb',quote['physical_mb']),
+                                      memory_commit_observed_mb=quote.get('observed_commit_mb',quote['commit_mb']),
                                       memory_sample_cpus=quote['sample_cpus'])
             commit(result['cpus'],result.get('memory_mb',old_memory),result.get('memory_phase'))
             cpu_ready_limit=min(cpu_ready_limit,result.get('cpu_available',cpu_ready_limit))

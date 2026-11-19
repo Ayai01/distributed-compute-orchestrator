@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock,patch
 
 from remote_compute import Pool,python_map,python_task
-from remote_compute.memory import calibrated_model,plan_memory,pressure_victim,MemoryObservation,PressureGuard
+from remote_compute.memory import calibrated_model,plan_memory,pressure_victim,reservation,MemoryObservation,PressureGuard
 from remote_compute.client import Node
 from remote_compute.worker import Worker
 from test_compute import scratch,provider,python,until
@@ -50,6 +50,21 @@ class AdaptiveMemoryTests(unittest.TestCase):
         quote=calibrated_model(model,model,4,1024,1000,True,points=[(1,1024),(4,1024)])
         self.assertEqual(quote,dict(base_memory_mb=1024,memory_per_cpu_mb=0))
         self.assertEqual(plan_memory(64,2048,**quote),(64,1024))
+
+    def test_cold_modeled_probe_reserves_only_its_funded_memory(self):
+        _, job = self.sampled_worker()
+        job['startup_memory_mb'] = 256
+        self.assertEqual(reservation(job), (256, 256))
+
+    def test_center_quotes_measured_memory_instead_of_relearning_reservation(self):
+        node = Node('worker', None)
+        phase = dict(base_memory_mb=4096, memory_per_cpu_mb=4096)
+        node.health = {'active_jobs': [dict(id='one', memory_phase=phase, memory_sample_cpus=1,
+            memory_calibrated=True, memory_reservation_mb=8192, memory_commit_reservation_mb=8192,
+            memory_observed_mb=128, memory_commit_observed_mb=124)]}
+        quote = node.resize_memory_model('one', phase)
+        self.assertEqual(plan_memory(4, 1024, **quote), (4, 512))
+        self.assertEqual(node.memory_credit('one', 8192), 8192)
 
     def test_small_observed_growth_keeps_the_shared_baseline_once(self):
         model=dict(base_memory_mb=64,memory_per_cpu_mb=1024)
@@ -102,7 +117,7 @@ class AdaptiveMemoryTests(unittest.TestCase):
         worker.cpu_overcommit_factor=1.0
         worker._memory_state=Mock(return_value=dict(memory_available_mb=897));worker._save=Mock()
         observation=MemoryObservation(now=0)
-        for at in (0,1,2):observation.observe(96,95,now=at)
+        for at in (0,1,2):observation.observe(96,95,now=at,active_cpus=cpus)
         model=dict(base_memory_mb=64,memory_per_cpu_mb=per,memory_limit_mb=None)
         job=dict(task=dict(cpus=cpus,max_cpus=4,memory_mb=64+per*cpus,memory_model=model),
                  result=dict(status='running',active_cpus=cpus),cancel=threading.Event(),
@@ -159,7 +174,7 @@ class AdaptiveMemoryTests(unittest.TestCase):
         worker,job=self.sampled_worker(cpus=4,per=128)
         observation=job['memory_observation']
         reply=worker.resize('one',4,active_cpus=4)
-        self.assertEqual(reply['memory_mb'],576)
+        self.assertEqual(reply['memory_mb'],128)
         self.assertIs(job['memory_observation'],observation)
         worker,job=self.sampled_worker(cpus=2,per=128)
         observation=job['memory_observation']=MemoryObservation(now=0)
@@ -233,7 +248,7 @@ class AdaptiveMemoryTests(unittest.TestCase):
                     self.assertLess(reply['memory_mb'],64+768*4)
                     with pool.condition:
                         self.assertEqual(pool.nodes[0].memory_credit(identity,reply['memory_mb']),reply['memory_mb'])
-                    public=Client(client.url);receipt=public.status(identity)
+                    public=Client(client.url,client.token);receipt=public.status(identity)
                     self.assertEqual(receipt['memory_phase'],phase)
                     self.assertEqual(receipt['request_sha256'],original)
                     error=RemoteError('Center resource reply timed out; existing grant retained');error.status_code=409
@@ -257,7 +272,7 @@ class AdaptiveMemoryTests(unittest.TestCase):
                     self.assertEqual(reply['cpus'],4)
                     self.assertLess(reply['memory_mb'],1024)
                     self.assertEqual(reply['memory_phase'],phase)
-                    public=Client(client.url)
+                    public=Client(client.url,client.token)
                     self.assertEqual(public.status(identity)['memory_phase'],phase)
                     error=RemoteError('Center resource reply timed out; existing grant retained');error.status_code=409
                     with patch.object(public,'resize',side_effect=error):
