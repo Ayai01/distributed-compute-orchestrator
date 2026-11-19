@@ -18,6 +18,6 @@
 
 **待处理运维项**。学校 CPU 扩容。32 核／64 GiB 和 24 核／48 GiB 的提交校验均显示零台可放置宿主。等有实际位置后按标准规格补位。
 
-**运行时验收**。两个 PE64 执行端与三个 ONNX INT8 执行端通过探测并热登记。普通 SDK 复用归档载体跑完 FIR 的 28 条控制和 40 项检查；YOLO 的冻结整条件与已付结果一致。原 ID、费用与结果已保存。[能力登记](../.local/migration/runtime-profiles-production-current.json) · [真实任务验收](../.local/migration/runtime-workloads-20261119.json)
+**运行时验收**。两个 PE64 执行端与三个 ONNX INT8 执行端已热登记。FIR 复用归档载体通过 28 条控制、40 项检查及常规入口复验。YOLO 的同一冻结整条件在 Windows 和 Linux x86-64 上均与已付结果一致。原 ID、费用与结果已保存。[能力登记](../.local/migration/runtime-profiles-production-current.json) · [真实任务验收](../.local/migration/runtime-workloads-20261119.json)
 
 **版本上线**。`v1.0.14` 包含能力自检和 `v1.0.13` 的任务目录权限修复。生产继续用现有进程处理在途科研任务。普通凭据仍由工程共用，跨工程原 ID 隔离需按工程发放独立凭据。
