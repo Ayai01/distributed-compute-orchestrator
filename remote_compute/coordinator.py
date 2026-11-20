@@ -52,6 +52,10 @@ from .packages import (DEFAULT_PACKAGE, PACKAGES, RETAINED_NAMES, package_names,
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
 
+
+class _PreparationWorkerLost(Exception):
+    """The selected worker disconnected before submission began."""
+
 # These observations describe one worker attempt, rather than the frozen job.
 ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
     'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
@@ -1404,6 +1408,7 @@ class Coordinator:
     def _execute(self, job):
         node, identity, task = job["node"], job.get('worker_id',job['result']['id']), job["task"]
         result = None;retry=False
+        preparation_worker_lost = False
         try:
             reattach=job.pop('reattach',False)
             if reattach and job.pop('recover_submission',False):
@@ -1539,6 +1544,8 @@ class Coordinator:
                     time.sleep(interval)
                 else:
                     job['cancel'].wait(interval)
+        except _PreparationWorkerLost:
+            preparation_worker_lost = True
         except Exception as error:
             with self.condition:
                 if not retry:
@@ -1553,7 +1560,13 @@ class Coordinator:
                     job['resource_recovery_business_failure']=isinstance(error,BusinessItemFailure)
             with self.condition:
                 self.threads.discard(threading.current_thread())
-                if retry and not self.stopping and not job['cancel'].is_set():self._retry(job,result)
+                if preparation_worker_lost:
+                    if job['cancel'].is_set():
+                        self._update(job, dict(status='cancelled', finished=time.time(),
+                                               cancelled_before_submit=True, cpu_seconds=0))
+                    elif not self.stopping:
+                        self._requeue_unsubmitted(job)
+                elif retry and not self.stopping and not job['cancel'].is_set():self._retry(job,result)
                 elif retry and job['cancel'].is_set():
                     self._update(job,{**result,'status':'cancelled','finished':time.time()})
                 archive_job(self.jobs, job)
@@ -1598,6 +1611,11 @@ class Coordinator:
     def _submit(self, job, identity, payload, callback, *, assets=None):
         node, force, uncertain = job['node'], False, False
         assets = job['task']['assets'] if assets is None else assets
+
+        def lost_before_submit():
+            return (not uncertain and not job['result'].get('submission_recovered')
+                    and not self.stopping and (node.error or node.detached))
+
         asset_metrics = None
         if assets:
             asset_metrics = job['result'].setdefault('asset_transport', {'uploads': {}})
@@ -1629,6 +1647,8 @@ class Coordinator:
                 # Nothing was sent. Keep the same reservation and ID while the
                 # local transport queue drains, rather than ending the task.
                 if self.stopping:raise
+                if not submitting and lost_before_submit():
+                    raise _PreparationWorkerLost() from error
                 with self.condition:
                     job['result']['connection_error']=str(error)
                     self._publish(job)
@@ -1640,6 +1660,9 @@ class Coordinator:
                 if not force and getattr(error,'status_code',None)==400 and 'Synchronize missing asset first:' in str(error):
                     force=True
                     continue
+                if (not submitting and lost_before_submit()
+                        and (error.transport_retryable or error.status_code in (502,503,504))):
+                    raise _PreparationWorkerLost() from error
                 if self.stopping or getattr(error,'status_code',None) is not None:
                     raise
                 uncertain=uncertain or submitting
@@ -1667,6 +1690,24 @@ class Coordinator:
                             raise
                         error=observed
                         time.sleep(.5)
+
+    def _requeue_unsubmitted(self, job):
+        result = job['result']
+        with zipfile.ZipFile(job['directory'] / 'request.zip') as archive:
+            task = self._restored_task(json.loads(archive.read('task.json')), result)
+        if 'dispatch_priority' in result:
+            task['priority'] = result['dispatch_priority']
+        self._restore_accelerator(task, result)
+        job.update(task=task, node=None, auto_cpus=task['cpus'] == 0, elastic_cpus=elastic_cpus(task))
+        _restore_phase_demand(job)
+        for field in ('assigned_node', 'worker_url', 'dispatched', 'connection_error', 'asset_transport'):
+            result.pop(field, None)
+        result.update(status='queued', cpus=task['cpus'], memory_mb=task['memory_mb'],
+                      resource_wait_reason='transport: waiting for a reachable worker')
+        identity = result['id']
+        self.queue.append(identity)
+        self.queue.sort(key=lambda key: -self.jobs[key]['task']['priority'])
+        self._save(job)
 
     def _retry(self, job, outcome):
         if job.get('retired'):return

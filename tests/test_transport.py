@@ -23,6 +23,49 @@ from test_compute import provider, python, scratch, until
 
 
 class BulkIOControlTests(unittest.TestCase):
+    def test_disconnected_worker_releases_unsubmitted_job_to_another_worker(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root / 'first') as (_, first_client), \
+                    provider(root / 'second') as (_, second_client), \
+                    Pool([first_client, second_client], policy='round_robin') as pool, \
+                    center(pool, root / 'center') as (state, client):
+                first, _ = pool.nodes
+                asset = client.sync_files({'input': b'one original input'})
+                task = python('print("original executed once")', assets={'input': asset}, max_cpus=1)
+                original = first.client.request
+                disconnected = threading.Event()
+
+                def request(path, payload=None, **options):
+                    if path == '/assets/' + asset and payload is None:
+                        with pool.condition:
+                            first.error = 'Visitor connection refused'
+                            first.detached = True
+                            disconnected.set()
+                    if disconnected.is_set() and (path == '/health' or path == '/assets/' + asset):
+                        error = RemoteError('Visitor connection refused')
+                        error.transport_retryable = True
+                        raise error
+                    return original(path, payload, **options)
+
+                with patch.object(first.client, 'request', side_effect=request):
+                    identity = client.submit(task)['id']
+                    self.assertTrue(disconnected.wait(2))
+                    try:
+                        self.assertEqual(client.wait(identity, wait_timeout=3)['status'], 'succeeded')
+                    finally:
+                        if client.status(identity, brief=True)['status'] not in {'succeeded', 'failed', 'cancelled', 'timed_out'}:
+                            client.cancel(identity)
+                            client.wait(identity, wait_timeout=3)
+                receipt = client.fetch(identity, delete=False)
+                self.assertEqual(receipt['stdout'].strip(), 'original executed once')
+                self.assertFalse(receipt.get('attempts'))
+                self.assertEqual(second_client.status(identity)['status'], 'succeeded')
+                with self.assertRaises(RemoteError) as missing:
+                    first_client.status(identity)
+                self.assertEqual(missing.exception.status_code, 404)
+                self.assertEqual(first.reserved, 0)
+
     def test_shared_cache_reads_on_different_workers_do_not_wait_for_one_lookup(self):
         with scratch() as directory:
             root = Path(directory)
