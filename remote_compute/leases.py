@@ -2,7 +2,7 @@
 import json
 import os
 import time
-from .allocation import plan_resize
+from .allocation import ACTIVE_GRANT_CONFLICT, plan_resize
 from .memory import same_phase, plan_memory
 from .deadline import check_deadline, remaining_time
 
@@ -134,6 +134,20 @@ class CpuLease:
                 and self.memory_mb>0) else None)
             self.updated = time.monotonic()
         return self.cpus
+
+    def activate(self, width, *, min_cpus=0):
+        """Confirm the proposed launch width before starting any work."""
+        try:
+            return self.refresh(active_cpus=width, ready_cpus=0, min_cpus=min_cpus)
+        except Exception as error:
+            if getattr(error, 'status_code', None) != 409 or ACTIVE_GRANT_CONFLICT not in str(error):
+                raise
+            # Nothing launched under this proposal. Readmit from zero active
+            # threads. An active map's ordinary refresh still enforces its floor.
+            self.cpus = 0
+            self.confirmed = None
+            self.demand = self.active_cpus = self.min_cpus = None
+            return 0
 
     def _retained_downshift(self,grant,active):
         """Fund a probe under the acknowledged phase when its estimate falls."""

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from remote_compute import check_deadline, remaining_time, python_map, python_task
+from remote_compute.execution_timing import summarize
 from test_compute import provider, python, scratch, until
 
 
@@ -37,6 +38,16 @@ def cooperative(value):
 
 
 class DeadlineTests(unittest.TestCase):
+    def test_wall_timing_counts_overlapping_native_work_and_resource_wait_once(self):
+        with scratch() as folder:
+            root = Path(folder)
+            (root / 'phase-pending.log').write_text('11 resource\n19 idle\n', encoding='ascii')
+            (root / 'phase-native.log').write_text('14 native\n18 idle\n', encoding='ascii')
+            result = summarize(root, 8, 10, 20)
+        self.assertEqual(result, dict(worker_received_to_process_seconds=2,
+            worker_received_to_native_seconds=6, process_window_seconds=10, native_execution_seconds=4,
+            resource_wait_seconds=4, other_execution_seconds=2))
+
     def test_no_deadline_outside_worker(self):
         with patch.dict(os.environ,{},clear=True):
             self.assertIsNone(remaining_time())

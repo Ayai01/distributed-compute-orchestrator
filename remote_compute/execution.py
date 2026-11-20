@@ -15,6 +15,8 @@ if __package__ in (None, ''):
     sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
     sys.path.insert(0,os.getcwd())
 
+from remote_compute.execution_timing import PhaseClock
+
 
 def validate_execution(value):
     if not isinstance(value,dict) or set(value)-{'function','items','kwargs','mode','backend'}:
@@ -229,6 +231,8 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
     keep_single_slot = (task_maximum == item_max_cpus == 1 and not owns_task
                         and stop is None and ready_slots is None and ready_demand is None)
     _local.single_slot = False
+    timing = PhaseClock()
+    timing.set('resource')
     grants=_Grants(maximum,limits);maximum=grants.maximum
     resources=None
     if item_max_cpus>1:
@@ -252,7 +256,8 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
             from remote_compute.memory import memory_waiting,memory_boundary
             if on_capacity:on_capacity(grants.cpus)
             requested=len(items)-position
-            if failures or stop and stop() or memory_waiting():requested=0
+            memory_blocked = memory_waiting()
+            if failures or stop and stop() or memory_blocked:requested=0
             elif ready_slots is not None:requested=min(requested,ready_slots())
             starts=resources.reserve(position,requested)if resources else grants.reserve(requested)
             for _ in range(starts):
@@ -269,6 +274,12 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
                 active[future]=position;position+=1
                 future.add_done_callback(completed.put)
             stopped=bool(failures or stop and stop())
+            if active:
+                timing.set('native')
+            elif not stopped and (requested or memory_blocked):
+                timing.set('resource')
+            else:
+                timing.set('idle')
             def ready():
                 remaining=len(items)-position
                 if failures or stop and stop():return 0
@@ -306,6 +317,7 @@ def _map_items(function,items,*,kwargs=None,backend='process',on_result=None,col
         return values if collect else position
     finally:
         pool.shutdown(wait=True)
+        timing.close()
         if resources:resources.close()
         if resources and owns_task:grants.close(task_finished=True)
         elif succeeded and keep_single_slot:
@@ -491,6 +503,8 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
     retained = keep_single_slot and getattr(_local, 'single_slot', False)
     _local.single_slot = False
     actual=0
+    timing = PhaseClock()
+    timing.set('resource')
     try:
         try:
             with preparation_window(start_timeout):
@@ -499,23 +513,27 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
                     check_deadline()
                     # A held single slot can commit the new phase directly.
                     # Both branches still require the provider's phase acknowledgement.
-                    actual=lease.refresh(active_cpus=maximum if retained else 0,
-                                         ready_cpus=0 if retained else maximum,min_cpus=maximum)
+                    actual=(lease.activate(maximum, min_cpus=maximum) if retained else
+                            lease.refresh(active_cpus=0, ready_cpus=maximum, min_cpus=maximum))
                     if _confirmed_width(lease, maximum):
                         if retained:break
-                        actual=lease.refresh(active_cpus=maximum,ready_cpus=0,min_cpus=maximum)
+                        actual=lease.activate(maximum, min_cpus=maximum)
                         if _confirmed_width(lease, maximum):break
                     if actual < maximum:retained = False
                     time.sleep(min(.1,check_deadline()or .1))
+                timing.set('idle')
                 _kernel_threads(maximum);check_deadline()
         except TimeoutError as error:
             raise TimeoutError('Fixed kernel needs %d CPUs; obtained %d; startup wait expired before execution'%(maximum,actual))from error
         check_deadline()
         _local.kernel=True
-        value = _function(function)(**kwargs)
+        target = _function(function)
+        timing.set('native')
+        value = target(**kwargs)
         _local.single_slot = keep_single_slot and _confirmed_width(lease, 1)
         return value
     finally:
+        timing.close()
         _local.kernel=False
         try:_kernel_threads(1,reset=True)
         finally:
@@ -525,6 +543,32 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
                 try:
                     with resource_window(1):lease.refresh(active_cpus=0,ready_cpus=0)
                 except (RemoteError,TimeoutError):pass
+
+
+def _start_flexible_kernel(lease, maximum):
+    from remote_compute.deadline import check_deadline, resource_window
+    from remote_compute.memory import memory_boundary
+    while True:
+        check_deadline()
+        memory_boundary()
+        actual = lease.refresh(active_cpus=0, ready_cpus=maximum)
+        if 0 < actual < maximum and lease.memory_calibrating:
+            # A cold RAM probe may initially fund one slot. Keep the demand
+            # visible until that calibration resolves or the short window ends.
+            try:
+                with resource_window(3):
+                    while actual < maximum and lease.memory_calibrating:
+                        time.sleep(min(.1, check_deadline() or .1))
+                        actual = lease.refresh(active_cpus=0, ready_cpus=maximum)
+            except TimeoutError:
+                check_deadline()
+                actual = lease.cpus
+        if actual:
+            check_deadline()
+            granted = lease.activate(actual)
+            if granted:
+                return granted
+        time.sleep(min(.1, check_deadline() or .1))
 
 
 def run_call(function,*,limits=None,**kwargs):
@@ -582,38 +626,23 @@ def run_call(function,*,limits=None,**kwargs):
     if exact is not None:return _run_exact_kernel(function,kwargs,maximum,model,start_timeout)
     _local.single_slot = False
     actual=min(actual,maximum)
+    timing = PhaseClock()
     if os.environ.get('REMOTE_COMPUTE_URL')and os.environ.get('REMOTE_COMPUTE_RESIZE')=='1':
         from remote_compute import Client
         client=Client(os.environ['REMOTE_COMPUTE_URL'],os.environ.get('REMOTE_COMPUTE_TOKEN',''),ca_file=os.environ.get('REMOTE_COMPUTE_CA')or None)
         lease=client.cpu_lease(os.environ['REMOTE_COMPUTE_JOB_ID'],max_cpus=max(maximum,actual),cpus=actual,**model)
-        actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
-        while actual<1:
-            time.sleep(.1);check_deadline();memory_boundary()
-            actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
-        if actual<maximum:
-            # A cold RAM probe can fund one slot before the phase is known.
-            # Confirm the still-ready width once before freezing the kernel;
-            # busy hosts may retain the smaller grant without waiting for peers.
-            check_deadline()
-            if lease.memory_calibrating:
-                from remote_compute.deadline import resource_window
-                try:
-                    with resource_window(3):
-                        while actual<maximum and lease.memory_calibrating:
-                            time.sleep(.1);check_deadline()
-                            actual=lease.refresh(active_cpus=0,ready_cpus=maximum)
-                except TimeoutError:
-                    check_deadline()
-                    actual=lease.cpus
-            else:actual=lease.refresh(active_cpus=actual,ready_cpus=maximum-actual)
-        actual=lease.refresh(active_cpus=actual,ready_cpus=0)
+        timing.set('resource')
+        actual = _start_flexible_kernel(lease, maximum)
+        timing.set('idle')
     try:
         _local.kernel=True
         target=_function(function);_kernel_threads(actual)
+        timing.set('native')
         value = target(**kwargs)
         _local.single_slot = task_maximum == 1 and _confirmed_width(lease, 1)
         return value
     finally:
+        timing.close()
         _local.kernel=False
         _kernel_threads(1,reset=True)
         if lease and not _local.single_slot:lease.refresh(active_cpus=0,ready_cpus=0)

@@ -47,7 +47,7 @@ from .compat import unlink
 from .receipts import read_receipt
 from .deadline import PREPARATION_TIMEOUT, execution_remaining, preparation_elapsed
 from .paths import cache_environment
-from .allocation import (STARTUP_CPU_FLOOR, plan_resize, cpu_capacity, validate_cpu_overcommit, validate_cpu_utilization,
+from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, plan_resize, cpu_capacity, validate_cpu_overcommit, validate_cpu_utilization,
                          validate_min_start_cpus)
 from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
@@ -818,7 +818,7 @@ class Worker:
             cpus=min(cpus if min_cpus is not None else cpus or capacity,maximum)
             floor=(active_cpus or 0)if min_cpus is not None else max(1,active_cpus or 0)
             if active_cpus is not None and (active_cpus>old or requested_cpus and active_cpus>cpus):
-                raise ValueError('active_cpus must count threads within the existing grant and requested width')
+                raise ValueError(ACTIVE_GRANT_CONFLICT)
             cpus=max(cpus,floor)
             # Shrinking the borrowed ceiling blocks new grants. An exact one-CPU
             # phase can reuse its incumbent slot while the other grants drain.
@@ -958,6 +958,7 @@ class Worker:
                 self.condition.notify_all()
 
     def submit(self, identity, payload, *, callback=None):
+        received = time.monotonic()
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
@@ -1051,6 +1052,7 @@ class Worker:
                 job = Job({"result": result, "cancel": threading.Event(), "task": task,
                        "commands": commands, "directory": directory, "cwd": cwd,
                        'callback':dict(self.callback if callback is None else callback),
+                       'received_at': received,
                        'templates':templates,'resolved_env':resolved_env,'execution':execution,
                        'python_argv':self._tool_argv('python',task)if uses_python(task)else []})
                 # This small immutable admission record survives damage to a
@@ -1202,6 +1204,8 @@ class Worker:
         preparing = time.monotonic()
         preparation_deadline = job['preparation_deadline'] = preparing + PREPARATION_TIMEOUT
         deadline = None
+        first_started = None
+        timing_root = None
         clock = directory / 'preparation-clock.json' if 'execution' in task else None
         result['preparation_stage'] = 'environment'
         pressure_wait = 0.0
@@ -1252,11 +1256,12 @@ class Worker:
             # tool bindings once in this job's scratch before any child starts.
             tools_file = temporary / 'tool-bindings.json'
             tools_file.write_bytes(json_bytes(result['tools']))
+            if 'execution' in task:
+                timing_root = temporary / 'execution-timing'
+                timing_root.mkdir()
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
                                REMOTE_COMPUTE_JOB_TEMP=str(temporary),
-                               REMOTE_COMPUTE_TOOLS_FILE=str(tools_file),
-                               REMOTE_COMPUTE_MIN_START_CPUS=str(task.get('min_start_cpus', 1)),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
             environment.pop('REMOTE_COMPUTE_PREPARATION_CLOCK', None)
             if clock is not None:
@@ -1312,6 +1317,9 @@ class Worker:
                         if key not in task['env']:environment[key]=str(task['cpus'])
                     environment.update(REMOTE_COMPUTE_CPUS=str(task['cpus']),
                         REMOTE_COMPUTE_MAX_CPUS=str(task['max_cpus']),
+                        REMOTE_COMPUTE_MIN_START_CPUS=str(task.get('min_start_cpus', 1)),
+                        REMOTE_COMPUTE_TOOLS_FILE=str(tools_file),
+                        REMOTE_COMPUTE_TIMING_ROOT=str(timing_root) if timing_root is not None else '',
                         REMOTE_COMPUTE_MEMORY_MODEL=json.dumps(task.get('memory_model')or dict(memory_mb=job['parent_memory_mb'])))
                     for name,text in templates.items():
                         inside(work,name).write_text(text.replace('${cpus}',str(task['cpus'])),encoding='utf8')
@@ -1350,6 +1358,8 @@ class Worker:
                     if process is None:
                         state = 'cancelled' if self.stopping or job['cancel'].is_set() else 'timed_out'
                         break
+                    if initial:
+                        first_started = deadline - task['timeout']
                     with self.pressure_process_lock:
                         job['process']=process
                         self.pressure_processes[result['id']]=job
@@ -1442,6 +1452,8 @@ class Worker:
                 job['memory_pressure']=True
                 result.update(error_kind='memory_pressure',error='Task deadline reached while waiting for host memory recovery',
                               memory_pressure={**self.host.sample(),'guard':dict(self.pressure_guard.state)})
+            from .execution_timing import summarize
+            result['execution_timing'] = summarize(timing_root, job.get('received_at', preparing), first_started, time.monotonic())
             self._clean_temp(job)
             self._clean_work(job)
             while True:

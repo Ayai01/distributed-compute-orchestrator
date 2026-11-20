@@ -444,6 +444,34 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
+    def test_replayed_and_reordered_lease_answers_do_not_resize_twice(self):
+        state = Coordinator.__new__(Coordinator)
+        calls, sent = [], []
+
+        def resize(original, **request):
+            calls.append((original, request['cpus']))
+            return dict(cpus=request['cpus'], active_cpus=request['active_cpus'])
+
+        def acknowledge(path, reply):
+            sent.append((path, dict(reply)))
+            if len(sent) == 1:
+                raise RemoteError('Transport lost after sending the reply')
+            return {'accepted': True}
+
+        state.resize = resize
+        job = dict(result={'id': 'original'}, node=SimpleNamespace(client=SimpleNamespace(request=acknowledge)))
+        first = {'resource_request': dict(request_id=1, cpus=3, active_cpus=0)}
+        second = {'resource_request': dict(request_id=2, cpus=2, active_cpus=2)}
+        with self.assertRaisesRegex(RemoteError, 'Transport lost'):
+            state._answer_resource_request(job, 'attempt', first)
+        state._answer_resource_request(job, 'attempt', first)
+        state._answer_resource_request(job, 'attempt', second)
+        state._answer_resource_request(job, 'attempt', first)
+        self.assertEqual(calls, [('original', 3), ('original', 2)])
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0], sent[1])
+        self.assertEqual(second['active_cpus'], 2)
+
     def test_worker_alias_keeps_legacy_active_receipt_visible(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,worker):
             with Pool([dict(name='xjtu-arm64',client=worker,aliases=['legacy-worker'])]) as pool, \

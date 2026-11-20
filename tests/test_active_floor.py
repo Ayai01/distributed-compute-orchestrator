@@ -3,13 +3,72 @@ from pathlib import Path
 import threading
 import unittest
 
-from remote_compute import Pool, RemoteError
+from remote_compute import Client, Pool, RemoteError, python_task
+from remote_compute.allocation import ACTIVE_GRANT_CONFLICT
+from remote_compute.execution import _start_flexible_kernel
+from remote_compute.leases import CpuLease
 import test_center as fixtures
+from test_capability_packages import packaged_worker
 from test_center import center
 from test_compute import provider, python, scratch, until
 
 
 class ActiveFloorTests(unittest.TestCase):
+    def test_original_runs_once_after_worker_grant_changes_at_launch(self):
+        source = """from pathlib import Path
+from remote_compute import run_call
+
+def body():
+    with Path('native.log').open('a') as marker:
+        marker.write('started\\n')
+    return 17
+
+def entry():
+    return run_call(body, limits={'max_cpus': 3})
+"""
+        identity = 'a' * 32
+        with scratch() as folder, packaged_worker(Path(folder) / 'worker', 'python', cpus=3) as (_, worker):
+            with Pool([worker]) as pool, center(pool, Path(folder) / 'center') as (state, operator):
+                client = Client(operator.url, operator.token)
+                resize = state.resize
+                replaced = []
+
+                def move_grant(original, cpus, **options):
+                    if options.get('active_cpus', 0) > 1 and not replaced:
+                        lower = resize(original, 1, active_cpus=0, min_cpus=0)
+                        replaced.append(lower['cpus'])
+                    return resize(original, cpus, **options)
+
+                state.resize = move_grant
+                task = python_task('fixture:entry', max_cpus=3, min_start_cpus=3, memory_mb=128,
+                                   outputs=['native.log'], timeout=12, retries=0)
+                result = client.run(task, files={'fixture.py': source}, job_id=identity, keep=True)
+                self.assertEqual(result['status'], 'succeeded', (result.get('error'), result.get('stderr')))
+                self.assertEqual(replaced, [1])
+                self.assertEqual(result['id'], identity)
+                self.assertEqual(result['files']['native.log'].splitlines(), [b'started'])
+                self.assertEqual(result['attempts'], [])
+                self.assertGreater(result['execution_timing']['resource_wait_seconds'], 0)
+
+    def test_kernel_reacquires_a_stale_launch_proposal_before_computing(self):
+        class Provider:
+            def __init__(self):
+                self.calls = []
+
+            def resize(self, identity, cpus, *, active_cpus, **options):
+                self.calls.append((identity, cpus, active_cpus))
+                if active_cpus == 3:
+                    error = RemoteError(ACTIVE_GRANT_CONFLICT)
+                    error.status_code = 409
+                    raise error
+                return {'cpus': 3 if len(self.calls) == 1 else 2, 'memory_mb': 128}
+
+        provider = Provider()
+        lease = CpuLease(provider, 'original', max_cpus=4)
+        self.assertEqual(_start_flexible_kernel(lease, 4), 2)
+        self.assertEqual(provider.calls, [('original', 4, 0), ('original', 3, 3),
+                                         ('original', 4, 0), ('original', 2, 2)])
+
     def test_polling_worker_lease_transports_the_active_floor(self):
         code="""import json,os,sys
 sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME'])

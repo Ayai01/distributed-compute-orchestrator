@@ -26,7 +26,8 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
 from .telemetry import Activity
-from .allocation import STARTUP_CPU_FLOOR, weighted_node_threads, plan_resize, elastic_cpus, startup_cpus
+from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, weighted_node_threads,
+                         plan_resize, elastic_cpus, startup_cpus)
 from .memory import plan_memory, startup_memory, same_phase
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
@@ -60,7 +61,7 @@ class _PreparationWorkerLost(Exception):
 # These observations describe one worker attempt, rather than the frozen job.
 ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
     'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
-    'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request')
+    'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request','execution_timing')
 
 
 def _matching_pass(pool):
@@ -1565,24 +1566,8 @@ class Coordinator:
                         node.client.cancel(identity)
                         cancel_sent=True
                     remote = node.client.status(identity, brief=True)
-                    request=remote.get('resource_request')
-                    if request and job.get('lease_answered')!=request['request_id']:
-                        options={k:v for k,v in request.items() if k!='request_id'}
-                        try:
-                            operation=options.pop('_operation','resize')
-                            reply={'grant':self.admission(options) if operation=='admission' else self.resize(job['result']['id'],**options)}
-                        except (Conflict,RemoteError,ValueError) as error:
-                            message=str(error)
-                            if isinstance(error,RemoteError)and (error.transport_retryable or error.status_code in (502,503,504)):
-                                message=RESOURCE_TRANSPORT_RETAINED+': '+message
-                            reply={'error':message}
-                        grant=reply.get('grant',{})
-                        if isinstance(grant,dict)and 'memory_phase'in grant:
-                            # This poll predates the resize it requested.
-                            # Keep the acknowledged phase when publishing it.
-                            remote['memory_phase']=grant['memory_phase']
-                        node.client.request('/jobs/'+identity+'/lease',{'request_id':request['request_id'],**reply})
-                        job['lease_answered']=request['request_id']
+                    if remote.get('resource_request'):
+                        self._answer_resource_request(job, identity, remote)
                     if remote['status'] in TERMINAL:
                         remote = node.client.status(identity)
                 except RemoteError as error:
@@ -1655,6 +1640,35 @@ class Coordinator:
                     self._update(job,{**result,'status':'cancelled','finished':time.time()})
                 archive_job(self.jobs, job)
                 self.condition.notify_all()
+
+    def _answer_resource_request(self, job, worker_id, remote):
+        request = remote['resource_request']
+        serial = request['request_id']
+        reply = job.get('lease_reply')
+        if serial <= job.get('lease_answered', 0) or reply and serial < reply['request_id']:
+            return
+        if not reply or serial != reply['request_id']:
+            options = {key: value for key, value in request.items() if key != 'request_id'}
+            operation = options.pop('_operation', 'resize')
+            reply = {'request_id': serial}
+            try:
+                reply['grant'] = (self.admission(options) if operation == 'admission'
+                                  else self.resize(job['result']['id'], **options))
+            except (Conflict, RemoteError, ValueError) as error:
+                message = str(error)
+                if isinstance(error, RemoteError) and (error.transport_retryable or error.status_code in (502, 503, 504)):
+                    message = RESOURCE_TRANSPORT_RETAINED + ': ' + message
+                reply['error'] = message
+            # The worker may already have received a reply whose ACK was lost.
+            # Replaying this answer must never apply the resource change twice.
+            job['lease_reply'] = reply
+        grant = reply.get('grant', {})
+        if 'memory_phase' in grant:
+            remote['memory_phase'] = grant['memory_phase']
+        if 'active_cpus' in grant:
+            remote['active_cpus'] = grant['active_cpus']
+        job['node'].client.request('/jobs/' + worker_id + '/lease', reply)
+        job['lease_answered'] = serial
 
     def _prepare_resource_recovery(self,job,outcome):
         """Fetch paid checkpoints outside the scheduling lock before requeue."""
@@ -1871,7 +1885,7 @@ class Coordinator:
         self._restore_accelerator(task, job['result'])
         worker_id=hashlib.sha256((identity+':'+str(len(attempts))).encode()).hexdigest()[:32]
         job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task),node=None,worker_id=worker_id)
-        job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
+        job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None);job.pop('lease_reply',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
         for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_cpus','peak_rss_mb','cpu_seconds','total_cpu_seconds','cost_incomplete',
                     'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency','error_kind','memory_pressure','peak_private_mb',
@@ -2333,7 +2347,7 @@ class Coordinator:
                 if not explicit:desired=max(1,desired)
                 active_floor=(active_cpus or 0)if explicit else max(1,active_cpus or 0)
                 if active_cpus is not None and (active_cpus>old or active_cpus>desired):
-                    raise ValueError('active_cpus must count threads within the existing grant and requested width')
+                    raise ValueError(ACTIVE_GRANT_CONFLICT)
                 model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
                 requested_model={k:v for k,v in model.items()if v is not None}
                 sample=next((j for j in node.health.get('active_jobs',())if j['id']==job.get('worker_id',identity)),{})

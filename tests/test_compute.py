@@ -76,7 +76,7 @@ class ExecutionTests(unittest.TestCase):
 from pathlib import Path
 tools = json.loads(Path(os.environ['REMOTE_COMPUTE_TOOLS_FILE']).read_bytes())
 assert not Path(os.environ['REMOTE_COMPUTE_JOB_DIR'], 'result.json').exists()
-print(json.dumps(tools['python']['argv']))
+print(json.dumps([os.environ['REMOTE_COMPUTE_JOB_ID'], tools['python']['argv']]))
 """
         save = self.worker._save
 
@@ -86,11 +86,15 @@ print(json.dumps(tools['python']['argv']))
             else:
                 save(job)
 
-        task = python(code)
+        task = python(code, env={'REMOTE_COMPUTE_TOOLS_FILE': 'unpublished.json'})
+        task['steps'].append(task['steps'][0][:])
+        identity = uuid.uuid4().hex
         with patch.object(self.worker, '_save', side_effect=withhold_running_receipt):
-            result = self.client.run(task)
+            result = self.client.run(task, job_id=identity)
         self.assertEqual(result['status'], 'succeeded', result.get('stderr'))
-        self.assertEqual(json.loads(result['stdout']), self.worker._tool_argv('python', task))
+        expected = [identity, self.worker._tool_argv('python', task)]
+        self.assertEqual([json.loads(line) for line in result['stdout'].splitlines()], [expected, expected])
+        self.assertEqual(result['id'], identity)
 
     def test_opt_in_publishes_live_cpu_snapshot_and_final_receipt(self):
         code=("import json,os,time\nfrom pathlib import Path\n"

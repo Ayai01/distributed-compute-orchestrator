@@ -2,6 +2,7 @@
 import math
 
 STARTUP_CPU_FLOOR = 'startup_cpu_floor'
+ACTIVE_GRANT_CONFLICT = 'active_cpus must count threads within the existing grant and requested width'
 
 
 def validate_cpu_overcommit(value):
