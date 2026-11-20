@@ -1813,19 +1813,13 @@ class Coordinator:
                 node.asset_session = session
             if force:node.known_assets.difference_update(assets)
             pending_assets = assets - node.known_assets
-            if not shared_cache:
-                locks = node.__dict__.setdefault('_asset_upload_locks', weakref.WeakValueDictionary())
-                pending = [(asset, locks.setdefault(asset, threading.Lock())) for asset in pending_assets]
-        if shared_cache:
-            # Workers with the same mount serialize the presence check and upload.
-            with self.shared_asset_upload_lock:
-                pending = [(asset, self.shared_asset_uploads.setdefault((shared_cache, asset), threading.Lock()))
-                           for asset in pending_assets]
-        for asset,transfer in pending:
+            locks = node.__dict__.setdefault('_asset_upload_locks', weakref.WeakValueDictionary())
+            pending = [(asset, locks.setdefault(asset, threading.Lock())) for asset in pending_assets]
+        for asset, lookup in pending:
             _check_cancelled(cancel)
-            while not transfer.acquire(timeout=.1):
+            while not lookup.acquire(timeout=.1):
                 _check_cancelled(cancel)
-            held = True
+            upload_locked = False
             try:
                 _check_cancelled(cancel)
                 with node.asset_lock:
@@ -1845,9 +1839,19 @@ class Coordinator:
                 route = '/assets/' + asset
                 archive = self.root / 'assets' / (asset + '.zip')
                 exists = node.client.request(route, cancel=abandoned)['exists']
+                if shared_cache and not exists:
+                    # Wait across workers only when a write may be needed.
+                    # Recheck on the target after another writer could have completed.
+                    key = (shared_cache, asset)
+                    with self.shared_asset_upload_lock:
+                        upload = self.shared_asset_uploads.setdefault(key, threading.Lock())
+                    while not upload.acquire(timeout=.1):
+                        _check_cancelled(cancel)
+                    upload_locked = True
+                    _check_cancelled(cancel)
+                    exists = node.client.request(route, cancel=abandoned)['exists']
                 wait_until = time.monotonic() + self.shared_asset_visibility_seconds
                 while shared_cache and not exists:
-                    key = (shared_cache, asset)
                     with self.shared_asset_upload_lock:
                         published = self.shared_asset_publications.get(key)
                     if not published or published[0] == node.name:
@@ -1861,8 +1865,8 @@ class Coordinator:
                     if time.monotonic() >= deadline:
                         break
                     # Other nodes may already see the archive. Serialize sends, not waiting.
-                    transfer.release()
-                    held = False
+                    upload.release()
+                    upload_locked = False
                     delay = 1
                     while not exists:
                         retry = min(deadline, time.monotonic() + delay)
@@ -1875,9 +1879,9 @@ class Coordinator:
                             break
                         delay = min(30, delay * 2)
                     if not exists:
-                        while not transfer.acquire(timeout=.1):
+                        while not upload.acquire(timeout=.1):
                             _check_cancelled(cancel)
-                        held = True
+                        upload_locked = True
                         _check_cancelled(cancel)
                         with self.shared_asset_upload_lock:
                             current_publication = self.shared_asset_publications.get(key)
@@ -1909,8 +1913,9 @@ class Coordinator:
                     if node.asset_session==session:node.known_assets.add(asset)
                 _check_cancelled(cancel)
             finally:
-                if held:
-                    transfer.release()
+                if upload_locked:
+                    upload.release()
+                lookup.release()
 
     def _update(self, job, remote):
         if job.get('retired'):return

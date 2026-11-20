@@ -23,6 +23,84 @@ from test_compute import provider, python, scratch, until
 
 
 class BulkIOControlTests(unittest.TestCase):
+    def test_shared_cache_reads_on_different_workers_do_not_wait_for_one_lookup(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {'DCO_SHARED_ASSET_CACHE': str(root / 'shared')}), \
+                    provider(root / 'first') as (_, first_client), \
+                    provider(root / 'second') as (_, second_client), \
+                    Pool([first_client, second_client]) as pool, \
+                    center(pool, root / 'center') as (state, client):
+                asset = client.sync_files({'model': b'immutable shared input'})
+                route = '/assets/' + asset
+                payload = (state.root / 'assets' / (asset + '.zip')).read_bytes()
+                first_client.request(route, payload)
+                first, second = pool.nodes
+                entered, release = threading.Event(), threading.Event()
+                requests = []
+                request = first.client.request
+
+                def slow(path, payload=None, **options):
+                    if path == route:
+                        requests.append(payload)
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError('Asset lookup was not released')
+                    return request(path, payload, **options)
+
+                with patch.object(first.client, 'request', side_effect=slow), ThreadPoolExecutor(3) as transfers:
+                    blocked = transfers.submit(state._ensure_assets, first, [asset])
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        duplicate = transfers.submit(state._ensure_assets, first, [asset])
+                        independent = transfers.submit(state._ensure_assets, second, [asset])
+                        independent.result(timeout=2)
+                        self.assertIn(asset, second.known_assets)
+                    finally:
+                        release.set()
+                    blocked.result(timeout=3)
+                    duplicate.result(timeout=3)
+                self.assertEqual(requests, [None])
+
+    def test_parallel_shared_cache_misses_upload_the_digest_once(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {'DCO_SHARED_ASSET_CACHE': str(root / 'shared')}), \
+                    provider(root / 'first') as (_, first_client), \
+                    provider(root / 'second') as (_, second_client), \
+                    Pool([first_client, second_client]) as pool, \
+                    center(pool, root / 'center') as (state, client):
+                asset = client.sync_files({'model': b'cold shared input'})
+                route = '/assets/' + asset
+                observed_miss = threading.Barrier(2)
+                uploads = []
+
+                def observe(request):
+                    first_lookup = True
+
+                    def invoke(path, payload=None, **options):
+                        nonlocal first_lookup
+                        result = request(path, payload, **options)
+                        if path == route:
+                            if payload is not None:
+                                uploads.append(payload)
+                            elif first_lookup:
+                                first_lookup = False
+                                self.assertFalse(result['exists'])
+                                observed_miss.wait(3)
+                        return result
+                    return invoke
+
+                first, second = pool.nodes
+                with patch.object(first.client, 'request', side_effect=observe(first.client.request)), \
+                        patch.object(second.client, 'request', side_effect=observe(second.client.request)), \
+                        ThreadPoolExecutor(2) as transfers:
+                    futures = [transfers.submit(state._ensure_assets, node, [asset]) for node in pool.nodes]
+                    for future in futures:
+                        future.result(timeout=5)
+                self.assertEqual([hashlib.sha256(data).hexdigest() for data in uploads], [asset])
+                self.assertTrue(all(asset in node.known_assets for node in pool.nodes))
+
     def test_oversized_request_stops_before_opening_a_connection(self):
         client=Client('http://127.0.0.1:1')
         with patch('remote_compute.client.MAX_BODY',64),patch('remote_compute.client.http.client.HTTPConnection') as connection:
