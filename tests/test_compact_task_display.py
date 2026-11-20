@@ -22,7 +22,7 @@ class CompactTaskDisplayTests(unittest.TestCase):
             with self.subTest(width=width):
                 text = '\n'.join(format_status(value, width=width).fit(36))
                 self.assertNotIn('Share/Pri', text)
-                self.assertIn('CPU/上限',text)
+                self.assertIn('CPU/限',text)
                 self.assertIn('4/128',text)
                 if width >= 140:
                     self.assertIn('ep:96', text)

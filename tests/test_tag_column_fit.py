@@ -29,7 +29,7 @@ class TagColumnTests(unittest.TestCase):
         job=dict(id='abcd'+'f'*28,label='run corner comparison',cpus=4,max_cpus=128,status='running')
         rows=format_status(dict(role='worker',node='test',cpus=8,active_jobs=[job]),width=110)
         text='\n'.join(rows)
-        self.assertIn('CPU/上限',text);self.assertIn('4/128',text)
+        self.assertIn('CPU/限',text);self.assertIn('4/128',text)
         self.assertNotIn('1/4',text)
 
     def test_all_projects_fit_real_tag_cells_without_ellipsis(self):

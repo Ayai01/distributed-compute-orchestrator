@@ -65,38 +65,38 @@ def _short(text, width):
 
 
 def _progress_label(job):
-    """Format an explicit task ratio without estimating from wall time."""
+    """Render only a numeric progress measure with a known denominator."""
     progress = job.get('progress')
-    if isinstance(progress,dict) and progress.get('schema')=='dco.progress.v1':
-        done,total=progress.get('completed'),progress.get('total')
-        if isinstance(done,(int,float)) and isinstance(total,(int,float)) and 0<=done<=total and total>0:
-            return f'{done/total*100:.0f}%'
-        return progress.get('phase') or job.get('phase') or '—'
+    numeric = (int, float)
+    values = {**job, **progress} if isinstance(progress, dict) else job
+    for done_key, total_key in (('completed', 'total'), ('current', 'target'), ('nfe', 'budget')):
+        done, total = values.get(done_key), values.get(total_key)
+        if type(done) in numeric and type(total) in numeric and 0 <= done <= total and total > 0:
+            if math.isfinite(total):
+                return f'{done/total*100:.0f}%'
+    percent_unit = str(values.get('unit') or '').lower() in ('%', 'percent', 'percentage')
     if isinstance(progress, dict):
-        for key in ('ratio', 'fraction', 'percent'):
+        for key, scale in (('ratio', 1), ('fraction', 1), ('percent', 100)):
             value = progress.get(key)
-            if isinstance(value, (int, float)):
-                ratio = float(value) / (100 if key == 'percent' or value > 1 else 1)
-                return f'{max(0, min(1, ratio)) * 100:.0f}%'
-        job = {**job, **progress}
-    for done_key, total_key in (('completed', 'total'), ('current', 'target'),
-                                ('nfe', 'budget')):
-        done, total = job.get(done_key), job.get(total_key)
-        if isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
-            return f'{max(0, min(total, done))/total*100:.0f}%'
+            if type(value) in numeric and 0 <= value <= scale:
+                return f'{value/scale*100:.0f}%'
+        done = progress.get('completed')
+        if percent_unit and type(done) in numeric and 0 <= done <= 100 and progress.get('total') is None:
+            return f'{done:.0f}%'
+        if progress.get('schema') == 'dco.progress.v1':
+            return ''
+    if type(progress) in numeric and 0 <= progress <= 100:
+        scale = 100 if percent_unit or progress > 1 else 1
+        return f'{progress/scale*100:.0f}%'
     total = job.get('total_steps')
-    if isinstance(total, int) and total > 0:
-        steps = job.get('steps') or ()
+    steps = job.get('steps')
+    if type(total) is int and total > 0 and isinstance(steps, (list, tuple)):
         done = sum(1 for step in steps
                    if isinstance(step, dict)
                    and (step.get('finished') is not None
                         or step.get('returncode') is not None))
         return f'{min(done, total)/total*100:.0f}%'
-    value = job.get('progress')
-    if isinstance(value, (int, float)):
-        ratio = float(value) / (100 if value > 1 else 1)
-        return f'{max(0, min(1, ratio)) * 100:.0f}%'
-    return job.get('phase') or '—'
+    return ''
 
 
 def _cell(text, width, right=False):
@@ -615,39 +615,38 @@ class StatusRows(list):
         records=[r if len(r)>7 else [*r,'-'] for r in records]
         ram_width=max([9]+[_width(r[4])for r in records])
         state_width=max([4]+[_width(r[5])for r in records])
-        def tag(record):
-            return record[6] if record[9]=='—' else f'{record[9]} {record[6]}'
+        cpu_header, cpu_width = 'CPU/限', 7
         # The full progress column appears only when the task panel has room
         # for it.  Narrow panes retain every existing identity/resource field;
         # the same ratio remains available in the status/API payload.
         show_progress = width >= 140
         if show_progress:
-            table=_table(['ID','节点','工程','CPU/上限','内存实/报','秒','状态','进度','任务标签'],
+            table=_table(['ID','节点','工程',cpu_header,'内存实/报','秒','状态','进度','任务标签'],
                          [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,state_width,8,None],width,right=(3,4,5,6))
+                         [4,self.node_width,6,cpu_width,ram_width,6,state_width,4,None],width,right=(3,4,5,6))
         elif width>=100:
-            table=_table(['ID','节点','工程','CPU/上限','内存实/报','秒','状态','任务标签'],
-                         [[r[i] for i in (0,1,2,3,4,7,5)]+[tag(r)] for r in records],
-                         [4,self.node_width,6,9,ram_width,6,state_width,None],width,right=(3,4,5))
+            table=_table(['ID','节点','工程',cpu_header,'内存实/报','秒','状态','任务标签'],
+                         [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
+                         [4,self.node_width,6,cpu_width,ram_width,6,state_width,None],width,right=(3,4,5))
         elif width>=80:
-            table=_table(['ID','节点','CPU/上限','内存实/报','秒','状态','任务标签'],
-                         [[r[i]for i in (0,1,3,4,7,5)]+[tag(r)]for r in records],
-                         [4,self.node_width,9,ram_width,5,state_width,None],width,right=(2,3,4))
+            table=_table(['ID','节点',cpu_header,'内存实/报','秒','状态','任务标签'],
+                         [[r[i] for i in (0,1,3,4,7,5,6)] for r in records],
+                         [4,self.node_width,cpu_width,ram_width,5,state_width,None],width,right=(2,3,4))
         elif width>=64:
-            table=_table(['ID','节点','CPU/上限','秒','任务标签'],[[r[i] for i in (0,1,3,7)]+[tag(r)] for r in records],
-                         [4,self.node_width,9,5,None],width,right=(2,3))
+            table=_table(['ID','节点',cpu_header,'秒','任务标签'],[[r[i] for i in (0,1,3,7,6)] for r in records],
+                         [4,self.node_width,cpu_width,5,None],width,right=(2,3))
         elif width>=54:
-            table=_table(['ID','节点','CPU/上限','任务标签'],
-                         [[r[i] for i in (0,1,3)]+[tag(r)] for r in records],
-                         [4,self.node_width,9,None],width,right=(2,))
+            table=_table(['ID','节点',cpu_header,'任务标签'],
+                         [[r[i] for i in (0,1,3,6)] for r in records],
+                         [4,self.node_width,cpu_width,None],width,right=(2,))
         elif width>=38:
-            table=_table(['ID','CPU/上限','秒','任务标签'],[[r[i] for i in (0,3,7)]+[tag(r)] for r in records],
-                         [4,8,4,None],width,right=(1,2))
+            table=_table(['ID',cpu_header,'任务标签'],[[r[i] for i in (0,3,6)] for r in records],
+                         [4,cpu_width,None],width,right=(1,))
         else:
             table=[_line('ID CPU 任务',width)]
             for r in records:
                 prefix=f'{r[0]} {r[3]} '
-                fitted=compact_tag({'label':tag(r),'id':r[0]},max(1,width-4-_width(prefix)),measure=_width)
+                fitted=compact_tag({'label':r[6],'id':r[0]},max(1,width-4-_width(prefix)),measure=_width)
                 table.append(_line(prefix+fitted,width))
         title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页'
         if not self.records:

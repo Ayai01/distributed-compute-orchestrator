@@ -1020,6 +1020,39 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('50%', text)
         self.assertNotIn('2/4', text)
 
+    def test_task_monitor_keeps_progress_and_action_separate_at_both_widths(self):
+        from remote_compute.view import StatusRows
+
+        base = dict(cpus=24, max_cpus=1024, status='running', project='ARH')
+        jobs = [
+            dict(base, id='abcd' + 'a'*28, label='检错继续 YOLOv8n 剂量256',
+                 progress=dict(schema='dco.progress.v1', phase='YOLO detailed stage',
+                               completed=14, total=25, unit='cycles')),
+            dict(base, id='bcde' + 'b'*28, label='停机对照 YOLOv8n 剂量256',
+                 progress=dict(schema='dco.progress.v1', phase='YOLO another stage',
+                               completed=12, unit='cycles')),
+        ]
+        value = dict(role='scheduler', node='local',
+                     nodes=[dict(name='fixture', capacity=32, active_jobs=jobs)])
+        for width in (38, 83, 160):
+            with self.subTest(width=width):
+                screen = _layout(StatusRows(value, width=width, viewport=True), [], [], 33)
+                header = next(row.split('|') for row in screen if 'CPU/限' in row)
+                task_rows = [next(row.split('|') for row in screen if job['id'][:4] in row)
+                             for job in jobs]
+                index = [cell.strip() for cell in header].index('CPU/限')
+                self.assertEqual(_width(header[index]) - 2, 7)
+                self.assertEqual([row[index].strip() for row in task_rows], ['24/1024', '24/1024'])
+                tag_index = [cell.strip() for cell in header].index('任务标签')
+                self.assertTrue(task_rows[0][tag_index].strip().startswith('检错继续 YOLOv8n'))
+                self.assertTrue(task_rows[1][tag_index].strip().startswith('停机对照 YOLOv8n'))
+                if width == 160:
+                    progress_index = [cell.strip() for cell in header].index('进度')
+                    self.assertEqual([row[progress_index].strip() for row in task_rows], ['56%', ''])
+                else:
+                    self.assertNotIn('%', task_rows[0][tag_index])
+                self.assertFalse(any('stage' in part for row in task_rows for part in row))
+
     def test_page_keys_change_task_pages_while_preserving_input_and_output_history(self):
         keyboard=Keyboard(['\x00','Q','\x00','Q',*'ping\rquit\r'])
         jobs=[dict(id=f'{i:04x}'+'b'*28,label=f'unique-task-{i}',cpus=1,status='running') for i in range(50)]
