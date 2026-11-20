@@ -100,6 +100,13 @@ def remaining_time():
     return min(original,window)if original is not None and window is not None else original if window is None else window
 
 
+def checkpoint_requested():
+    """Return true during the configured grace window inside the execution limit."""
+    grace = os.environ.get('REMOTE_COMPUTE_TIMEOUT_GRACE')
+    remaining = remaining_time()
+    return grace is not None and remaining is not None and remaining <= float(grace)
+
+
 def check_deadline(*,reserve_seconds=0):
     """Raise TimeoutError at a business boundary, leaving time to publish state."""
     reserve=float(reserve_seconds)

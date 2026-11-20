@@ -31,6 +31,7 @@ from .policy import (normalize_accelerator_requirement, select_accelerator_units
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
 from .allocation import elastic_cpus,cpu_capacity
+from .build_refs import provider_abi
 from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
 from .packages import package_names, provider_has_package
 
@@ -683,15 +684,28 @@ class Client:
         # not strand an otherwise successful build during publication.
         return self._read_reconnecting(lambda:self.request('/cache-references/'+identity,dict(content_id=content_id)))
 
+    def publish_reference(self, identity, *, project, paths, recipe_sha256, kind='artifact', legacy_abi=None):
+        """Retain existing files from an original receipt before retiring transport."""
+        from .build_refs import declaration
+        from .cache_refs import reference_id
+        reference_id(identity)
+        spec = declaration(dict(paths=list(paths), recipe_sha256=recipe_sha256), kind=kind)
+        request = dict(project=project, kind=kind, **spec)
+        if legacy_abi is not None:
+            request['legacy_abi'] = list(legacy_abi)
+        return self._read_reconnecting(lambda: self.request('/jobs/' + identity + '/publish-reference', request))
+
     def submit(self, task, *, inputs=None, files=None, job_id=None):
         from .policy import validate_operator_fields
         try:validate_operator_fields(task,self.operator)
         except ValueError as error:raise RemoteError(str(error)) from None
         if 'cpus' in task:
             raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')
-        identity = job_id or uuid.uuid4().hex
         # A stable id can be queried or resubmitted to THIS node after a lost reply.
-        return self.submit_bundle(identity, task_bundle(task, inputs, files))
+        bundle = task_bundle(task, inputs, files)
+        if job_id is None and task.get('produces_artifact_ref'):
+            job_id = hashlib.sha256(b'DCO artifact producer\0' + bundle).hexdigest()[:32]
+        return self.submit_bundle(job_id or uuid.uuid4().hex, bundle)
 
     def submit_bundle(self, identity, payload, *, callback=None, cancel=None):
         path='/jobs/'+identity
@@ -1347,6 +1361,7 @@ class Node:
     asset_lock: object = field(default_factory=threading.Lock)
     asset_session: object = None
     known_assets: set = field(default_factory=set)
+    artifact_claims: dict = field(default_factory=dict)
     known_jobs: set = field(default_factory=set)
     live_jobs: set = field(default_factory=set)
     memory_holds: dict = field(default_factory=dict)
@@ -1892,6 +1907,13 @@ class Pool:
                     or not supports_native_cache(health, task.get('native_cache'), getattr(node,'native_architecture',None))
                     or node.memory_capacity<node.startup_memory(task)):
                 continue
+            if any(key in task for key in ('_artifact_abi', 'produces_artifact_ref', 'checkpoint_output')):
+                abi = provider_abi(health)
+                if abi is None or task.get('_artifact_abi', abi) != abi:
+                    continue
+            if any(key in task for key in ('step_phases', 'timeout_grace_s', 'short_job', 'checkpoint_output')):
+                if 'execution_profiles_v1' not in health.get('capabilities', ()):
+                    continue
             if package:
                 if not provider_has_package(health, package):
                     continue
@@ -1946,6 +1968,16 @@ class Pool:
                          and n.health.get("queued", 0) == 0
                          and (task.get('accelerator')is None or
                               n.can_match_accelerator(n.execution_accelerator(task,available=True)))]
+                affinity = set(task.get('_affinity_assets', ()))
+                if ready and affinity:
+                    def preference(node):
+                        session = tuple(node.health.get(key) for key in ('pid', 'root', 'asset_revision'))
+                        known = len(affinity.intersection(node.known_assets)) if node.asset_session == session else 0
+                        pending = len(affinity.intersection(set().union(*node.artifact_claims.values())))
+                        return known, pending
+                    scores = [(preference(node), node) for node in ready]
+                    preferred = max(score for score, _ in scores)
+                    ready = [node for score, node in scores if score == preferred]
                 if ready:
                     if self.policy == "round_robin":
                         node = next((n for n in self.nodes[self.rotation:] + self.nodes[:self.rotation] if n in ready))
@@ -1992,6 +2024,8 @@ class Pool:
                     if job_id:
                         node.known_jobs.add(job_id)
                         node.live_jobs.add(job_id)
+                        if affinity:
+                            node.artifact_claims[job_id] = affinity
                     return node
                 if not block:
                     return None
@@ -2060,6 +2094,7 @@ class Pool:
             node.reserved -= task.get("cpus", 1)
             node.reserved_memory_mb -= task.get("memory_mb", 256)
             node.live_jobs.discard(job_id)
+            node.artifact_claims.pop(job_id, None)
             node.memory_holds.pop(job_id,None)
             if result is None:
                 # A lost connection can leave the worker running this job;

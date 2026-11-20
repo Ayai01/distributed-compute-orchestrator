@@ -31,7 +31,9 @@ def python_task(function, *, kwargs=None, **options):
 def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
-            accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True):
+            accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True,
+            artifact_ref=None, produces_artifact_ref=None, checkpoint_ref=None, checkpoint_output=None,
+            affinity_keys=None, timeout_grace_s=None, step_phases=None, short_job=False):
     if type(resource_recovery) is not bool:raise ValueError("resource_recovery must be a boolean")
     platform = validate_platform(platform)
     model=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
@@ -68,6 +70,13 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
         task["stdin"] = str(stdin)
     if retries!=2:task['retries']=retries
     if not resource_recovery:task['resource_recovery']=False
+    task.update({key: value for key, value in (
+        ('artifact_ref', artifact_ref), ('produces_artifact_ref', produces_artifact_ref),
+        ('checkpoint_ref', checkpoint_ref), ('checkpoint_output', checkpoint_output),
+        ('affinity_keys', affinity_keys), ('timeout_grace_s', timeout_grace_s), ('step_phases', step_phases),
+    ) if value is not None})
+    if short_job:
+        task['short_job'] = short_job
     return task
 
 

@@ -15,6 +15,7 @@ import zipfile
 
 from .bundle import PROTOCOL, TERMINAL, atomic_json, batch_status, json_bytes, pack, progress_fields
 from . import client as transport
+from . import build_refs
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import (Conflict, _ASSET, _ID, lock_root, validate_task, asset_handoff,
                      handoff_references, retire_asset, missing_task_assets)
@@ -68,6 +69,8 @@ def _matching_pass(pool):
     def matching(task):
         accelerator=task.get('accelerator')
         key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
+             task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
+             tuple(key for key in ('step_phases', 'short_job', 'timeout_grace_s', 'checkpoint_output') if key in task),
              task.get('cpus',1)or 1,task.get('memory_mb',256),
              execution_bindings(task),capability_set(task.get('requires',())),
              json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
@@ -641,7 +644,7 @@ class Coordinator:
 
     def public_result(self, result):
         """Return a project result without placement or worker-local paths."""
-        hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd',
+        hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd', '_artifact_abi',
                   'tool_root', 'root', 'home', 'worker_root',
                   'shared_paths', 'unavailable_shared', 'resource_request',
                   'observe_only', 'source', 'revision', '_asset_variants'}
@@ -651,12 +654,16 @@ class Coordinator:
             package = cleaned.get('capability_package')
             if package in RETAINED_NAMES:
                 cleaned['capability_package'] = RETAINED_NAMES[package]
-            for key in ('error', 'connection_error'):
+            for key in ('error', 'connection_error', 'artifact_publication_error'):
                 if isinstance(cleaned.get(key), str):
                     cleaned[key] = self.public_error(cleaned[key])
+            if isinstance(mapping.get('cache_hit'), dict):
+                hit = mapping['cache_hit']
+                cleaned['cache_hit'] = dict(artifact=bool(hit.get('artifact')), checkpoint=bool(hit.get('checkpoint')),
+                                            worker_id=result['id'])
             # Keep per-step timing and return codes without argv/path data.
             if isinstance(mapping.get('steps'), list):
-                cleaned['steps'] = [{key: step[key] for key in ('started', 'finished', 'returncode') if key in step}
+                cleaned['steps'] = [{key: step[key] for key in ('started', 'finished', 'returncode', 'cpu_phase', 'cpu_seconds') if key in step}
                                    for step in mapping['steps'] if isinstance(step, dict)]
             if result.get('capability_package'):
                 cleaned.pop('tools', None)
@@ -1009,6 +1016,7 @@ class Coordinator:
 
     def _restored_task(self, raw_task, result):
         task = validate_task(raw_task, max(1, raw_task.get('cpus', 1)), allow_auto=True)
+        task = build_refs.bind(self.root, task)
         package = result.get('capability_package')
         if package is None:
             return self._cache_placement(task)
@@ -1036,6 +1044,42 @@ class Coordinator:
             record=register(self.root,identity,project=result.get('project'),provider=provider,
                 content_id=request.get('content_id'))
             return public(record)
+
+    def publish_reference(self, identity, request, *, operator=False):
+        """Retain files produced by the original job, with its observed ABI."""
+        if not _ID.fullmatch(identity):
+            raise ValueError('Publication requires an original job ID')
+        required = {'project', 'kind', 'paths', 'recipe_sha256'}
+        if not isinstance(request, dict) or not required <= set(request) or set(request) - required - {'legacy_abi'}:
+            raise ValueError('Publication requires project, kind, paths and recipe_sha256')
+        if 'legacy_abi' in request and not operator:
+            raise ValueError('Legacy ABI attestation is operator-only')
+        kind = request['kind']
+        spec = build_refs.declaration({key: request[key] for key in ('paths', 'recipe_sha256')}, kind=kind)
+        with self.submission_lock.hold(identity):
+            result = self.get(identity)
+            if not result.get('project') or result['project'] != request['project']:
+                raise ValueError('Publication project differs from original receipt')
+            if result['status'] != 'succeeded' and not (kind == 'checkpoint' and result['status'] == 'timed_out'):
+                raise ValueError('Publication requires a successful producer or a timed-out checkpoint')
+            abi = result.get('_artifact_abi')
+            if abi is None and 'legacy_abi' in request:
+                attested = build_refs.provider_abi(dict(artifact_abi=request['legacy_abi']))
+                provider = next((node for node in self.pool.nodes if node.name == result.get('assigned_node')), None)
+                if attested is None or provider is None or provider.error or build_refs.provider_abi(provider.health) != attested:
+                    raise ValueError('Legacy ABI attestation requires the original provider with matching live ABI')
+                abi = attested
+            if not abi:
+                raise ValueError('Original receipt has no verified artifact ABI')
+            raw = self.artifacts(identity)
+            stored = self.root / 'jobs' / identity / 'worker-artifacts.zip'
+            archive = build_refs.output_archive(stored.read_bytes() if stored.is_file() else raw,
+                                                result.get('worker_id', identity) if stored.is_file() else identity,
+                                                spec['paths'], checkpoint=kind == 'checkpoint')
+            if archive is None:
+                raise ValueError('Checkpoint was not committed by the original task')
+            return build_refs.public(build_refs.register(self, project=result['project'], producer_id=identity,
+                                                         kind=kind, spec=spec, abi=abi, archive=archive))
 
     def _validate_project_share(self, task):
         """New originals keep the active project's weight; recovery keeps its request."""
@@ -1078,6 +1122,7 @@ class Coordinator:
                     package, accelerator = project_package(raw_task.get('requires', []), raw_task.get('accelerator'))
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
+                task = build_refs.bind(self.root, task)
                 task = self._cache_placement(task) if operator else package_task(task, package, accelerator)
             with self.condition:
                 self._validate_project_share(task)
@@ -1111,6 +1156,8 @@ class Coordinator:
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
                 if task.get('cache_ref'):job['result']['cache_ref']=task['cache_ref']
+                if 'checkpoint_output' in task or 'timeout_grace_s' in task:
+                    job['result']['partial_checkpoint_ref'] = None
                 if task['assets'] and self.asset_variants:
                     variants = freeze_asset_variants(task, self.asset_variants)
                     if variants:
@@ -1332,6 +1379,9 @@ class Coordinator:
                         fixed = None
                         job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
                                              cpus=job['task']['cpus'])
+                        abi = build_refs.provider_abi(node.health)
+                        if abi is not None:
+                            job['result']['_artifact_abi'] = list(abi)
                         job['result'].pop('resource_retry_after',None)
                         job['result'].pop('resource_wait_reason',None)
                         if job['result'].get('accelerator')!=job['task'].get('accelerator'):
@@ -1409,6 +1459,7 @@ class Coordinator:
         node, identity, task = job["node"], job.get('worker_id',job['result']['id']), job["task"]
         result = None;retry=False
         preparation_worker_lost = False
+        released = False
         try:
             reattach=job.pop('reattach',False)
             if reattach and job.pop('recover_submission',False):
@@ -1450,6 +1501,9 @@ class Coordinator:
                     worker_task.pop('_capability_package', None)
                     worker_task.pop('single_thread_weight',None)
                     worker_task.pop('retries',None)
+                    for field in (*(build_refs.REFERENCE_FIELDS - {'checkpoint_output'}),
+                                  '_artifact_abi', '_artifact_mounts', '_affinity_assets'):
+                        worker_task.pop(field, None)
                     if worker_task.get('accelerator') is not None:
                         worker_task['accelerator'] = {
                             key: value for key, value in worker_task['accelerator'].items()
@@ -1530,6 +1584,21 @@ class Coordinator:
                         self._publish(job)
                     time.sleep(.5)
                     continue
+                spec, checkpoint = task.get('produces_artifact_ref'), task.get('checkpoint_output')
+                completed = remote['status'] == 'succeeded'
+                publish = (spec and completed) or (checkpoint and (completed or remote['status'] == 'timed_out'))
+                if publish:
+                    self.pool._release(node, task, remote, job_id=identity)
+                    released = True
+                    try:
+                        raw = self._worker_artifact_archive(node.client, identity, job['directory'] / 'worker-artifacts.zip')
+                        if spec and completed:
+                            remote['artifact_ref'] = self._retain_output(job['result'], raw, identity, 'artifact', spec)
+                        if checkpoint:
+                            remote['partial_checkpoint_ref'] = self._retain_output(job['result'], raw, identity,
+                                                                                  'checkpoint', checkpoint)
+                    except (OSError, ValueError, KeyError, RemoteError, zipfile.BadZipFile) as error:
+                        remote['artifact_publication_error'] = str(error)
                 with self.condition:
                     job['result'].pop('connection_error',None)
                     # Retry is one atomic state transition. A client must not
@@ -1552,7 +1621,8 @@ class Coordinator:
                     job["result"].update(status="interrupted", error=str(error), finished=time.time())
                     self._save(job)
         finally:
-            self.pool._release(node, task, result,job_id=identity)
+            if not released:
+                self.pool._release(node, task, result,job_id=identity)
             if retry and result and resource_recovery(job['task'],result) and not job['cancel'].is_set():
                 try:self._prepare_resource_recovery(job,result)
                 except Exception as error:
@@ -1591,10 +1661,17 @@ class Coordinator:
         snapshot=resume_map(job['task'],job['result']['id'],job['result']['request_sha256'],raw,previous)
         atomic_json(path,snapshot)
 
+    def _retain_output(self, result, raw, identity, kind, spec):
+        archive = build_refs.output_archive(raw, identity, spec['paths'], checkpoint=kind == 'checkpoint')
+        if archive is not None:
+            return build_refs.register(self, project=result['project'], producer_id=result['id'],
+                kind=kind, spec=spec, abi=result['_artifact_abi'], archive=archive)['id']
+
     def _pace_submission(self, job):
         # Planning can reserve fair shares in one pass. Pace only the actual
         # POST after asset preparation, without serializing network transfers.
-        node=job['node'];interval=1. if job.get('cpu_overcommit')else .5
+        node = job['node']
+        interval = 1. if job.get('cpu_overcommit') else .1 if job.get('task', {}).get('short_job') else .5
         with node.dispatch_lock:
             deadline=node.next_dispatch+max(0,interval-node.dispatch_interval)
             if self.stopping or job['cancel'].wait(max(0,deadline-time.monotonic())):
@@ -1633,6 +1710,12 @@ class Coordinator:
                     finally:
                         job['result']['asset_preparation_seconds'] = (
                             job['result'].get('asset_preparation_seconds', 0.0) + time.monotonic() - started)
+                    if mounts := job['task'].get('_artifact_mounts'):
+                        hits = asset_metrics['uploads']
+                        job['result']['cache_hit'] = dict(
+                            artifact=hits.get(mounts.get('dco_artifact'), {}).get('cache_hit', False),
+                            checkpoint=hits.get(mounts.get('dco_checkpoint'), {}).get('cache_hit', False),
+                            worker_id=node.name)
                     if not uncertain and job['cancel'].is_set():return False
                     if not uncertain:
                         if not self._pace_submission(job):return False
@@ -1700,7 +1783,7 @@ class Coordinator:
         self._restore_accelerator(task, result)
         job.update(task=task, node=None, auto_cpus=task['cpus'] == 0, elastic_cpus=elastic_cpus(task))
         _restore_phase_demand(job)
-        for field in ('assigned_node', 'worker_url', 'dispatched', 'connection_error', 'asset_transport'):
+        for field in ('assigned_node', 'worker_url', 'dispatched', 'connection_error', 'asset_transport', 'cache_hit', '_artifact_abi'):
             result.pop(field, None)
         result.update(status='queued', cpus=task['cpus'], memory_mb=task['memory_mb'],
                       resource_wait_reason='transport: waiting for a reachable worker')
@@ -1716,7 +1799,9 @@ class Coordinator:
         measured={key:deepcopy(outcome.get(key,job['result'].get(key))) for key in (
             'started','elapsed','cpus','memory_mb','peak_cpus','peak_rss_mb','cpu_seconds',
             'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds',
-            'cpu_frequency','cost_incomplete','peak_private_mb','error_kind','memory_pressure') if key in outcome or key in job['result']}
+            'cpu_frequency','cost_incomplete','peak_private_mb','error_kind','memory_pressure',
+            'cpu_breakdown_s','compile_cpu_s','load_check_cpu_s','projection_cpu_s','sim_cpu_s')
+            if key in outcome or key in job['result']}
         if 'cpu_seconds' not in outcome:
             measured['cost_incomplete']=True  # A live snapshot is only the known prefix.
         job['result'].update(measured)
@@ -1775,7 +1860,8 @@ class Coordinator:
         job.pop('desired_cpus',None);job.pop('phase_memory',None);job.pop('lease_answered',None)
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
         for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_cpus','peak_rss_mb','cpu_seconds','total_cpu_seconds','cost_incomplete',
-                    'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency','error_kind','memory_pressure','peak_private_mb'):
+                    'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency','error_kind','memory_pressure','peak_private_mb',
+                    'cpu_breakdown_s','compile_cpu_s','load_check_cpu_s','projection_cpu_s','sim_cpu_s','cache_hit','_artifact_abi'):
             job['result'].pop(key,None)
         job['result'].update(started=None,stdout='',stderr='',steps=[])
         for key in ATTEMPT_OBSERVATIONS:job['result'].pop(key,None)
@@ -1854,6 +1940,9 @@ class Coordinator:
                 node.asset_session = session
             if force:node.known_assets.difference_update(assets)
             pending_assets = assets - node.known_assets
+            if report is not None:
+                for asset in assets - pending_assets:
+                    report.setdefault(asset, {}).setdefault('cache_hit', True)
             locks = node.__dict__.setdefault('_asset_upload_locks', weakref.WeakValueDictionary())
             pending = [(asset, locks.setdefault(asset, threading.Lock())) for asset in pending_assets]
         for asset, lookup in pending:
@@ -1864,7 +1953,10 @@ class Coordinator:
             try:
                 _check_cancelled(cancel)
                 with node.asset_lock:
-                    if node.asset_session==session and asset in node.known_assets:continue
+                    if node.asset_session==session and asset in node.known_assets:
+                        if report is not None:
+                            report.setdefault(asset, {}).setdefault('cache_hit', True)
+                        continue
                 def abandoned():
                     if cancel is None or not cancel():return False
                     # Other accepted jobs can still need this same upload.
@@ -1879,7 +1971,10 @@ class Coordinator:
                                        for job in active_values(self.jobs))
                 route = '/assets/' + asset
                 archive = self.root / 'assets' / (asset + '.zip')
-                exists = node.client.request(route, cancel=abandoned)['exists']
+                presence = node.client.request(route, cancel=abandoned)
+                exists = presence['exists']
+                if report is not None:
+                    report.setdefault(asset, {}).setdefault('cache_hit', presence.get('cache_hit', exists and not shared_cache))
                 if shared_cache and not exists:
                     # Wait across workers only when a write may be needed.
                     # Recheck on the target after another writer could have completed.
@@ -2586,6 +2681,21 @@ class Coordinator:
             thread.start()
             return False
 
+    @staticmethod
+    def _worker_artifact_archive(client, worker_id, cached):
+        if cached.is_file():
+            return cached.read_bytes()
+        # Resume the original download and keep it for publication and fetch.
+        temporary = cached.with_suffix('.partial')
+        client.artifacts(worker_id, destination=temporary)
+        raw = temporary.read_bytes()
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            if json.loads(archive.read('result.json'))['id'] != worker_id:
+                raise ValueError('Artifact task identity mismatch')
+        temporary.replace(cached)
+        unlink(temporary.with_name(temporary.name + '.http.json'))
+        return raw
+
     def artifacts(self, identity, *, is_connected=None, public=False, cache_only=False):
         job = load_job(self.jobs, self.condition, identity)
         with self.condition:
@@ -2608,25 +2718,12 @@ class Coordinator:
             files = {}
             if client or cached.is_file():
                 from .local import LocalClient
-                if isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts'):
+                if isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts') and not cached.is_file():
                     return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
                 try:
                     if is_connected and not is_connected():
                         raise ConnectionAbortedError('Result download caller disconnected while queued')
-                    if cached.is_file():
-                        raw=cached.read_bytes()
-                    else:
-                        # The original-ID lock coalesces duplicate reads. The
-                        # existing bounded HTTP pool handles distinct results;
-                        # a slow provider ZIP must not serialize every ID.
-                        temporary=cached.with_suffix('.partial')
-                        client.artifacts(worker_id,destination=temporary)
-                        raw=temporary.read_bytes()
-                        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-                            if json.loads(archive.read('result.json'))['id']!=worker_id:
-                                raise ValueError('Artifact task identity mismatch')
-                        temporary.replace(cached)
-                        unlink(temporary.with_name(temporary.name+'.http.json'))
+                    raw = self._worker_artifact_archive(client, worker_id, cached)
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
                         raise

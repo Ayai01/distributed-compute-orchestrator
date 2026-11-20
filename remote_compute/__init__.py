@@ -2,15 +2,16 @@
 
 PROJECT_NAME = "Distributed Compute Orchestrator"
 ABBREVIATION = "DCO"
-__version__ = "1.0.33"
+__version__ = "1.0.34"
 
-__all__ = ["Client", "Pool", "RemoteError", "RequestCancelled", "command", "ngspice", "verilator", "python_map", "python_call", "python_task", "map_items", "run_call", "iter_items", "StreamResultsPending", "remaining_time", "check_deadline", "report_progress", "Deferred", "Skipped", "ExecutionFailure", "ExecutionPaused"]
+__all__ = ["Client", "Pool", "RemoteError", "RequestCancelled", "command", "ngspice", "verilator", "python_map", "python_call", "python_task", "map_items", "run_call", "iter_items", "StreamResultsPending", "remaining_time", "check_deadline", "checkpoint_requested", "report_checkpoint", "report_progress", "Deferred", "Skipped", "ExecutionFailure", "ExecutionPaused"]
 
 _exports={name:module for module,names in (
     ('client',('Client','Pool','RemoteError','RequestCancelled')),
     ('tasks',('command','ngspice','verilator','python_map','python_call','python_task')),
     ('execution',('map_items','run_call','iter_items','StreamResultsPending')),
-    ('deadline',('remaining_time','check_deadline')),
+    ('deadline',('remaining_time','check_deadline','checkpoint_requested')),
+    ('build_refs',('report_checkpoint',)),
     ('progress',('report_progress',)),
     ('pipeline',('Deferred','Skipped','ExecutionFailure','ExecutionPaused')),
 )for name in names}

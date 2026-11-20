@@ -42,3 +42,25 @@
 资产缓存每十分钟检查一次。超过七天未命中的无引用资产回收；容量超过 64 GiB 时，继续依最后一次命中从旧到新回收。中心和进程内 worker 共用本机额度，独立 worker 各自管理解包缓存，同一挂载上的学校 worker 共用一个共享 ZIP 缓存。正在交接、执行或等待领取的资产保留到引用解除。结果、原 ID、费用账本和显式保留的检查点遵循各自的生命周期。
 
 调用方只提交可复现的输入和生成器，临时中间件留在 worker 作业目录。SDK 缓存未命中时重新生成并发布输入，worker 优先读取共享副本，否则从中心恢复。SDK 的内容索引只记摘要，最多 128 条。依赖安装和项目自己的长期缓存由其所有者管理。
+
+## 制品、检查点和短任务
+
+中心公布 `artifact_cas_v1`、`warm_affinity_v1` 和 `staged_cpu_accounting_v1`。可分配线程继续从 `admission(project, activity=True)` 的聚合容量读取。新增字段需要 1.0.34 或更新的中心与兼容 worker，省略时沿用现有请求。
+
+- 冷构建用 `produces_artifact_ref={"recipe_sha256": digest, "paths": ["build.zip"]}` 声明精确的输出文件。配方摘要应覆盖输入源码、工具链、编译选项和 ABI。中心把声明文件按内容入库，并在构建完成回执中返回 `artifact_ref`。SDK 对完全相同的构建请求复用原 ID。显式传入的 `job_id` 仍为原 ID。
+- 消费用 `artifact_ref` 和 `checkpoint_ref` 引用同工程的制品。挂载变量分别为 `${asset:dco_artifact}`、`${asset:dco_checkpoint}`。中心验证制品所属工程和 worker ABI，在已满足能力与资源条件的节点中优先使用热缓存，满载时可到兼容节点拉取。Linux 制品要求平台、架构和 glibc 一致，其他动态依赖应随制品带齐或由公开能力包提供。普通回执的 `cache_hit.worker_id` 是随原任务变化的标识。
+- `step_phases=["compile","load_check","projection","sim"]` 按步骤声明 CPU 阶段，与 `steps` 一一对应。回执使用 `cpu_breakdown_s`，各阶段之和等于本次执行的进程树 CPU。重试保留在 `attempts`，原任务总费用沿用 `total_cpu_seconds`。固定单核、无加速器的短任务可传 `short_job=True`，中心和 worker 使用 100 毫秒启动间隔。若涉及 CPU 超发仍走一秒间隔与现有内存保护。
+- `timeout_grace_s` 预留原执行预算的最后一段。程序在 `checkpoint_requested()` 成立后保存声明的文件，调用 `report_checkpoint(paths)` 提交摘要，并用 `report_progress` 报告当前进度。任务声明 `checkpoint_output={"recipe_sha256": digest, "paths": ["state.json"]}` 和对应的 `outputs`。中心验证摘要后在终态返回 `partial_checkpoint_ref`，缺少已提交的完整快照时字段为 `null`。
+- 在退休运输副本前可用 `Client.publish_reference(id, project=..., paths=..., recipe_sha256=...)` 补登记。引用保留原 ID 和内容绑定，缓存文件服从七天和 64 GiB 覆盖策略。调用方应持久保存复现实验所需的原始产物与配方。
+
+```python
+producer = command(build_argv, project="demo", requires=["rtl"], max_cpus=1,
+                   outputs=["build.zip"], step_phases=["compile"],
+                   produces_artifact_ref={"recipe_sha256": digest, "paths": ["build.zip"]})
+receipt = client.wait(client.submit(producer, files=inputs)["id"])
+ref = receipt["artifact_ref"]
+consumer = command(sim_argv, project="demo", requires=["rtl"], max_cpus=1,
+                   artifact_ref=ref, affinity_keys=[ref], step_phases=["sim"],
+                   env={"BUILD": "${asset:dco_artifact}/build.zip"})
+consumer_id = client.submit(consumer, files=sim_inputs)["id"]
+```

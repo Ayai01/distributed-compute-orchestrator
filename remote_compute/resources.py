@@ -449,6 +449,9 @@ class Host:
         return result
 
 
+CPU_STAGES = ('compile', 'load_check', 'projection', 'sim')
+
+
 def process_usage(process):
     """Sum the owned job/process group; CPU time includes completed Windows children."""
     if os.name != "nt":
@@ -457,7 +460,7 @@ def process_usage(process):
         for pid,parts in process._posix_members(fresh=False).items():
             totals[(pid,parts[19])]=(int(parts[11])+int(parts[12]))/os.sysconf('SC_CLK_TCK')
             rss+=int(parts[21])*os.sysconf('SC_PAGE_SIZE')
-        seconds=sum(totals.values())
+        seconds=max(sum(totals.values()), getattr(process.child, 'reaped_cpu_seconds', 0.0))
         return {"rss_mb": rss / MIB, "cpu_seconds": seconds}
 
     from ctypes import wintypes as w

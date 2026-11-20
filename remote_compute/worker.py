@@ -158,9 +158,14 @@ def cpu_budget(value=0):
 
 
 def validate_task(task, capacity, *, allow_auto=False):
+    from .build_refs import CHECKPOINT_MANIFEST, REFERENCE_FIELDS, validate_fields
+    from .resources import CPU_STAGES
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
     unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "resource_recovery", "accelerator", "platform", "cache_ref", "native_cache"}
+    unknown -= {'step_phases', 'timeout_grace_s', 'checkpoint_output', 'short_job'}
+    if allow_auto:
+        unknown -= REFERENCE_FIELDS
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     maximum=task.get('max_cpus',task.get('cpus') or 1024)
@@ -216,6 +221,16 @@ def validate_task(task, capacity, *, allow_auto=False):
             not isinstance(argv, list) or not argv or any(not isinstance(x, str) or "\0" in x for x in argv)
             for argv in steps)):
         raise ValueError("steps must be a nonempty list of argv lists")
+    if 'step_phases' in task:
+        phases = task['step_phases']
+        if not isinstance(phases, list) or len(phases) != len(steps) or any(phase not in CPU_STAGES for phase in phases):
+            raise ValueError('step_phases must contain one of compile, load_check, projection, sim for each step')
+    if 'timeout_grace_s' in task:
+        grace = task['timeout_grace_s']
+        if type(grace) not in (int, float) or not 0 < grace < timeout:
+            raise ValueError('timeout_grace_s must be positive and smaller than the execution timeout')
+    if 'short_job' in task and (task['short_job'] is not True or maximum != 1 or task['accelerator'] is not None):
+        raise ValueError('short_job requires a fixed one-CPU job without an accelerator')
     for key in ("outputs", "render"):
         if not isinstance(task[key], list) or any(not isinstance(x, str) for x in task[key]):
             raise ValueError(key + " must be a list of relative file patterns")
@@ -229,6 +244,10 @@ def validate_task(task, capacity, *, allow_auto=False):
             not isinstance(k, str) or not _NAME.fullmatch(k) or not isinstance(v, str)
             or not _ASSET.fullmatch(v) for k, v in task["assets"].items()):
         raise ValueError("assets must map names to synchronized SHA256 ids")
+    if REFERENCE_FIELDS.intersection(task):
+        validate_fields(task)
+    if 'checkpoint_output' in task and CHECKPOINT_MANIFEST not in task['outputs']:
+        task['outputs'] = [*task['outputs'], CHECKPOINT_MANIFEST]
     if not isinstance(task["label"], str):
         raise ValueError("label must be a string")
     if (type(task["priority"]) is not int
@@ -429,7 +448,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress']
+                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress','execution_profiles_v1']
                         + ([ASSET_RESUME_CAPABILITY] if self.shared_assets else [])
                         + (['restart'] if self.restart_available else []))
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:
@@ -438,7 +457,9 @@ class Worker:
         with self.condition:
             resources = self._memory_state()
             disk = shutil.disk_usage(self.root)
+            from .build_refs import worker_abi
             value = {**identity, "platform": sys.platform, "architecture": self.architecture,
+                    "artifact_abi": worker_abi(self.architecture),
                     "node_ip": self.node_ip,
                     "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
                     "cpus": self._cpu_capacity(resources), "base_cpus":self.capacity,
@@ -1144,7 +1165,7 @@ class Worker:
                     job['result']['preparation_stage'] = 'memory_calibration' if cold else 'host_memory_pressure'
                     return None
                 job['cancel'].wait(.05)
-            interval=1. if job.get('cpu_overcommit')else .5
+            interval = 1. if job.get('cpu_overcommit') else .1 if job.get('task', {}).get('short_job') else .5
             deadline=self.next_start+max(0,interval-self.start_interval)
             if self.stopping or job['cancel'].wait(max(0,min(deadline,expires)-time.monotonic())):
                 return None
@@ -1165,6 +1186,7 @@ class Worker:
             self.start_lock.release()
 
     def _execute(self, job):
+        from .resources import CPU_STAGES
         task, result, directory = job["task"], job["result"], job["directory"]
         job['parent_memory_mb']=task['memory_mb']
         work = directory / "input"
@@ -1181,6 +1203,8 @@ class Worker:
             return now >= deadline and execution_remaining(deadline, clock) <= 0
         state, error = "succeeded", None
         cpu_seconds = 0.0
+        phases = task.get('step_phases')
+        breakdown = dict.fromkeys(CPU_STAGES, 0.0) if phases else None
         accounting = None
         accounting_saved = time.monotonic()
         accounting_saved_cpu = -1.0
@@ -1200,6 +1224,10 @@ class Worker:
                 environment['PATH'] = os.pathsep.join(
                     [str(path) for path in msys_paths if path.is_dir()] + ([inherited] if inherited else []))
             environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
+            if 'timeout_grace_s' in task:
+                environment['REMOTE_COMPUTE_TIMEOUT_GRACE'] = str(task['timeout_grace_s'])
+            if 'checkpoint_output' in task:
+                environment['REMOTE_COMPUTE_CHECKPOINT_ROOT'] = str(work)
             environment = cache_environment(environment, self.cache_root)
             from .paths import build_environment
             environment = build_environment(environment,self.tools)
@@ -1235,7 +1263,7 @@ class Worker:
             self._accelerator_environment(result['id'], environment)
             with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                 templates=job.get('templates',{})
-                for frozen in job['commands']:
+                for index, frozen in enumerate(job['commands']):
                     initial = deadline is None
                     waiting_since = time.monotonic() if initial and self.pressure_guard.state['waiting'] else None
                     if waiting_since is not None:
@@ -1281,6 +1309,8 @@ class Worker:
                         state='timed_out'
                         break
                     step = {"argv": argv, "returncode": None}
+                    if phases:
+                        step['cpu_phase'] = phases[index]
                     def begin_execution():
                         nonlocal deadline
                         started = time.monotonic()
@@ -1348,7 +1378,11 @@ class Worker:
                             job["cancel"].wait(0.05)
                         step.update(returncode=process.child.wait(), finished=time.time())
                         usage = process_usage(process)
+                        previous_cpu = cpu_seconds
                         cpu_seconds = max(result["cpu_seconds"], cpu_seconds + usage["cpu_seconds"])
+                        if breakdown is not None:
+                            step['cpu_seconds'] = cpu_seconds - previous_cpu
+                            breakdown[step['cpu_phase']] += step['cpu_seconds']
                         measured = accounting.update(cpu_seconds) if accounting else None
                         progress_update = sample_progress(job,cpu_seconds,force=True)
                         with self.condition:
@@ -1372,6 +1406,9 @@ class Worker:
             state, error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
             job.pop('preparation_deadline', None)
+            if breakdown is not None:
+                result['cpu_breakdown_s'] = dict(breakdown, total=cpu_seconds)
+                result.update({phase + '_cpu_s': seconds for phase, seconds in breakdown.items()})
             if deadline is None:
                 result['preparation_seconds'] = time.monotonic() - preparing
                 if state == 'timed_out':
@@ -1673,14 +1710,14 @@ class Worker:
         if job_id is not None and not _ID.fullmatch(job_id):
             raise ValueError('Job id requires 32 lowercase hex characters')
         directory = self.root / "assets" / identity
-        def published():
+        def published(*, materialized=False):
             exists = directory.is_dir()
             if exists:
                 self.asset_cache.touch(identity)
             if job_id is not None:
                 held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                 self.asset_handoff(job_id, list(set(held) | {identity}))
-            return {"id": identity, "exists": exists}
+            return {"id": identity, "exists": exists, "cache_hit": exists and not materialized}
         with self.asset_cache.lock:
             if directory.is_dir() or (payload is None and self.shared_assets is None):
                 return published()
@@ -1712,7 +1749,7 @@ class Worker:
                     if self.stopping:
                         raise Conflict('Worker is stopping')
                     temporary.replace(directory)
-                    return published()
+                    return published(materialized=True)
             finally:
                 if temporary.exists():
                     remove_owned(temporary)
@@ -1971,6 +2008,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts)==2 and parts[0]=='cache-references' and scheduler and self.command in ('GET','POST'):
                 request=json.loads(body)if self.command=='POST'else None
                 value=worker.cache_reference(parts[1],request)
+            elif len(parts) == 3 and parts[0] == 'jobs' and parts[2] == 'publish-reference' and scheduler and self.command == 'POST':
+                value = worker.publish_reference(parts[1], json.loads(body), operator=operator)
             elif parts == ['jobs','status'] and self.command == 'POST':
                 request = json.loads(body)
                 identities = validate_status_ids(request.get('ids') if isinstance(request, dict) else None)

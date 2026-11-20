@@ -132,6 +132,32 @@ def low_integrity_directory(path):
         kernel.LocalFree(descriptor)
 
 
+class _AccountedPopen(subprocess.Popen):
+    """Keep per-process Linux rusage when wait reaps the root and joined children."""
+
+    reaped_cpu_seconds = 0.0
+
+    def _try_wait(self, flags):
+        try:
+            pid, status, usage = os.wait4(self.pid, flags)
+        except ChildProcessError:
+            return self.pid, 0
+        if pid == self.pid:
+            self.reaped_cpu_seconds = usage.ru_utime + usage.ru_stime
+        return pid, status
+
+    def poll(self):
+        if self.returncode is None and self._waitpid_lock.acquire(False):
+            try:
+                if self.returncode is None:
+                    pid, status = self._try_wait(os.WNOHANG)
+                    if pid == self.pid:
+                        self._handle_exitstatus(status)
+            finally:
+                self._waitpid_lock.release()
+        return self.returncode
+
+
 class Process:
     def __init__(self, argv, cwd, env, stdout, stderr, *, stdin=None):
         self.job = None
@@ -139,8 +165,9 @@ class Process:
         options = {"start_new_session": True} if os.name != "nt" else {
             "creationflags": subprocess.CREATE_NO_WINDOW | 4,  # CREATE_SUSPENDED
         }
-        self.child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
-                                      stdout=stdout, stderr=stderr, **options)
+        popen = _AccountedPopen if os.name != 'nt' and hasattr(os, 'wait4') else subprocess.Popen
+        self.child = popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                           stdout=stdout, stderr=stderr, **options)
         if os.name == "nt":
             try:
                 self._windows_job()
