@@ -272,6 +272,7 @@ class AssetCache:
         self.metadata_lock = threading.Lock()
         self.entries = {}
         self.revision = 0
+        self.next_size_scan = 0.0
         self.size_index=self.root.parent/(self.root.name+'.sizes.jsonl')
         sizes={};self.index_records=0
         if not archives and self.size_index.is_file():
@@ -291,27 +292,78 @@ class AssetCache:
                 self._add(path, sizes.get(identity))
         self._compact_sizes()
 
+    def _unpacked_size(self, path):
+        size = 0
+        for folder, directories, files in os.walk(path, followlinks=False):
+            directories[:] = [name for name in directories if not self._linked(Path(folder) / name)]
+            size += sum((Path(folder) / name).stat().st_size for name in files
+                        if not self._linked(Path(folder) / name))
+        return size
+
+    def _record_sizes(self, sizes):
+        if not sizes:
+            return
+        with self.size_index.open('a+b') as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell():
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b'\n':
+                    stream.write(b'\n')
+            for identity, size in sizes.items():
+                line = json.dumps(dict(id=identity, bytes=size), separators=(',', ':'))
+                stream.write((line + '\n').encode('utf8'))
+        self.index_records += len(sizes)
+
     def _add(self, path, known_size=None):
         # Assets can unpack successfully into the extended namespace while
         # their deep children still exceed Win32 paths during cache indexing.
         path = native_path(path,force=True)
         size = path.stat().st_size if self.archives else known_size or 0
         if not self.archives and known_size is None:
-            for folder, directories, files in os.walk(path, followlinks=False):
-                directories[:] = [name for name in directories if not self._linked(Path(folder)/name)]
-                size += sum((Path(folder)/name).stat().st_size for name in files
-                            if not self._linked(Path(folder)/name))
+            size = self._unpacked_size(path)
         used = path.stat().st_mtime
         with self.metadata_lock:
             self.entries[path.stem if self.archives else path.name] = (size, used)
         if not self.archives and known_size is None:
-            with self.size_index.open('a+b')as stream:
-                stream.seek(0,os.SEEK_END)
-                if stream.tell():
-                    stream.seek(-1,os.SEEK_END)
-                    if stream.read(1)!=b'\n':stream.write(b'\n')
-                stream.write((json.dumps(dict(id=path.name,bytes=size),separators=(',',':'))+'\n').encode('utf8'))
-            self.index_records+=1
+            self._record_sizes({path.name: size})
+
+    def reconcile_sizes(self):
+        """Account for build products written below unpacked caches."""
+        if self.archives:
+            return
+        with self.lock:
+            now = time.monotonic()
+            if now < self.next_size_scan:
+                return
+            self.next_size_scan = now + ASSET_SWEEP_SECONDS
+            snapshot = tuple(self.entries.items())
+        measured = {}
+        for identity, (known, _) in snapshot:
+            path = native_path(self._path(identity), force=True)
+            try:
+                info = path.lstat()
+                if self._linked(path):
+                    continue
+                size = self._unpacked_size(path)
+            except FileNotFoundError:
+                continue
+            if size != known:
+                measured[identity] = (path, info.st_dev, info.st_ino, size)
+        with self.lock:
+            changes = {}
+            for identity, (path, device, inode, size) in measured.items():
+                if identity not in self.entries:
+                    continue
+                try:
+                    current = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (current.st_dev, current.st_ino) == (device, inode) and not self._linked(path):
+                    changes[identity] = size
+            self._record_sizes(changes)
+            with self.metadata_lock:
+                for identity, size in changes.items():
+                    self.entries[identity] = (size, self.entries[identity][1])
 
     def _compact_sizes(self):
         if self.archives or self.index_records<=max(1024,4*len(self.entries)):return

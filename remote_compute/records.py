@@ -346,8 +346,10 @@ def archive_job(records, job, *, startup=False):
         records.archive(job, startup=startup)
 
 
-def asset_references(records):
-    referenced = set(records.assets) if isinstance(records, JobRecords) else set()
+def asset_references(records, *, recent_terminal_assets=None):
+    """Protect active work and optionally bound archived input pins by cache age."""
+    archived = records.assets.keys() if isinstance(records, JobRecords) else ()
+    referenced = set(archived) if recent_terminal_assets is None else recent_terminal_assets.intersection(archived)
     for job in active_values(records):
         referenced.update(job['result'].get('assets', {}).values())
     return referenced

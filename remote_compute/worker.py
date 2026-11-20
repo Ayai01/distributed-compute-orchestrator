@@ -435,7 +435,6 @@ class Worker:
         self.asset_cache = AssetCache(self.root / 'assets',
                                       limit=min(cache_mib * 1024**2, ASSET_CACHE_BYTES))
         self.asset_cache.reclaim_uploads()
-        self._prune_assets()
         self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
                             seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
         atomic_json(self.root/'startup-current.json',self.startup)
@@ -445,6 +444,7 @@ class Worker:
         self.scheduler.start()
         self.retirement.start()
         self.asset_maintenance = AssetMaintenance(self._maintain_assets, self._report_asset_cleanup)
+        self.asset_maintenance.request()
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
@@ -1532,7 +1532,9 @@ class Worker:
             protected = {identity for identity, (_size, used) in self.asset_cache.entries.items()
                          if recent and now-used<5}
             protected.update(handoff_references(self))
-            protected.update(asset_references(self.jobs))
+            recent_inputs = {asset for asset, (_, used) in self.asset_cache.entries.items()
+                             if now - used < self.asset_cache.max_idle}
+            protected.update(asset_references(self.jobs, recent_terminal_assets=recent_inputs))
             return protected
 
     def _report_asset_cleanup(self, error):
@@ -1545,6 +1547,7 @@ class Worker:
                 self._report_asset_cleanup(error)
 
     def _maintain_assets(self):
+        self.asset_cache.reconcile_sizes()
         self._prune_assets()
         if self.shared_assets is not None:
             for error in self.shared_assets.prune():

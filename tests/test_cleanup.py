@@ -118,6 +118,23 @@ class CleanupTests(unittest.TestCase):
             with patch('remote_compute.cleanup.os.walk',side_effect=AssertionError('torn metadata lost a complete size')):
                 self.assertEqual(AssetCache(root).snapshot()['bytes'],126)
 
+    def test_background_size_scan_counts_generated_files_and_persists_the_total(self):
+        with scratch() as directory:
+            root = Path(directory) / 'assets'
+            asset = root / ('a' * 64)
+            asset.mkdir(parents=True)
+            (asset / 'source').write_bytes(b'source')
+            cache = AssetCache(root)
+            last_used = cache.entries[asset.name][1]
+            generated = asset / 'build'
+            generated.mkdir()
+            (generated / 'evaluator').write_bytes(b'a' * 4196)
+            cache.reconcile_sizes()
+            self.assertEqual(cache.entries[asset.name], (4202, last_used))
+            with patch('remote_compute.cleanup.os.walk', side_effect=AssertionError('unexpected repeated scan')):
+                cache.reconcile_sizes()
+                self.assertEqual(AssetCache(root).snapshot()['bytes'], 4202)
+
     def test_slow_asset_reclaim_retires_the_old_name_and_leaves_cache_control_free(self):
         from remote_compute.cleanup import remove_owned
         with scratch()as directory:
@@ -347,6 +364,43 @@ class CleanupTests(unittest.TestCase):
                 with patch('remote_compute.worker.time.time',return_value=time.time()+6),worker.condition:
                     worker._prune_assets()
                 self.assertLessEqual(worker.asset_cache.snapshot()['bytes'],100)
+
+    def test_expired_inputs_release_terminal_pins_without_retiring_originals(self):
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root / 'worker') as (worker, provider_client), Pool([provider_client]) as pool:
+                with center(pool, root / 'center') as (state, client):
+                    asset = client.sync_files({'input.txt': b'cold cache'})
+                    task = python(
+                        "from pathlib import Path; Path('output.txt').write_text("
+                        "Path(r'${asset:source}/input.txt').read_text())",
+                        assets={'source': asset}, outputs=['output.txt'],
+                    )
+                    identity = client.submit(task)['id']
+                    finished = client.wait(identity)
+                    for service in (state, worker):
+                        cache = service.asset_cache
+                        with cache.lock:
+                            size, _ = cache.entries[asset]
+                            cache.entries[asset] = size, time.time() - cache.max_idle - 60
+                        service._prune_assets()
+                        self.assertNotIn(asset, cache.entries)
+                    archived = client.fetch(identity, delete=False)
+                    self.assertEqual(archived['id'], identity)
+                    self.assertEqual(archived['cpu_seconds'], finished['cpu_seconds'])
+                    self.assertEqual(archived['files']['output.txt'], b'cold cache')
+
+                    self.assertEqual(client.sync_files({'input.txt': b'cold cache'}), asset)
+                    state.control({'paused': True})
+                    queued = client.submit(task)['id']
+                    with state.asset_cache.lock:
+                        size, _ = state.asset_cache.entries[asset]
+                        state.asset_cache.entries[asset] = size, time.time() - state.asset_cache.max_idle - 60
+                    state._prune_assets()
+                    self.assertIn(asset, state.asset_cache.entries)
+                    state.control({'paused': False})
+                    self.assertEqual(client.wait(queued)['status'], 'succeeded')
+                    self.assertEqual(client.fetch(queued)['files']['output.txt'], b'cold cache')
 
     def test_recent_asset_survives_collection_between_upload_and_submit(self):
         with scratch() as directory, provider(Path(directory)/'worker',cpus=2) as (worker,client):

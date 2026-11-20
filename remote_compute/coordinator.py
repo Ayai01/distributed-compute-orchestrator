@@ -223,7 +223,6 @@ class Coordinator:
         self.local_asset_workers = tuple(dict.fromkeys(worker for node in self.pool.nodes
                                                        if (worker := getattr(node.client, 'worker', None)) is not None))
         self.asset_cache.reclaim_uploads()
-        self._maintain_assets()
         self.startup.update(asset_seconds=round(time.monotonic()-phase,4),
                             seconds=round(time.monotonic()-started,4),pid=os.getpid(),version=__version__)
         atomic_json(self.root/'startup-current.json',self.startup)
@@ -231,6 +230,7 @@ class Coordinator:
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
         self.retirement.start()
+        self.asset_maintenance.request()
 
     def _load_operator_token(self, supplied):
         path = self.root / 'operator.token'
@@ -2823,7 +2823,9 @@ class Coordinator:
                          if recent and now - self.asset_cache.entries.get(asset, (0, 0))[1] < 3600}
             self.legacy_assets.intersection_update(protected)
             protected.update(handoff_references(self))
-            protected.update(asset_references(self.jobs))
+            recent_inputs = {asset for asset, (_, used) in self.asset_cache.entries.items()
+                             if now - used < self.asset_cache.max_idle}
+            protected.update(asset_references(self.jobs, recent_terminal_assets=recent_inputs))
             protected.update(self.accepting_assets)
             return protected
 
