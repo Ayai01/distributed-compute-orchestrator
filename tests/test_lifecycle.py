@@ -245,14 +245,21 @@ class SharedRamdiskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='compute-ramdisk-') as directory:
             root=Path(directory);cache=root/'inflight-input'
             cache.write_bytes(b'active scientific input')
+            marker = root / ramdisk.MARKER
+            marker.write_text('{"kind":"ramdisk","shared":true,"capacity_bytes":8589934592}', encoding='utf8')
+            (ramdisk.ROOT/'.local').mkdir()
+            (ramdisk.ROOT/'.local/worker.json').write_text('{"ramdisk_gib":4}', encoding='utf8')
+            marker_before = marker.read_bytes()
             with patch.object(ramdisk,'shared_volume',return_value=root), \
                     patch.object(ramdisk,'driver',return_value='imdisk.exe'), \
                     patch.object(ramdisk,'_run') as run, \
                     patch.object(ramdisk.shutil,'disk_usage',return_value=SimpleNamespace(total=8*1024**3-4096)):
                 with self.assertRaisesRegex(OSError,'preserve its files'):
                     ramdisk.ensure_shared(4)
+                self.assertEqual(ramdisk.scratch('DCO'), root/'DCO')
             run.assert_not_called()
             self.assertEqual(cache.read_bytes(),b'active scientific input')
+            self.assertEqual(marker.read_bytes(), marker_before)
 
     def test_concurrent_starts_create_one_marked_eight_gib_volume(self):
         # Use the real cross-project Win32 mutex, but emulate every disk operation.

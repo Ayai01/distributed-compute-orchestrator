@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,16 @@ from test_compute import scratch
 
 
 class LaunchHandoffTests(unittest.TestCase):
+    def test_managed_launch_keeps_the_active_entry_and_explicit_versions_stay_pinned(self):
+        runtime = Path.cwd() / '.runtime'
+        installed = runtime / 'v1.0.29'
+        active = runtime / 'active' / 'main.py'
+        with patch.object(cli, 'ROOT', installed):
+            with patch.object(sys, 'argv', [str(active)]):
+                self.assertEqual(cli.service_entry(), active)
+            with patch.object(sys, 'argv', [str(installed / 'main.py')]):
+                self.assertEqual(cli.service_entry(), installed / 'main.py')
+
     def test_frpc_uses_its_configured_transport_without_inheriting_http_proxy(self):
         for executable in ('frpc','frps'):
             with self.subTest(executable=executable),scratch() as directory:
@@ -54,6 +65,7 @@ class LaunchHandoffTests(unittest.TestCase):
                     server.return_value.server_port=26133
                     center.return_value.paused=False
                     thread.return_value.start.side_effect=lambda *args:events.append('http')
+                    thread.return_value.is_alive.return_value=False
                     tunnel.return_value.__enter__.side_effect=lambda *args:events.append('tunnel')
                     tunnel.return_value.__exit__.side_effect=lambda *args:events.append('closed')
                     self.assertEqual(cli.main(['--service-child','--no-dashboard']),0)

@@ -102,7 +102,7 @@ def _mark_shared(root, size):
     path.write_text(json.dumps(dict(expected,purpose='Shared simulation scratch for all local projects'),indent=2),encoding='utf-8')
 
 
-def ensure_shared(size_gib=None, *, create=False):
+def ensure_shared(size_gib=None, *, create=False, reuse_larger=False):
     """Reuse/extend the marked volume; never create a second disk after a failed resize."""
     settings=json.loads((ROOT/'.local/worker.json').read_text(encoding='utf-8-sig')) if (ROOT/'.local/worker.json').is_file() else {}
     # Capacity belongs to this host's operator, including for older callers passing 8.
@@ -131,6 +131,8 @@ def ensure_shared(size_gib=None, *, create=False):
         executable = driver()
         if root:
             if shutil.disk_usage(root).total > size + 32 * 1024**2:
+                if reuse_larger:
+                    return root
                 raise OSError(f'Shared RAM disk exceeds {size_gib} GiB; preserve its files and resize it during maintenance')
             if shutil.disk_usage(root).total < size - 32 * 1024**2:
                 if not executable:
@@ -153,7 +155,7 @@ def ensure_shared(size_gib=None, *, create=False):
 
 
 def scratch(project):
-    volume = ensure_shared()
+    volume = ensure_shared(reuse_larger=True)
     root = (volume / project) if volume else ROOT / '.local/tmp' / project
     root.mkdir(parents=True, exist_ok=True)
     return root

@@ -282,9 +282,19 @@ def supervise(argv, *, stopping=None):
         return _supervise(argv, stopping=stopping)
 
 
+def service_entry():
+    """Keep the installed alias on reload and respect explicitly pinned launches."""
+    entry = Path(sys.argv[0]).absolute()
+    active = ROOT.parent / 'active' / 'main.py'
+    if ROOT.parent.name == '.runtime' and entry == active:
+        return active
+    return ROOT / 'main.py'
+
+
 def _supervise(argv, *, stopping=None):
+    entry = service_entry()
     while True:
-        process = subprocess.Popen([sys.executable, "-B", str(ROOT / "main.py"), "--service-child", *argv],
+        process = subprocess.Popen([sys.executable, "-B", str(entry), "--service-child", *argv],
                                    env=dict(os.environ,DCO_SUPERVISOR_REVISION='memory31'))
         while True:
             try:
@@ -344,7 +354,7 @@ def handoff_python(invocation):
     environment.pop('PYTHONHOME',None)
     environment['PATH']=str(executable.parent)+os.pathsep+str(executable.parent/'Scripts')+os.pathsep+environment.get('PATH','')
     args=[arg for arg in invocation if arg!='--service-child']
-    subprocess.Popen([str(executable),'-B',str(ROOT/'main.py'),*args],cwd=ROOT,env=environment)
+    subprocess.Popen([str(executable),'-B',str(service_entry()),*args],cwd=ROOT,env=environment)
     return True
 
 
