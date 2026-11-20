@@ -1,6 +1,8 @@
 """Integer weighted shares, redistributing demand that a project cannot use."""
 import math
 
+STARTUP_CPU_FLOOR = 'startup_cpu_floor'
+
 
 def validate_cpu_overcommit(value):
     if isinstance(value,bool)or not isinstance(value,(int,float))or not math.isfinite(value)or not 1<=value<=1.5:
@@ -20,6 +22,16 @@ def cpu_capacity(base,used,percent,factor,utilization=90):
     if used>=base and percent is not None and math.isfinite(percent)and 0<=percent<utilization:
         capacity=int(base*factor)
     return capacity
+
+
+def startup_cpus(task):
+    """Width required before an unassigned task can start."""
+    return task.get('cpus', 1) or task.get('min_start_cpus', 1)
+
+
+def validate_min_start_cpus(value, maximum):
+    if type(value) is not int or type(maximum) is not int or not 1 <= value <= maximum:
+        raise ValueError('min_start_cpus must be an integer in 1..max_cpus')
 
 
 def elastic_cpus(task):

@@ -26,7 +26,7 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
 from .telemetry import Activity
-from .allocation import weighted_node_threads, plan_resize, elastic_cpus
+from .allocation import STARTUP_CPU_FLOOR, weighted_node_threads, plan_resize, elastic_cpus, startup_cpus
 from .memory import plan_memory, startup_memory, same_phase
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
@@ -71,7 +71,7 @@ def _matching_pass(pool):
         key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
              task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
              tuple(key for key in ('step_phases', 'short_job', 'timeout_grace_s', 'checkpoint_output') if key in task),
-             task.get('cpus',1)or 1,task.get('memory_mb',256),
+             startup_cpus(task),task.get('min_start_cpus',1)>1,task.get('memory_mb',256),
              execution_bindings(task),capability_set(task.get('requires',())),
              json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
         if key not in cache:cache[key]=tuple(pool._matching(task))
@@ -94,9 +94,8 @@ def _restore_phase_demand(job):
             requested=node.capacity
         job['desired_cpus']=min(requested,job['task']['max_cpus'])
     elif job['task'].get('execution',{}).get('mode')=='entry':
-        # The worker also starts an entry with one CPU; nested map/call
-        # requests publish their actual useful widths at phase boundaries.
-        job['desired_cpus']=1
+        # Nested map/call requests publish their useful widths at phase boundaries.
+        job['desired_cpus']=startup_cpus(job['task'])
 
 
 def _infrastructure_interruption(job, outcome):
@@ -489,6 +488,7 @@ class Coordinator:
 
     def _project_activity(self, project, nodes):
         """Expose each original's CPU sample without revealing its worker."""
+        disconnected = {node.name for node in nodes if node.error}
         reported = {sample['id']: sample for node in nodes if not node.error
                     for sample in node.health.get('active_jobs') or ()}
         rows = []
@@ -506,11 +506,20 @@ class Coordinator:
         jobs = []
         for result, sample in rows:
             runtime = sample.get('runtime') or result.get('runtime') or {}
+            active = sample.get('active_cpus')
+            if active is None and result.get('assigned_node', result.get('node')) not in disconnected:
+                active = result.get('active_cpus')
+            if type(active) is not int or active < 0:
+                active = None
             jobs.append(dict(id=result['id'], status=result['status'], cpus=result.get('cpus'),
-                active_cpus=sample.get('active_cpus', result.get('active_cpus')),
+                active_cpus=active,
                 cpu_seconds=runtime.get('cpu_seconds'), sampled_at=runtime.get('sampled_at'),
                 process_alive=runtime.get('process_alive')))
-        return dict(sampled_at=time.time(), jobs=jobs)
+        running = [job['active_cpus'] for job in jobs if job['status'] == 'running']
+        observed = [width for width in running if width is not None]
+        active = dict(lower_bound=sum(observed), observed_jobs=len(observed), running_jobs=len(running),
+                      coverage=len(observed) / len(running) if running else 1.0)
+        return dict(sampled_at=time.time(), jobs=jobs, active_cpus=active)
 
     @staticmethod
     def _cpu_availability(nodes, *, operator=False):
@@ -806,7 +815,7 @@ class Coordinator:
                 task = job.get('task', {})
                 name = task.get('project') or 'default'
                 shares[name] = task.get('resource_share', 1.0)
-                startup=task.get('cpus',1)
+                startup=startup_cpus(task)
                 if held is not None and _elastic_job(job):startup=max(4,startup)
                 demand = job.get('desired_cpus',largest if job.get('auto_cpus') else startup)
                 demand=min(demand,task.get('max_cpus',demand))
@@ -1151,6 +1160,8 @@ class Coordinator:
                                   "stdout": "", "stderr": "", "steps": [],
                                   "total_steps": len(task["steps"]), "assets": task["assets"]}})
                 _restore_phase_demand(job)
+                if 'min_start_cpus' in task:
+                    job['result']['min_start_cpus'] = task['min_start_cpus']
                 if package is not None:
                     job['result']['capability_package'] = package
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
@@ -1203,9 +1214,9 @@ class Coordinator:
         ready=[key for key in self.queue if self.jobs[key]['result'].get('resource_retry_after',0)<=time.time()]
         counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
                         for node in matching(self.jobs[key]['task'])) for key in ready}
-        modes={key:self.jobs[key]['task'].get('cpus',1)or 1 for key in ready}
+        modes={key:startup_cpus(self.jobs[key]['task']) for key in ready}
         groups={}
-        for key in sorted(ready,key=lambda key:(-self.jobs[key]['task']['priority'],self.jobs[key]['task'].get('cpus',1)or 1,counts[key])):
+        for key in sorted(ready,key=lambda key:(-self.jobs[key]['task']['priority'],modes[key],counts[key])):
             task=self.jobs[key]['task']
             groups.setdefault(task.get('project')or'default',deque()).append(key)
         while groups:
@@ -1291,9 +1302,8 @@ class Coordinator:
                 job = self.jobs[identity]
                 if job['result'].get('resource_retry_after',0)>time.time():continue
                 group = task.get('project') or 'default'; resource = resources[group]
-                width = task['cpus']
-                if (job.get('auto_cpus')and job.get('node')is None or width <= 1 or group in groups or job['cancel'].is_set()
-                        ):
+                width = startup_cpus(task)
+                if width <= 1 or group in groups or job['cancel'].is_set():
                     continue
                 held=job.get('node')
                 ready = [node for node in self.pool._matching(task)
@@ -1316,8 +1326,10 @@ class Coordinator:
         protected = {}
         for name, (node, waiting) in claims.items():
             owner = waiting.get('project') or 'default'; resource = resources[owner]
-            if (owner != group and resource['used']/resource['resource_share'] <= current['used']/current['resource_share']):
-                protected[name] = max(0, min(waiting['cpus'], node.capacity-node.reserved-node.external))
+            startup_claim = (waiting.get('cpus') == 0 and waiting is not task
+                             and waiting.get('priority', 0) >= task.get('priority', 0))
+            if (owner != group or startup_claim) and resource['used']/resource['resource_share'] <= current['used']/current['resource_share']:
+                protected[name] = max(0, min(startup_cpus(waiting), node.capacity-node.reserved-node.external))
         return protected
 
     def _schedule(self):
@@ -1358,7 +1370,7 @@ class Coordinator:
                             for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
                                 headroom[name] = max(headroom.get(name, 0), count)
                             node = self.pool._acquire(job["task"], block=False,
-                                cpu_limit=1 if job.get('auto_cpus') else None,
+                                cpu_limit=startup_cpus(job['task']) if job.get('auto_cpus') else None,
                                 partial_cpus=True,job_id=job.get('worker_id',identity),
                                 node_headroom=headroom,memory_floor=job['result'].get('resource_recovery_memory_mb',0),
                                 resource_recovery=bool(job['result'].get('resource_recovery_count')))
@@ -1500,6 +1512,8 @@ class Coordinator:
                     worker_task.pop('native_cache',None)
                     worker_task.pop('_capability_package', None)
                     worker_task.pop('single_thread_weight',None)
+                    if STARTUP_CPU_FLOOR not in node.health.get('capabilities', ()):
+                        worker_task.pop('min_start_cpus', None)
                     worker_task.pop('retries',None)
                     for field in (*(build_refs.REFERENCE_FIELDS - {'checkpoint_output'}),
                                   '_artifact_abi', '_artifact_mounts', '_affinity_assets'):
@@ -2125,7 +2139,7 @@ class Coordinator:
                     fixed[group]=fixed.get(group,0)+task['cpus']
                 continue
             elastic=_elastic_job(job)
-            demand=job.get('desired_cpus',max(4,task.get('cpus',1))if held is not None and elastic else task.get('cpus',1)or 1)
+            demand=job.get('desired_cpus',max(4,task.get('cpus',1))if held is not None and elastic else startup_cpus(task))
             if demand_override is not None:demand=demand_override.get(key,demand)
             demand=min(demand,task.get('max_cpus',demand))
             eligible=[]
@@ -2180,7 +2194,8 @@ class Coordinator:
         if claim is not None:
             owner=claim[1].get('project')or'default'
             if owner==group or resources[owner]['used']/resources[owner]['resource_share']<=resources[group]['used']/resources[group]['resource_share']:
-                claimed_room=max(0,current['node'].capacity-current['node'].external-current['node'].reserved+current['task']['cpus']-claim[1]['cpus'])
+                claimed_room=max(0,current['node'].capacity-current['node'].external-current['node'].reserved
+                                 +current['task']['cpus']-startup_cpus(claim[1]))
                 if claimed_room==0:return 0
         if desired==1:
             # The plan grants at most the requested width and at least one.
@@ -2242,7 +2257,7 @@ class Coordinator:
                 max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(4,task.get('cpus',1)))
             demands[key]=min(demand,task.get('max_cpus',demand))
             rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
-            if held is None:waiting[key]=task.get('cpus',1)or 1
+            if held is None:waiting[key]=startup_cpus(task)
         for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-row[1].get('priority',0),len(row[2]),row[3])):
             choices=[name for name in eligible if capacities[name]>=task['cpus']]
             if choices:
@@ -2476,7 +2491,7 @@ class Coordinator:
         task=job['task']; choices=[]
         for node in self.pool._matching(task):
             if (node.error or not node.enabled or node.health.get('paused') or node.health.get('queued',0)
-                    or node.capacity-node.reserved-node.external < (task.get('cpus') or 1)
+                    or node.capacity-node.reserved-node.external < startup_cpus(task)
                     or task.get('accelerator') is not None and not node.can_match_accelerator(
                         node.execution_accelerator(task,available=True))):
                 continue

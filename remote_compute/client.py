@@ -30,7 +30,7 @@ from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle,
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
                      MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
-from .allocation import elastic_cpus,cpu_capacity
+from .allocation import STARTUP_CPU_FLOOR, elastic_cpus, cpu_capacity, startup_cpus
 from .build_refs import provider_abi
 from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
 from .packages import package_names, provider_has_package
@@ -1895,7 +1895,7 @@ class Pool:
                   "timing_labels": len(n.durations), "error": n.error} for n in self.nodes]}
 
     def _matching(self, task):
-        cpus=task.get('cpus',1) or 1
+        cpus=startup_cpus(task)
         required_tools,required_shared,python,backend=execution_bindings(task)
         required=capability_set(task.get('requires',()))
         package = task.get('_capability_package')
@@ -1903,6 +1903,7 @@ class Pool:
         for node in self.nodes:
             health=node.health
             if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
+                    or task.get('min_start_cpus', 1) > 1 and STARTUP_CPU_FLOOR not in health.get('capabilities', ())
                     or task.get('platform') is not None and health.get('platform') != task['platform']
                     or not supports_native_cache(health, task.get('native_cache'), getattr(node,'native_architecture',None))
                     or node.memory_capacity<node.startup_memory(task)):
@@ -1937,7 +1938,9 @@ class Pool:
                 not isinstance(argv, list) or not argv for argv in task["steps"]):
             raise ValueError("Task requires nonempty argv steps")
         automatic = task.get('cpus') == 0
-        cpus = task.get("cpus", 1) or 1
+        cpus = startup_cpus(task)
+        if automatic and cpu_limit is not None:
+            cpu_limit = max(cpus, cpu_limit)
         memory_mb = task.get("memory_mb", 256)
         label = task.get("label", "")
         with self.condition:

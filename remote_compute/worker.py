@@ -47,7 +47,8 @@ from .compat import unlink
 from .receipts import read_receipt
 from .deadline import PREPARATION_TIMEOUT, execution_remaining, preparation_elapsed
 from .paths import cache_environment
-from .allocation import plan_resize,cpu_capacity,validate_cpu_overcommit,validate_cpu_utilization
+from .allocation import (STARTUP_CPU_FLOOR, plan_resize, cpu_capacity, validate_cpu_overcommit, validate_cpu_utilization,
+                         validate_min_start_cpus)
 from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
@@ -163,7 +164,7 @@ def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
     unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "resource_recovery", "accelerator", "platform", "cache_ref", "native_cache"}
-    unknown -= {'step_phases', 'timeout_grace_s', 'checkpoint_output', 'short_job'}
+    unknown -= {'step_phases', 'timeout_grace_s', 'checkpoint_output', 'short_job', 'min_start_cpus'}
     if allow_auto:
         unknown -= REFERENCE_FIELDS
     if unknown:
@@ -173,6 +174,10 @@ def validate_task(task, capacity, *, allow_auto=False):
             "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256,
             "accelerator": None, **task}
     cpus, timeout = task["cpus"], task["timeout"]
+    if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
+        raise ValueError(f"Task cpus must be in 1..{capacity}")
+    if type(maximum) is not int or maximum < 1 or cpus > maximum:
+        raise ValueError('max_cpus must be a positive integer no smaller than cpus')
     if task.get('cache_ref')is not None:
         from .cache_refs import reference_id
         reference_id(task['cache_ref'])
@@ -183,13 +188,21 @@ def validate_task(task, capacity, *, allow_auto=False):
     if 'execution' in task:
         from .execution import validate_execution
         validate_execution(task['execution'])
+    minimum = task.get('min_start_cpus', 1)
+    if 'min_start_cpus' in task:
+        validate_min_start_cpus(minimum, maximum)
+        if allow_auto and cpus != 0:
+            raise ValueError('min_start_cpus requires automatic allocation')
+        if not allow_auto and cpus < minimum:
+            raise ValueError('Worker CPU grant is below min_start_cpus')
     if 'memory_model'in task:
         model=task['memory_model']
         if not isinstance(model,dict)or set(model)-{'base_memory_mb','memory_per_cpu_mb','memory_limit_mb'}:
             raise ValueError('memory_model requires base/per-CPU memory and optional limit')
         base,per=model.get('base_memory_mb',0),model.get('memory_per_cpu_mb',0)
-        width,required=plan_resize(1,None,base,per,model.get('memory_limit_mb'),task['memory_mb'])
-        if width!=1 or required>task['memory_mb']:raise ValueError('Initial memory must fit one execution slot')
+        width,required=plan_resize(minimum,None,base,per,model.get('memory_limit_mb'),task['memory_mb'])
+        if width!=minimum or required>task['memory_mb']:
+            raise ValueError('Initial memory must fit the startup CPU width')
     if type(task.get('retries',2)) is not int or not 0<=task.get('retries',2)<=10:
         raise ValueError('retries must be an integer in 0..10')
     if type(task.get('resource_recovery',True)) is not bool:
@@ -207,10 +220,6 @@ def validate_task(task, capacity, *, allow_auto=False):
     task['accelerator'] = normalize_accelerator_requirement(task.get('accelerator'))
     task['requires'] = canonical_capabilities(task.get('requires', ()))
     validate_platform(task.get('platform'))
-    if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
-        raise ValueError(f"Task cpus must be in 1..{capacity}")
-    if 'max_cpus' in task and (type(task['max_cpus']) is not int or task['max_cpus']<1 or cpus>task['max_cpus']):
-        raise ValueError('max_cpus must be a positive integer no smaller than cpus')
     if type(task["memory_mb"]) is not int or task["memory_mb"] < 1:
         raise ValueError("memory_mb must be a positive integer in MiB")
     if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
@@ -448,7 +457,7 @@ class Worker:
 
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
-                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress','execution_profiles_v1']
+                        capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress','execution_profiles_v1',STARTUP_CPU_FLOOR]
                         + ([ASSET_RESUME_CAPABILITY] if self.shared_assets else [])
                         + (['restart'] if self.restart_available else []))
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:
@@ -1239,9 +1248,15 @@ class Worker:
             temporary = self._temporary(job)
             temporary.mkdir()
             low_integrity_directory(temporary)
+            # The runtime receipt is replaced repeatedly. Publish the accepted
+            # tool bindings once in this job's scratch before any child starts.
+            tools_file = temporary / 'tool-bindings.json'
+            tools_file.write_bytes(json_bytes(result['tools']))
             environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
                                REMOTE_COMPUTE_JOB_TEMP=str(temporary),
+                               REMOTE_COMPUTE_TOOLS_FILE=str(tools_file),
+                               REMOTE_COMPUTE_MIN_START_CPUS=str(task.get('min_start_cpus', 1)),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
             environment.pop('REMOTE_COMPUTE_PREPARATION_CLOCK', None)
             if clock is not None:
@@ -1287,7 +1302,10 @@ class Worker:
                         job['memory_observation']=MemoryObservation()
                         job['memory_phase_model']=task.get('memory_model')
                         result['memory_phase']=task.get('memory_model') or dict(memory_mb=job['parent_memory_mb'])
-                    self._automatic_grant(job)
+                    # A declared initial floor is already funded by placement.
+                    # Later commands and explicit phase requests remain elastic.
+                    if not initial or task.get('min_start_cpus', 1) == 1:
+                        self._automatic_grant(job)
                     environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
                     self._accelerator_environment(result['id'],environment)
                     for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','NUMBA_NUM_THREADS'):

@@ -6,6 +6,8 @@ from pathlib import Path
 import threading
 import time
 
+from .allocation import startup_cpus
+
 PRESSURE_GRACE_SECONDS=2.0
 PRESSURE_RECOVERY_SECONDS=2.0
 COMMIT_EMERGENCY_MB=1024
@@ -98,8 +100,8 @@ def memory_boundary():
 
 
 def startup_memory(task):
-    """Fund one cold probe rather than reject an unmeasured large estimate."""
-    return min(task.get('memory_mb',256),256*max(1,task.get('cpus',1)))
+    """Fund the startup width without reserving an unmeasured peak."""
+    return min(task.get('memory_mb',256),256*startup_cpus(task))
 
 
 def same_phase(model,previous):

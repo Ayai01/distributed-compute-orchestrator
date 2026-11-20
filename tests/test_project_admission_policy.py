@@ -2,7 +2,7 @@
 import json,sys,threading,unittest,uuid
 from pathlib import Path
 from unittest.mock import patch
-from remote_compute import Client,Pool,RemoteError,command,python_map
+from remote_compute import Client,Pool,RemoteError,command,python_map,python_task
 from remote_compute.bundle import task_bundle
 from remote_compute.runtimes import SINGLE_CORE_PHASE_HANDOFF
 from test_compute import provider,scratch,until
@@ -11,6 +11,23 @@ from test_capability_packages import packaged_worker
 
 
 class ProjectAdmissionPolicyTests(unittest.TestCase):
+    def test_public_startup_floor_survives_worker_dispatch(self):
+        with scratch() as folder, packaged_worker(Path(folder) / 'worker', 'python', cpus=4) as (_, remote), Pool([remote]) as pool:
+            with center(pool, Path(folder) / 'center') as (_, operator):
+                client = Client(operator.url, operator.token)
+                source = "import os\ndef run():\n    print(os.environ['REMOTE_COMPUTE_CPUS'], os.environ['OMP_NUM_THREADS'])\n"
+                job = client.run(python_task('entry:run', max_cpus=4, min_start_cpus=3),
+                                 files={'entry.py': source}, keep=True)
+                self.assertEqual(job['status'], 'succeeded', job)
+                self.assertEqual(job['stdout'].strip(), '3 1')
+                self.assertEqual(job['initial_cpus'], 3)
+                self.assertEqual(job['min_start_cpus'], 3)
+                default = client.run(python_task('entry:run', max_cpus=4), files={'entry.py': source}, keep=True)
+                self.assertEqual(default['initial_cpus'], 1)
+                self.assertEqual(default['stdout'].strip(), '1 1')
+                with self.assertRaisesRegex(ValueError, 'min_start_cpus'):
+                    python_task('entry:run', max_cpus=2, min_start_cpus=3)
+
     def test_rtl_and_chisel_remain_available_before_the_handoff_upgrade(self):
         with scratch() as folder, packaged_worker(Path(folder)/'old','rtl',cpus=4) as (old,old_client), \
                 packaged_worker(Path(folder)/'first-release','rtl',cpus=2) as (new,new_client):
@@ -68,8 +85,9 @@ class ProjectAdmissionPolicyTests(unittest.TestCase):
                 self.assertIn('capability_cpus', view)
                 self.assertTrue({'platform', 'nodes', 'worker_url', 'node'}.isdisjoint(view))
                 activity = view['activity']
-                self.assertEqual(set(activity), {'sampled_at', 'jobs'})
+                self.assertEqual(set(activity), {'sampled_at', 'jobs', 'active_cpus'})
                 self.assertEqual(activity['jobs'], [])
+                self.assertEqual(activity['active_cpus'], dict(lower_bound=0, observed_jobs=0, running_jobs=0, coverage=1.0))
                 operator.control(paused=True)
                 a = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='A'))['id']
                 b = client.submit(command(['${tool:python}', '-c', 'pass'], max_cpus=1, project='B'))['id']

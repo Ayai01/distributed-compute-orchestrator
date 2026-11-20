@@ -28,7 +28,7 @@ def python_task(function, *, kwargs=None, **options):
     return task
 
 
-def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
+def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
             accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True,
@@ -36,21 +36,27 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
             affinity_keys=None, timeout_grace_s=None, step_phases=None, short_job=False):
     if type(resource_recovery) is not bool:raise ValueError("resource_recovery must be a boolean")
     platform = validate_platform(platform)
+    if min_start_cpus is not None:
+        from .allocation import validate_min_start_cpus
+        validate_min_start_cpus(min_start_cpus, max_cpus)
     model=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
     if model:
         if memory_mb is not None:raise ValueError('Declare fixed memory_mb or a base/per-CPU memory model')
         from .allocation import plan_resize
         base=0 if base_memory_mb is None else base_memory_mb
         per=0 if memory_per_cpu_mb is None else memory_per_cpu_mb
-        width,memory_mb=plan_resize(1,None,base,per,memory_limit_mb,base+per)
-        if width!=1 or memory_mb is None or memory_limit_mb is not None and memory_mb>memory_limit_mb:
-            raise ValueError('Memory model must fit the first execution slot')
+        startup_width = min_start_cpus or 1
+        width,memory_mb=plan_resize(startup_width,None,base,per,memory_limit_mb,base+per*startup_width)
+        if width!=startup_width or memory_mb is None or memory_limit_mb is not None and memory_mb>memory_limit_mb:
+            raise ValueError('Memory model must fit the startup CPU width')
     else:memory_mb=256 if memory_mb is None else memory_mb
     task = {"steps": [list(argv)], "max_cpus": max_cpus, "timeout": timeout,
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
             "render": list(render), "label": label, "priority": priority,
             "requires": canonical_capabilities(requires), "node": node, "memory_mb": memory_mb,
             "project": project, "resource_share": resource_share}
+    if min_start_cpus is not None:
+        task['min_start_cpus'] = min_start_cpus
     if model:task['memory_model']=dict(base_memory_mb=base,memory_per_cpu_mb=per,**({'memory_limit_mb':memory_limit_mb}if memory_limit_mb is not None else{}))
     if accelerator is not None:
         task["accelerator"] = accelerator

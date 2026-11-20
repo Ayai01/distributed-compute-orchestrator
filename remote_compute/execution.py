@@ -45,9 +45,9 @@ def _item(function,item,kwargs):
     return target(item,**kwargs)
 
 
-def _single_threaded(item_process=True):
+def _single_threaded(item_process=True, *, preserve_grant=False):
     if item_process:os.environ['DCO_ITEM_PROCESS']='1'
-    os.environ['REMOTE_COMPUTE_CPUS']='1'
+    if not preserve_grant:os.environ['REMOTE_COMPUTE_CPUS']='1'
     for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','NUMBA_NUM_THREADS'):
         os.environ[key]='1'
 
@@ -679,7 +679,7 @@ def main(path):
             value=run_call(spec['function'],**spec['kwargs']);publish(0,value,None)
         elif spec['mode']=='entry':
             started(0)
-            _single_threaded(False)
+            _single_threaded(False, preserve_grant=int(os.environ.get('REMOTE_COMPUTE_MIN_START_CPUS', '1')) > 1)
             value=_function(spec['function'])(**spec['kwargs']);publish(0,value,None)
         else:
             pending=[i for i in range(total)if i not in records]

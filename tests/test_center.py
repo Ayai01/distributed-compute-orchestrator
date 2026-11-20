@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
+from remote_compute.allocation import STARTUP_CPU_FLOOR
 from remote_compute.client import PoolBusy, RequestCancelled
 from remote_compute.coordinator import Coordinator
 from remote_compute.cli import SchedulerShell
@@ -19,6 +20,52 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
+    def test_explicit_startup_width_accumulates_on_one_suitable_worker(self):
+        state = self.center([4, 4])
+        pool = state.pool
+        pool.closed = False
+        pool.policy = 'round_robin'
+        pool.rotation = 0
+        wide, narrow = pool.nodes
+        wide.health['capabilities'] = [STARTUP_CPU_FLOOR]
+        wide.reserved = 2
+        common = dict(steps=[['echo']], cpus=0, max_cpus=4, memory_mb=64, project='a', priority=0)
+        floor = dict(common, min_start_cpus=3)
+        state.queue = ['floor', 'small']
+        state.jobs = {key: dict(task=task, auto_cpus=True, cancel=threading.Event(), result={'status': 'queued'})
+                      for key, task in zip(state.queue, (floor, common))}
+        budgets = state.project_resources()
+        claims = state._fixed_queue_claims(budgets)
+        self.assertEqual(claims[wide.name], (wide, floor))
+        self.assertIsNone(pool._acquire(floor, cpu_limit=3, block=False))
+        headroom = state._fixed_queue_headroom(common, budgets, claims)
+        self.assertEqual(headroom, {wide.name: 2})
+        self.assertIs(pool._acquire(common, cpu_limit=1, block=False, node_headroom=headroom), narrow)
+        wide.reserved = 1
+        self.assertIs(pool._acquire(floor, cpu_limit=3, block=False), wide)
+        self.assertEqual(floor['cpus'], 3)
+
+    def test_project_activity_sums_known_samples_with_mixed_worker_reports(self):
+        state = self.center([4, 4])
+        current, legacy = state.pool.nodes
+        state.observations = SimpleNamespace(active=set(), rows={})
+        current.health['active_jobs'] = [{'id': 'known', 'active_cpus': 0}]
+        legacy.health['active_jobs'] = [{'id': 'fallback', 'active_cpus': None}, {'id': 'unknown'}]
+        state.jobs = {
+            identity: dict(task={'project': 'a'}, result=dict(id=identity, status=status, cpus=4,
+                assigned_node=node.name, **fields))
+            for identity, status, node, fields in (
+                ('known', 'running', current, {'active_cpus': 3}),
+                ('fallback', 'running', legacy, {'active_cpus': 2}),
+                ('unknown', 'running', legacy, {}),
+                ('pending', 'queued', legacy, {}))}
+        value = state._project_activity('a', state.pool.nodes)
+        self.assertEqual([job['active_cpus'] for job in value['jobs']], [0, 2, None, None])
+        self.assertEqual(value['active_cpus'], dict(lower_bound=2, observed_jobs=2, running_jobs=3, coverage=2/3))
+        legacy.error = 'disconnected'
+        value = state._project_activity('a', state.pool.nodes)
+        self.assertEqual(value['active_cpus'], dict(lower_bound=0, observed_jobs=1, running_jobs=3, coverage=1/3))
+
     def test_disabled_connected_node_drains_original_grants_without_growth(self):
         state=self.center([4]);node=state.pool.nodes[0]
         node.enabled=False;node.reserved=2;node.reserved_memory_mb=64;node.live_jobs.add('original')
