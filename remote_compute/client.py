@@ -34,6 +34,7 @@ from .allocation import STARTUP_CPU_FLOOR, elastic_cpus, cpu_capacity, startup_c
 from .build_refs import provider_abi
 from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
 from .packages import package_names, provider_has_package
+from .ramdisk import validate_executable_ram_mb
 
 
 from .runtimes import (supports_python, execution_bindings, execution_tool_set, capability_set,
@@ -804,11 +805,13 @@ class Client:
             raise RemoteError('Device list is operator-only; use capabilities()')
         return self.request("/nodes")
 
-    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None, platform=None, activity=False):
+    def admission(self, project, *, resource_share=1.0, queue_ratio=1.0, requires=(), node=None, max_cpus=1024, job_id=None, accelerator=None, ready_tasks=None, platform=None, activity=False, executable_ram_mb=None):
         """Center-owned transport window; execution slots stay in the central queue."""
         if node is not None and not self.operator:
             raise RemoteError('node selection belongs to the DCO operator; use requires for capabilities')
         request=dict(project=project,resource_share=resource_share,queue_ratio=queue_ratio,requires=list(requires))
+        if executable_ram_mb is not None:
+            request['executable_ram_mb'] = validate_executable_ram_mb(executable_ram_mb)
         if activity:
             request['activity'] = True
         platform = validate_platform(platform)
@@ -831,6 +834,8 @@ class Client:
             value = self._read_reconnecting(lambda:self.request('/jobs/'+identity+'/lease',dict(request,_operation='admission')))
         else:
             value = self._read_reconnecting(lambda:self.request('/admission',request))
+        if executable_ram_mb is not None and value.get('executable_ram_mb') != executable_ram_mb:
+            raise RemoteError('The scheduling center does not support executable_ram_mb')
         return value
 
     def window(self, project, **options):
@@ -1365,6 +1370,7 @@ class Node:
     known_jobs: set = field(default_factory=set)
     live_jobs: set = field(default_factory=set)
     memory_holds: dict = field(default_factory=dict)
+    ram_holds: dict = field(default_factory=dict)
     host_ip: str = ""
     node_ip_observation: dict = field(default_factory=dict)
     native_architecture: str | None = None
@@ -1378,6 +1384,15 @@ class Node:
     next_dispatch: float = 0.0
     dispatch_interval: float = .5
     display_name: str = ""
+
+    @property
+    def executable_ram_capacity(self):
+        return (self.health.get('executable_ram') or {}).get('capacity_mb', 0)
+
+    @property
+    def executable_ram_available(self):
+        available = (self.health.get('executable_ram') or {}).get('available_mb', 0)
+        return max(0, available - sum(self.ram_holds.values()))
 
     @property
     def base_capacity(self):
@@ -1625,6 +1640,7 @@ class Pool:
                 if previous_name != value.get('node'):
                     node.health.pop('node_ip',None)
                 merged = {**node.health, **value}
+                merged['executable_ram'] = value.get('executable_ram')
                 merged['tags'] = provider_tags(merged)
                 node.health=merged
                 for identity,row in list(node.memory_holds.items()):
@@ -1635,6 +1651,9 @@ class Pool:
                                and actual_name != node.name and actual_name not in node.aliases)
                 if renamed:node.aliases.append(actual_name)
                 jobs=value.get('active_jobs') or []
+                if node.ram_holds:
+                    for job in jobs:
+                        node.ram_holds.pop(job['id'], None)
                 running=[job for job in jobs if job['status']=='running']
                 node.external=sum(job['cpus'] for job in running if job['id'] not in node.known_jobs)
                 node.refresh_external_accelerators(running)
@@ -1896,6 +1915,7 @@ class Pool:
 
     def _matching(self, task):
         cpus=startup_cpus(task)
+        executable_ram_mb = task.get('executable_ram_mb', 0)
         required_tools,required_shared,python,backend=execution_bindings(task)
         required=capability_set(task.get('requires',()))
         package = task.get('_capability_package')
@@ -1905,6 +1925,7 @@ class Pool:
             if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
                     or task.get('min_start_cpus', 1) > 1 and STARTUP_CPU_FLOOR not in health.get('capabilities', ())
                     or task.get('platform') is not None and health.get('platform') != task['platform']
+                    or executable_ram_mb and node.executable_ram_capacity < executable_ram_mb
                     or not supports_native_cache(health, task.get('native_cache'), getattr(node,'native_architecture',None))
                     or node.memory_capacity<node.startup_memory(task)):
                 continue
@@ -1942,6 +1963,7 @@ class Pool:
         if automatic and cpu_limit is not None:
             cpu_limit = max(cpus, cpu_limit)
         memory_mb = task.get("memory_mb", 256)
+        executable_ram_mb = task.get('executable_ram_mb', 0)
         label = task.get("label", "")
         with self.condition:
             while True:
@@ -1951,6 +1973,8 @@ class Pool:
                     return None
                 matching = self._matching(task)
                 if not matching:
+                    if executable_ram_mb:
+                        raise RemoteError('No worker meets the task requirements including executable RAM scratch')
                     if task.get('_capability_package'):
                         raise RemoteError('No worker offers the ' + task['_capability_package']
                                           + ' capability package for these resource requirements')
@@ -1968,6 +1992,7 @@ class Pool:
                 ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
                          and available(n) >= needed(n)
                          and memory_ready(n)
+                         and (not executable_ram_mb or n.executable_ram_available >= executable_ram_mb)
                          and n.health.get("queued", 0) == 0
                          and (task.get('accelerator')is None or
                               n.can_match_accelerator(n.execution_accelerator(task,available=True)))]
@@ -2024,6 +2049,8 @@ class Pool:
                         task['accelerator']=requirement
                     node.reserved += cpus
                     node.reserved_memory_mb += memory_mb
+                    if executable_ram_mb:
+                        node.ram_holds[reservation_id] = executable_ram_mb
                     if job_id:
                         node.known_jobs.add(job_id)
                         node.live_jobs.add(job_id)
@@ -2099,6 +2126,7 @@ class Pool:
             node.live_jobs.discard(job_id)
             node.artifact_claims.pop(job_id, None)
             node.memory_holds.pop(job_id,None)
+            node.ram_holds.pop(job_id or f'local:{id(task)}', None)
             if result is None:
                 # A lost connection can leave the worker running this job;
                 # its next health snapshot must account for that work.

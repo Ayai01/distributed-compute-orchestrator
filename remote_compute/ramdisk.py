@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import re
@@ -14,11 +15,13 @@ import sys
 MARKER = '.codex-shared-ramdisk.json'
 SIZE = 8 * 1024**3
 ROOT = Path(__file__).resolve().parent.parent
+MIB = 1024**2
+EXECUTABLE_RAM_UNAVAILABLE = 'Executable RAM scratch is unavailable'
 
 
-def _run(argv):
+def _run(argv, *, timeout=60):
     result = subprocess.run([str(x) for x in argv], capture_output=True, text=True,
-                            errors='replace', timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                            errors='replace', timeout=timeout, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if result.returncode:
         raise OSError((result.stdout + result.stderr).strip())
     return result.stdout
@@ -63,7 +66,7 @@ def volumes():
     return [Path(chr(65 + i) + ':/') for i in range(25, 2, -1) if mask & (1 << i)]
 
 
-def is_ram(root):
+def is_ram(root, *, timeout=60, allow_proxy=True):
     kernel = c.windll.kernel32
     kernel.GetDriveTypeW.argtypes = [w.LPCWSTR]
     if kernel.GetDriveTypeW(str(root)) == 6:
@@ -71,11 +74,116 @@ def is_ram(root):
     executable = driver()
     if executable:
         try:
-            value = _run([executable, '-l', '-m', str(root)[:2]])
-            return 'No image file.' in value and ('Virtual Memory' in value or 'Proxy' in value)
-        except OSError:
+            value = _run([executable, '-l', '-m', str(root)[:2]], timeout=timeout)
+            return 'No image file.' in value and ('Virtual Memory' in value or allow_proxy and 'Proxy' in value)
+        except (OSError, subprocess.TimeoutExpired):
             pass
     return False
+
+
+def validate_executable_ram_mb(value):
+    if type(value) is not int or value < 1:
+        raise ValueError('executable_ram_mb must be a positive integer in MiB')
+    return value
+
+
+def _linux_memory_mount(path, device):
+    match = f'{os.major(device)}:{os.minor(device)}'
+    with Path('/proc/self/mountinfo').open(encoding='utf-8', errors='surrogateescape') as mounts:
+        for line in mounts:
+            before, _, after = line.partition(' - ')
+            fields = before.split()
+            if len(fields) < 5 or fields[2] != match or not after:
+                continue
+            mount = Path(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4]))
+            if (path == mount or mount in path.parents) and after.split()[0] in ('tmpfs', 'ramfs'):
+                return True
+    return False
+
+
+class ExecutableScratch:
+    """An existing RAM filesystem on which the worker has launched a native executable."""
+
+    def __init__(self, root):
+        self.root = root
+        self.identity = self._identity()
+
+    def _identity(self):
+        current = self.root.stat()
+        return current.st_dev, current.st_ino
+
+    def space(self):
+        """Return capacity and free MiB. A changed mount needs a fresh probe."""
+        try:
+            if self._identity() != self.identity:
+                return 0, 0
+            if os.name == 'nt':
+                usage = shutil.disk_usage(self.root)
+                return usage.total // MIB, usage.free // MIB
+            state = os.statvfs(self.root)
+            if state.f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
+                return 0, 0
+            return state.f_blocks * state.f_frsize // MIB, state.f_bavail * state.f_frsize // MIB
+        except OSError:
+            return 0, 0
+
+
+def probe_executable_scratch(configured, namespace):
+    candidates = [(configured, False)] if configured else []
+    if sys.platform.startswith('linux'):
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if runtime:
+            candidates.append((Path(runtime), True))
+        candidates.extend((path, True) for path in (Path(f'/run/user/{os.getuid()}'), Path('/dev/shm')))
+    elif os.name != 'nt':
+        return None
+    seen = set()
+    for candidate, separate in candidates:
+        try:
+            try:
+                base = candidate.resolve(strict=True)
+            except OSError as error:
+                # ImDisk can report ERROR_INVALID_FUNCTION for handle-based
+                # path resolution despite supporting ordinary file operations.
+                if os.name != 'nt' or getattr(error, 'winerror', None) != 1:
+                    continue
+                base = candidate.absolute()
+                if any(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                       for path in (base, *base.parents)):
+                    continue
+            if base in seen or not base.is_dir():
+                continue
+            seen.add(base)
+            if os.name == 'nt':
+                if not is_ram(Path(base.anchor), timeout=2, allow_proxy=False):
+                    continue
+                source = Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32/cmd.exe'
+                args = ['/d', '/c', 'exit', '0']
+            else:
+                if not _linux_memory_mount(base, base.stat().st_dev):
+                    continue
+                if os.statvfs(base).f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
+                    continue
+                source, args = Path('/bin/true'), []
+            root = base / ('dco-ram-' + namespace) if separate else base
+            root.mkdir(mode=0o700, exist_ok=True)
+            if separate and root.resolve(strict=True) != root:
+                continue
+            scratch = ExecutableScratch(root)
+            if scratch.identity[0] != base.stat().st_dev or not scratch.space()[0]:
+                continue
+            with tempfile.TemporaryDirectory(prefix='dco-ram-probe-', dir=root) as probe:
+                from .process import low_integrity_directory
+                low_integrity_directory(probe)
+                executable = Path(probe) / source.name
+                shutil.copy2(source, executable)
+                subprocess.run([str(executable), *args], cwd=probe, check=True, timeout=2,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            return scratch
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            continue
+    return None
 
 
 def shared_volume():

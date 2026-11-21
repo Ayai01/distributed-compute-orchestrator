@@ -33,7 +33,8 @@ def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=()
             project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
             accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True,
             artifact_ref=None, produces_artifact_ref=None, checkpoint_ref=None, checkpoint_output=None,
-            affinity_keys=None, timeout_grace_s=None, step_phases=None, short_job=False):
+            affinity_keys=None, timeout_grace_s=None, step_phases=None, short_job=False,
+            executable_ram_mb=None):
     if type(resource_recovery) is not bool:raise ValueError("resource_recovery must be a boolean")
     platform = validate_platform(platform)
     if min_start_cpus is not None:
@@ -57,6 +58,9 @@ def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=()
             "project": project, "resource_share": resource_share}
     if min_start_cpus is not None:
         task['min_start_cpus'] = min_start_cpus
+    if executable_ram_mb is not None:
+        from .ramdisk import validate_executable_ram_mb
+        task['executable_ram_mb'] = validate_executable_ram_mb(executable_ram_mb)
     if model:task['memory_model']=dict(base_memory_mb=base,memory_per_cpu_mb=per,**({'memory_limit_mb':memory_limit_mb}if memory_limit_mb is not None else{}))
     if accelerator is not None:
         task["accelerator"] = accelerator

@@ -8,7 +8,7 @@ import sys
 
 
 @contextmanager
-def console_close(stopping):
+def console_close(stopping, *, allow_detached=False):
     """Let terminal closure reach the service's normal finally blocks."""
     if os.name != 'nt':
         import signal
@@ -41,7 +41,11 @@ def console_close(stopping):
 
     kernel.SetConsoleCtrlHandler.argtypes = [callback_type, w.BOOL]
     if not kernel.SetConsoleCtrlHandler(close, True):
-        raise c.WinError(c.get_last_error())
+        error = c.get_last_error()
+        if allow_detached and error == 6:  # ERROR_INVALID_HANDLE, no attached console.
+            yield
+            return
+        raise c.WinError(error)
     try:
         yield
     finally:

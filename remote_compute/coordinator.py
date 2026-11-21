@@ -48,6 +48,7 @@ from urllib.parse import urlsplit
 from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python, execution_bindings, capability_set
 from . import __version__
 from .policy import validate_operator_fields
+from .ramdisk import validate_executable_ram_mb
 from .packages import (DEFAULT_PACKAGE, PACKAGES, RETAINED_NAMES, package_names, package_task,
                        project_package, provider_environment, provider_has_package)
 
@@ -61,7 +62,8 @@ class _PreparationWorkerLost(Exception):
 # These observations describe one worker attempt, rather than the frozen job.
 ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
     'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
-    'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request','execution_timing')
+    'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request','execution_timing',
+    'task_process_started')
 
 
 def _matching_pass(pool):
@@ -72,7 +74,7 @@ def _matching_pass(pool):
         key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
              task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
              tuple(key for key in ('step_phases', 'short_job', 'timeout_grace_s', 'checkpoint_output') if key in task),
-             startup_cpus(task),task.get('min_start_cpus',1)>1,task.get('memory_mb',256),
+             startup_cpus(task),task.get('min_start_cpus',1)>1,task.get('memory_mb',256),task.get('executable_ram_mb',0),
              execution_bindings(task),capability_set(task.get('requires',())),
              json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
         if key not in cache:cache[key]=tuple(pool._matching(task))
@@ -103,7 +105,9 @@ def _infrastructure_interruption(job, outcome):
     # Named-machine operations may change external state and retain their
     # explicit retry allowance. Ordinary frozen jobs run in fresh workdirs.
     return not job['task'].get('cwd') and (outcome.get('status') == 'interrupted'
-        or outcome.get('error_kind') == 'memory_pressure')
+        or outcome.get('error_kind') == 'memory_pressure'
+        or (outcome.get('error_kind') == 'scratch_unavailable' and outcome.get('task_process_started') is False
+            and outcome.get('cpu_seconds') == 0))
 
 
 class Coordinator:
@@ -363,6 +367,8 @@ class Coordinator:
         maximum_cpus = request.get('max_cpus')
         ready_tasks = validate_ready_tasks(request.get('ready_tasks'))
         platform = validate_platform(request.get('platform'))
+        executable_ram_mb = (validate_executable_ram_mb(request['executable_ram_mb'])
+                             if 'executable_ram_mb' in request else 0)
         validate_operator_fields(request,operator)
         raw_requires = request.get('requires', [])
         raw_accelerator = request.get('accelerator')
@@ -386,11 +392,13 @@ class Coordinator:
             raise ValueError(f'project, resource_share <= {MAX_RESOURCE_SHARE:g}, queue_ratio <= {MAX_QUEUE_RATIO:g} and cpus required')
         paused={node.name for node in self.pool.nodes if node.health.get('paused')}
         resources = self.project_resources() if paused or job_id is not None else {}
-        held={name:cpus for name,cpus in resources.get(project,{}).get('node_demands',{}).items() if name in paused}
+        held = ({name: cpus for name, cpus in resources.get(project, {}).get('node_demands', {}).items()
+                 if name in paused} if not executable_ram_mb else {})
         eligible=[n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')
                   and n.capacity>=max(1,cpus)
                   and (not node_name or n.name==node_name)
                   and (platform is None or n.health.get('platform') == platform)
+                  and (not executable_ram_mb or n.executable_ram_capacity >= executable_ram_mb)
                   and (provider_has_package(n.health, package) if package is not None else
                        set(requires).issubset(canonical_capabilities(n.health.get('tags',()))))
                   ]
@@ -461,6 +469,8 @@ class Coordinator:
                     in_flight=ready+math.ceil(wave*ratio),max_in_flight=ceiling+math.ceil(ceiling_wave*ratio))
         if operator and platform is not None:
             value['platform'] = platform
+        if executable_ram_mb:
+            value['executable_ram_mb'] = executable_ram_mb
         if package is not None:
             value['capability_package'] = package
         if ready_tasks is None and ratio > 0:
@@ -479,9 +489,9 @@ class Coordinator:
             # Telemetry reads the published worker samples and active records.
             # A CPU resize or dispatch must not hold up project producers.
             nodes = tuple(self.pool.nodes)
-            online = [node for node in nodes if node.health and node.enabled and
-                      not node.error and not node.health.get('paused')]
-            value.update(self._cpu_availability(online, operator=operator))
+            online = eligible if executable_ram_mb else [node for node in nodes if node.health and node.enabled and
+                                                         not node.error and not node.health.get('paused')]
+            value.update(self._cpu_availability(online, operator=operator, executable_ram_mb=executable_ram_mb))
             value['activity'] = self._project_activity(project, nodes)
         if package is not None and not capable and not fallback_capable:
             value.update(running_tasks=0, queued_tasks=0, in_flight=0, max_in_flight=0)
@@ -523,12 +533,14 @@ class Coordinator:
         return dict(sampled_at=time.time(), jobs=jobs, active_cpus=active)
 
     @staticmethod
-    def _cpu_availability(nodes, *, operator=False):
+    def _cpu_availability(nodes, *, operator=False, executable_ram_mb=0):
         capacity = available = 0
         labels = {} if operator else {name: {'capacity': 0, 'available': 0} for name in PACKAGES}
         for node in nodes:
             width = node.capacity
             free = max(0, width - node.reserved - node.external)
+            if executable_ram_mb and node.executable_ram_available < executable_ram_mb:
+                free = 0
             capacity += width
             available += free
             tags = node.health.get('tags', ())
@@ -1874,6 +1886,9 @@ class Coordinator:
                 resource_recovery_memory_mb=max(job['result'].get('resource_recovery_memory_mb',0),
                     startup_memory({**job['task'],'cpus':1}),reservation_floor,peak*1.25,peak+32),
                 resource_recovery_policy='same identity; completed map items retained; unknown running prefixes preserved')
+        elif outcome.get('error_kind') == 'scratch_unavailable':
+            job['result'].update(resource_retry_after=time.time()+1,
+                                 resource_wait_reason='waiting for a fresh executable RAM scratch sample')
         cached=job['directory']/'worker-artifacts.zip'
         if cached.is_file():
             saved=job['directory']/'attempts'/('%04d.zip'%len(attempts));saved.parent.mkdir(exist_ok=True)

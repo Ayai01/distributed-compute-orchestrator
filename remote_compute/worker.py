@@ -47,6 +47,7 @@ from .compat import unlink
 from .receipts import read_receipt
 from .deadline import PREPARATION_TIMEOUT, execution_remaining, preparation_elapsed
 from .paths import cache_environment
+from .ramdisk import EXECUTABLE_RAM_UNAVAILABLE, probe_executable_scratch, validate_executable_ram_mb
 from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, plan_resize, cpu_capacity, validate_cpu_overcommit, validate_cpu_utilization,
                          validate_min_start_cpus)
 from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
@@ -64,6 +65,11 @@ _VAR = re.compile(r"\$\{(work|cpus|exe|dco|tool:[A-Za-z_][A-Za-z0-9_+.-]*|asset:
 
 class Conflict(ValueError):
     pass
+
+
+class ExecutableScratchUnavailable(RuntimeError):
+    def __init__(self):
+        super().__init__(EXECUTABLE_RAM_UNAVAILABLE)
 
 
 def missing_task_assets(task):
@@ -164,7 +170,7 @@ def validate_task(task, capacity, *, allow_auto=False):
     if not isinstance(task, dict):
         raise ValueError("Task must be an object")
     unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "resource_recovery", "accelerator", "platform", "cache_ref", "native_cache"}
-    unknown -= {'step_phases', 'timeout_grace_s', 'checkpoint_output', 'short_job', 'min_start_cpus'}
+    unknown -= {'step_phases', 'timeout_grace_s', 'checkpoint_output', 'short_job', 'min_start_cpus', 'executable_ram_mb'}
     if allow_auto:
         unknown -= REFERENCE_FIELDS
     if unknown:
@@ -222,6 +228,8 @@ def validate_task(task, capacity, *, allow_auto=False):
     validate_platform(task.get('platform'))
     if type(task["memory_mb"]) is not int or task["memory_mb"] < 1:
         raise ValueError("memory_mb must be a positive integer in MiB")
+    if 'executable_ram_mb' in task:
+        validate_executable_ram_mb(task['executable_ram_mb'])
     if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
             or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("Task timeout must be a positive number")
@@ -290,9 +298,10 @@ class Worker:
             # normal persistent worker/jobs/<id>/tmp path can exceed 108 bytes.
             self._temporary_context = tempfile.TemporaryDirectory(prefix='dco-',dir='/tmp')
             temp_root = self._temporary_context.name
+        namespace = hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
         self.temp_root=Path(temp_root).expanduser().resolve() if temp_root else None
         if self.temp_root:
-            self.temp_root/=hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
+            self.temp_root/=namespace
             self.temp_root.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.callback = {}
         physical_limit = host_cpu_capacity()
@@ -365,6 +374,14 @@ class Worker:
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
         self.temp_reclaimer=Reclaimer(self.temp_root/'.trash')if self.temp_root else None
+        self.temp_reclaimers = {self.temp_root: self.temp_reclaimer} if self.temp_reclaimer else {}
+        self.ram_scratch = probe_executable_scratch(self.temp_root, namespace)
+        if self.ram_scratch and self.ram_scratch.root not in self.temp_reclaimers:
+            path = self.ram_scratch.root
+            try:
+                self.temp_reclaimers[path] = Reclaimer(path / '.trash')
+            except (OSError, ValueError):
+                self.ram_scratch = None
         benchmark_python=self.tools['python'][0]
         benchmark_env=tuple((name,self.env[name]) for name in ('PATH','LD_LIBRARY_PATH','OPENBLAS_CORETYPE','MKL_ENABLE_INSTRUCTIONS')
                             if name in self.env)
@@ -432,10 +449,17 @@ class Worker:
             self.jobs.write_index()
         if not self.retirement.pending:
             self.jobs.compact_index()
-        if self.temp_reclaimer:
-            for path in self.temp_root.iterdir():
-                if _ID.fullmatch(path.name)and path.name not in self.startup_recoveries:
-                    self.temp_reclaimer.defer(path)
+        for root, reclaimer in tuple(self.temp_reclaimers.items()):
+            try:
+                for path in root.iterdir():
+                    if _ID.fullmatch(path.name) and path.name not in self.startup_recoveries:
+                        reclaimer.defer(path)
+            except (OSError, ValueError):
+                if root == self.temp_root:
+                    raise
+                reclaimer.close()
+                del self.temp_reclaimers[root]
+                self.ram_scratch = None
         self.startup['recovery_seconds']=round(time.monotonic()-phase,4)
         phase=time.monotonic()
         cache_mib = int(self.env.get('DCO_ASSET_CACHE_MIB', ASSET_CACHE_BYTES // 1024**2))
@@ -492,6 +516,7 @@ class Worker:
                     "work_reclaim":self.work_reclaimer.snapshot(),
                     "service": service_usage(),
                     "scratch_disk": dict(total=disk.total, used=disk.used, free=disk.free),
+                    "executable_ram": self._executable_ram_capacity() if self.ram_scratch else None,
                     "tool_root": Path(__file__).resolve().parent.parent.as_posix(), "shared_paths": self.shared,
                     "unavailable_shared": self.unavailable_shared, "root": self.root.as_posix(),
                     "cache_root": self.cache_root.as_posix(),
@@ -515,6 +540,16 @@ class Worker:
                 for name in ('benchmark','tools','shared','tags','home','tool_root','shared_paths','unavailable_shared','root','cache_root','temp_root'):
                     value.pop(name,None)
             return value
+
+    def _executable_ram_capacity(self):
+        capacity, free = self.ram_scratch.space() if self.ram_scratch else (0, 0)
+        reserved = sum(job['task'].get('executable_ram_mb', 0) for job in active_values(self.jobs)
+                       if job['result']['status'] not in TERMINAL) if capacity else 0
+        return dict(capacity_mb=capacity, available_mb=max(0, min(free, capacity - reserved)))
+
+    def _require_executable_ram(self, amount):
+        if amount and (not self.ram_scratch or self.ram_scratch.space()[1] < amount):
+            raise ExecutableScratchUnavailable()
 
     def _accelerator_units(self):
         units=[]
@@ -1270,6 +1305,8 @@ class Worker:
             for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS"):
                 if key not in task['env']:
                     environment[key] = str(task["cpus"])
+            executable_ram_mb = task.get('executable_ram_mb', 0)
+            self._require_executable_ram(executable_ram_mb)
             temporary = self._temporary(job)
             temporary.mkdir()
             low_integrity_directory(temporary)
@@ -1280,9 +1317,10 @@ class Worker:
             if 'execution' in task:
                 timing_root = temporary / 'execution-timing'
                 timing_root.mkdir()
-            environment.update(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
+            scratch_environment = dict(TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary),
+                                       REMOTE_COMPUTE_JOB_TEMP=str(temporary))
+            environment.update(scratch_environment,
                                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", REMOTE_COMPUTE_JOB_DIR=str(directory),
-                               REMOTE_COMPUTE_JOB_TEMP=str(temporary),
                                REMOTE_COMPUTE_WORKER='1', REMOTE_COMPUTE_JOB_ID=result['id'])
             environment.pop('REMOTE_COMPUTE_PREPARATION_CLOCK', None)
             if clock is not None:
@@ -1333,6 +1371,8 @@ class Worker:
                     if not initial or task.get('min_start_cpus', 1) == 1:
                         self._automatic_grant(job)
                     environment.update({key:value.replace('${cpus}',str(task['cpus']))for key,value in job.get('resolved_env',{}).items()})
+                    if executable_ram_mb:
+                        environment.update(scratch_environment)
                     self._accelerator_environment(result['id'],environment)
                     for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','NUMBA_NUM_THREADS'):
                         if key not in task['env']:environment[key]=str(task['cpus'])
@@ -1360,6 +1400,7 @@ class Worker:
                         step['cpu_phase'] = phases[index]
                     def begin_execution():
                         nonlocal deadline
+                        self._require_executable_ram(executable_ram_mb)
                         started = time.monotonic()
                         step['started'] = time.time()
                         deadline = started + task['timeout']
@@ -1451,6 +1492,9 @@ class Worker:
                     if step["returncode"] != 0:
                         state, error = "failed", f"Command exited with {step['returncode']}"
                         break
+        except ExecutableScratchUnavailable as exc:
+            state, error = 'failed', str(exc)
+            result.update(error_kind='scratch_unavailable', task_process_started=False)
         except Exception as exc:
             state, error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
@@ -1606,16 +1650,18 @@ class Worker:
 
     def _temporary(self, job):
         base=getattr(self,'temp_root',None)
+        if job.get('task', {}).get('executable_ram_mb') and self.ram_scratch:
+            base = self.ram_scratch.root
         return base/job['result']['id'] if base else job['directory']/'tmp'
 
     def _clean_temp(self, job):
         """Process TEMP is scratch; keep result inputs/outputs until collection."""
         issue=None
-        for temporary in {self._temporary(job),job['directory']/'tmp'}:
+        for temporary in {self._temporary(job), job['directory'] / 'tmp'}:
             try:
                 # Scratch has no declared scientific outputs. Retire its name
                 # before finalizing; physical deletion never holds CPU slots.
-                reclaimer=self.temp_reclaimer if self.temp_reclaimer and temporary.parent==self.temp_root else self.work_reclaimer
+                reclaimer = self.temp_reclaimers.get(temporary.parent, self.work_reclaimer)
                 reclaimer.defer(temporary)
             except InterruptedError:
                 self.cleanup_pending.add(job['result']['id'])
@@ -1833,11 +1879,11 @@ class Worker:
         self._prune_assets(recent=False)
         self.asset_cache.reclaimer.close()
         self.work_reclaimer.close()
-        if self.temp_reclaimer:self.temp_reclaimer.close()
         unlink(self.memory_wait_file)
-        if self.temp_root:
+        for root, reclaimer in self.temp_reclaimers.items():
+            reclaimer.close()
             try:
-                self.temp_root.rmdir()
+                root.rmdir()
             except OSError:
                 pass  # Keep any unfinished files; remove only our empty namespace.
         self.root_lock.close()

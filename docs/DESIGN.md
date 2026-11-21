@@ -31,6 +31,8 @@ worker 在启动进程前写好该任务的工具表。`REMOTE_COMPUTE_TOOLS_FIL
 
 同阶段归还空闲 CPU 时，内存工作集可继续使用原额度。SDK 收到 worker 确认后才将资源归还视为完成。面板的线程预留表示授权额度，容器 CPU 使用率以其有效配额为分母。
 
+1.0.39 起，必须在可执行 RAM 上暂存的任务用 `command(..., requires=["rtl"], executable_ram_mb=256)` 或 `python_task` 申报开算时所需的空闲 MiB。用 `admission(project, requires=["rtl"], executable_ram_mb=256, activity=True)` 查询这类任务的聚合可用核。中心选择已实测可从 RAM 启动程序且空间充足的 worker，`REMOTE_COMPUTE_JOB_TEMP` 和 `TMPDIR` 指向该任务的 RAM 目录。该值与进程的 `memory_mb` 分开。省略字段的任务沿用普通暂存和原有能力池。
+
 同一租约请求的回信可原样重发。开算前发现授权已变更时，SDK 以零活跃线程重新申请，确认后再执行。已运行的工作继续按其真实活跃线程保护。
 
 1.0.38 的中心和 worker 协商多核 `exact_cpus` 的本地启动确认。中心足额授权后，worker 仅确认仍属于该原任务、同一授权与内存阶段的启动凭据。旧端沿用中心确认。时限仍按原准备窗口执行，到期报等授权、等确认或内核初始化。`execution_timing` 的 `exact_grant_wait_seconds` 和 `exact_launch_confirmation_seconds` 分别记录前两阶段。

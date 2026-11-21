@@ -119,12 +119,12 @@ raise SystemExit(main())
         for no_dashboard in (False, True):
             with self.subTest(no_dashboard=no_dashboard), scratch() as directory:
                 root = Path(directory)
-                with provider(root/'worker') as (worker, remote):
+                with provider(root/'worker', python_runtimes={'ml': [sys.executable]}) as (worker, remote):
                     config = root/'config.json'
-                    config.write_text('{}', encoding='utf-8')
+                    config.write_text(json.dumps({'token': remote.token}), encoding='utf-8')
                     nodes = root/'nodes.json'
                     nodes.write_text(json.dumps({'nodes': [
-                        {'name': 'isolated', 'url': remote.url}]}), encoding='utf-8')
+                        {'name': 'isolated', 'url': remote.url, 'token': remote.token}]}), encoding='utf-8')
                     with socket.socket() as probe:
                         probe.bind(('127.0.0.1', 0))
                         port = probe.getsockname()[1]
@@ -135,7 +135,7 @@ raise SystemExit(main())
                     if no_dashboard:
                         command.append('--no-dashboard')
                     child = subprocess.Popen(command, cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE)
-                    client = Client('http://127.0.0.1:' + str(port), timeout=1)
+                    client = Client('http://127.0.0.1:' + str(port), remote.token, timeout=1)
                     identity = None
                     try:
                         def ready():
@@ -166,8 +166,12 @@ raise SystemExit(main())
                     finally:
                         try:
                             if identity:
-                                remote.cancel(identity)
-                                remote.wait(identity, wait_timeout=5)
+                                try:
+                                    remote.cancel(identity)
+                                    remote.wait(identity, wait_timeout=5)
+                                except RemoteError as error:
+                                    if error.status_code != 404:
+                                        raise
                         finally:
                             if child.poll() is None:
                                 user.PostMessageW(int(hwnd_path.read_text()), 0x10, 0, 0)
@@ -179,12 +183,12 @@ raise SystemExit(main())
         from remote_compute import Client, RemoteError
         with scratch() as directory:
             root = Path(directory)
-            with provider(root/'worker') as (worker, remote):
+            with provider(root/'worker', python_runtimes={'ml': [sys.executable]}) as (worker, remote):
                 config = root/'config.json'
-                config.write_text('{}', encoding='utf-8')
+                config.write_text(json.dumps({'token': remote.token}), encoding='utf-8')
                 nodes = root/'nodes.json'
                 nodes.write_text(json.dumps({'nodes': [
-                    {'name': 'isolated', 'url': remote.url}]}), encoding='utf-8')
+                    {'name': 'isolated', 'url': remote.url, 'token': remote.token}]}), encoding='utf-8')
                 with socket.socket() as probe:
                     probe.bind(('127.0.0.1', 0))
                     port = probe.getsockname()[1]
@@ -196,7 +200,7 @@ raise SystemExit(main())
                     '--nodes', str(nodes), '--root', str(root/'center'), '--no-dashboard'],
                     cwd=ROOT, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
                 os.close(slave)
-                client = Client('http://127.0.0.1:' + str(port), timeout=1)
+                client = Client('http://127.0.0.1:' + str(port), remote.token, timeout=1)
                 identity = None
                 try:
                     def ready():
@@ -228,8 +232,12 @@ raise SystemExit(main())
                 finally:
                     try:
                         if identity:
-                            remote.cancel(identity)
-                            remote.wait(identity, wait_timeout=5)
+                            try:
+                                remote.cancel(identity)
+                                remote.wait(identity, wait_timeout=5)
+                            except RemoteError as error:
+                                if error.status_code != 404:
+                                    raise
                     finally:
                         if master is not None:
                             os.close(master)
@@ -392,10 +400,11 @@ raise SystemExit(main())
                 with center(pool, Path(directory) / 'center') as (_, hub):
                     port = int(hub.url.rsplit(':', 1)[1])
                     with patch.object(startup, 'owners', return_value=[]), patch.object(startup, 'terminate') as kill:
-                        self.assertEqual(startup.resolve('127.0.0.1', port, policy='reuse', reuse_role='scheduler'), hub.url)
+                        self.assertEqual(startup.resolve('127.0.0.1', port, policy='reuse', reuse_role='scheduler',
+                                                         token=hub.token), hub.url)
                         with patch.object(startup.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value=''):
                             with self.assertRaises(startup.Cancelled):
-                                startup.resolve('127.0.0.1', port, reuse_role='scheduler')
+                                startup.resolve('127.0.0.1', port, reuse_role='scheduler', token=hub.token)
                         self.assertEqual(hub.health()['role'], 'scheduler')
                         kill.assert_not_called()
 

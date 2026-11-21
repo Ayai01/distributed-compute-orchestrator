@@ -438,8 +438,8 @@ def main(argv=None):
             text_service = args.no_dashboard and not args.url
             if not text_service:
                 require_visible()
-            if (text_service and os.name != 'nt') or (not text_service and (args.service_child or args.url)):
-                lifetime.enter_context(console_close(stopping))
+            if (text_service and os.name != 'nt') or args.service_child or args.url:
+                lifetime.enter_context(console_close(stopping, allow_detached=text_service))
         if (args.service_child and not args.url and args.action is None and
                 not (args.test or args.test_native or args.check) and handoff_python(invocation)):
             return 0
