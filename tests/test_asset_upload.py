@@ -192,7 +192,7 @@ class AssetUploadTests(unittest.TestCase):
                 self._check_published(root / 'shared')
 
     def test_center_switches_receivers_without_replaying_the_job_or_confirmed_prefix(self):
-        contents = Random(1028).randbytes(ASSET_RESUME_MIN_BYTES + 137)
+        contents = Random(1028).randbytes(max(ASSET_RESUME_MIN_BYTES, 2 * ASSET_CHUNK_BYTES) + 137)
         payload = pack({'model.bin': contents})
         identity = sha256(payload).hexdigest()
         endpoint = f'/assets/{identity}/upload'

@@ -487,12 +487,13 @@ class Worker:
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:
             identity['capabilities'].append(SINGLE_CORE_PHASE_HANDOFF)
         if brief:return identity
+        disk = shutil.disk_usage(self.root)
+        from .build_refs import worker_abi
+        artifact_abi = worker_abi(self.architecture)
         with self.condition:
             resources = self._memory_state()
-            disk = shutil.disk_usage(self.root)
-            from .build_refs import worker_abi
             value = {**identity, "platform": sys.platform, "architecture": self.architecture,
-                    "artifact_abi": worker_abi(self.architecture),
+                    "artifact_abi": artifact_abi,
                     "node_ip": self.node_ip,
                     "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
                     "cpus": self._cpu_capacity(resources), "base_cpus":self.capacity,

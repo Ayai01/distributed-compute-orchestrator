@@ -115,62 +115,72 @@ def _short_dispatch_request(path, data, method):
         return True
     if re.fullmatch(r'/assets/[0-9a-f]{64}', path):
         return ((verb == 'GET' and data is None) or
-                (verb == 'POST' and isinstance(data, bytes) and len(data) <= SHORT_DISPATCH_BYTES))
+                (verb == 'POST' and isinstance(data, bytes) and len(data) < MIN_BULK_BYTES))
     if re.fullmatch(r'/jobs/[0-9a-f]{32}/asset-handoff', path):
         return verb in ('POST', 'DELETE')
     if verb == 'DELETE' and re.fullmatch(r'/jobs/[0-9a-f]{32}', path):
         return True
-    return (verb == 'POST' and isinstance(data, bytes) and len(data) <= SHORT_DISPATCH_BYTES
+    return (verb == 'POST' and isinstance(data, bytes) and len(data) < MIN_BULK_BYTES
             and re.fullmatch(r'/jobs/[0-9a-f]{32}', path) is not None)
 
 
 class _ConnectionPool:
     def __init__(self):
         self.idle = []
-        self.lock = threading.Lock()
         self.condition = threading.Condition()
         self.available = 8
+        self.bulk_limit = 7
         self.bulk_active = 0
         self.waiting = deque()
+
+    def set_bulk_limit(self, limit):
+        if self.bulk_limit != limit:
+            with self.condition:
+                self.bulk_limit = limit
+                self.condition.notify_all()
 
     def acquire(self, timeout, *, bulk=False, short_job=False, cancel=None):
         ticket = (object(), 'short_job' if short_job else bulk)
 
         def eligible(kind):
             if kind == 'short_job':
-                return self.available > 1 and not getattr(self, 'short_job_active', False)
-            return not kind or self.available > 1 and self.bulk_active < getattr(self, 'bulk_limit', 7)
+                return self.available > 1
+            return not kind or self.available > 1 and self.bulk_active < self.bulk_limit
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
             self.waiting.append(ticket)
-            try:
-                # Reserve one of the same eight slots for health, status and
-                # grants, even when slow uploads have queued more transfers.
-                while not self.available or next((entry for entry in self.waiting
-                        if eligible(entry[1])), None) is not ticket:
-                    _check_cancelled(cancel)
+        try:
+            while True:
+                # Cancellation may inspect the coordinator. Check after
+                # dropping the transport condition.
+                _check_cancelled(cancel)
+                with self.condition:
+                    # Leave one slot for health, status and resource grants.
+                    if self.available and next((entry for entry in self.waiting if eligible(entry[1])), None) is ticket:
+                        self.available -= 1
+                        self.bulk_active += int(bulk)
+                        return True
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         return False
                     wait_for=remaining
                     if cancel is not None:wait_for=.1 if remaining is None else min(.1,remaining)
                     self.condition.wait(wait_for)
-                _check_cancelled(cancel)
-                self.available -= 1
-                self.bulk_active += int(bulk)
-                if short_job:
-                    self.short_job_active = True
-                return True
-            finally:
+        finally:
+            with self.condition:
                 self.waiting.remove(ticket)
                 self.condition.notify_all()
 
-    def release(self, *, bulk=False, short_job=False):
+    def take_idle(self):
         with self.condition:
+            return self.idle.pop() if self.idle else None
+
+    def release(self, *, bulk=False, connection=None):
+        with self.condition:
+            if connection is not None:
+                self.idle.append(connection)
             self.available += 1
             self.bulk_active -= int(bulk)
-            if short_job:
-                self.short_job_active = False
             self.condition.notify_all()
 
     def __del__(self):
@@ -267,28 +277,20 @@ class Client:
 
     def _routed_request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None, _output=None):
         authority = self.endpoint.geturl()
-        paced = _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint)
+        relayed = _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint)
         artifact_get = (binary and data is None and method in (None, 'GET')
                         and re.fullmatch(r'/jobs/[0-9a-f]{32}/(?:artifacts|files/.+)', path))
         retirement = method == 'DELETE' and re.fullmatch(r'/jobs/[0-9a-f]{32}', path)
         pools=self.__dict__.setdefault('_transports',{})
         if artifact_get:
-            # Keep completed jobs clear of uploads, and let a second receipt
-            # advance while the first one is waiting on a slow archive.
-            # Configured relays share a byte budget in _request.
+            # Results and input staging have independent connection slots.
             pool = self.__dict__.setdefault('_artifact_transports', {}).setdefault(authority, _ConnectionPool())
-            limit = 2 if paced else getattr(self, 'bulk_limit', 7)
         elif retirement:
             pool = self.__dict__.setdefault('_retirement_transports', {}).setdefault(authority, _ConnectionPool())
-            limit = getattr(self, 'bulk_limit', 7)
         else:
             pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if authority==self.url
                   else pools.setdefault(authority,_ConnectionPool()))
-            limit=getattr(self,'bulk_limit',7)
-        with pool.condition:
-            if getattr(pool,'bulk_limit',7)!=limit:
-                pool.bulk_limit=limit
-                pool.condition.notify_all()
+        pool.set_bulk_limit(getattr(self, 'bulk_limit', 7))
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
         # Cache lookups/handoffs and collection cleanup may wait behind disk I/O,
@@ -298,24 +300,23 @@ class Client:
                 or retirement)
         # A near-ready task can acquire its pins, look up assets and send a
         # small missing archive without waiting for a multi-MB result stream.
-        # _request still charges the shared byte budget for these uploads.
-        short_job = (paced and not artifact_get and not retirement
+        short_job = (relayed and not artifact_get and not retirement
                      and _short_dispatch_request(path, data, method))
         bulk = bulk and not short_job
         if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, short_job=short_job, cancel=cancel):
             raise PoolBusy(f'{self.url}{path}: connection pool is busy')
-        # Old live instances may still own a per-thread cached connection.
-        previous=getattr(self.connections,'connection',None)
-        if previous is not None:previous.close()
-        self.connections.owner=None
-        with pool.lock:
-            connection=pool.idle.pop() if pool.idle else None
-        if connection is not None and connection.sock is not None:
-            try:
-                if select.select([connection.sock],[],[],0)[0]:connection.close()
-            except (OSError,ValueError):connection.close()
-        self.connections.connection=connection
         try:
+            # Old live instances may still own a per-thread cached connection.
+            previous=getattr(self.connections,'connection',None)
+            self.connections.connection=None
+            if previous is not None:previous.close()
+            self.connections.owner=None
+            connection=pool.take_idle()
+            if connection is not None and connection.sock is not None:
+                try:
+                    if select.select([connection.sock],[],[],0)[0]:connection.close()
+                except (OSError,ValueError):connection.close()
+            self.connections.connection=connection
             return self._request(path,data,method=method,binary=binary,brief=brief,extra_headers=extra_headers,cancel=cancel,_output=_output)
         except RequestCancelled:
             connection=getattr(self.connections,'connection',None)
@@ -325,9 +326,7 @@ class Client:
         finally:
             connection=getattr(self.connections,'connection',None)
             self.connections.connection=None
-            if connection is not None:
-                with pool.lock:pool.idle.append(connection)
-            pool.release(bulk=bulk, short_job=short_job)
+            pool.release(bulk=bulk, connection=connection)
 
     def _confirm_asset_publication(self, path, extra_headers, cancel):
         """Give a fully sent archive time to publish before replaying its body."""
@@ -390,14 +389,13 @@ class Client:
         if data is not None and len(data)>MAX_BODY:
             raise ValueError('Request body has %d bytes; protocol limit is %d bytes. Use separate content assets for large inputs.'%(len(data),MAX_BODY))
         method = method or ('POST' if data is not None else 'GET')
-        bulk_budget = _RELAY_BULK_BUDGET
-        large_upload = stream_body and len(data) >= MIN_BULK_BYTES
+        relay = _RELAY_BULK_BUDGET
+        if relay is not None and not relay.matches(self.endpoint):
+            relay = None
+        upload_budget = (relay if relay is not None and relay.bytes_per_second is not None
+                         and stream_body and len(data) >= MIN_BULK_BYTES else None)
         binary_download = binary and method == 'GET'
-        if bulk_budget is not None and (large_upload or binary_download) and bulk_budget.matches(self.endpoint):
-            upload_budget = bulk_budget if large_upload else None
-        else:
-            upload_budget = bulk_budget = None
-        relayed_artifact = (bulk_budget is not None and binary_download
+        relayed_artifact = (relay is not None and binary_download
                             and re.fullmatch(r'/jobs/[0-9a-f]{32}/artifacts', path))
         partial, etag = _output if _output is not None else io.BytesIO(), None
         receiver = None
@@ -419,8 +417,7 @@ class Client:
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
         # Bulk streams tolerate relay stalls without resetting a paid prefix.
         # Control requests keep their short socket deadline.
-        short_relay_job = (job_upload and len(data) <= SHORT_DISPATCH_BYTES
-                           and _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(self.endpoint))
+        short_relay_job = job_upload and len(data) <= SHORT_DISPATCH_BYTES and relay is not None
         if asset_upload or job_upload:network_timeout=max(120,network_timeout)
         if asset_chunk:
             # A bounded socket idle timeout lets the next receiver take over.
@@ -437,7 +434,7 @@ class Client:
             if remaining is not None and remaining<=0:
                 raise TimeoutError('DCO kernel startup wait expired')
             attempt_timeout=min(network_timeout,remaining)if remaining is not None else network_timeout
-            if asset_upload and (attempt or (upload_budget is not None and len(data) >= 1024 * 1024)):
+            if asset_upload and (attempt or (relay is not None and large_asset)):
                 # Another campus worker may have published this archive while
                 # this upload waited for the bulk slot. Check inside the slot.
                 # The same check recovers an upload whose reply was lost.
@@ -516,8 +513,9 @@ class Client:
                     etag=response.getheader('ETag') if response.getheader('Accept-Ranges')=='bytes' else None
                     if _output is not None:
                         self.connections.etag=etag
-                    download_budget = bulk_budget.download if bulk_budget is not None and binary_download and (
-                        continued or response.length is None or response.length >= MIN_BULK_BYTES) else None
+                    download_budget = (relay.download if relay is not None and binary_download
+                                       and relay.download.bytes_per_second is not None
+                                       and (continued or response.length is None or response.length >= MIN_BULK_BYTES) else None)
                     chunk_size = MIN_BULK_BYTES if download_budget is not None else 128 * 1024
                     while True:
                         chunk=response.read1(chunk_size)
@@ -1064,8 +1062,8 @@ class Client:
                 backend=self.__dict__.setdefault('_result_client',Client(self.url,self.token,timeout=max(120,self.timeout),ca_file=getattr(self,'ca_file',None),operator=self.operator,operator_token=self.operator_token,pool_timeout=getattr(self,'pool_timeout',None),relay_url=self.relay_url,peer_id=self.peer_id))
             backend.timeout=max(120,self.timeout)
             backend._artifact_header_timeout=self.timeout
-            if getattr(self,'bulk_limit',7)!=7:
-                backend.bulk_limit=self.bulk_limit
+            backend.bulk_limit=getattr(self,'bulk_limit',7)
+            if backend.bulk_limit!=7:
                 backend._transport=self.__dict__.setdefault('_transport',_ConnectionPool())
                 backend._transports=self.__dict__.setdefault('_transports',{})
         metrics=self.__dict__.setdefault('_artifact_timing',threading.local())
@@ -1710,22 +1708,36 @@ class Pool:
             # probes. Explicit maintenance refreshes keep their direct path.
             selected = [node for node in selected if not node.detached and
                         (node.enabled or node.live_jobs or node.reserved or node.external)]
+        pending, in_flight = [], []
         with self.refresh_lock:
             for node in selected:
-                pending=self.probe_futures.get(node.name)
+                future=self.probe_futures.get(node.name)
                 interval=min(self.sample_seconds,.2) if node.live_jobs else self.sample_seconds
                 # A worker sample carries all active jobs and their lease requests.
                 # Keep relayed samples inside Client.status's two-second reuse window.
                 endpoint = getattr(node.client, 'endpoint', None)
                 if monitor and node.live_jobs and endpoint and _RELAY_BULK_BUDGET and _RELAY_BULK_BUDGET.matches(endpoint):
                     interval = min(self.sample_seconds, 1.25)
-                if pending is not None and not pending.done():
-                    if monitor or timeout is not None:continue
-                    pending.result()
+                if future is not None and not future.done():
+                    if not monitor:
+                        if timeout is None:
+                            in_flight.append((node, future))
+                        else:
+                            pending.append(future)
+                    continue
                 if monitor and time.monotonic()-getattr(node,'sampled_at',0)<interval:continue
-                self.probe_futures[node.name]=self.probes.submit(self._probe,node,not monitor)
-            pending=[self.probe_futures[node.name] for node in selected]
+                future=self.probes.submit(self._probe,node,not monitor)
+                self.probe_futures[node.name]=future
+                pending.append(future)
         if not monitor:
+            for node, previous in in_flight:
+                previous.result()
+                with self.refresh_lock:
+                    future=self.probe_futures.get(node.name)
+                    if future is previous:
+                        future=self.probes.submit(self._probe,node,True)
+                        self.probe_futures[node.name]=future
+                    pending.append(future)
             if timeout is not None:
                 pending,_=wait_futures(pending,timeout=timeout)
             for future in pending:future.result()
@@ -1826,14 +1838,6 @@ class Pool:
                     node.connection_generation+=1
                     node.error='Node address changed; checking worker'
                 node.client.bulk_limit=bulk_limit
-                transport=getattr(node.client,'_transport',None)
-                route_pools=list(getattr(node.client,'_transports',{}).values())
-                if transport is not None:
-                    route_pools.append(transport)
-                for pool in route_pools:
-                    with pool.condition:
-                        pool.bulk_limit=bulk_limit
-                        pool.condition.notify_all()
                 for key, value in changes.items():
                     setattr(node, key, value)
                 if 'enabled' in changes:
@@ -1844,7 +1848,18 @@ class Pool:
                 if timeout is not None:
                     node.client.timeout=timeout
             self.condition.notify_all()
-        if name is not None and connection_change:self._save_reconnect(node)
+        if name is not None:
+            client=node.client
+            result_client=getattr(client,'_result_client',None)
+            if result_client is not None:
+                result_client.bulk_limit=client.bulk_limit
+            for routed in (client, result_client) if result_client is not None else (client,):
+                pools=[getattr(routed,'_transport',None)]
+                for key in ('_transports','_artifact_transports','_retirement_transports'):
+                    pools.extend(getattr(routed,key,{}).copy().values())
+                for pool in filter(None,pools):
+                    pool.set_bulk_limit(client.bulk_limit)
+            if connection_change:self._save_reconnect(node)
 
     def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None, relay_url=None, peer_id=None, bulk_limit=7, display_name=""):
         if type(bulk_limit)is not int or not 1<=bulk_limit<=7:

@@ -1,4 +1,5 @@
 """Offline expiry and explicit LAN discovery, without touching production nodes."""
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stdout
 import io
 import json
@@ -20,6 +21,33 @@ from test_compute import provider, scratch
 
 
 class OfflineTests(unittest.TestCase):
+    def test_explicit_refresh_can_wait_without_blocking_other_worker_probes(self):
+        waiting, fast_polled = threading.Event(), threading.Event()
+
+        class SlowProbe(Future):
+            def result(self, timeout=None):
+                waiting.set()
+                return super().result(timeout)
+
+        old_probe = SlowProbe()
+        slow, fast = Node('slow', None), Node('fast', None)
+        pool = Pool.__new__(Pool)
+        pool.nodes = [slow, fast]
+        pool.sample_seconds = 0
+        pool.refresh_lock = threading.Lock()
+        pool.probe_futures = {'slow': old_probe}
+        pool._probe = lambda node, _: fast_polled.set() if node is fast else None
+        with ThreadPoolExecutor(2) as calls, ThreadPoolExecutor(2) as probes:
+            pool.probes = probes
+            explicit = calls.submit(pool.refresh, nodes=[slow])
+            try:
+                self.assertTrue(waiting.wait(1))
+                calls.submit(pool.refresh, monitor=True, nodes=[fast]).result(1)
+                self.assertTrue(fast_polled.wait(1))
+            finally:
+                old_probe.set_result(None)
+            explicit.result(1)
+
     def test_detached_profile_retains_the_device_route_and_saved_credential(self):
         with scratch() as directory:
             path=Path(directory)/'.local/nodes.json';path.parent.mkdir()
@@ -180,14 +208,14 @@ class OfflineTests(unittest.TestCase):
             self.assertFalse(node.enabled)
             self.assertIn('identity differs',node.error)
 
-    def test_startup_retains_the_previous_name_as_an_alias_for_the_same_endpoint(self):
+    def test_startup_keeps_configured_name_and_records_live_name_as_alias(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
             path=Path(root)/'.local/nodes.json'
             path.parent.mkdir(parents=True,exist_ok=True)
             path.write_text(json.dumps({'nodes':[dict(name='old-name',url=client.url,token=client.token,aliases=['older-name'])]}))
             loaded=load_nodes(path)['nodes'][0]
-            self.assertEqual(loaded['name'],client.health()['node'])
-            self.assertEqual(loaded['aliases'],['older-name','old-name'])
+            self.assertEqual(loaded['name'],'old-name')
+            self.assertEqual(loaded['aliases'],['older-name',client.health()['node']])
 
     def test_saved_retry_budget_survives_restart_and_manual_off_stays_off(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client):
@@ -384,7 +412,8 @@ class DiscoveryTests(unittest.TestCase):
     def test_real_lan_handshake_reads_worker_identity_without_job_submission(self):
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):
             with patch.object(worker,'submit',side_effect=AssertionError('discovery must not submit')):
-                result=scan(['127.0.0.1/32'],port=client.endpoint.port,timeout=.3)
+                result=scan(['127.0.0.1/32'],port=client.endpoint.port,timeout=.3,
+                            known=[{'url':client.url,'token':client.token}])
             self.assertEqual(result['nodes'],[{'name':worker.health(brief=True)['node'],'url':client.url}])
             self.assertFalse(worker.jobs)
 
@@ -420,10 +449,13 @@ class DiscoveryTests(unittest.TestCase):
             name=worker.health(brief=True)['node']
             with Pool([dict(name=name,client=remote,enabled=False,limit=1)]) as pool, \
                  center(pool,Path(root)/'center') as (coordinator,client):
+                operator_token=Path(root)/'.local/state/scheduler/operator.token'
+                operator_token.parent.mkdir(parents=True)
+                operator_token.write_text(coordinator.operator_token)
                 with patch('remote_compute.cli.ROOT',Path(root)),patch('remote_compute.commands.ROOT',Path(root)), \
                      patch('remote_compute.cli.Worker',side_effect=AssertionError('new worker during scan')), \
                      patch('remote_compute.commands.scan_devices',return_value=[{'name':name,'url':remote.url}]), \
-                     patch.dict(os.environ,REMOTE_COMPUTE_TOKEN='',REMOTE_COMPUTE_OPERATOR_TOKEN=coordinator.operator_token), \
+                     patch.dict(os.environ,REMOTE_COMPUTE_TOKEN=remote.token), \
                      redirect_stdout(io.StringIO()):
                     self.assertEqual(main(['--url',client.url,'scan','--add']),0)
                 self.assertTrue(pool.nodes[0].enabled)

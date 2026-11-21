@@ -1,4 +1,4 @@
-"""Shared body pacing for explicitly configured local FRP visitors."""
+"""Relay routes and optional shared body pacing."""
 
 import json
 from pathlib import Path
@@ -8,6 +8,8 @@ import time
 
 MIN_BULK_BYTES = 64 * 1024
 RELAY_BULK_CONFIG = Path(__file__).resolve().parent.parent / '.local/relay-bulk.json'
+# Persist an effectively unlimited positive rate for SDKs that predate null.
+UNLIMITED_RATE = (1 << 63) - 1
 
 
 class RelayBulkBudget:
@@ -15,12 +17,11 @@ class RelayBulkBudget:
         if (not isinstance(ports, list) or not ports
                 or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)):
             raise ValueError('Relay bulk ports must be a nonempty list of TCP port numbers')
-        if type(bytes_per_second) is not int or bytes_per_second <= 0:
-            raise ValueError('Relay bulk bytes_per_second must be a positive integer')
+        if bytes_per_second is not None and (type(bytes_per_second) is not int or bytes_per_second <= 0):
+            raise ValueError('Relay bulk bytes_per_second must be a positive integer or null')
         self._authorities = frozenset(f'127.0.0.1:{port}' for port in ports)
-        self.bytes_per_second = bytes_per_second
-        self._lock = threading.Lock()
-        self._condition = threading.Condition(self._lock)
+        self.bytes_per_second = None if bytes_per_second == UNLIMITED_RATE else bytes_per_second
+        self._condition = threading.Condition()
         self._waiting = []
         self._grants = 0
         self._next = 0.0
@@ -39,36 +40,37 @@ class RelayBulkBudget:
         if not size:
             return
         check()
+        if self.bytes_per_second is None:
+            return
         ticket = (remaining if remaining is not None else float('inf'), object())
         with self._condition:
             self._waiting.append(ticket)
-            try:
-                while True:
-                    check()
+        try:
+            while True:
+                check()
+                with self._condition:
                     # Reserve every fourth block for the oldest waiting stream.
                     # Let short transfers finish first with the other blocks.
                     winner = (self._waiting[0] if self._grants % 4 == 3 else
                               min(self._waiting, key=lambda entry: entry[0]))
-                    delay = self._next - time.monotonic()
+                    now = time.monotonic()
+                    delay = self._next - now
                     if winner is ticket and delay <= 0:
-                        ready = time.monotonic() + size / self.bytes_per_second
-                        self._next = ready
+                        # Send this block now. Time spent on the wire counts
+                        # toward the interval before the next grant.
+                        self._next = now + size / self.bytes_per_second
                         self._grants += 1
-                        break
+                        self._paced_bytes += size
+                        self._paced_chunks += 1
+                        return
                     self._condition.wait(min(.1, delay) if delay > 0 else .1)
-            finally:
+        finally:
+            with self._condition:
                 self._waiting.remove(ticket)
                 self._condition.notify_all()
-        while (remaining := ready - time.monotonic()) > 0:
-            check()
-            time.sleep(min(.1, remaining))
-        check()
-        with self._lock:
-            self._paced_bytes += size
-            self._paced_chunks += 1
 
     def snapshot(self):
-        with self._lock:
+        with self._condition:
             state = {'bytes_per_second': self.bytes_per_second,
                      'paced_bytes': self._paced_bytes, 'paced_chunks': self._paced_chunks}
         if self.download is not self:

@@ -634,7 +634,15 @@ class ArtifactReloadTests(unittest.TestCase):
                 identity=client.submit(python("print('executed once')"))['id']
                 original=client.wait(identity)
                 raw=pool.nodes[0].client.artifacts(identity)
-                with patch.object(pool.nodes[0].client,'artifacts',side_effect=[RemoteError('provider reloading'),RemoteError('provider starting'),raw]) as download, \
+                responses=iter([RemoteError('provider reloading'), RemoteError('provider starting'), raw])
+                def interrupted_download(worker_id, *, destination):
+                    self.assertEqual(worker_id,identity)
+                    response=next(responses)
+                    if isinstance(response,RemoteError):
+                        raise response
+                    destination.write_bytes(response)
+                    return destination
+                with patch.object(pool.nodes[0].client,'artifacts',side_effect=interrupted_download) as download, \
                         patch.object(client,'submit',side_effect=AssertionError('must not resubmit')):
                     result=client.fetch(identity)
                 self.assertEqual(download.call_count,3)
@@ -973,7 +981,7 @@ class TransportTests(unittest.TestCase):
             time.sleep(.15)
             return dict(id=key, cpus=1, memory_mb=128)
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
-            client = Client(remote.url, timeout=.05)
+            client = Client(remote.url, remote.token, timeout=.05)
             environment = dict(REMOTE_COMPUTE_LEASE='1', REMOTE_COMPUTE_URL=remote.url,
                                REMOTE_COMPUTE_JOB_ID=identity, REMOTE_COMPUTE_WORKER_JOB_ID=identity)
             with patch.dict('os.environ', environment), patch.object(worker, 'lease', side_effect=delayed_lease), \
@@ -994,7 +1002,7 @@ class TransportTests(unittest.TestCase):
             time.sleep(.15)
             return dict(id=key, cpus=1, memory_mb=128)
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
-            client = Client(remote.url, timeout=1, lease_timeout=.05)
+            client = Client(remote.url, remote.token, timeout=1, lease_timeout=.05)
             with patch.object(worker, 'lease', side_effect=delayed_lease):
                 with self.assertRaisesRegex(RemoteError, 'timed out'):
                     client.request('/jobs/'+identity+'/lease', dict(cpus=1, memory_mb=128))
@@ -1012,7 +1020,7 @@ class TransportTests(unittest.TestCase):
             time.sleep(.15)
             return dict(id=key, cpus=cpus, memory_mb=options['memory_mb'])
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
-            client = Client(remote.url, timeout=.05)
+            client = Client(remote.url, remote.token, timeout=.05)
             with patch.object(worker, 'resize', side_effect=delayed_resize), \
                     patch.object(http.client.HTTPConnection, 'request', request):
                 result = client.resize(identity, 1, memory_mb=128)
@@ -1032,7 +1040,7 @@ class TransportTests(unittest.TestCase):
             time.sleep(.15)
             return dict(id=key, cpus=state['cpus'], memory_mb=state['memory_mb'])
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
-            client = Client(remote.url, timeout=1, lease_timeout=.05)
+            client = Client(remote.url, remote.token, timeout=1, lease_timeout=.05)
             reconnect=client._read_reconnecting
             def bounded(read,**options):
                 return reconnect(read,**{**options,'deadline':time.monotonic()+.4})
@@ -1062,7 +1070,7 @@ class TransportTests(unittest.TestCase):
                 listing = executor.submit(client.status)
                 try:
                     self.assertTrue(entered.wait(2))
-                    control = Client(client.url, timeout=.5)
+                    control = Client(client.url, client.token, timeout=.5)
                     self.assertEqual(control.request('/jobs/'+identity+'/lease',
                         dict(request_id=1, grant=dict(cpus=1, memory_mb=128))), dict(accepted=True))
                 finally:
@@ -1172,7 +1180,7 @@ class TransportTests(unittest.TestCase):
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):
             with patch.object(Handler,'_reply',reply):
                 result=client.request('/assets/'+identity,payload,extra_headers={'X-DCO-Asset-Job':owner})
-            self.assertEqual(result,dict(id=identity,exists=True))
+            self.assertEqual(result,dict(id=identity,exists=True,cache_hit=True))
             self.assertEqual(requests,[('POST',len(payload)),('GET',0)])
             self.assertEqual(worker.asset_handoffs[owner][0],frozenset({identity}))
             self.assertEqual((worker.root/'assets'/identity/'model.npz').read_bytes(),bytes(range(256))*8192)
@@ -1197,7 +1205,7 @@ class TransportTests(unittest.TestCase):
         with scratch() as root, provider(Path(root)/'worker') as (_, client):
             with patch.object(Handler, '_reply', reply):
                 result = client.request(route, payload)
-            self.assertEqual(result, dict(id=identity, exists=True))
+            self.assertEqual(result, dict(id=identity, exists=True, cache_hit=True))
             self.assertEqual(requests, ['POST', 'GET', 'GET'])
 
     def test_large_asset_with_unreadable_receipts_suppresses_body_replay(self):
@@ -1394,10 +1402,9 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(backend.timeout,.05)
                 self.assertIs(backend._transport,control_pool)
                 self.assertGreaterEqual(backend._result_client.timeout,120)
-                self.assertIsNot(backend._result_client._transport,control_pool)
+                self.assertIsNot(backend._result_client._artifact_transports[backend.url],control_pool)
                 client.delete(identity)
-                self.assertNotIn(identity,worker.jobs)
-                self.assertNotIn(identity,state.jobs)
+                until(lambda: identity not in worker.jobs and identity not in state.jobs)
 
     def test_idle_keep_alive_is_reclaimed_and_the_same_client_reconnects(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client),patch.object(Handler,'idle_timeout',.05):
@@ -1513,7 +1520,7 @@ class TransportTests(unittest.TestCase):
                     directory=state.jobs[identity]['directory']
                     self.assertTrue((directory/'worker-artifacts.zip').exists())
                     client.delete(identity)
-                    self.assertFalse(directory.exists())
+                    until(lambda: not directory.exists())
 
     def test_slow_provider_result_does_not_hold_other_finished_ids_in_preparing(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,node):
@@ -1561,10 +1568,11 @@ class TransportTests(unittest.TestCase):
                 def delayed(*args):
                     entered.set();release.wait(2);return original(*args)
                 with patch.object(pool.nodes[0].client,'delete',side_effect=delayed),ThreadPoolExecutor(max_workers=2) as executor:
-                    waiting=executor.submit(Client(client.url).delete,identity)
+                    ordinary=Client(client.url,client.token)
+                    waiting=executor.submit(ordinary.delete,identity)
                     try:
                         self.assertTrue(entered.wait(1))
-                        health=executor.submit(Client(client.url).health)
+                        health=executor.submit(ordinary.health)
                         self.assertEqual(health.result(timeout=.7)['role'],'scheduler')
                     finally:
                         release.set();waiting.result(timeout=2)

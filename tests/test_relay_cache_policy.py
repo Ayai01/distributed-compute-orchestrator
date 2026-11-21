@@ -1,4 +1,5 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import threading
@@ -12,8 +13,8 @@ from remote_compute.bundle import pack
 from remote_compute.cleanup import (
     ASSET_CACHE_IDLE_SECONDS, AssetCache, AssetMaintenance, prune_asset_caches,
 )
-from remote_compute.client import PoolBusy, _ConnectionPool
-from remote_compute.relay_bulk import RelayBulkBudget
+from remote_compute.client import PoolBusy, RequestCancelled, _ConnectionPool
+from remote_compute.relay_bulk import RelayBulkBudget, UNLIMITED_RATE
 from remote_compute.shared_assets import SharedAssets
 from test_compute import provider, python, scratch
 
@@ -63,7 +64,8 @@ class CachePolicyTests(unittest.TestCase):
         with scratch() as directory:
             root = Path(directory)
             shared = root / 'shared'
-            with provider(root / 'worker', env={'DCO_SHARED_ASSET_CACHE': str(shared)}) as (worker, client):
+            with patch('remote_compute.worker.AssetMaintenance'), \
+                    provider(root / 'worker', env={'DCO_SHARED_ASSET_CACHE': str(shared)}) as (worker, client):
                 owner = worker.shared_assets
                 cold = b'cold copy'
                 expired = hashlib.sha256(cold).hexdigest()
@@ -108,6 +110,14 @@ class CachePolicyTests(unittest.TestCase):
 
 
 class RelayPolicyTests(unittest.TestCase):
+    def test_legacy_readable_rate_disables_only_the_selected_direction(self):
+        budget = RelayBulkBudget([19001], 1024, download_bytes_per_second=UNLIMITED_RATE)
+        budget.download.pace(64, lambda: None)
+        snapshot = budget.snapshot()
+        self.assertEqual(snapshot['bytes_per_second'], 1024)
+        self.assertIsNone(snapshot['download_bytes_per_second'])
+        self.assertEqual(snapshot['paced_bytes'], 0)
+
     def test_upload_and_download_have_separate_pacing_when_configured(self):
         budget = RelayBulkBudget([19001], 1000, download_bytes_per_second=1000)
         budget._next = time.monotonic() + 100
@@ -122,12 +132,68 @@ class RelayPolicyTests(unittest.TestCase):
         pool.bulk_limit = 3
         try:
             self.assertTrue(all(pool.acquire(0, bulk=True) for _ in range(3)))
-            with patch('remote_compute.client._RELAY_BULK_BUDGET', RelayBulkBudget([19001], 1000)), \
+            self.assertTrue(pool.acquire(0, short_job=True))
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', RelayBulkBudget([19001], None)), \
                     patch.object(client, '_request', return_value={'ready': True}):
                 self.assertTrue(client.request('/assets/' + 'a' * 64)['ready'])
                 self.assertTrue(client.request('/health')['ready'])
                 with self.assertRaises(PoolBusy):
                     client.request('/assets/' + 'b' * 64, bytes(300 * 1024))
         finally:
+            pool.release()
             for _ in range(3):
                 pool.release(bulk=True)
+
+    def test_connection_waiter_can_check_cancel_while_configuration_changes(self):
+        pool = _ConnectionPool()
+        checked, proceed = threading.Event(), threading.Event()
+
+        def cancelled():
+            checked.set()
+            proceed.wait(3)
+            return True
+
+        with ThreadPoolExecutor(2) as executor:
+            waiting = executor.submit(pool.acquire, 2, bulk=True, cancel=cancelled)
+            try:
+                self.assertTrue(checked.wait(1))
+                executor.submit(pool.set_bulk_limit, 3).result(1)
+            finally:
+                proceed.set()
+            with self.assertRaises(RequestCancelled):
+                waiting.result(1)
+        self.assertEqual((pool.available, pool.bulk_active, pool.bulk_limit), (8, 0, 3))
+
+    def test_pacer_can_check_cancel_while_health_reads_meter(self):
+        budget = RelayBulkBudget([19001], 1024)
+        checked, proceed = threading.Event(), threading.Event()
+        calls = 0
+
+        def check():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                checked.set()
+                proceed.wait(3)
+                raise RequestCancelled('test cancellation')
+
+        with ThreadPoolExecutor(2) as executor:
+            waiting = executor.submit(budget.pace, 64, check)
+            try:
+                self.assertTrue(checked.wait(1))
+                self.assertEqual(executor.submit(budget.snapshot).result(1)['paced_bytes'], 0)
+            finally:
+                proceed.set()
+            with self.assertRaises(RequestCancelled):
+                waiting.result(1)
+        self.assertEqual(budget._waiting, [])
+
+    def test_wire_time_can_satisfy_pacing_interval(self):
+        budget = RelayBulkBudget([19001], 100)
+        clock = 100.
+        with patch('remote_compute.relay_bulk.time.monotonic', side_effect=lambda: clock), \
+                patch('remote_compute.relay_bulk.time.sleep', side_effect=AssertionError('paced after grant')):
+            budget.pace(100, lambda: None)
+            clock += 1.1
+            budget.pace(100, lambda: None)
+        self.assertEqual(budget.snapshot()['paced_bytes'], 200)

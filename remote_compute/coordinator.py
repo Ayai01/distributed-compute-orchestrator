@@ -571,9 +571,13 @@ class Coordinator:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
                         capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []))
         if display:
-            return self._display_health()
-        with self.condition, self.pool.condition:
-            return self._health()
+            value = self._display_health()
+        else:
+            with self.condition, self.pool.condition:
+                value = self._health()
+        relay = transport._RELAY_BULK_BUDGET
+        value['relay_bulk'] = relay.snapshot() if relay is not None else None
+        return value
 
     def _display_health(self):
         """Keep the display responsive and queue a fresh sample when busy."""
@@ -780,7 +784,6 @@ class Coordinator:
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
-                    'relay_bulk': (transport._RELAY_BULK_BUDGET.snapshot() if transport._RELAY_BULK_BUDGET else None),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
                                      + sum(row['status'] in TERMINAL for row in observation_rows.values()),
@@ -855,14 +858,18 @@ class Coordinator:
         if isinstance(changes, dict) and set(changes) == {'observations'}:
             return self.observe(changes['observations'])
         if isinstance(changes, dict) and set(changes) == {'relay_bulk'}:
-            from .relay_bulk import RELAY_BULK_CONFIG, RelayBulkBudget
+            from .relay_bulk import RELAY_BULK_CONFIG, UNLIMITED_RATE, RelayBulkBudget
             config = changes['relay_bulk']
             if not isinstance(config, dict) or not {'ports', 'bytes_per_second'} <= config.keys() or (
                     config.keys() - {'ports', 'bytes_per_second', 'download_bytes_per_second'}):
                 raise ValueError('Relay bulk control requires ports and validated byte rates')
-            budget = RelayBulkBudget(**config)
+            persisted = dict(config)
+            for rate in ('bytes_per_second', 'download_bytes_per_second'):
+                if rate in persisted and persisted[rate] is None:
+                    persisted[rate] = UNLIMITED_RATE
+            budget = RelayBulkBudget(**persisted)
             with self.condition:
-                atomic_json(RELAY_BULK_CONFIG, config)
+                atomic_json(RELAY_BULK_CONFIG, persisted)
                 transport._RELAY_BULK_BUDGET = budget
             return budget.snapshot()
         if isinstance(changes,dict)and set(changes)=={'retire_asset'}:
@@ -2035,12 +2042,8 @@ class Coordinator:
                         published = self.shared_asset_publications.get(key)
                     if not published or published[0] == node.name:
                         break
-                    budget = transport._RELAY_BULK_BUDGET
-                    size = archive.stat().st_size
-                    rate = (budget.bytes_per_second if budget and size >= transport.MIN_BULK_BYTES
-                            and budget.matches(node.client.endpoint) else 8 * 1024**2)
                     # Bound the visibility wait by the cost of retransmitting this archive.
-                    deadline = min(wait_until, published[1] + 1 + 2 * size / rate)
+                    deadline = min(wait_until, published[1] + 1 + 2 * published[2])
                     if time.monotonic() >= deadline:
                         break
                     # Other nodes may already see the archive. Serialize sends, not waiting.
@@ -2071,6 +2074,7 @@ class Coordinator:
                     metrics = report.setdefault(asset, {}) if report is not None else {}
                     receivers = self._resumable_asset_receivers(node, shared_cache) if archive_bytes >= ASSET_RESUME_MIN_BYTES else []
                     receiver = None
+                    upload_started = time.monotonic()
                     if receivers:
                         receiver = self._upload_shared_asset(receivers, asset, archive, cancel=abandoned, report=metrics)
                     elif metrics.get('protocol') == 'resumable':
@@ -2083,7 +2087,8 @@ class Coordinator:
                         with self.shared_asset_upload_lock:
                             publications = self.shared_asset_publications
                             publications.pop(key, None)
-                            publications[key] = ((receiver or node).name, time.monotonic())
+                            completed = time.monotonic()
+                            publications[key] = ((receiver or node).name, completed, completed - upload_started)
                             if len(publications) > 1024:
                                 del publications[next(iter(publications))]
                     if receiver is not None and not node.client.request(route, cancel=abandoned)['exists']:

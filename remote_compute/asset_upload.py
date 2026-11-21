@@ -11,7 +11,7 @@ from .bundle import MAX_BODY, atomic_json
 
 ASSET_RESUME_CAPABILITY = 'resumable_assets'
 ASSET_CHUNK_BYTES = 2 * 1024**2
-ASSET_RESUME_MIN_BYTES = 8 * 1024**2
+ASSET_RESUME_MIN_BYTES = 1024**2
 _DIGEST = r'[a-f0-9]{64}'
 _PART = re.compile(r'\.upload-(' + _DIGEST + r')(_meta)?\Z')
 _RANGE = re.compile(r'bytes ([0-9]{1,9})-([0-9]{1,9})/([0-9]{1,9})\Z')
