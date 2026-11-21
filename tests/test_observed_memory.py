@@ -1,5 +1,6 @@
 """Overestimated requests, private commit, phase peaks and recovery use real headroom."""
 from concurrent.futures import ThreadPoolExecutor
+import sys
 from unittest.mock import Mock
 import unittest
 
@@ -58,9 +59,11 @@ class ObservedMemoryTests(unittest.TestCase):
         job=self.job(memory_observation=observed());job['memory_phase_model']=dict(base_memory_mb=768,memory_per_cpu_mb=0)
         self.assertEqual(reservation(job),(768,768))
         job['memory_phase_model']=dict(base_memory_mb=512,memory_per_cpu_mb=600)
-        job['task'].update(cpus=2,memory_mb=256)
+        job['task'].update(cpus=2,memory_mb=1712)
+        job['startup_memory_mb']=1712
         self.assertEqual(reservation(job),(1712,1712))
-        job['task']['cpus']=0
+        job['task'].update(cpus=0,memory_mb=512)
+        job['startup_memory_mb']=512
         self.assertEqual(reservation(job),(512,512))
         job['memory_phase_model']=None
         self.assertEqual(reservation(job),(128,127))
@@ -126,7 +129,12 @@ class ObservedMemoryTests(unittest.TestCase):
 
     def test_next_command_restores_parent_fixed_default_and_environment(self):
         import json
-        code="import os,sys;sys.path.insert(0,os.environ['REMOTE_COMPUTE_HOME']);from remote_compute import Client;Client(os.environ['REMOTE_COMPUTE_URL']).resize(os.environ['REMOTE_COMPUTE_JOB_ID'],1,base_memory_mb=256,memory_per_cpu_mb=0)"
+        code="""import os, sys
+sys.path.insert(0, os.environ['REMOTE_COMPUTE_HOME'])
+from remote_compute import Client
+client = Client(os.environ['REMOTE_COMPUTE_URL'], os.environ['REMOTE_COMPUTE_TOKEN'])
+client.resize(os.environ['REMOTE_COMPUTE_JOB_ID'], 1, base_memory_mb=256, memory_per_cpu_mb=0)
+"""
         with scratch()as root,provider(root+'/worker',cpus=1,memory_mb=1024,memory_headroom_mb=0)as(_,node):
             with Pool([node])as pool,center(pool,root+'/center')as(_,client):
                 task=python(code,memory_mb=64)
@@ -167,10 +175,11 @@ class ObservedMemoryTests(unittest.TestCase):
             finally:client.cancel(identity);client.wait(identity);client.fetch(identity)
 
     def test_zero_available_memory_still_accepts_and_later_executes_a_queued_plan(self):
-        with scratch()as root,provider(root+'/worker',cpus=1,memory_mb=512,memory_headroom_mb=0)as(worker,node):
+        with scratch() as root, provider(root+'/worker', cpus=1, memory_mb=512, memory_headroom_mb=0,
+                                        python_runtimes={'ml': [sys.executable]}) as (worker, node):
             worker.host.sample=Mock(return_value=dict(memory_total_mb=4096,host_memory_available_mb=0,host_commit_available_mb=0))
             with Pool([node])as pool,center(pool,root+'/center')as(_,client),ThreadPoolExecutor(1)as threads:
-                ordinary=Client(client.url)
+                ordinary=Client(client.url,client.token)
                 future=threads.submit(ordinary.execute,{'one':{'task':python("print('done')",memory_mb=128)}},project='queue-zero',output_dir=root+'/out')
                 until(lambda:client.health()['queued']==1)
                 self.assertEqual(worker.health()['memory_available_mb'],0)

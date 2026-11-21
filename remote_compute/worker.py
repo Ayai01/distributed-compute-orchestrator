@@ -1193,64 +1193,78 @@ class Worker:
                 # FIFO prevents a continuous stream of small jobs starving a larger one.
                 if self.queue and not self.paused:
                     job = self.jobs[self.queue[0]]
-                    if (self.used + job["task"]["cpus"] <= self._cpu_capacity(host)
-                            and startup_memory(job['task']) <= self._memory_state()["memory_available_mb"]
-                            and (job['task'].get('accelerator') is None or self._match_accelerator(job['task']['accelerator']))):
-                        self.queue.popleft()
-                        job['cpu_overcommit']=self.used+job['task']['cpus']>self.capacity
-                        self.used += job["task"]["cpus"]
-                        job['startup_memory_mb']=startup_memory(job['task'])
-                        self.accelerator_reservations[job['result']['id']]=self._match_accelerator(job['task'].get('accelerator')) or []
-                        job["result"].update(status="running", started=time.time(),cpu_overcommit=job['cpu_overcommit'],
-                                             memory_mb=job['startup_memory_mb'])
-                        self._save(job)
-                        thread = threading.Thread(target=self._execute, args=(job,), name="compute-job", daemon=True)
-                        self.threads.add(thread)
-                        thread.start()
-                        continue
+                    task = job['task']
+                    if self.used + task['cpus'] <= self._cpu_capacity(host):
+                        available = self._memory_state()['memory_available_mb']
+                        # Fully fund startup within measured RAM and commit headroom.
+                        # A larger declaration can still use the existing cold probe.
+                        funded = task['memory_mb'] if task['memory_mb'] <= available else startup_memory(task)
+                        accelerators = self._match_accelerator(task.get('accelerator'))
+                        if funded <= available and (task.get('accelerator') is None or accelerators):
+                            self.queue.popleft()
+                            job['cpu_overcommit'] = self.used + task['cpus'] > self.capacity
+                            self.used += task['cpus']
+                            job['startup_memory_mb'] = funded
+                            self.accelerator_reservations[job['result']['id']] = accelerators or []
+                            job['result'].update(status='running', started=time.time(), cpu_overcommit=job['cpu_overcommit'],
+                                                 memory_mb=funded)
+                            self._save(job)
+                            thread = threading.Thread(target=self._execute, args=(job,), name='compute-job', daemon=True)
+                            self.threads.add(thread)
+                            thread.start()
+                            continue
                 self.condition.wait(0.5)
 
     def _start_process(self, job, *args, before_spawn=None, **kwargs):
-        # Serialize only initial OS process creation, outside the scheduler
-        # condition. Cancellation wakes the pacing wait without starting it.
+        # Keep memory and pacing waits outside the initial process creation lock.
+        cancel = job['cancel']
+        task = job['task']
         expires = job.get('preparation_deadline', math.inf)
-        while not self.start_lock.acquire(timeout=.05):
-            if self.stopping or job['cancel'].is_set() or time.monotonic() >= expires:
+        interval = 1. if job.get('cpu_overcommit') else .1 if task.get('short_job') else .5
+        while not self.stopping and not cancel.is_set():
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
                 return None
-        try:
-            # Serialize probes whose declared RAM is not fully funded yet.
-            # Small tasks and declared phase floors already reserve their full
-            # startup footprint, so their calibration can run concurrently.
-            while not self.stopping and not job['cancel'].is_set():
-                with self.pressure_process_lock:
-                    cold=any(j is not job and not j['cancel'].is_set() and
-                             getattr(j.get('memory_observation'),'envelope',None)is None and
-                             min(reservation(j))<j['task']['memory_mb']
-                             for j in self.pressure_processes.values())
-                if not cold and not self.pressure_guard.state['limited']:break
-                if time.monotonic() >= expires:
-                    job['result']['preparation_stage'] = 'memory_calibration' if cold else 'host_memory_pressure'
-                    return None
-                job['cancel'].wait(.05)
-            interval = 1. if job.get('cpu_overcommit') else .1 if job.get('task', {}).get('short_job') else .5
-            deadline=self.next_start+max(0,interval-self.start_interval)
-            if self.stopping or job['cancel'].wait(max(0,min(deadline,expires)-time.monotonic())):
-                return None
-            if self.stopping or job['cancel'].is_set() or time.monotonic() >= expires:
-                return None
+            if not self.start_lock.acquire(timeout=min(.05, remaining)):
+                continue
             try:
-                if before_spawn is not None:
-                    before_spawn()
-                process=Process(*args, **kwargs)
-                with self.pressure_process_lock:
-                    job['process']=process
-                    self.pressure_processes[job['result']['id']]=job
-                return process
+                now = time.monotonic()
+                if self.stopping or cancel.is_set() or now >= expires:
+                    return None
+                cold = False
+                if min(reservation(job)) < task['memory_mb']:
+                    with self.pressure_process_lock:
+                        cold = any(other is not job and not other['cancel'].is_set()
+                                   and getattr(other.get('memory_observation'), 'envelope', None) is None
+                                   and min(reservation(other)) < other['task']['memory_mb']
+                                   for other in self.pressure_processes.values())
+                if self.pressure_guard.state['limited']:
+                    job['result']['preparation_stage'] = 'host_memory_pressure'
+                    delay = .05
+                elif cold:
+                    job['result']['preparation_stage'] = 'memory_calibration'
+                    delay = .05
+                else:
+                    delay = self.next_start + max(0, interval - self.start_interval) - now
+                    if delay <= 0:
+                        if self.stopping or cancel.is_set() or time.monotonic() >= expires:
+                            return None
+                        try:
+                            if before_spawn is not None:
+                                before_spawn()
+                            process = Process(*args, **kwargs)
+                            with self.pressure_process_lock:
+                                job['process'] = process
+                                self.pressure_processes[job['result']['id']] = job
+                            return process
+                        finally:
+                            self.next_start = time.monotonic() + interval
+                            self.start_interval = interval
+                    job['result']['preparation_stage'] = 'launch_pacing'
             finally:
-                self.next_start = time.monotonic() + interval
-                self.start_interval=interval
-        finally:
-            self.start_lock.release()
+                self.start_lock.release()
+            cancel.wait(max(0, min(delay, expires - time.monotonic())))
+        return None
 
     def _execute(self, job):
         from .resources import CPU_STAGES

@@ -9,9 +9,8 @@ from remote_compute import Pool
 from remote_compute.client import Node
 from remote_compute.worker import Worker
 from remote_compute.memory import PressureGuard
-from types import SimpleNamespace
 from remote_compute.coordinator import Coordinator
-from test_compute import provider,python,scratch
+from test_compute import provider,python,scratch,until
 from test_center import center
 
 
@@ -22,19 +21,49 @@ class LaunchSpacingTests(unittest.TestCase):
         worker.pressure_guard=PressureGuard()
         return worker
 
+    @staticmethod
+    def pending(identity='next', cancel=None, **values):
+        return dict(task=dict(cpus=1, memory_mb=256), cancel=cancel if cancel is not None else threading.Event(),
+                    result=dict(id=identity), **values)
+
     def test_concurrent_initial_process_creation_is_spaced(self):
         worker=self.worker()
         worker.start_lock=threading.Lock();worker.next_start=0.;worker.start_interval=.5;worker.stopping=False
         barrier=threading.Barrier(3);times=[]
         def start(_):
             barrier.wait()
-            return worker._start_process(dict(cancel=threading.Event(),result=dict(id=str(threading.get_ident())),memory_observation=SimpleNamespace(envelope=(1,1))),['echo'])
+            return worker._start_process(self.pending(str(threading.get_ident())), ['echo'])
         def process(*args,**kwargs):
             times.append(time.monotonic());return object()
         with patch('remote_compute.worker.Process',side_effect=process),ThreadPoolExecutor(3)as pool:
             self.assertEqual(len(list(pool.map(start,range(3)))),3)
         self.assertEqual(len(times),3)
         self.assertTrue(all(b-a>=.5 for a,b in zip(times,times[1:])),times)
+
+    def test_funded_short_jobs_start_while_a_cold_probe_is_pending(self):
+        with scratch() as root, provider(root, cpus=4, memory_mb=2048) as (_, client), \
+                patch('remote_compute.memory.MemoryObservation.observe'), \
+                patch('remote_compute.worker.PREPARATION_TIMEOUT', 2):
+            probe = client.submit(python('import time; time.sleep(12)', memory_mb=8192, timeout=15))['id']
+            try:
+                until(lambda: client.status(probe).get('execution_started') is not None)
+                blocked = client.submit(python('print("cold")', memory_mb=8192, short_job=True))['id']
+                funded = [client.submit(python(f'print({i})', memory_mb=512, short_job=True))['id']
+                          for i in range(2)]
+                for i, identity in enumerate(funded):
+                    result = client.wait(identity, wait_timeout=8)
+                    self.assertEqual(result['id'], identity)
+                    self.assertEqual(result['status'], 'succeeded', result.get('preparation_stage'))
+                    self.assertLess(result['preparation_seconds'], 2)
+                    self.assertEqual(client.fetch(identity)['stdout'].strip(), str(i))
+                waiting = client.wait(blocked, wait_timeout=8)
+                self.assertEqual(waiting['error_kind'], 'startup_timeout')
+                self.assertEqual(waiting['preparation_stage'], 'memory_calibration')
+                self.assertEqual(waiting['cpu_seconds'], 0)
+                self.assertEqual(client.status(probe)['status'], 'running')
+            finally:
+                client.cancel(probe)
+                client.wait(probe, wait_timeout=8)
 
     def test_cancelled_start_does_not_launch_or_wait_out_the_interval(self):
         worker=self.worker()
@@ -43,11 +72,11 @@ class LaunchSpacingTests(unittest.TestCase):
         with patch('remote_compute.worker.Process')as process:
             started=time.monotonic()
             previous=worker.next_start
-            self.assertIsNone(worker._start_process(dict(cancel=cancel),['echo']))
+            self.assertIsNone(worker._start_process(self.pending(cancel=cancel), ['echo']))
             self.assertLess(time.monotonic()-started,.1)
             self.assertEqual(worker.next_start,previous)
             worker.stopping=True;cancel.clear()
-            self.assertIsNone(worker._start_process(dict(cancel=cancel),['echo']))
+            self.assertIsNone(worker._start_process(self.pending(cancel=cancel), ['echo']))
             self.assertLess(time.monotonic()-started,.1)
             self.assertEqual(worker.next_start,previous)
             process.assert_not_called()
@@ -75,7 +104,7 @@ class LaunchSpacingTests(unittest.TestCase):
             time.sleep(.01);worker.stopping=True
         with patch('remote_compute.worker.Process')as process,ThreadPoolExecutor(1)as pool:
             stopping=pool.submit(stop)
-            self.assertIsNone(worker._start_process(dict(cancel=threading.Event(),result=dict(id=str(threading.get_ident())),memory_observation=SimpleNamespace(envelope=(1,1))),['echo']))
+            self.assertIsNone(worker._start_process(self.pending(), ['echo']))
             stopping.result();process.assert_not_called()
         self.assertEqual(worker.next_start,previous)
 
@@ -101,7 +130,8 @@ class LaunchSpacingTests(unittest.TestCase):
         worker.start_lock=threading.Lock();worker.next_start=0.;worker.start_interval=.5;worker.stopping=False
         with patch('remote_compute.worker.time.monotonic',side_effect=lambda:clock.now), \
                 patch('remote_compute.worker.Process',side_effect=lambda *args,**kwargs:times.append(clock.now)):
-            for borrowed in (False,True,False):worker._start_process(dict(cancel=clock,cpu_overcommit=borrowed,result=dict(id='clock'),memory_observation=SimpleNamespace(envelope=(1,1))),['echo'])
+            for borrowed in (False,True,False):
+                worker._start_process(self.pending('clock', cancel=clock, cpu_overcommit=borrowed), ['echo'])
         self.assertEqual(times,[10.,11.,12.])
 
     def test_device_dispatch_gates_are_independent_and_borrowed_entry_waits_one_second(self):
