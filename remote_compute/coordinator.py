@@ -2126,7 +2126,7 @@ class Coordinator:
 
     def _callback(self, node):
         if not node.client.url.startswith('local://'):
-            return {'mode':'poll','timeout':node.client.timeout}
+            return {'mode':'poll','timeout':node.client.timeout,'local_exact_activation':True}
         if not self.callback_address:return None
         host,port=self.callback_address[:2]
         host='127.0.0.1' if host=='0.0.0.0' else host

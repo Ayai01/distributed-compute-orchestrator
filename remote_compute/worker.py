@@ -931,6 +931,18 @@ class Worker:
                 return {'accepted':True}
             if job['result']['status']!='running':raise Conflict('Only a running task can request resources')
             if job.get('callback',{}).get('mode')!='poll':raise Conflict('Task is not owned by a polling center')
+            if request.get('_operation') == 'activate_exact':
+                result = job['result']
+                serial, width = request.get('ticket'), request.get('cpus')
+                if (type(serial) is not int or type(width) is not int
+                        or self.stopping or job['cancel'].is_set() or self.pressure_guard.state['waiting']
+                        or job.get('lease_serial') != serial or job['task']['cpus'] != width
+                        or job.get('exact_launch_offer') != (serial, width, result['resize_count'], result.get('memory_phase'))):
+                    raise Conflict(ACTIVE_GRANT_CONFLICT)
+                # Commit locally. The placement grant is already funded and
+                # repeating this acknowledgement changes no reservation.
+                result['active_cpus'] = width
+                return {'cpus': width}
             deadline=time.monotonic()+120
 
             def remaining_time():
@@ -952,7 +964,16 @@ class Worker:
                     self.condition.wait(min(remaining_time(),.5))
                 reply=job.pop('resource_reply')
                 if reply.get('error'):raise Conflict(reply['error'])
-                return reply['grant']
+                grant = reply['grant']
+                width = request.get('cpus')
+                if (job['callback'].get('local_exact_activation') is True
+                        and type(width) is int and width > 1 and request.get('min_cpus') == width
+                        and request.get('active_cpus') == 0 and grant.get('supported') is not False
+                        and grant.get('cpus') == job['task']['cpus'] == width):
+                    result = job['result']
+                    job['exact_launch_offer'] = (serial, width, result['resize_count'], result.get('memory_phase'))
+                    return {**grant, 'exact_start_ticket': serial}
+                return grant
             finally:
                 job['result'].pop('resource_request',None)
                 self.condition.notify_all()

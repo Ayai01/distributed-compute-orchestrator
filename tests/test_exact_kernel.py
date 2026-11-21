@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from remote_compute import Client,Pool,python_task,run_call
 from remote_compute.deadline import resource_window,remaining_time,check_deadline
+from remote_compute.worker import Conflict
+from test_capability_packages import packaged_worker
 from test_center import center
 from test_compute import provider,scratch,python,until
 
@@ -47,6 +49,49 @@ def overcommitted_single():
 
 
 class ExactKernelTests(unittest.TestCase):
+    def test_six_core_start_with_a_lost_second_center_ack(self):
+        source = SOURCE + """
+def six():
+    return run_call(kernel, limits=dict(exact_cpus=6, start_timeout=2, memory_mb=768))
+"""
+        with scratch() as folder, packaged_worker(Path(folder) / 'worker', 'python', cpus=6) as (_, remote):
+            with Pool([remote]) as pool, center(pool, Path(folder) / 'center') as (state, operator):
+                client = Client(operator.url, operator.token)
+                answer = state._answer_resource_request
+                callback = state._callback
+                lost = set()
+
+                def drop_confirmation(job, worker_id, snapshot):
+                    request = snapshot['resource_request']
+                    if request.get('active_cpus') == request.get('min_cpus') == 6:
+                        original = job['result']['id']
+                        if original not in lost:
+                            grant = state.resize(original, **{k: v for k, v in request.items() if k != 'request_id'})
+                            self.assertEqual(grant['cpus'], 6)
+                            lost.add(original)
+                        return
+                    answer(job, worker_id, snapshot)
+
+                task = python_task('business:six', max_cpus=6, memory_mb=768, timeout=12, retries=0, outputs=['calls'])
+                with patch.object(state, '_answer_resource_request', side_effect=drop_confirmation):
+                    with patch.object(state, '_callback', side_effect=lambda n: dict(callback(n), local_exact_activation=False)):
+                        old = client.run(task, files={'business.py': source}, keep=True)
+                    new = client.run(task, files={'business.py': source}, keep=True)
+
+                self.assertEqual(lost, {old['id']})
+                self.assertEqual(old['status'], 'failed', old)
+                self.assertEqual((old['initial_cpus'], old['peak_cpus']), (1, 6))
+                self.assertIn('obtained 6; startup wait expired before execution (launch_confirmation)', old['stderr'])
+                self.assertNotIn('calls', old['files'])
+                self.assertEqual(old['execution_timing']['native_execution_seconds'], 0)
+                self.assertEqual(new['status'], 'succeeded', new.get('stderr'))
+                self.assertEqual(new['files']['calls'], b'1')
+                self.assertEqual(new['attempts'], [])
+                value = json.loads(new['files']['.dco-results.json'])['items'][0]['value']
+                self.assertEqual(value, {'cpus': 6, 'calls': 1})
+                self.assertLess(new['execution_timing']['exact_launch_confirmation_seconds'],
+                                old['execution_timing']['exact_launch_confirmation_seconds'])
+
     def test_single_kernel_keeps_its_existing_grant_when_temporary_ceiling_shrinks(self):
         hold = ('import time\nfrom pathlib import Path\nPath("preparing").touch()\n'
                 'while not Path("resume").exists():time.sleep(.02)')
@@ -123,6 +168,8 @@ class ExactKernelTests(unittest.TestCase):
         with scratch()as folder,provider(Path(folder)/'worker',cpus=4,memory_mb=4096,memory_headroom_mb=0)as(worker,remote):
             with Pool([remote])as pool,center(pool,Path(folder)/'center')as(_,client):
                 original=worker.resize;requests=[];partial=0
+                original_lease = worker.lease
+                confirmations = []
                 def resize(identity,cpus,**options):
                     nonlocal partial
                     if options.get('min_cpus')==4 and not options.get('active_cpus')and partial<2:
@@ -131,14 +178,24 @@ class ExactKernelTests(unittest.TestCase):
                     finally:worker.capacity=4
                     requests.append(dict(active=options.get('active_cpus'),cpus=cpus,grant=result['cpus']))
                     return result
-                with patch.object(worker,'resize',side_effect=resize):
+                def lease(identity, request):
+                    if request.get('_operation') != 'activate_exact':
+                        return original_lease(identity, request)
+                    with self.assertRaisesRegex(Conflict, 'existing grant'):
+                        original_lease(identity, dict(request, ticket=request['ticket'] - 1))
+                    grant = original_lease(identity, request)
+                    confirmations.append(grant['cpus'])
+                    return grant
+
+                with patch.object(worker,'resize',side_effect=resize), patch.object(worker,'lease',side_effect=lease):
                     result=client.run(python_task('business:entry',max_cpus=4,memory_mb=512,timeout=15,retries=0),files={'business.py':SOURCE})
                 self.assertEqual(result['status'],'succeeded',result.get('stderr'))
                 value=json.loads(result['files']['.dco-results.json'])['items'][0]['value']
                 self.assertEqual((value['cpus'],value['calls']),(4,1));self.assertTrue(value['deadline_preserved'])
                 self.assertEqual([r['grant']for r in requests[:2]],[0,0])
                 self.assertTrue(all(r['active']==0 for r in requests[:3]),requests)
-                self.assertTrue(any(r['active']==4 and r['grant']==4 for r in requests),requests)
+                self.assertEqual(confirmations, [4])
+                self.assertFalse(any(r['active']==4 for r in requests),requests)
                 self.assertEqual(worker.used,0)
 
     def test_waits_for_peer_release_without_preempting_or_resubmitting_it(self):

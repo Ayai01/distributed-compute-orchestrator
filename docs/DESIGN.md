@@ -33,6 +33,8 @@ worker 在启动进程前写好该任务的工具表。`REMOTE_COMPUTE_TOOLS_FIL
 
 同一租约请求的回信可原样重发。开算前发现授权已变更时，SDK 以零活跃线程重新申请，确认后再执行。已运行的工作继续按其真实活跃线程保护。
 
+1.0.38 的中心和 worker 协商多核 `exact_cpus` 的本地启动确认。中心足额授权后，worker 仅确认仍属于该原任务、同一授权与内存阶段的启动凭据。旧端沿用中心确认。时限仍按原准备窗口执行，到期报等授权、等确认或内核初始化。`execution_timing` 的 `exact_grant_wait_seconds` 和 `exact_launch_confirmation_seconds` 分别记录前两阶段。
+
 `execution_timing` 以 worker 单调时钟记录接收到进程启动和到首次原生派发的时间。托管 Python 阶段另记原生执行、空等资源、其余执行墙钟。并行原生区间合并，与原生执行重叠的等待计入执行区间。`cpu_seconds` 继续计量进程树实际 CPU。首次派发或执行区间缺少观测时对应值为 `null`。
 
 `admission(project, activity=True)` 返回聚合 `cpu`、各可调度能力的 `capability_cpus`、提交窗口和所请求工程的在途任务。容量与当前可分配量分别记录，当前池未提供的能力配额为零。工程用 `statuses(ids)` 短请求批量查询，按原 ID 领取结果。任务目录、ID 前缀搜索、节点名、设备 IP、中转地址和部署分组归运维端。

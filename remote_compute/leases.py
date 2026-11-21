@@ -30,6 +30,7 @@ class CpuLease:
         self.phase_pending = False
         self.resize_pending = False
         self.memory_calibrating = False
+        self.exact_start_ticket = None
 
     def refresh(self, *, active_cpus=0, ready_cpus=None, min_cpus=0):
         """Report in-flight threads and immediately runnable demand; return CPUs.
@@ -74,7 +75,7 @@ class CpuLease:
                 grant=self._retained_status(target,desired,active_cpus,error,inherited)
                 if not desired:
                     self.cpus=0;self.demand=0;self.active_cpus=0;self.min_cpus=0
-                    self.confirmed=None;self.updated=time.monotonic()
+                    self.confirmed=None;self.exact_start_ticket=None;self.updated=time.monotonic()
                     return 0
                 available=grant.get('memory_mb',0)
                 if isinstance(grant.get('memory_phase'),dict)and same_phase(self.memory,grant['memory_phase']):
@@ -123,6 +124,7 @@ class CpuLease:
                 self.resize_pending = False
             self.cpus = grant['cpus']
             self.phase_pending = bool(grant.get('_phase_pending'))
+            self.exact_start_ticket = (None if self.phase_pending or self.resize_pending else grant.get('exact_start_ticket'))
             self.memory_calibrating = bool(grant.get('memory_calibrating'))
             self.memory_mb = grant.get('memory_mb', self.memory_mb)
             self.demand, self.active_cpus, self.min_cpus = desired, active_cpus, min_cpus
@@ -138,6 +140,16 @@ class CpuLease:
     def activate(self, width, *, min_cpus=0):
         """Confirm the proposed launch width before starting any work."""
         try:
+            if self.exact_start_ticket is not None and width == min_cpus == self.cpus:
+                target = os.environ.get('REMOTE_COMPUTE_WORKER_JOB_ID', self.identity)
+                request = dict(_operation='activate_exact', cpus=width, ticket=self.exact_start_ticket)
+                remaining = remaining_time()
+                grant = self.client._read_reconnecting(
+                    lambda: self.client.request('/jobs/' + target + '/lease', request),
+                    deadline=time.monotonic() + remaining if remaining is not None else None, check=check_deadline)
+                self.cpus = self.active_cpus = grant['cpus']
+                self.exact_start_ticket = None
+                return self.active_cpus
             return self.refresh(active_cpus=width, ready_cpus=0, min_cpus=min_cpus)
         except Exception as error:
             if getattr(error, 'status_code', None) != 409 or ACTIVE_GRANT_CONFLICT not in str(error):
@@ -146,6 +158,7 @@ class CpuLease:
             # threads. An active map's ordinary refresh still enforces its floor.
             self.cpus = 0
             self.confirmed = None
+            self.exact_start_ticket = None
             self.demand = self.active_cpus = self.min_cpus = None
             return 0
 

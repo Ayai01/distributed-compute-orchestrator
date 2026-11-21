@@ -504,7 +504,8 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
     _local.single_slot = False
     actual=0
     timing = PhaseClock()
-    timing.set('resource')
+    stage = 'grant_wait'
+    timing.set('exact_grant')
     try:
         try:
             with preparation_window(start_timeout):
@@ -513,18 +514,28 @@ def _run_exact_kernel(function,kwargs,maximum,model,start_timeout):
                     check_deadline()
                     # A held single slot can commit the new phase directly.
                     # Both branches still require the provider's phase acknowledgement.
-                    actual=(lease.activate(maximum, min_cpus=maximum) if retained else
-                            lease.refresh(active_cpus=0, ready_cpus=maximum, min_cpus=maximum))
+                    if retained:
+                        stage = 'launch_confirmation'
+                        timing.set('exact_confirm')
+                        actual = lease.activate(maximum, min_cpus=maximum)
+                    else:
+                        actual = lease.refresh(active_cpus=0, ready_cpus=maximum, min_cpus=maximum)
                     if _confirmed_width(lease, maximum):
                         if retained:break
+                        stage = 'launch_confirmation'
+                        timing.set('exact_confirm')
                         actual=lease.activate(maximum, min_cpus=maximum)
                         if _confirmed_width(lease, maximum):break
                     if actual < maximum:retained = False
+                    stage = 'grant_wait'
+                    timing.set('exact_grant')
                     time.sleep(min(.1,check_deadline()or .1))
+                stage = 'kernel_setup'
                 timing.set('idle')
                 _kernel_threads(maximum);check_deadline()
         except TimeoutError as error:
-            raise TimeoutError('Fixed kernel needs %d CPUs; obtained %d; startup wait expired before execution'%(maximum,actual))from error
+            raise TimeoutError('Fixed kernel needs %d CPUs; obtained %d; startup wait expired before execution (%s)'
+                               % (maximum, actual, stage)) from error
         check_deadline()
         _local.kernel=True
         target = _function(function)

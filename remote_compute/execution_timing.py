@@ -33,7 +33,7 @@ def summarize(root, received, started, ended):
     if root is None or started is None:
         return timing
 
-    states = {'native': 0, 'resource': 1}
+    states = {'native': 0, 'resource': 1, 'exact_grant': 2, 'exact_confirm': 3}
     events = []
 
     def interval(phase, begin, end):
@@ -49,7 +49,7 @@ def summarize(root, received, started, ended):
             with path.open(encoding='ascii', errors='replace') as stream:
                 for line in stream:
                     parts = line.split()
-                    if len(parts) != 2 or parts[1] not in ('idle', 'native', 'resource'):
+                    if len(parts) != 2 or (parts[1] != 'idle' and parts[1] not in states):
                         continue
                     try:
                         stamp = float(parts[0])
@@ -62,22 +62,30 @@ def summarize(root, received, started, ended):
             continue
         interval(phase, previous, ended)
 
-    live = [0, 0]
-    totals = [0., 0.]
+    live = [0] * len(states)
+    totals = [0.] * len(states)
     previous = started
     first_native = None
+    exact_seen = False
     for stamp, kind, delta in sorted(events):
         if live[0]:
             totals[0] += stamp - previous
-        elif live[1]:
+        elif any(live[1:]):
             totals[1] += stamp - previous
+            if live[3]:
+                totals[3] += stamp - previous
+            elif live[2]:
+                totals[2] += stamp - previous
         if kind == 0 and delta > 0 and first_native is None:
             first_native = stamp
+        exact_seen |= kind >= 2
         live[kind] += delta
         previous = stamp
     timing.update(worker_received_to_native_seconds=None if first_native is None else max(0., first_native - received),
                   process_window_seconds=max(0., ended - started),
                   native_execution_seconds=totals[0] if events else None,
                   resource_wait_seconds=totals[1] if events else None,
-                  other_execution_seconds=max(0., ended - started - sum(totals)) if events else None)
+                  other_execution_seconds=max(0., ended - started - sum(totals[:2])) if events else None)
+    if exact_seen:
+        timing.update(exact_grant_wait_seconds=totals[2], exact_launch_confirmation_seconds=totals[3])
     return timing
