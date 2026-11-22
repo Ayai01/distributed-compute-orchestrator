@@ -160,7 +160,10 @@ class JobRecords(MutableMapping):
 
     def record_lock(self, identity):
         with self.loading_lock:
-            return self.loading.setdefault(identity, threading.RLock())
+            lock = self.loading.get(identity)
+            if lock is None:
+                self.loading[identity] = lock = threading.RLock()
+            return lock
 
     def read_result(self, identity):
         """Read indexed terminal receipts without taking the scheduler lock."""

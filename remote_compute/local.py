@@ -50,7 +50,10 @@ class LocalClient(Client):
             if len(parts) == 3 and parts[0] == 'assets' and parts[2] == 'upload' and method in {'GET', 'POST'}:
                 if not worker.shared_assets:
                     raise KeyError('Resumable asset uploads are unavailable')
-                return worker.shared_assets.uploads.receive(parts[1], data, (extra_headers or {}).get('Content-Range'))
+                headers = extra_headers or {}
+                body = json.dumps(data).encode() if isinstance(data, dict) else data
+                return worker.shared_assets.uploads.receive(parts[1], body, headers.get('Content-Range'),
+                    encoding=headers.get('X-DCO-Chunk-Encoding'), accept_encoding=headers.get('X-DCO-Accept-Chunk-Encoding'))
             if len(parts) >= 2 and parts[0] == 'jobs':
                 identity = parts[1]
                 if len(parts) == 2:

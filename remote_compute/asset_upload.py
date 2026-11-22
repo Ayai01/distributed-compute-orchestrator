@@ -7,11 +7,17 @@ from pathlib import Path
 import re
 
 from .bundle import MAX_BODY, atomic_json
+from .relay_bulk import MIN_BULK_BYTES
+
+try:
+    import lzma
+except ImportError:
+    lzma = None
 
 
 ASSET_RESUME_CAPABILITY = 'resumable_assets'
 ASSET_CHUNK_BYTES = 2 * 1024**2
-ASSET_RESUME_MIN_BYTES = 1024**2
+ASSET_RESUME_MIN_BYTES = MIN_BULK_BYTES
 _DIGEST = r'[a-f0-9]{64}'
 _PART = re.compile(r'\.upload-(' + _DIGEST + r')(_meta)?\Z')
 _RANGE = re.compile(r'bytes ([0-9]{1,9})-([0-9]{1,9})/([0-9]{1,9})\Z')
@@ -54,11 +60,16 @@ class AssetUploads:
                 return dict(id=identity, complete=False, total=None, offset=0)
         return dict(id=identity, complete=True, total=size, offset=size)
 
-    def receive(self, identity, body=None, content_range=None):
+    def receive(self, identity, body=None, content_range=None, *, encoding=None, accept_encoding=None):
         if body is None:
-            return self.status(identity)
+            status = self.status(identity)
+            if lzma is not None and accept_encoding == 'xz':
+                status['chunk_encoding'] = 'xz'
+            return status
         archive, part, meta = self._paths(identity)
         if content_range is None:
+            if encoding is not None:
+                raise ValueError('Chunk encoding requires a byte range')
             commit = json.loads(body)
             if not isinstance(commit, dict) or set(commit) != {'total'} or type(commit['total']) is not int:
                 raise ValueError('Asset upload commit requires total bytes')
@@ -68,7 +79,20 @@ class AssetUploads:
             if not match:
                 raise ValueError('Asset upload requires a valid Content-Range')
             offset, end, total = map(int, match.groups())
-            if not 0 <= offset <= end < total or end - offset + 1 != len(body) or len(body) > ASSET_CHUNK_BYTES:
+            size = end - offset + 1
+            if not 0 <= offset <= end < total <= MAX_BODY or size > ASSET_CHUNK_BYTES or len(body) > ASSET_CHUNK_BYTES:
+                raise ValueError('Asset chunk does not match its range')
+            if encoding is not None:
+                if encoding != 'xz' or lzma is None:
+                    raise ValueError('Unsupported asset chunk encoding')
+                decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=16 * 1024**2)
+                try:
+                    body = decoder.decompress(body, max_length=size + 1)
+                except lzma.LZMAError as error:
+                    raise ValueError('Invalid compressed asset chunk') from error
+                if not decoder.eof or decoder.unused_data:
+                    raise ValueError('Incomplete or trailing compressed asset chunk')
+            if len(body) != size:
                 raise ValueError('Asset chunk does not match its range')
         if not 0 < total <= MAX_BODY:
             raise ValueError('Asset upload exceeds the archive size limit')

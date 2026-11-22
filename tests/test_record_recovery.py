@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from remote_compute import Pool
+from remote_compute import Pool, RemoteError
 from remote_compute.bundle import atomic_json
 from remote_compute.receipts import read_receipt
 from remote_compute.records import Job, JobRecords
@@ -68,7 +68,7 @@ class RecordRecoveryTests(unittest.TestCase):
                     release.wait(3)
                 return read_receipt(path, **options)
             with provider(folder) as (worker, client), \
-                    patch('remote_compute.records.read_receipt', side_effect=slow_read), \
+                    patch.object(worker.jobs, 'receipt_reader', side_effect=slow_read), \
                     ThreadPoolExecutor(max_workers=1) as executor:
                 reading = executor.submit(client.status, identity)
                 try:
@@ -131,11 +131,14 @@ class RecordRecoveryTests(unittest.TestCase):
                 deleting = executor.submit(client.delete, identity)
                 try:
                     self.assertTrue(entered.wait(2))
-                    self.assertEqual(client.status(identity)['status'], 'succeeded')
+                    with self.assertRaises(RemoteError) as retired:
+                        client.status(identity)
+                    self.assertEqual(retired.exception.status_code, 404)
                     self.assertFalse(directory.exists())
                 finally:
                     release.set()
                 self.assertEqual(deleting.result(timeout=3), {'deleted': identity})
+                self.assertFalse(directory.exists())
 
     def test_startup_compaction_preserves_receipts_and_original_ids(self):
         with scratch() as folder:

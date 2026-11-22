@@ -11,7 +11,7 @@ from unittest.mock import patch
 from remote_compute import Client, Pool, RemoteError
 from remote_compute.worker import Handler
 from test_center import center
-from test_compute import provider, python, scratch
+from test_compute import provider, python, scratch, until
 
 
 class ArtifactPreparationTests(unittest.TestCase):
@@ -20,8 +20,9 @@ class ArtifactPreparationTests(unittest.TestCase):
             with Pool([node])as pool,center(pool,Path(root)/'center')as(_,client):
                 identity=client.submit(python("print('unchanged result')"))['id'];client.wait(identity)
                 original=pool.nodes[0].client.artifacts
-                def delayed(i):
-                    time.sleep(1.7);return original(i)
+                def delayed(job_id, **options):
+                    time.sleep(1.7)
+                    return original(job_id, **options)
                 output=Path(root)/'returned'
                 with patch.object(pool.nodes[0].client,'artifacts',side_effect=delayed):
                     started=time.monotonic();result=client.fetch(identity,output,delete=False)
@@ -81,11 +82,11 @@ class ArtifactPreparationTests(unittest.TestCase):
                 original = pool.nodes[0].client.artifacts
                 calls = []
 
-                def slow_download(job_id):
+                def slow_download(job_id, **options):
                     calls.append(job_id)
                     entered.set()
                     release.wait(5)
-                    return original(job_id)
+                    return original(job_id, **options)
 
                 # Scale the production 120s header/reconnect boundary down so
                 # this real HTTP test spans several complete timeout windows.
@@ -159,23 +160,27 @@ class ArtifactPreparationTests(unittest.TestCase):
                 client.wait(identity)
                 entered, release = threading.Event(), threading.Event()
                 original = pool.nodes[0].client.artifacts
-                def delayed(job_id):
+                def delayed(job_id, **options):
                     entered.set()
                     release.wait(5)
-                    return original(job_id)
+                    return original(job_id, **options)
                 with patch.object(pool.nodes[0].client, 'artifacts', side_effect=delayed), \
                         ThreadPoolExecutor(max_workers=1) as transfers:
                     client.request('/jobs/'+identity+'/artifacts', binary=True,
                                    extra_headers={'X-DCO-Artifact-Poll':'1'})
                     self.assertTrue(entered.wait(2))
-                    deletion = transfers.submit(Client(client.url).delete, identity)
+                    deletion = transfers.submit(Client(client.url, state.token).delete, identity)
                     try:
-                        time.sleep(.1)
-                        self.assertFalse(deletion.done())
+                        self.assertEqual(deletion.result(timeout=3)['deleted'], identity)
                         self.assertEqual(client.health(brief=True)['role'], 'scheduler')
+                        with self.assertRaises(RemoteError) as retired:
+                            client.status(identity)
+                        self.assertEqual(retired.exception.status_code, 404)
                     finally:
                         release.set()
-                    self.assertEqual(deletion.result(timeout=3)['deleted'], identity)
+                marker = state.retirement.root / (identity + '.json')
+                until(lambda: not marker.is_file())
+                self.assertFalse((state.jobs.root / identity).exists())
                 self.assertNotIn(identity, state.jobs)
 
     def test_final_full_receipt_replaces_stale_compact_step_progress(self):

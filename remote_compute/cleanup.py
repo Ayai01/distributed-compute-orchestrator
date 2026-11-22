@@ -161,6 +161,10 @@ class Reclaimer:
         except OSError:pass  # Retired bytes resume in this namespace next start.
 
 
+class UnregisteredRetirementProvider(OSError):
+    """The saved provider can be contacted again after a routing change."""
+
+
 class TransportRetirement:
     """Persist DELETE intent before a background thread touches a transport copy."""
 
@@ -170,16 +174,18 @@ class TransportRetirement:
         if self.root.is_symlink() or getattr(self.root.lstat(), 'st_file_attributes', 0) & 1024:
             raise ValueError('Retirement namespace must be an owned directory')
         self.reclaim = reclaim
-        self.pending = [(0, path.stem) for path in self.root.glob('*.json')
+        self.pending = [(0, path.stem, 5) for path in self.root.glob('*.json')
                         if re.fullmatch('[a-f0-9]{32}', path.stem)]
         heapq.heapify(self.pending)
         self.locks = SubmissionLocks()
         self.condition = threading.Condition()
+        self.unrouted = set()
+        self.route_revision = 0
         self.stopping = False
         self.thread = None
 
     def restore(self, records):
-        for _, identity in self.pending:
+        for _, identity, _ in self.pending:
             if identity in records:
                 records.forget(identity, journal=False)
             else:
@@ -190,13 +196,26 @@ class TransportRetirement:
 
     def schedule(self, identity):
         with self.condition:
-            heapq.heappush(self.pending, (0, identity))
+            heapq.heappush(self.pending, (0, identity, 5))
             self._start()
             self.condition.notify()
 
     def start(self):
         with self.condition:
             self._start()
+
+    def routes_changed(self):
+        with self.condition:
+            self.route_revision += 1
+            for identity in self.unrouted:
+                heapq.heappush(self.pending, (0, identity, 5))
+            self.unrouted.clear()
+            self._start()
+            self.condition.notify()
+
+    def status(self):
+        with self.condition:
+            return dict(queued=len(self.pending), awaiting_route=len(self.unrouted))
 
     def _start(self):
         if self.pending and self.thread is None and not self.stopping:
@@ -209,21 +228,28 @@ class TransportRetirement:
                 if self.stopping or not self.pending:
                     self.thread = None
                     return
-                due, identity = self.pending[0]
+                due, identity, retry_delay = self.pending[0]
                 remaining = due - time.monotonic()
                 if remaining > 0:
                     self.condition.wait(remaining)
                     continue
                 heapq.heappop(self.pending)
+                revision = self.route_revision
             path = self.root / (identity + '.json')
             try:
                 self.reclaim(identity, json.loads(path.read_bytes()))
                 path.unlink()
+            except UnregisteredRetirementProvider:
+                with self.condition:
+                    if revision == self.route_revision:
+                        self.unrouted.add(identity)
+                    else:
+                        heapq.heappush(self.pending, (0, identity, 5))
             except (OSError, ValueError):
                 # The intent still owns both the local name and any worker
                 # copies. An unavailable provider is retried independently.
                 with self.condition:
-                    heapq.heappush(self.pending, (time.monotonic() + 5, identity))
+                    heapq.heappush(self.pending, (time.monotonic() + retry_delay, identity, min(300, 2 * retry_delay)))
 
     def close(self):
         with self.condition:
@@ -390,11 +416,13 @@ class AssetCache:
         info = path.lstat()
         return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 1024)
 
-    def touch(self, identity):
+    def touch(self, identity, *, unpacked_bytes=None):
         with self.lock:
             path = self._path(identity)
             if identity not in self.entries:
-                self._add(path)
+                self._add(path, unpacked_bytes)
+                if unpacked_bytes is not None:
+                    self._record_sizes({identity: unpacked_bytes})
             os.utime(path, None)
             with self.metadata_lock:
                 size, _ = self.entries[identity]

@@ -190,7 +190,10 @@ class _ConnectionPool:
 
 
 class Client:
-    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None, state_dir=None, relay_url=None, peer_id=None):
+    def __init__(self, url="http://127.0.0.1:26133", token="", *, timeout=None, ca_file=None, operator=False, operator_token=None, pool_timeout=None, lease_timeout=None, state_dir=None, relay_url=None, peer_id=None, collection_workers=2):
+        if type(collection_workers) is not int or collection_workers < 1:
+            raise ValueError('collection_workers must be a positive integer')
+        self.collection_workers = collection_workers
         self.url, self.token, self.operator = url.rstrip("/"), token, bool(operator)
         if not self.token and urlsplit(self.url).scheme in {'http','https'}:
             from .auth import loopback_endpoint
@@ -282,15 +285,18 @@ class Client:
         artifact_get = (binary and data is None and method in (None, 'GET')
                         and re.fullmatch(r'/jobs/[0-9a-f]{32}/(?:artifacts|files/.+)', path))
         retirement = method == 'DELETE' and re.fullmatch(r'/jobs/[0-9a-f]{32}', path)
-        pools=self.__dict__.setdefault('_transports',{})
         if artifact_get:
             # Results and input staging have independent connection slots.
-            pool = self.__dict__.setdefault('_artifact_transports', {}).setdefault(authority, _ConnectionPool())
+            pools, key = self.__dict__.setdefault('_artifact_transports', {}), authority
         elif retirement:
-            pool = self.__dict__.setdefault('_retirement_transports', {}).setdefault(authority, _ConnectionPool())
+            pools, key = self.__dict__.setdefault('_retirement_transports', {}), authority
+        elif authority == self.url:
+            pools, key = self.__dict__, '_transport'
         else:
-            pool=(self.__dict__.setdefault('_transport',_ConnectionPool()) if authority==self.url
-                  else pools.setdefault(authority,_ConnectionPool()))
+            pools, key = self.__dict__.setdefault('_transports', {}), authority
+        pool = pools.get(key)
+        if pool is None:
+            pool = pools.setdefault(key, _ConnectionPool())
         pool.set_bulk_limit(getattr(self, 'bulk_limit', 7))
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
@@ -1065,7 +1071,9 @@ class Client:
             backend._artifact_header_timeout=self.timeout
             backend.bulk_limit=getattr(self,'bulk_limit',7)
             if backend.bulk_limit!=7:
-                backend._transport=self.__dict__.setdefault('_transport',_ConnectionPool())
+                if '_transport' not in self.__dict__:
+                    self.__dict__.setdefault('_transport', _ConnectionPool())
+                backend._transport=self._transport
                 backend._transports=self.__dict__.setdefault('_transports',{})
         metrics=self.__dict__.setdefault('_artifact_timing',threading.local())
         stats=dict(requests=0,request_seconds=0.0,preparing_responses=0,prepare_sleep_seconds=0.0)
@@ -1214,9 +1222,25 @@ class Client:
         options = {'extra_headers':{'X-DCO-Asset-Job':job_id}} if job_id else {}
         return self._read_reconnecting(lambda:self.request('/assets/'+identity, **options))['exists']
 
+    def stage_archive(self, payload, *, job_id=None):
+        """Stage one already-packed immutable ZIP and report the observed cache hit."""
+        identity = hashlib.sha256(payload).hexdigest()
+        with self._asset_lock:
+            transfer = self._asset_transfers.get(identity)
+            if transfer is None:
+                self._asset_transfers[identity] = transfer = threading.Lock()
+        with transfer:
+            present = self.has_asset(identity, job_id=job_id)
+            if not present:
+                options = {'extra_headers': {'X-DCO-Asset-Job': job_id}} if job_id else {}
+                receipt = self.request('/assets/' + identity, payload, **options)
+                if receipt.get('id') != identity or not receipt.get('exists'):
+                    raise ValueError('Unexpected asset publication receipt')
+        return dict(asset=identity, archive_bytes=len(payload), present_before=present)
+
     def upload_resumable(self, identity, archive, *, cancel=None, report=None, fail_fast=False):
         """Resume from the receiver's committed prefix after a lost connection."""
-        from .asset_upload import ASSET_CHUNK_BYTES
+        from .asset_upload import ASSET_CHUNK_BYTES, lzma
 
         if not re.fullmatch(r'[a-f0-9]{64}', identity):
             raise ValueError('Asset id requires SHA256')
@@ -1228,18 +1252,22 @@ class Client:
         metrics = report if report is not None else {}
         metrics.setdefault('confirmed_bytes', 0)
         metrics.setdefault('attempted_bytes', 0)
+        metrics.setdefault('wire_body_bytes', 0)
         metrics.setdefault('reconciliations', 0)
         metrics.setdefault('resumed_from_bytes', 0)
         metrics['protocol'] = 'resumable'
         metrics['archive_bytes'] = total
         current, failures = None, 0
+        use_xz = False
         with archive.open('rb') as stream:
             while True:
                 _check_cancelled(cancel)
                 offset = current['offset'] if current is not None else None
                 try:
                     if offset is None:
-                        receipt = self.request(path, cancel=cancel)
+                        headers = {'X-DCO-Accept-Chunk-Encoding': 'xz'} if lzma is not None else {}
+                        receipt = self.request(path, extra_headers=headers, cancel=cancel)
+                        use_xz = lzma is not None and receipt.get('chunk_encoding') == 'xz'
                     elif offset == total:
                         receipt = self.request(path, {'total': total}, cancel=cancel)
                     else:
@@ -1249,7 +1277,14 @@ class Client:
                             raise ValueError('Asset archive changed during upload')
                         metrics['attempted_bytes'] += len(chunk)
                         header = f'bytes {offset}-{offset + len(chunk) - 1}/{total}'
-                        receipt = self.request(path, chunk, extra_headers={'Content-Range': header}, cancel=cancel)
+                        headers = {'Content-Range': header}
+                        if use_xz and len(chunk) >= MIN_BULK_BYTES:
+                            encoded = lzma.compress(chunk, preset=0)
+                            if len(encoded) <= len(chunk) * 7 // 8:
+                                chunk = encoded
+                                headers['X-DCO-Chunk-Encoding'] = 'xz'
+                        metrics['wire_body_bytes'] += len(chunk)
+                        receipt = self.request(path, chunk, extra_headers=headers, cancel=cancel)
                     confirmed = receipt.get('offset')
                     if (receipt.get('id') != identity or type(confirmed) is not int or not 0 <= confirmed <= total
                             or receipt.get('total') not in (None, total) or (confirmed and receipt.get('total') != total)

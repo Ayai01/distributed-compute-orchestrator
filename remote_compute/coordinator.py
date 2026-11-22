@@ -32,7 +32,8 @@ from .memory import plan_memory, startup_memory, same_phase
 from .placement import PlacementPlanning, PlacementSnapshot, _elastic_job, _matching_pass
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
-from .cleanup import AssetCache, AssetMaintenance, TransportRetirement, prune_asset_caches, remove_owned, retire_job
+from .cleanup import (AssetCache, AssetMaintenance, TransportRetirement, UnregisteredRetirementProvider,
+                      prune_asset_caches, remove_owned, retire_job)
 from .acceptance import SubmissionAssets, SubmissionLocks
 from .asset_upload import ASSET_RESUME_CAPABILITY, ASSET_RESUME_MIN_BYTES
 from .asset_variants import bind_asset_variants, freeze_asset_variants, load_asset_variants
@@ -778,6 +779,7 @@ class Coordinator(PlacementPlanning):
                     'pid':os.getpid(), 'version':__version__, 'root':self.root.as_posix(),
                     'tool_root':Path(__file__).resolve().parent.parent.as_posix(),
                     'asset_cache': self.asset_cache.snapshot(),
+                    'transport_retirement': self.retirement.status(),
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
                                      + sum(row['status'] in TERMINAL for row in observation_rows.values()),
@@ -867,6 +869,8 @@ class Coordinator(PlacementPlanning):
                 raise ValueError('Unknown node: ' + str(name))
             if "routing" in changes:
                 self.pool.configure(name, **changes["routing"])
+                if {'url', 'name', 'aliases'} & changes['routing'].keys():
+                    self.retirement.routes_changed()
             if "worker" in changes:
                 try:
                     result=node.client.control(**changes["worker"])
@@ -883,6 +887,7 @@ class Coordinator(PlacementPlanning):
             return self.health()
         if isinstance(changes, dict) and set(changes) == {"add"}:
             self.pool.add(**changes["add"])
+            self.retirement.routes_changed()
             return self.health()
         if (not isinstance(changes,dict)or not changes or set(changes)-{'paused','accepting'}
                 or any(type(value)is not bool for value in changes.values())):
@@ -1287,7 +1292,7 @@ class Coordinator(PlacementPlanning):
                 job=self.jobs.get(identity)
                 if job is None or job['result']['status'] in TERMINAL:
                     pending.discard(identity);continue
-                node=next((n for n in self.pool.nodes if n.client.url==job['result']['worker_url']),None)
+                node = self._original_node(job['result'].get('assigned_node'), job['result'].get('worker_url'))
                 worker_id=job['result'].get('worker_id',identity)
                 if node is None or node.error or worker_id in node.live_jobs:continue
                 remote=next((r for r in node.health.get('active_jobs') or [] if r['id']==worker_id),None)
@@ -1876,7 +1881,7 @@ class Coordinator(PlacementPlanning):
                 published = self.shared_asset_publications.get(key)
             if published and published[0] != node.name:
                 now = time.monotonic()
-                deadline = min(now + self.shared_asset_visibility_seconds, published[1] + 1 + 2 * published[2])
+                deadline = published[1] + min(self.shared_asset_visibility_seconds, 1 + 2 * published[2])
                 delay = 1
                 while now < deadline:
                     until = min(deadline, now + delay)
@@ -1956,6 +1961,8 @@ class Coordinator(PlacementPlanning):
                             node.known_assets.add(asset)
                     _check_cancelled(cancel)
                     break
+            if 'protocol' not in metrics:
+                metrics.setdefault('wire_body_bytes', 0)
 
     def _update(self, job, remote):
         if job.get('retired'):return
@@ -2233,12 +2240,18 @@ class Coordinator(PlacementPlanning):
             return dict(result,id=identity,node=node.name,requested_cpus=cpus,cpu_ready_limit=cpu_ready_limit,
                         memory_calibrating=bool(result.get('memory_calibrating')or calibrating))
 
+    def _original_node(self, name, url):
+        if name:
+            return next((node for node in self.pool.nodes if node.name == name or name in getattr(node, 'aliases', ())), None)
+        # Older attempt records only carry an endpoint.
+        return next((node for node in self.pool.nodes if node.client.url == url), None)
+
     def _client(self, job):
         if job.get("node"):
             return job["node"].client
-        assigned = job["result"].get("assigned_node")
-        return next((n.client for n in self.pool.nodes if n.name == assigned or assigned in getattr(n,'aliases',())
-                     or n.client.url == job['result'].get('worker_url')), None) if assigned else None
+        result = job['result']
+        node = self._original_node(result.get('assigned_node'), result.get('worker_url'))
+        return node.client if node is not None else None
 
     def _queued_memory_wait(self, job):
         """Explain the current admission predicate without changing a grant."""
@@ -2487,6 +2500,11 @@ class Coordinator(PlacementPlanning):
                 if self.jobs.get(identity) is not job:
                     raise KeyError(identity)
             files = {}
+            if (client is None and not cached.is_file() and result['status'] != 'interrupted'
+                    and not (result.get('cancelled_before_submit') or result.get('rejected_before_submit'))
+                    and (result['status'] == 'succeeded' or result.get('execution_started') or result.get('worker_id'))
+                    and (result.get('assigned_node') or result.get('worker_url'))):
+                raise Conflict('Original result archive is waiting for its worker to reconnect')
             if client or cached.is_file():
                 from .local import LocalClient
                 if isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts') and not cached.is_file():
@@ -2515,9 +2533,9 @@ class Coordinator(PlacementPlanning):
                 if not attempt.get('artifact'):continue
                 saved=job['directory']/'attempts'/('%04d.zip'%index)
                 if not saved.is_file():
-                    source=next((n.client for n in self.pool.nodes if n.client.url==attempt.get('worker_url')),None)
+                    source = self._original_node(attempt.get('node'), attempt.get('worker_url'))
                     if source is None:raise Conflict('Interrupted attempt provider is unavailable')
-                    raw=source.artifacts(attempt['worker_id'])
+                    raw=source.client.artifacts(attempt['worker_id'])
                     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                         if json.loads(archive.read('result.json'))['id']!=attempt['worker_id']:
                             raise ValueError('Interrupted attempt identity mismatch')
@@ -2551,7 +2569,7 @@ class Coordinator(PlacementPlanning):
                 targets.append(dict(url=url, node=result.get('assigned_node'),
                     id=job.get('worker_id') or result.get('worker_id') or result['id'],
                     cancel=bool(result.get('remote_cancel_pending'))))
-        targets.extend(dict(url=attempt['worker_url'], id=attempt['worker_id'])
+        targets.extend(dict(url=attempt['worker_url'], node=attempt.get('node'), id=attempt['worker_id'])
                        for attempt in result.get('attempts', ())
                        if attempt.get('artifact') and attempt.get('worker_url') and attempt.get('worker_id'))
         return dict(targets=targets)
@@ -2559,22 +2577,23 @@ class Coordinator(PlacementPlanning):
     def _reclaim_retired(self, identity, record):
         with self.jobs.record_lock(identity):
             remove_owned(self.root / 'jobs' / identity)
-            for target in record['targets']:
-                if self.retirement.stopping:
-                    raise InterruptedError('Retirement resumes on next startup')
-                node = next((n for n in self.pool.nodes if n.client.url == target.get('url')
-                             or n.name == target.get('node') or target.get('node') in n.aliases), None)
-                if node is None or node.error or node.detached:
-                    raise OSError('Retirement provider temporarily unavailable')
-                try:
-                    if target.get('cancel'):
-                        node.client.cancel(target['id'])
-                    node.client.delete(target['id'])
-                except RemoteError as error:
-                    if error.status_code != 404:
-                        raise OSError(str(error)) from error
-            with self.condition:
-                self.jobs.record_retired(identity)
+        for target in record['targets']:
+            if self.retirement.stopping:
+                raise InterruptedError('Retirement resumes on next startup')
+            node = self._original_node(target.get('node'), target.get('url'))
+            if node is None:
+                raise UnregisteredRetirementProvider('Original retirement provider is no longer configured')
+            if node.error or node.detached:
+                raise OSError('Retirement provider temporarily unavailable')
+            try:
+                if target.get('cancel'):
+                    node.client.cancel(target['id'])
+                node.client.delete(target['id'])
+            except RemoteError as error:
+                if error.status_code != 404:
+                    raise OSError(str(error)) from error
+        with self.condition:
+            self.jobs.record_retired(identity)
         self.asset_maintenance.request()
 
     def delete(self, identity):

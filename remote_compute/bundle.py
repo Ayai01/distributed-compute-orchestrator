@@ -157,6 +157,7 @@ def validate_archive(path, root):
 
 def unpack(data, root):
     root = native_path(root,force=True)
+    sizes = {}
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         for item, target, mode in _archive_members(archive, root):
             if item.is_dir():
@@ -164,8 +165,10 @@ def unpack(data, root):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(archive.read(item))
+            sizes[target] = item.file_size
             if os.name != "nt":
                 target.chmod(stat.S_IMODE(mode) or 0o644)
+    return sum(sizes.values())
 
 
 def task_bundle(task, inputs=None, files=None):

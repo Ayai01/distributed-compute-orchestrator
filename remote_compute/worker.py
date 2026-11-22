@@ -1804,7 +1804,7 @@ class Worker:
             self.work_reclaimer.defer(self.root / 'jobs' / identity)
             with self.condition:
                 self.jobs.record_retired(identity)
-        self._prune_assets()
+        self.asset_maintenance.request()
 
     def delete(self, identity):
         return retire_job(self, identity)
@@ -1825,10 +1825,10 @@ class Worker:
         if job_id is not None and not _ID.fullmatch(job_id):
             raise ValueError('Job id requires 32 lowercase hex characters')
         directory = self.root / "assets" / identity
-        def published(*, materialized=False):
+        def published(*, materialized=False, unpacked_bytes=None):
             exists = directory.is_dir()
             if exists:
-                self.asset_cache.touch(identity)
+                self.asset_cache.touch(identity, unpacked_bytes=unpacked_bytes)
             if job_id is not None:
                 held = self.asset_handoffs.get(job_id, (set(), 0))[0]
                 self.asset_handoff(job_id, list(set(held) | {identity}))
@@ -1853,7 +1853,7 @@ class Worker:
             temporary = directory.with_suffix(".upload")
             try:
                 temporary.mkdir(exist_ok=True)
-                unpack(payload, temporary)
+                unpacked_bytes = unpack(payload, temporary)
                 if self.shared_assets is not None and not from_shared:
                     try:
                         self.shared_assets.publish(identity, payload)
@@ -1864,7 +1864,7 @@ class Worker:
                     if self.stopping:
                         raise Conflict('Worker is stopping')
                     temporary.replace(directory)
-                    return published(materialized=True)
+                    return published(materialized=True, unpacked_bytes=unpacked_bytes)
             finally:
                 if temporary.exists():
                     remove_owned(temporary)
@@ -2199,7 +2199,9 @@ class Handler(BaseHTTPRequestHandler):
             elif asset_upload and self.command in {'GET', 'POST'}:
                 if scheduler or not worker.shared_assets:
                     raise KeyError('Resumable asset uploads are unavailable')
-                value = worker.shared_assets.uploads.receive(parts[1], body, self.headers.get('Content-Range'))
+                value = worker.shared_assets.uploads.receive(parts[1], body, self.headers.get('Content-Range'),
+                    encoding=self.headers.get('X-DCO-Chunk-Encoding'),
+                    accept_encoding=self.headers.get('X-DCO-Accept-Chunk-Encoding'))
             elif len(parts) == 2 and parts[0] == "assets" and self.command in {"GET", "POST"}:
                 job_id = self.headers.get('X-DCO-Asset-Job')
                 value = worker.asset(parts[1], body, **({'job_id':job_id} if job_id else {}))

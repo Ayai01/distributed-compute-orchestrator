@@ -186,7 +186,7 @@ class _Controller:
             self.restore_index(owner)
             window=client.window(self.project,**({}if ready_tasks is None else dict(ready_tasks=ready_tasks)))
             self.pools=tuple(ThreadPoolExecutor(width,thread_name_prefix='dco-'+name)
-                             for width,name in ((4,'prepare'),(2,'submit'),(2,'collect')))
+                             for width,name in ((4,'prepare'),(2,'submit'),(getattr(client,'collection_workers',2),'collect')))
             self.window=window
 
     def register(self,owner):
