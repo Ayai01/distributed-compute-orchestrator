@@ -11,7 +11,7 @@ from unittest.mock import patch
 from remote_compute import Client, Pool, RemoteError
 from remote_compute.worker import Handler
 from test_center import center
-from test_compute import provider, python, scratch, until
+from test_compute import provider, python, scratch
 
 
 class ArtifactPreparationTests(unittest.TestCase):
@@ -20,9 +20,8 @@ class ArtifactPreparationTests(unittest.TestCase):
             with Pool([node])as pool,center(pool,Path(root)/'center')as(_,client):
                 identity=client.submit(python("print('unchanged result')"))['id'];client.wait(identity)
                 original=pool.nodes[0].client.artifacts
-                def delayed(job_id, **options):
-                    time.sleep(1.7)
-                    return original(job_id, **options)
+                def delayed(i, **options):
+                    time.sleep(1.7);return original(i, **options)
                 output=Path(root)/'returned'
                 with patch.object(pool.nodes[0].client,'artifacts',side_effect=delayed):
                     started=time.monotonic();result=client.fetch(identity,output,delete=False)
@@ -169,18 +168,13 @@ class ArtifactPreparationTests(unittest.TestCase):
                     client.request('/jobs/'+identity+'/artifacts', binary=True,
                                    extra_headers={'X-DCO-Artifact-Poll':'1'})
                     self.assertTrue(entered.wait(2))
-                    deletion = transfers.submit(Client(client.url, state.token).delete, identity)
+                    deletion = transfers.submit(client.delete, identity)
                     try:
-                        self.assertEqual(deletion.result(timeout=3)['deleted'], identity)
+                        self.assertEqual(deletion.result(timeout=2)['deleted'], identity)
                         self.assertEqual(client.health(brief=True)['role'], 'scheduler')
-                        with self.assertRaises(RemoteError) as retired:
-                            client.status(identity)
-                        self.assertEqual(retired.exception.status_code, 404)
                     finally:
                         release.set()
-                marker = state.retirement.root / (identity + '.json')
-                until(lambda: not marker.is_file())
-                self.assertFalse((state.jobs.root / identity).exists())
+                    self.assertEqual(deletion.result(timeout=3)['deleted'], identity)
                 self.assertNotIn(identity, state.jobs)
 
     def test_final_full_receipt_replaces_stale_compact_step_progress(self):

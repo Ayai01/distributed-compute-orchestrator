@@ -22,7 +22,7 @@ from .bundle import atomic_json
 from .runtimes import EXECUTION_CAPABILITIES
 from .startup import Cancelled, single_instance
 from .liveboard_wire import encode as encode_cbor
-from .progress import SCHEMA, normalize as normalize_progress, diagnose
+from .progress import SCHEMA, normalize as normalize_progress, diagnose, work_fraction
 from .policy import priority_weight
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -230,17 +230,14 @@ def display_progress(job):
         try:
             progress = normalize_progress(p)
         except ValueError:return None
-        if 'ratio' not in progress:
-            from .bundle import command_step_progress
-            steps = command_step_progress(job)
-            if steps is not None:
-                return {**progress, **steps, 'ratio':steps['completed']/steps['total'], 'unit':'steps',
-                        'source':'execution', 'business_completed':progress.get('completed'),
-                        'business_unit':progress.get('unit')}
+        ratio = work_fraction({'progress':progress})
+        if ratio is not None:
+            progress['ratio'] = ratio
         return progress
-    done,count=number(job.get('completed')),number(job.get('total'))
-    return (dict(completed=done,total=count,ratio=done/count)
-            if done is not None and count is not None and 0<=done<=count and count>0 else None)
+    ratio = work_fraction(job)
+    if ratio is None:
+        return None
+    return dict(completed=number(job.get('completed')), total=number(job.get('total')), ratio=ratio)
 
 
 class NoRedirect(HTTPRedirectHandler):

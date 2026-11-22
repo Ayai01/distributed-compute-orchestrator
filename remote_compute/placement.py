@@ -125,6 +125,13 @@ class PlacementPlanning:
                 key=(peer['task'].get('project')or'default',node.name)
                 occupied[key]=occupied.get(key,0)+peer['task']['cpus']
         warm_cache['occupied']=occupied
+        active_count = sum(1 for _key, peer in active_items(self.jobs)
+                           if peer['result']['status'] not in TERMINAL and not peer.get('recover'))
+        # A deep queue should consume idle headroom before we reserve it for
+        # speculative growth. Existing grants remain untouched. A task that
+        # has already sent a resize request keeps its reservation so the
+        # request can complete without a placement race.
+        queue_pressure = len(self.queue) > max(8, active_count // 2)
         for identity,job in sorted(active_items(self.jobs),key=lambda row:(row[1]['result'].get('submitted',0),row[0])):
             held=job.get('node');current=job.get('task',{})
             group=current.get('project')or'default'
@@ -134,14 +141,17 @@ class PlacementPlanning:
                    resources[group]['used']/resources[group]['resource_share']<resources[other]['used']/resources[other]['resource_share'])
             startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
             desired=job.get('desired_cpus',startup)
+            old=current.get('cpus',0)
             request=job['result'].get('resource_request')or {}
             pending=request and request.get('request_id')!=job.get('lease_answered')
             wide_request=lower and pending and desired>4
             # Beyond warmup, protect growth only while its owner is actually
             # requesting it. A standing ceiling during a long native step
             # must not strand idle slots or prevent overcommit from opening.
-            if not wide_request:desired=min(4,desired)
-            old=current.get('cpus',0)
+            if queue_pressure and not pending:
+                desired = old
+            elif not wide_request:
+                desired=min(4,desired)
             if (held is None or desired<=old
                     or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
                     or held.error or not held.enabled or held.health.get('paused')):

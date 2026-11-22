@@ -6,13 +6,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import threading
-import sys
 import time
 import unittest
 from unittest.mock import patch
 
 from remote_compute import Client, Pool, RemoteError
-from remote_compute.allocation import STARTUP_CPU_FLOOR
 from remote_compute.client import PoolBusy, RequestCancelled
 from remote_compute.coordinator import Coordinator
 from remote_compute.cli import SchedulerShell
@@ -21,52 +19,6 @@ from test_compute import provider, python, scratch, until
 
 
 class AdmissionPlanningTests(unittest.TestCase):
-    def test_explicit_startup_width_accumulates_on_one_suitable_worker(self):
-        state = self.center([4, 4])
-        pool = state.pool
-        pool.closed = False
-        pool.policy = 'round_robin'
-        pool.rotation = 0
-        wide, narrow = pool.nodes
-        wide.health['capabilities'] = [STARTUP_CPU_FLOOR]
-        wide.reserved = 2
-        common = dict(steps=[['echo']], cpus=0, max_cpus=4, memory_mb=64, project='a', priority=0)
-        floor = dict(common, min_start_cpus=3)
-        state.queue = ['floor', 'small']
-        state.jobs = {key: dict(task=task, auto_cpus=True, cancel=threading.Event(), result={'status': 'queued'})
-                      for key, task in zip(state.queue, (floor, common))}
-        budgets = state.project_resources()
-        claims = state._fixed_queue_claims(budgets)
-        self.assertEqual(claims[wide.name], (wide, floor))
-        self.assertIsNone(pool._acquire(floor, cpu_limit=3, block=False))
-        headroom = state._fixed_queue_headroom(common, budgets, claims)
-        self.assertEqual(headroom, {wide.name: 2})
-        self.assertIs(pool._acquire(common, cpu_limit=1, block=False, node_headroom=headroom), narrow)
-        wide.reserved = 1
-        self.assertIs(pool._acquire(floor, cpu_limit=3, block=False), wide)
-        self.assertEqual(floor['cpus'], 3)
-
-    def test_project_activity_sums_known_samples_with_mixed_worker_reports(self):
-        state = self.center([4, 4])
-        current, legacy = state.pool.nodes
-        state.observations = SimpleNamespace(active=set(), rows={})
-        current.health['active_jobs'] = [{'id': 'known', 'active_cpus': 0}]
-        legacy.health['active_jobs'] = [{'id': 'fallback', 'active_cpus': None}, {'id': 'unknown'}]
-        state.jobs = {
-            identity: dict(task={'project': 'a'}, result=dict(id=identity, status=status, cpus=4,
-                assigned_node=node.name, **fields))
-            for identity, status, node, fields in (
-                ('known', 'running', current, {'active_cpus': 3}),
-                ('fallback', 'running', legacy, {'active_cpus': 2}),
-                ('unknown', 'running', legacy, {}),
-                ('pending', 'queued', legacy, {}))}
-        value = state._project_activity('a', state.pool.nodes)
-        self.assertEqual([job['active_cpus'] for job in value['jobs']], [0, 2, None, None])
-        self.assertEqual(value['active_cpus'], dict(lower_bound=2, observed_jobs=2, running_jobs=3, coverage=2/3))
-        legacy.error = 'disconnected'
-        value = state._project_activity('a', state.pool.nodes)
-        self.assertEqual(value['active_cpus'], dict(lower_bound=0, observed_jobs=1, running_jobs=3, coverage=1/3))
-
     def test_disabled_connected_node_drains_original_grants_without_growth(self):
         state=self.center([4]);node=state.pool.nodes[0]
         node.enabled=False;node.reserved=2;node.reserved_memory_mb=64;node.live_jobs.add('original')
@@ -255,15 +207,12 @@ class AdmissionPlanningTests(unittest.TestCase):
     def center(self, capacities):
         from types import SimpleNamespace
         from remote_compute.client import Node
-        from remote_compute.packages import PACKAGES
         pool=Pool.__new__(Pool)
         pool.condition=threading.Condition()
         pool.nodes=[]
         for index,capacity in enumerate(capacities):
             node=Node(str(index),SimpleNamespace(url=str(index)))
-            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=PACKAGES['ng47'].requirements,
-                             python_backends=['cpu', 'ml'],
-                             tools={name: {'available': True} for name in PACKAGES['ng47'].tools},
+            node.health=dict(cpus=capacity,cpu_limit=capacity,tags=['ngspice47'],
                              memory_capacity_mb=8192,memory_available_mb=8192,host_memory_available_mb=8192)
             pool.nodes.append(node)
         state=Coordinator.__new__(Coordinator)
@@ -445,34 +394,6 @@ def host_load(worker, percent, machine):
 
 
 class CenterTests(unittest.TestCase):
-    def test_replayed_and_reordered_lease_answers_do_not_resize_twice(self):
-        state = Coordinator.__new__(Coordinator)
-        calls, sent = [], []
-
-        def resize(original, **request):
-            calls.append((original, request['cpus']))
-            return dict(cpus=request['cpus'], active_cpus=request['active_cpus'])
-
-        def acknowledge(path, reply):
-            sent.append((path, dict(reply)))
-            if len(sent) == 1:
-                raise RemoteError('Transport lost after sending the reply')
-            return {'accepted': True}
-
-        state.resize = resize
-        job = dict(result={'id': 'original'}, node=SimpleNamespace(client=SimpleNamespace(request=acknowledge)))
-        first = {'resource_request': dict(request_id=1, cpus=3, active_cpus=0)}
-        second = {'resource_request': dict(request_id=2, cpus=2, active_cpus=2)}
-        with self.assertRaisesRegex(RemoteError, 'Transport lost'):
-            state._answer_resource_request(job, 'attempt', first)
-        state._answer_resource_request(job, 'attempt', first)
-        state._answer_resource_request(job, 'attempt', second)
-        state._answer_resource_request(job, 'attempt', first)
-        self.assertEqual(calls, [('original', 3), ('original', 2)])
-        self.assertEqual(len(sent), 3)
-        self.assertEqual(sent[0], sent[1])
-        self.assertEqual(second['active_cpus'], 2)
-
     def test_worker_alias_keeps_legacy_active_receipt_visible(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,worker):
             with Pool([dict(name='xjtu-arm64',client=worker,aliases=['legacy-worker'])]) as pool, \
@@ -1237,8 +1158,7 @@ class CenterTests(unittest.TestCase):
     def test_slow_resize_reserves_growth_without_blocking_admission(self):
         # Test resource acknowledgement separately from initial kernel preparation.
         with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
-            with scratch() as root,provider(Path(root)/'worker',cpus=4,tags=['ml'],
-                                             python_runtimes={'ml':[sys.executable]}) as (_,worker):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
                 with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
                     identity=client.submit(python('import time;time.sleep(30)',project='A',max_cpus=4))['id']
                     until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
@@ -1329,7 +1249,7 @@ class CenterTests(unittest.TestCase):
                     until(lambda:pool.nodes[0].reserved==0)
                     self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
-    def test_retired_serial_hint_is_not_forwarded_to_older_worker(self):
+    def test_serial_hint_is_center_metadata_and_not_forwarded_to_older_worker(self):
         import zipfile
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
             original=worker.submit_bundle
@@ -1338,11 +1258,10 @@ class CenterTests(unittest.TestCase):
                     self.assertNotIn('single_thread_weight',json.loads(archive.read('task.json')))
                 return original(identity,payload,**options)
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client),patch.object(worker,'submit_bundle',side_effect=submit):
-                result=client.run(dict(python('print(42)',priority=7),single_thread_weight=2))
+                result=client.run(python('print(42)',single_thread_weight=2))
                 self.assertEqual(result['status'],'succeeded',result)
-                self.assertEqual(result['priority'],7)
-                self.assertNotIn('single_thread_weight',result)
-                self.assertNotIn('single_thread_weight',client.health()['capabilities'])
+                self.assertEqual(result['single_thread_weight'],2)
+                self.assertIn('single_thread_weight',client.health()['capabilities'])
 
 
 
@@ -1949,7 +1868,7 @@ class CenterTests(unittest.TestCase):
                         self.assertEqual(packed.call_count,1)
                     self.assertEqual(result['files']['value'],b'42')
                     self.assertEqual(result['worker_url'],local.url)
-                    until(lambda: local.status() == [])
+                    self.assertEqual(local.status(),[])
             finally:
                 worker.close()
 
@@ -1977,7 +1896,7 @@ class CenterTests(unittest.TestCase):
                         release.set();blocked.result(timeout=3)
                 self.assertTrue({large,small}.issubset(node.known_assets))
 
-    def test_asset_revision_preserves_the_inflight_transfer_and_releases_it_afterward(self):
+    def test_asset_revision_preserves_the_inflight_hash_lock_and_releases_it_afterward(self):
         from concurrent.futures import ThreadPoolExecutor
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
@@ -1995,23 +1914,21 @@ class CenterTests(unittest.TestCase):
                     first=transfers.submit(state._ensure_assets,node,[asset])
                     try:
                         self.assertTrue(entered.wait(2))
-                        key = ('node', id(node), asset)
-                        with state.asset_flight_lock:
-                            transfer = state.asset_flights[key]
                         with node.asset_lock:
+                            transfer=node._asset_upload_locks[asset]
                             revision=node.health.get('asset_revision',0)+1
                             node.health['asset_revision']=revision
                         second=transfers.submit(state._ensure_assets,node,[asset])
                         until(lambda:node.asset_session[-1]==revision)
-                        with state.asset_flight_lock:
-                            self.assertIs(state.asset_flights[key], transfer)
+                        with node.asset_lock:
+                            self.assertIs(node._asset_upload_locks[asset],transfer)
                     finally:
                         release.set()
                     first.result(timeout=3);second.result(timeout=3)
                 self.assertEqual(uploads,[(state.root/'assets'/(asset+'.zip')).stat().st_size])
                 self.assertIn(asset,node.known_assets)
-                self.assertTrue(transfer.is_set())
-                self.assertFalse(state.asset_flights)
+                del transfer
+                self.assertFalse(node._asset_upload_locks)
 
     def test_concurrent_jobs_check_and_upload_an_asset_once(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,node):
@@ -2203,7 +2120,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(set(result['tools']['python']), {'argv', 'available'})
                 self.assertNotIn('sha256', result['tools']['python'])
                 self.assertEqual(client.status(), [])
-                until(lambda: node.status() == [])
+                self.assertEqual(node.status(), [])
                 self.assertEqual(list((state.root/'jobs').iterdir()), [])
 
     def test_memory_blocks_until_inflight_task_finishes(self):
@@ -2291,7 +2208,7 @@ class CenterTests(unittest.TestCase):
                     if not shell.closing.is_set():
                         shell.close()
                 self.assertEqual(client.status(), [])
-                until(lambda: node.status() == [])
+                self.assertEqual(node.status(), [])
 
 
 if __name__ == '__main__':

@@ -65,7 +65,9 @@ class _PreparationWorkerLost(Exception):
 ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
     'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
     'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request','execution_timing',
-    'task_process_started')
+    'task_process_started','preparation_stage','preparation_seconds','worker_sampled_at',
+    'worker_preparation_elapsed_seconds','execution_started','bundle_unpack_seconds','worker_admission_seconds',
+    'dispatch_stage','dispatch_stage_started_at','handoff_seconds','handoff_acknowledged_at','handoff_transport')
 
 
 def _restore_phase_demand(job):
@@ -769,8 +771,13 @@ class Coordinator(PlacementPlanning):
                 for item in owned:
                     job=self.jobs[item['id']]
                     worker_id=job.get('worker_id',job['result'].get('worker_id',item['id']))
-                    item['rss_mb']=sampled.get(worker_id,{}).get('rss_mb')
-                    item.update(progress_fields(sampled.get(worker_id,{})))
+                    sample = sampled.get(worker_id, {})
+                    item['rss_mb'] = sample.get('rss_mb')
+                    item.update(progress_fields(sample))
+                    if item.get('dispatch_stage') == 'awaiting_worker' and sample.get('status') in ('queued','running'):
+                        item['worker_status'] = sample['status']
+                    elif item.get('dispatch_stage') == 'awaiting_worker' and not node['error']:
+                        item.update(progress_fields(node.get('pending_unpacks', {}).get(worker_id, {})))
                 for item in node.get('active_jobs',[]):
                     known = item['id'] in known_ids or item['id'] in self.jobs
                     if isinstance(self.jobs, JobRecords):
@@ -1290,7 +1297,7 @@ class Coordinator(PlacementPlanning):
         job['node'] = node
         job['cpu_overcommit'] = node.reserved + node.external > node.base_capacity
         job['result'].update(status='dispatching', assigned_node=node.name, worker_url=node.client.url,
-                             cpus=job['task']['cpus'])
+                             cpus=job['task']['cpus'], dispatch_stage='bundle', dispatch_stage_started_at=time.time())
         abi = build_refs.provider_abi(node.health)
         if abi is not None:
             job['result']['_artifact_abi'] = list(abi)
@@ -1427,6 +1434,13 @@ class Coordinator(PlacementPlanning):
                     result=dict(status='cancelled',finished=time.time(),cancelled_before_submit=True,cpu_seconds=0)
                     with self.condition:self._update(job,result)
                     return
+                with self.condition:
+                    ack = time.time()
+                    job['result']['handoff_acknowledged_at'] = ack
+                    if 'handoff_clock' in job:
+                        job['result']['handoff_seconds'] = time.monotonic() - job.pop('handoff_clock')
+                    job['result'].update(dispatch_stage='worker_accepted', dispatch_stage_started_at=ack)
+                    self._publish(job)
             # Worker acceptance owns the executable copy. Recovery rereads
             # the frozen request on disk; polling needs no transport buffers.
             payload = files = None
@@ -1604,6 +1618,8 @@ class Coordinator(PlacementPlanning):
                 if self.stopping or job['cancel'].is_set():
                     return False
                 job['result']['dispatched'] = dispatched
+                job['result'].update(dispatch_stage='awaiting_worker', dispatch_stage_started_at=dispatched)
+                job['handoff_clock'] = time.monotonic()
                 self._save(job)
             return True
         return False
@@ -1624,9 +1640,14 @@ class Coordinator(PlacementPlanning):
             if not uncertain and job['cancel'].is_set():return False
             submitting=False
             try:
-                with self._asset_handoff(node,identity,assets.values(),enabled=bool(assets)):
-                    started = time.monotonic()
+                if assets and not uncertain:
+                    with self.condition:
+                        job['result'].update(dispatch_stage='assets', dispatch_stage_started_at=time.time())
+                        self._publish(job)
+                started = time.monotonic()
+                with ExitStack() as pins:
                     try:
+                        pins.enter_context(self._asset_handoff(node,identity,assets.values(),enabled=bool(assets)))
                         self._ensure_assets(node, assets.values(), force=force,
                                             cancel=None if uncertain else job['cancel'].is_set,
                                             report=asset_metrics['uploads'] if asset_metrics is not None else None)
@@ -1641,11 +1662,20 @@ class Coordinator(PlacementPlanning):
                             worker_id=node.name)
                     if not uncertain and job['cancel'].is_set():return False
                     if not uncertain:
+                        with self.condition:
+                            job['result'].update(dispatch_stage='pacing', dispatch_stage_started_at=time.time())
+                            self._publish(job)
                         if not self._pace_submission(job):return False
                         if self.stopping or job['cancel'].is_set():return False
                     submitting=True
-                    node.client.submit_bundle(identity,payload,cancel=job['cancel'].is_set,
-                        **({'callback':callback} if callback else {}))
+                    timing = dict(job['result'].get('handoff_transport', {}))
+                    try:
+                        with transport.measure_job_post(identity, timing):
+                            node.client.submit_bundle(identity,payload,cancel=job['cancel'].is_set,
+                                **({'callback':callback} if callback else {}))
+                    finally:
+                        if timing:
+                            job['result']['handoff_transport'] = timing
                 return True
             except RequestCancelled:
                 return False
@@ -1704,7 +1734,10 @@ class Coordinator(PlacementPlanning):
         self._restore_accelerator(task, result)
         job.update(task=task, node=None, auto_cpus=task['cpus'] == 0, elastic_cpus=elastic_cpus(task))
         _restore_phase_demand(job)
-        for field in ('assigned_node', 'worker_url', 'dispatched', 'connection_error', 'asset_transport', 'cache_hit', '_artifact_abi'):
+        job.pop('handoff_clock', None)
+        for field in ('assigned_node', 'worker_url', 'dispatched', 'dispatch_stage', 'dispatch_stage_started_at',
+                      'handoff_seconds', 'handoff_acknowledged_at', 'handoff_transport', 'connection_error',
+                      'asset_transport', 'cache_hit', '_artifact_abi'):
             result.pop(field, None)
         result.update(status='queued', priority=task['priority'], cpus=task['cpus'], memory_mb=task['memory_mb'],
                       resource_wait_reason='transport: waiting for a reachable worker')
@@ -1721,7 +1754,9 @@ class Coordinator(PlacementPlanning):
             'started','elapsed','cpus','memory_mb','peak_cpus','peak_rss_mb','cpu_seconds',
             'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds',
             'cpu_frequency','cost_incomplete','peak_private_mb','error_kind','memory_pressure',
-            'cpu_breakdown_s','compile_cpu_s','load_check_cpu_s','projection_cpu_s','sim_cpu_s')
+            'cpu_breakdown_s','compile_cpu_s','load_check_cpu_s','projection_cpu_s','sim_cpu_s',
+            'handoff_seconds','handoff_acknowledged_at','handoff_transport','asset_preparation_seconds',
+            'worker_admission_seconds','preparation_seconds','execution_timing')
             if key in outcome or key in job['result']}
         if 'cpu_seconds' not in outcome:
             measured['cost_incomplete']=True  # A live snapshot is only the known prefix.
@@ -1785,7 +1820,8 @@ class Coordinator(PlacementPlanning):
         job['result'].update(status='queued',worker_id=worker_id,cpus=task['cpus'],memory_mb=task['memory_mb'],finished=None)
         for key in ('error','connection_error','assigned_node','worker_url','dispatched','elapsed','total_elapsed','peak_cpus','peak_rss_mb','cpu_seconds','total_cpu_seconds','cost_incomplete',
                     'cumulative_cpu_seconds','cpu_accounting_sampled_at','cpu_work_ghz_seconds','cpu_frequency','error_kind','memory_pressure','peak_private_mb',
-                    'cpu_breakdown_s','compile_cpu_s','load_check_cpu_s','projection_cpu_s','sim_cpu_s','cache_hit','_artifact_abi'):
+            'cpu_breakdown_s','compile_cpu_s','load_check_cpu_s','projection_cpu_s','sim_cpu_s',
+            'asset_preparation_seconds','asset_transport','cache_hit','_artifact_abi'):
             job['result'].pop(key,None)
         job['result'].update(started=None,stdout='',stderr='',steps=[])
         for key in ATTEMPT_OBSERVATIONS:job['result'].pop(key,None)
@@ -1992,7 +2028,8 @@ class Coordinator(PlacementPlanning):
         clean_tool_snapshot(remote)
         # A polling snapshot owns these fields, including their absence before
         # the replacement attempt has created its first process.
-        for key in ('runtime','progress','step_progress','progress_error','diagnostic','phase','stage','unit',
+        for key in ('dispatch_stage','dispatch_stage_started_at','worker_sampled_at','worker_preparation_elapsed_seconds',
+                    'runtime','progress','step_progress','progress_error','diagnostic','phase','stage','unit',
                     'completed','total','current','target','nfe','budget'):
             if key not in remote:job['result'].pop(key,None)
         if remote.get('status') in TERMINAL and remote['status']!='interrupted':
@@ -2318,6 +2355,15 @@ class Coordinator(PlacementPlanning):
             job = self.jobs.cached(identity)
             if job is not None and 'read_result' in job:
                 result=json.loads(json_bytes(job['read_result']))
+                node = job.get('node')
+                if result.get('dispatch_stage') == 'awaiting_worker' and node and not node.error:
+                    worker_id = job.get('worker_id') or identity
+                    sample = next((row for row in node.health.get('active_jobs', ())
+                                   if row['id'] == worker_id), None)
+                    if sample and sample.get('status') in ('queued','running'):
+                        result.update(progress_fields(sample), worker_status=sample['status'])
+                    else:
+                        result.update(progress_fields(node.health.get('pending_unpacks', {}).get(worker_id, {})))
                 if result.get('status')=='queued' and not result.get('resource_wait_reason'):
                     with self.condition,self.pool.condition:
                         if job['result'].get('status')=='queued':

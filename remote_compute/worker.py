@@ -38,6 +38,7 @@ from .resources import (Host, CpuAccounting, process_usage, cpu_benchmark, servi
 from .telemetry import Activity
 from .network import local_node_ip
 from .progress import sample as sample_progress, diagnose
+from .acceptance import SubmissionAssets, SubmissionLocks
 from .client import RemoteError
 from .cleanup import ASSET_CACHE_BYTES, AssetCache, AssetMaintenance, Reclaimer, TransportRetirement, remove_owned, retire_job
 from .shared_assets import SharedAssets
@@ -411,6 +412,9 @@ class Worker:
         self.work_reclaimer = Reclaimer(self.root/'jobs'/'.trash',source_root=self.root/'jobs')
         self.retirement = TransportRetirement(self.root / 'retirements', self._reclaim_retired)
         self.asset_handoffs = {}
+        self.submission_lock = SubmissionLocks()
+        self.accepting_assets = SubmissionAssets()
+        self.pending_unpacks = {}
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
         phase=time.monotonic();indexed = self.jobs.load_index()
@@ -510,6 +514,10 @@ class Worker:
                     "configuration_revision": self.configuration_revision,
                     "startup_recoveries": self.startup_recoveries,
                     "asset_revision": self.asset_cache.revision, "asset_cache": self.asset_cache.snapshot(),
+                    "pending_unpacks": {
+                        identity: dict(worker_receive_stage='unpacking', worker_sampled_at=time.time(),
+                                       worker_unpack_elapsed_seconds=time.monotonic() - since)
+                        for identity, since in self.pending_unpacks.items()},
                     **({'shared_asset_cache': self.shared_assets.identity} if self.shared_assets else {}),
                     "startup":self.startup,"temp_reclaim":self.temp_reclaimer.snapshot()if self.temp_reclaimer else None,
                     "work_reclaim":self.work_reclaimer.snapshot(),
@@ -533,6 +541,7 @@ class Worker:
                                      'memory_commit_observed_mb':measured_memory(j)[1],
                                      'memory_reservation_mb':reservation(j)[0],
                                      'memory_commit_reservation_mb':reservation(j)[1], **progress_fields(j['result']),
+                                     **self._preparation_sample(j),
                                      **({'resource_request':j['result']['resource_request']} if 'resource_request' in j['result'] else {})}
                                     for j in active_values(self.jobs) if j['result']['status'] not in TERMINAL],
                     **self.activity.snapshot()}
@@ -1018,7 +1027,7 @@ class Worker:
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
-        with self.asset_cache.lock:
+        with self.submission_lock.hold(identity), self.accepting_assets.holding():
             with self.condition:
                 if self.stopping:
                     raise Conflict("Worker is stopping")
@@ -1051,10 +1060,12 @@ class Worker:
                     inside(self.root, item.filename)
                     if item.filename != "task.json" and not item.filename.startswith("input/"):
                         raise ValueError("Job bundle contains a file outside input/")
-            for asset in task["assets"].values():
-                if not (self.root / "assets" / asset).is_dir():
-                    raise ValueError("Synchronize missing asset first: " + asset)
-                self.asset_cache.touch(asset)
+            with self.asset_cache.lock:
+                for asset in set(task["assets"].values()):
+                    if not (self.root / "assets" / asset).is_dir():
+                        raise ValueError("Synchronize missing asset first: " + asset)
+                    self.asset_cache.touch(asset)
+                self.accepting_assets.update(task["assets"].values())
             # Resolve commands and references before admission, so typos do not occupy slots.
             work = self.root / "jobs" / identity / "input"
             cwd = Path(self._expand(task["cwd"], task, work)).expanduser() if "cwd" in task else work
@@ -1077,7 +1088,13 @@ class Worker:
             try:
                 low_integrity_directory(directory)
                 unpack_started = time.monotonic()
-                unpack(payload, directory)
+                with self.condition:
+                    self.pending_unpacks[identity] = unpack_started
+                try:
+                    unpack(payload, directory)
+                finally:
+                    with self.condition:
+                        self.pending_unpacks.pop(identity, None)
                 unpack_seconds = time.monotonic() - unpack_started
                 work.mkdir(exist_ok=True)
                 if "stdin" in task and not inside(work, task["stdin"]).is_file():
@@ -1124,6 +1141,7 @@ class Worker:
                         raise Conflict("Worker is stopping")
                     if task['cpus'] > int(self.capacity*self.cpu_overcommit_factor) or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
+                    result['worker_admission_seconds'] = time.monotonic() - received
                     self.jobs[identity] = job
                     self.asset_handoffs.pop(identity, None)
                     self.queue.append(identity)
@@ -1642,6 +1660,7 @@ class Worker:
             protected = {identity for identity, (_size, used) in self.asset_cache.entries.items()
                          if recent and now-used<5}
             protected.update(handoff_references(self))
+            protected.update(self.accepting_assets)
             recent_inputs = {asset for asset, (_, used) in self.asset_cache.entries.items()
                              if now - used < self.asset_cache.max_idle}
             protected.update(asset_references(self.jobs, recent_terminal_assets=recent_inputs))
@@ -1695,10 +1714,20 @@ class Worker:
                 if not job['result'].get('input_cleanup_error'):
                     self.cleanup_pending.discard(job['result']['id'])
 
+    @staticmethod
+    def _preparation_sample(job):
+        result = job['result']
+        deadline = job.get('preparation_deadline')
+        if deadline is None or result['status'] != 'running' or result.get('execution_started'):
+            return {}
+        return dict(worker_sampled_at=time.time(),
+                    worker_preparation_elapsed_seconds=max(0., time.monotonic() - (deadline - PREPARATION_TIMEOUT)))
+
     def get(self, identity):
         job = load_job(self.jobs, self.condition, identity)
         with self.condition:
-            return json.loads(json_bytes({**job["result"], 'diagnostic':diagnose(job['result'])}))
+            return json.loads(json_bytes({**job["result"], **self._preparation_sample(job),
+                                         'diagnostic':diagnose(job['result'])}))
 
     def job_file(self, identity, name, data=None):
         job = load_job(self.jobs, self.condition, identity)

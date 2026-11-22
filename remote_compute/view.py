@@ -14,7 +14,6 @@ from .policy import canonical_capabilities, priority_weight
 from .packages import DEFAULT_PACKAGE, PACKAGES, package_names
 from .task_tags import compact_tag
 from .telemetry import sampling_notice
-from .bundle import command_step_progress
 
 
 _ambiguous_width = None
@@ -66,35 +65,11 @@ def _short(text, width):
 
 
 def _progress_label(job):
-    """Render only a numeric progress measure with a known denominator."""
-    progress = job.get('progress')
-    numeric = (int, float)
-    business = isinstance(progress, dict) and progress.get('schema') == 'dco.progress.v1'
-    values = progress if business else ({**job, **progress} if isinstance(progress, dict) else job)
-    for done_key, total_key in (('completed', 'total'), ('current', 'target'), ('nfe', 'budget')):
-        done, total = values.get(done_key), values.get(total_key)
-        if type(done) in numeric and type(total) in numeric and 0 <= done <= total and total > 0:
-            if math.isfinite(total):
-                return f'{done/total*100:.0f}%'
-    percent_unit = str(values.get('unit') or '').lower() in ('%', 'percent', 'percentage')
-    if isinstance(progress, dict):
-        for key, scale in (('ratio', 1), ('fraction', 1), ('percent', 100)):
-            value = progress.get(key)
-            if type(value) in numeric and 0 <= value <= scale:
-                return f'{value/scale*100:.0f}%'
-        done = progress.get('completed')
-        if percent_unit and type(done) in numeric and 0 <= done <= 100 and progress.get('total') is None:
-            return f'{done:.0f}%'
-        if business:
-            steps = command_step_progress(job)
-            return (f"{steps['completed']/steps['total']*100:.0f}%" if steps else '')
-    if type(progress) in numeric and 0 <= progress <= 100:
-        scale = 100 if percent_unit or progress > 1 else 1
-        return f'{progress/scale*100:.0f}%'
-    steps = command_step_progress(job)
-    if steps:
-        return f"{steps['completed']/steps['total']*100:.0f}%"
-    return ''
+    from .progress import work_fraction
+    ratio = work_fraction(job)
+    if ratio is None:
+        return ''
+    return '100%' if ratio == 1 else f'{min(99, round(100 * ratio))}%'
 
 
 def _cell(text, width, right=False):

@@ -52,6 +52,13 @@ class SubmissionAssets:
         with self.lock:
             self.owners.pop(threading.get_ident(), None)
 
+    @contextmanager
+    def holding(self):
+        try:
+            yield
+        finally:
+            self.clear()
+
     def __iter__(self):
         with self.lock:
             held = set(self.legacy)

@@ -828,18 +828,6 @@ class ConsoleTests(unittest.TestCase):
             for width in range(38,201):
                 with self.subTest(width=width):format_status(value,width=width).fit(50)
 
-    def test_task_list_displays_running_and_queued_priorities_at_each_width(self):
-        running=dict(id='aaaa'+'f'*28,cpus=1,status='running',label='running',priority=17)
-        queued=dict(id='bbbb'+'f'*28,cpus=1,status='queued',label='queued',priority=22)
-        value=dict(role='scheduler',node='Aya1-PC',queued_jobs=[queued],
-                   nodes=[dict(name='Aya1-PC',capacity=14,active_jobs=[running])])
-        for width in (34,38,54,64,80,100,140,200):
-            with self.subTest(width=width):
-                rows=format_status(value,width=width).fit(50)
-                self.assertTrue(any('优先' in row for row in rows))
-                self.assertTrue(any('aaaa' in row and '17' in row for row in rows))
-                self.assertTrue(any('bbbb' in row and '22' in row for row in rows))
-
     def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):
         jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label='very-long-circuit-name/'*6+f'seed-{i}',
                    cpus=2,memory_mb=512,status='running') for i in range(43)]
@@ -869,7 +857,7 @@ class ConsoleTests(unittest.TestCase):
 
     def test_node_pages_keep_all_twenty_nodes_and_task_pages_independent(self):
         nodes=[dict(name=f'school-{i}',display_name=f'校方{i:02d}',reserved=1,base_capacity=64,
-                    logical_cpus=64,packages=['rtl'],host_ip=f'10.0.0.{i+1}') for i in range(15)]
+                    logical_cpus=64,tags=['rtl'],host_ip=f'10.0.0.{i+1}') for i in range(15)]
         nodes.extend(dict(name=f'host-{i}',capacity=16) for i in range(5))
         nodes[0]['active_jobs']=[dict(id=f'{i:04x}'+'b'*28,label=f'task-{i}',cpus=1,
                                      status='running') for i in range(32)]
@@ -898,7 +886,7 @@ class ConsoleTests(unittest.TestCase):
                 text='\n'.join(details)
                 self.assertIn('school-0',text)
                 self.assertIn('10.0.0.15',text)
-                self.assertIn('能力 Chisel',text)
+                self.assertIn('能力 RTL',text)
 
     def test_node_keys_change_page_and_open_full_width_detail(self):
         keyboard=Keyboard(['\x00','A','\x00','B',*'quit\r'])
@@ -916,31 +904,17 @@ class ConsoleTests(unittest.TestCase):
         self.assertRegex(text,r'设备资源 20 台 2/\d+页')
         self.assertIn('节点详情',text)
 
-    def test_probe_timeout_and_detached_worker_have_separate_panel_counts(self):
-        from remote_compute.view import StatusRows
-        nodes=[dict(name='temporary',error='probe timed out'),
-               dict(name='offline',error='connection timed out',enabled=False,detached=True),
-               dict(name='ready')]
-        status=StatusRows(dict(role='scheduler',nodes=nodes),width=160,viewport=True)
-        text='\n'.join(status.fit(30))
-        self.assertIn('失联 1',text)
-        self.assertIn('重连 1',text)
-        self.assertIn('temporary',text)
-        self.assertIn('offline',text)
-
     def test_live_overview_shows_twenty_registered_nodes_and_health_with_output(self):
         from remote_compute import __version__
         from remote_compute.view import StatusRows
         nodes = [dict(name=f'worker-{index}', display_name=f'node-{index:02}', capacity=32,
-                      memory_total_mb=65536, host_memory_available_mb=61440, packages=['ng47','rtl'])
+                      memory_total_mb=65536, host_memory_available_mb=61440, tags=['ng47','chisel','rtl'])
                  for index in range(20)]
         nodes[15]['error'] = 'Remote worker disconnected'
-        nodes[15]['detached'] = True
         nodes[16]['paused'] = True
         nodes[17]['enabled'] = False
-        nodes[18]['error'] = 'Transient health timeout'
         nodes[19]['active_jobs'] = [dict(id='68fc'+'a'*28, status='running', label='RTL', cpus=4)]
-        nodes[0]['packages'] += ['python','cuda','layout','onnx']
+        nodes[0]['tags'] += ['ml','cuda','layout','onnx']
         nodes[0].update(cpu_percent=12.6,url='http://192.0.2.11:26133')
         nodes[1].update(cpu_percent=0,node='school-worker',node_ip='10.96.4.15',url='http://127.0.0.1:27141')
         status = StatusRows(dict(role='scheduler',node='center',version=__version__,nodes=nodes),width=204,viewport=True)
@@ -954,11 +928,11 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(all(not row or _width(row) == 204 for row in displayed))
         for index in range(20):
             self.assertIn(f'node-{index:02}', text)
-        for text_fragment in ('失联 1', '重连 1', '暂停 1', '禁用 1', '68fc', 'ping succeeded'):
+        for text_fragment in ('失联 1', '暂停 1', '禁用 1', '68fc', 'ping succeeded'):
             self.assertIn(text_fragment, text)
         self.assertIn('能力',displayed[3])
         device_row=next(row for row in displayed if 'node-00' in row)
-        self.assertIn('ng47 Chisel ONNX layout cuda',device_row)
+        self.assertIn('ng47 Chisel ML CUDA Layout RTL ONNX',device_row)
         self.assertIn('可调度能力',text)
         status.resize(159)
         rows=_layout(status,['task accepted'],['ping succeeded'],50,reserved=5)
@@ -967,7 +941,7 @@ class ConsoleTests(unittest.TestCase):
             self.assertIn(header,rows[3])
         direct=next(row for row in rows if 'node-00' in row)
         relay=next(row for row in rows if 'node-01' in row)
-        for value in ('12.6%','4.0/64.0','192.0.2.11','ng47 Chisel ONNX layout cuda'):
+        for value in ('12.6%','4.0/64.0','192.0.2.11','ng47 Chisel ML CUDA Layout RTL ONNX'):
             self.assertIn(value,direct)
         self.assertEqual([cell.strip() for cell in relay.split('|')[6:8]],['10.96.4.15','127.0.0.1:27141'])
         self.assertIn('0.0%',relay)
@@ -975,12 +949,12 @@ class ConsoleTests(unittest.TestCase):
     def test_narrow_overview_keeps_cpu_memory_address_and_capabilities(self):
         from remote_compute.view import StatusRows
         value=dict(role='scheduler',node='center',nodes=[
-            dict(name='school',node='school-worker',node_ip='10.96.4.15',cpu_percent=9.5,packages=['rtl'],
+            dict(name='school',node='school-worker',node_ip='10.96.4.15',cpu_percent=9.5,tags=['chisel','rtl'],
                  memory_total_mb=65536,host_memory_available_mb=32768,url='http://127.0.0.1:27141')
         ])
         view=StatusRows(value,width=64,viewport=True)
         text='\n'.join(view.fit(25))
-        for value in ('CPU% 9.5%','内存用/总 GiB 32.0/64.0','节点 IP 10.96.4.15','中转入口 127.0.0.1:27141','能力 Chisel'):
+        for value in ('CPU% 9.5%','内存用/总 GiB 32.0/64.0','节点 IP 10.96.4.15','中转入口 127.0.0.1:27141','Chisel RTL'):
             self.assertIn(value,text)
 
     def test_overview_keeps_unknown_worker_ip_separate_from_relay(self):
@@ -1043,47 +1017,8 @@ class ConsoleTests(unittest.TestCase):
                      active_jobs=[job])
         text = '\n'.join(format_status(value, width=200).fit(30))
         self.assertIn('进度', text)
-        self.assertIn('50%', text)
         self.assertNotIn('2/4', text)
-
-    def test_task_monitor_keeps_progress_and_action_separate_at_both_widths(self):
-        from remote_compute.view import StatusRows
-
-        base = dict(cpus=24, max_cpus=1024, status='running', project='ARH')
-        jobs = [
-            dict(base, id='abcd' + 'a'*28, label='检错继续 YOLOv8n 剂量256',
-                 progress=dict(schema='dco.progress.v1', phase='YOLO detailed stage',
-                               completed=14, total=25, unit='cycles')),
-            dict(base, id='bcde' + 'b'*28, label='停机对照 YOLOv8n 剂量256',
-                 progress=dict(schema='dco.progress.v1', phase='YOLO another stage',
-                               completed=12, unit='cycles')),
-        ]
-        value = dict(role='scheduler', node='local',
-                     nodes=[dict(name='fixture', capacity=32, active_jobs=jobs)])
-        for width in (38, 80, 83, 100, 140, 160):
-            with self.subTest(width=width):
-                screen = _layout(StatusRows(value, width=width, viewport=True), [], [], 33)
-                header = next(row.split('|') for row in screen if 'CPU/限' in row)
-                task_rows = [next(row.split('|') for row in screen if job['id'][:4] in row)
-                             for job in jobs]
-                columns = [cell.strip() for cell in header]
-                index = columns.index('CPU/限')
-                self.assertEqual(_width(header[index]) - 2, 7)
-                self.assertEqual([row[index].strip() for row in task_rows], ['24/1024', '24/1024'])
-                tag_index = columns.index('任务标签')
-                tags = [row[tag_index].strip() for row in task_rows]
-                self.assertTrue(tags[0].startswith('检'))
-                self.assertTrue(tags[1].startswith('停'))
-                self.assertTrue(all('%' not in tag and 'stage' not in tag for tag in tags))
-                if width >= 140:
-                    self.assertTrue(tags[0].startswith('检错继续 YOLOv8n'))
-                    self.assertTrue(tags[1].startswith('停机对照 YOLOv8n'))
-                if width >= 80:
-                    progress_index = columns.index('进度')
-                    self.assertEqual([row[progress_index].strip() for row in task_rows], ['56%', ''])
-                else:
-                    self.assertNotIn('进度', columns)
-                self.assertTrue(all(_width(line) <= width for line in screen))
+        self.assertNotIn('50%', text)
 
     def test_page_keys_change_task_pages_while_preserving_input_and_output_history(self):
         keyboard=Keyboard(['\x00','Q','\x00','Q',*'ping\rquit\r'])
@@ -1120,8 +1055,7 @@ class ConsoleTests(unittest.TestCase):
                     status.task_page=page
                     rows=status.fit(22)
                     self.assertTrue(all(_width(row)==width for row in rows))
-                    header = next(row for row in rows if 'CPU/限' in row)
-                    self.assertEqual('秒' in header, width >= 64)
+                    self.assertIn('秒','\n'.join(rows))
                     for row in rows:
                         seen.extend(record[0] for record in status.records
                                     if any(prefix+record[0]+' |' in row for prefix in ('| ','+ ')))

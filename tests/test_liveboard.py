@@ -10,6 +10,23 @@ from remote_compute.liveboard_wire import encode as cbor
 
 
 class LiveboardTests(unittest.TestCase):
+    def test_small_active_project_is_visible_when_large_project_fills_snapshot(self):
+        large = [dict(id=str(i), project='large', status='running', cpus=4) for i in range(80)]
+        small = [dict(id='native-'+str(i), project='small', status='running', cpus=1) for i in range(2)]
+        sample = live.snapshot(self.health(), [self.node(active_jobs=large+small)])
+        self.assertEqual(len(sample['jobs']), 32)
+        self.assertEqual(sum(j['project']=='small' for j in sample['jobs']),2)
+        self.assertEqual(sample['coverage']['jobs_active_total'],82)
+
+    def test_native_snapshot_exposes_measured_cores_and_phase_when_available(self):
+        task = dict(id='a'*32, status='running', project='maintenance', cpus=4, max_cpus=4,
+                    observe_only=True, phase='prepare', measured_cpus=1.231, cpu_seconds=5.121)
+        row = live.snapshot(self.health(), [self.node(active_jobs=[task])])['jobs'][0]
+        self.assertEqual((row['cpus'], row['measured_cpus'], row['cpu_seconds'], row['phase']),
+                         (4, 1.23, 5.12, 'prepare'))
+        del task['measured_cpus']
+        self.assertNotIn('measured_cpus',live.snapshot(self.health(),[self.node(active_jobs=[task])])['jobs'][0])
+
     def test_cbor_matches_rfc8949_typed_value_vectors(self):
         vectors=[(0,'00'),(23,'17'),(24,'1818'),(1000,'1903e8'),(-1,'20'),(-1000,'3903e7'),
                  (2**32,'1b0000000100000000'),(True,'f5'),(False,'f4'),(None,'f6'),
@@ -78,15 +95,13 @@ class LiveboardTests(unittest.TestCase):
 
     def test_task_progress_is_explicit_and_job_width_elapsed_are_real(self):
         jobs=[dict(id='a'*32,label='Task',status='running',cpus=2,max_cpus=64,
-                   project='project',started=90,completed=2,total=8,priority=-5,argv=['SECRET']),
+                   project='project',started=90,completed=2,total=8,argv=['SECRET']),
               dict(id='b'*32,status='running',cpus=1,max_cpus=54,started=95)]
-        health=dict(self.health(),queued_jobs=[dict(id='c'*32,priority=12)])
-        value=live.snapshot(health,[self.node(active_jobs=jobs)],now=100)
+        value=live.snapshot(self.health(),[self.node(active_jobs=jobs)],now=100)
         self.assertEqual(value['jobs'][0]['progress'],dict(completed=2,total=8,ratio=.25))
         self.assertEqual(value['jobs'][0]['elapsed_seconds'],10)
         self.assertEqual(value['jobs'][0]['max_cpus'],64)
         self.assertIsNone(value['jobs'][1]['progress'])
-        self.assertEqual([row['priority'] for row in value['jobs']],[1,1,12])
         self.assertNotIn('SECRET',live.encode(value).decode())
 
     def test_bounds_hold_for_large_cached_active_sets_without_loading_history(self):
@@ -102,12 +117,35 @@ class LiveboardTests(unittest.TestCase):
         self.assertEqual(value['coverage']['jobs_active_total'],4000)
         self.assertFalse(value['coverage']['history'])
 
-    def test_display_collapses_complete_rtl_and_chisel_to_one_tag(self):
-        both = self.node(tags=['rtl', 'chisel', 'ng47'], packages=['rtl', 'ng47'])
-        incomplete = self.node(name='incomplete', tags=['rtl'], packages=[])
-        legacy = self.node(name='legacy', tags=['rtl', 'chisel'])
-        value = live.snapshot(self.health(), [both, incomplete, legacy])
-        self.assertEqual([n['capabilities'] for n in value['nodes']], [['ng47', 'chisel'], [], ['chisel']])
+    def test_disabled_historical_nodes_are_hidden_until_they_have_work(self):
+        nodes = [self.node(name='online'),
+                 self.node(name='retired', enabled=False, reserved=0, error='old connection error'),
+                 self.node(name='draining', enabled=False, reserved=1)]
+        value = live.snapshot(self.health(), nodes)
+        self.assertEqual([row['id'] for row in value['nodes']], ['online', 'draining'])
+        self.assertEqual(value['coverage']['nodes_total'], 2)
+        self.assertFalse(any(alert.get('node') == 'retired' for alert in value['alerts']))
+
+    def test_terminal_receipts_do_not_contribute_to_active_jobs_projects_or_alerts(self):
+        failed = {'id':'finished', 'project':'old', 'status':'failed'}
+        health = dict(self.health(), queued=0, recent_failures=[failed])
+        offline = self.node(name='offline', error='current transport fault', active_jobs=[failed])
+        empty = live.snapshot(health, [offline])
+        self.assertEqual(empty['coverage']['jobs_active_total'], 0)
+        self.assertEqual(empty['coverage']['projects_active_total'], 0)
+        self.assertEqual((empty['summary']['running'], empty['summary']['queued']), (0, 0))
+        self.assertEqual(empty['jobs'], [])
+        self.assertEqual(empty['projects'], [])
+        self.assertEqual([alert['code'] for alert in empty['alerts']], ['node_offline'])
+
+        node = self.node(active_jobs=[dict(id='running', project='current', status='running', cpus=1)])
+        queued = dict(id='queued', project='current')
+        active = live.snapshot(dict(health, queued=1, queued_jobs=[queued]), [node])
+        self.assertEqual(active['coverage']['jobs_active_total'], 2)
+        self.assertEqual(active['coverage']['projects_active_total'], 1)
+        self.assertEqual((active['summary']['running'], active['summary']['queued']), (1, 1))
+        self.assertEqual([job['id'] for job in active['jobs']], ['running', 'queued'])
+        self.assertEqual([project['name'] for project in active['projects']], ['current'])
 
     def test_missing_metrics_and_invalid_progress_stay_unknown(self):
         n=self.node(memory_total_mb=None,cpu_percent=float('nan'),active_jobs=[
@@ -177,6 +215,32 @@ class LiveboardTests(unittest.TestCase):
             self.assertEqual(gzip.decompress(request.data),cbor(dict(data=value)))
             self.assertLess(size,len(live.encode(dict(data=value))))
             self.assertEqual(sequence,4)
+
+    def test_heartbeat_is_small_and_stale_base_recovers_with_current_full_snapshot(self):
+        from io import BytesIO
+        from urllib.error import HTTPError
+        with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-') as folder:
+            path = Path(folder)/'upload.local.json'
+            url = 'https://example.test/manage/live/id/update/'
+            path.write_text(json.dumps(dict(url=url,token='s'*48)))
+            config = dict(upload_file=str(path), transport='cbor-gzip')
+            value = live.snapshot(self.health(), [self.node()])
+            next_sample = dict(value, sampled_at='2026-11-18T00:00:15Z')
+            latest = dict(next_sample, sampled_at='2026-11-18T00:00:30Z')
+            baseline = {}
+            def reply(sequence):
+                return dict(instance=dict(sequence=sequence), compact=1)
+            with patch.object(live, 'read_json', side_effect=[
+                    reply(1), reply(2), HTTPError(url,409,'stale',{},BytesIO()), reply(4)]) as read:
+                full, _, _ = live.upload(config, value, baseline=baseline)
+                heartbeat, _, _ = live.upload(config, next_sample, baseline=baseline)
+                self.assertEqual(baseline['kind'], 'heartbeat')
+                self.assertLess(heartbeat, full / 3)
+                live.upload(config, latest, baseline=baseline)
+            self.assertEqual(baseline['sequence'], 4)
+            self.assertEqual(baseline['kind'], 'resync')
+            retry = read.call_args.args[1]
+            self.assertEqual(gzip.decompress(retry.data), cbor({'data':latest}))
 
     def test_disabled_or_failed_optional_launcher_preserves_main_service(self):
         with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:

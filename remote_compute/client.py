@@ -2,6 +2,8 @@
 
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
 import gzip
@@ -59,6 +61,25 @@ class RequestCancelled(RemoteError):
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
 _RELAY_BULK_BUDGET = load_relay_bulk_budget()
 SHORT_DISPATCH_BYTES = 256 * 1024
+_measured_post = ContextVar('dco_measured_post', default=None)
+
+
+@contextmanager
+def measure_job_post(identity, metrics):
+    token = _measured_post.set(('/jobs/' + identity, metrics))
+    try:
+        yield
+    finally:
+        _measured_post.reset(token)
+
+
+@contextmanager
+def _elapsed(metrics, field):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        metrics[field] = metrics.get(field, 0.) + time.monotonic() - started
 # Waits after each unsuccessful probe. A relay recovering in the first
 # minute has two opportunities before falling back to minute spacing.
 RELAY_RECONNECT_INTERVALS = (10, 25, 60, 60, 60, 60)
@@ -310,8 +331,11 @@ class Client:
         short_job = (relayed and not artifact_get and not retirement
                      and _short_dispatch_request(path, data, method))
         bulk = bulk and not short_job
-        if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, short_job=short_job, cancel=cancel):
-            raise PoolBusy(f'{self.url}{path}: connection pool is busy')
+        trace = _measured_post.get()
+        timing = trace[1] if trace and trace[0] == path and isinstance(data, bytes) else None
+        with _elapsed(timing, 'pool_wait_seconds') if timing is not None else nullcontext():
+            if not pool.acquire(getattr(self, 'pool_timeout', None), bulk=bulk, short_job=short_job, cancel=cancel):
+                raise PoolBusy(f'{self.url}{path}: connection pool is busy')
         try:
             # Old live instances may still own a per-thread cached connection.
             previous=getattr(self.connections,'connection',None)
@@ -422,6 +446,8 @@ class Client:
         large_asset = asset_upload and len(data) >= 1024 * 1024
         asset_chunk = method == 'POST' and stream_body and asset_checkpoint
         job_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
+        trace = _measured_post.get()
+        timing = trace[1] if job_upload and trace and trace[0] == path else None
         # Bulk streams tolerate relay stalls without resetting a paid prefix.
         # Control requests keep their short socket deadline.
         short_relay_job = job_upload and len(data) <= SHORT_DISPATCH_BYTES and relay is not None
@@ -477,9 +503,12 @@ class Client:
                 # The reader loop sends bounded blocks, so active uploads can
                 # outlast the socket timeout. Each retry starts at byte zero.
                 body=_UploadBody(data,cancel,upload_budget) if stream_body else data
-                if connection.sock is None:connection.connect()
-                sent=True
-                connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
+                with _elapsed(timing, 'connect_send_seconds') if timing is not None else nullcontext():
+                    if connection.sock is None:connection.connect()
+                    sent=True
+                    if timing is not None:
+                        timing['post_attempts'] = timing.get('post_attempts', 0) + 1
+                    connection.request(method, self.endpoint.path.rstrip('/') + path, body=body, headers=headers)
                 asset_body_sent = large_asset
                 if asset_body_sent and connection.sock is not None:
                     connection.sock.settimeout(min(attempt_timeout, max(15, self.timeout)))
@@ -492,7 +521,8 @@ class Client:
                     # Once the body is sent, a short dispatch uses the normal RPC
                     # deadline. Lost acceptance is reconciled using the same ID.
                     connection.sock.settimeout(min(attempt_timeout,self.timeout))
-                response = connection.getresponse()
+                with _elapsed(timing, 'reply_header_seconds') if timing is not None else nullcontext():
+                    response = connection.getresponse()
                 if artifact_socket is not None and not response.isclosed():
                     artifact_socket.settimeout(attempt_timeout)
                 if self.peer_id and response.getheader('X-DCO-Node') != self.peer_id:
@@ -1962,6 +1992,7 @@ class Pool:
                  "network": dict(getattr(n, 'network', {}) or {}),
                  "shared_paths": n.health.get("shared_paths", {}),
                  "active_jobs": n.health.get("active_jobs") or [],
+                 "pending_unpacks": n.health.get("pending_unpacks") or {},
                  "unavailable_shared": n.health.get("unavailable_shared", {}),
                  "tool_root": n.health.get("tool_root"),
                  **{key: n.health.get(key) for key in ('node', 'cpu_limit', 'temperature_c', 'peers', 'events', 'root', 'version','memory_pressure_state','work_reclaim','temp_reclaim')},

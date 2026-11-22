@@ -17,6 +17,29 @@ def _number(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
+def work_fraction(job):
+    """Return a reported work fraction, keeping command counts separate."""
+    p = job.get('progress')
+    typed = isinstance(p, dict) and p.get('schema') == SCHEMA
+    values = p if typed else {**job, **p} if isinstance(p, dict) else job
+    for numerator, denominator in (('completed','total'), ('current','target'), ('nfe','budget')):
+        done, total = values.get(numerator), values.get(denominator)
+        if not typed and numerator == 'completed' and job.get('step_progress') == dict(completed=done, total=total):
+            continue
+        if _number(done) and _number(total) and 0 < total and done <= total:
+            return done / total
+    percent = str(values.get('unit') or '').lower() in ('%', 'percent', 'percentage')
+    if isinstance(p, dict):
+        for key, scale in (('ratio',1), ('fraction',1), ('percent',100)):
+            if _number(p.get(key)) and p[key] <= scale:
+                return p[key] / scale
+        if percent and _number(p.get('completed')) and p['completed'] <= 100 and p.get('total') is None:
+            return p['completed'] / 100
+    if _number(p) and p <= 100:
+        return p / 100 if percent or p > 1 else p
+    return None
+
+
 def _text(value, limit):
     if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 for c in value):
         raise ValueError('Progress text must be bounded printable text')
@@ -164,7 +187,12 @@ def diagnose(job, *, now=None, offline=False):
     elif state in ('succeeded','cancelled'):code = state
     elif state in ('queued','pending'):code = 'queued'
     elif offline:code,level = 'worker_unreachable','warning'
-    elif state=='dispatching':code = 'preparing'
+    elif state=='dispatching' and not job.get('worker_status'):
+        code = job.get('worker_receive_stage') or job.get('dispatch_stage') or 'preparing'
+    elif job.get('worker_status') == 'queued':code = 'worker_accepted'
+    elif job.get('preparation_stage') and job['preparation_stage'] != 'complete':
+        code = ('resource_wait' if job['preparation_stage'] in ('host_memory_pressure','resource_grant','memory_calibration')
+                else 'worker_preparing')
     elif runtime.get('process_alive') is False and runtime.get('returncode') is not None:
         code = 'finishing'
     elif runtime.get('process_alive') is False and (job.get('resource_request') or
@@ -192,6 +220,8 @@ def diagnose(job, *, now=None, offline=False):
 
 
 LABELS = dict(queued='排队',preparing='准备',finishing='收尾',resource_wait='等资源',waiting='等待',
+              bundle='组包',assets='备资产',pacing='等派发',awaiting_worker='等接单',
+              unpacking='解包',worker_accepted='已接单',worker_preparing='待开算',
               running='运行',progressing='推进',cpu_active='计算中',stalled='进度停滞',
               heartbeat_lost='业务报告静默',worker_unreachable='连接中断',worker_sample_stale='采样陈旧',
               process_lost='进程丢失',failed='失败',timed_out='超时',interrupted='中断',

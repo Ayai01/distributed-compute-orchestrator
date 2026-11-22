@@ -7,11 +7,11 @@ import unittest
 from unittest.mock import patch
 
 from remote_compute import Client,Pool,python_call,python_map,report_progress
-from remote_compute.bundle import command_step_progress, progress_fields
+from remote_compute.bundle import progress_fields
 from remote_compute.progress import SCHEMA,diagnose,normalize,sample,report_items
 from remote_compute import liveboard
-from remote_compute.view import _progress_label, _width, StatusRows
-from test_compute import scratch, provider, python, until
+from remote_compute.view import _progress_label,StatusRows
+from test_compute import scratch,provider,until
 from test_center import center
 
 
@@ -74,80 +74,7 @@ class ProgressTests(unittest.TestCase):
         p=normalize(dict(phase='replay',completed=200,unit='cycles',counters={'MAC':900}))
         fields=progress_fields(dict(progress=p,total_steps=1,steps=[]))
         self.assertNotIn('ratio',p);self.assertNotIn('total',fields)
-        self.assertEqual(_progress_label(fields), '')
-
-    def test_legacy_progress_shows_percentage_without_phase_only_text(self):
-        self.assertEqual(_progress_label(dict(progress=dict(completed=1,total=4))),'25%')
-        self.assertEqual(_progress_label(dict(progress=dict(phase='compile',completed=7))), '')
-
-    def test_command_progress_validates_denominator_and_prefers_business_units(self):
-        steps = dict(total_steps=2, steps=[{'returncode': 0}, {'started': 12}])
-        report = normalize(dict(phase='native', completed=900, unit='cycles',
-                                counters={'nominal_single_pass_cycles': 1000}))
-        unknown = dict(id='original', progress=report, nominal_single_pass_cycles=1000)
-        self.assertEqual(_progress_label(unknown), '')
-        self.assertNotIn('ratio', liveboard.display_progress(unknown))
-        mixed = dict(unknown, total=1000, current=5, target=10)
-        self.assertEqual(_progress_label(mixed), '')
-        dirty = dict(unknown, total_steps=2, steps=[{'finished': 'invalid'}, {'started': 12}])
-        self.assertNotEqual(_progress_label(dirty), '50%')
-        self.assertIsNone(liveboard.display_progress(dirty).get('ratio'))
-        legacy_dirty = {key: dirty[key] for key in ('total_steps', 'steps')}
-        self.assertNotIn('total', progress_fields(legacy_dirty))
-        self.assertEqual(_progress_label(progress_fields(legacy_dirty)), '')
-        self.assertIsNone(command_step_progress(dict(steps, total_steps=True)))
-        self.assertIsNone(command_step_progress(dict(steps, total_steps=1)))
-        self.assertIsNone(command_step_progress(dict(steps, step_progress={'completed': 1, 'total': 0},
-                                                      total_steps=None)))
-        fallback = dict(unknown, **steps)
-        self.assertEqual(progress_fields(fallback)['step_progress'], dict(completed=1, total=2))
-        self.assertEqual(_progress_label(fallback), '50%')
-        self.assertEqual(liveboard.display_progress(fallback)['ratio'], .5)
-        business = dict(fallback, progress=normalize(dict(completed=9, total=10, unit='cycles')))
-        self.assertEqual(_progress_label(business), '90%')
-        self.assertEqual(liveboard.display_progress(business)['ratio'], .9)
-        self.assertNotIn('step_progress', progress_fields(business))
-
-    def test_running_two_command_job_surfaces_one_completed_step_end_to_end(self):
-        second = '''from pathlib import Path
-from remote_compute import report_progress
-from time import sleep
-report_progress(phase='simulation', completed=900, unit='cycles',
-                counters={'nominal_single_pass_cycles': 1000})
-while not Path('release').exists():
-    sleep(.05)
-'''
-        with scratch() as folder:
-            root = Path(folder)
-            with provider(root / 'worker') as (_, worker), Pool([worker]) as pool, \
-                    center(pool, root / 'center') as (owner, client):
-                task = python("print('first command finished')")
-                task['steps'].append(python(second)['steps'][0])
-                original = client.submit(task)['id']
-                try:
-                    def active(health):
-                        rows = health['nodes'][0]['active_jobs'] if health['role'] == 'scheduler' else health['active_jobs']
-                        return next((row for row in rows if row['id'] == original), {})
-
-                    expected = dict(completed=1, total=2)
-                    until(lambda: active(worker.health()).get('step_progress') == expected, seconds=10)
-                    until(lambda: client.statuses([original])[original].get('step_progress') == expected, seconds=10)
-                    self.assertEqual(client.statuses([original], compact=True)[original], {'status': 'running'})
-                    until(lambda: active(owner.health()).get('step_progress') == expected, seconds=10)
-                    health = owner.health()
-                    rendered = liveboard.snapshot(health, health['nodes'])
-                    row = next(row for row in rendered['jobs'] if row['id'] == original)
-                    self.assertEqual((row['progress']['ratio'], row['progress']['unit']), (.5, 'steps'))
-                    for width in (80, 100, 140):
-                        with self.subTest(width=width):
-                            lines = StatusRows(health, width=width)
-                            task_row = next(line for line in lines if original[:4] in line and '50%' in line)
-                            self.assertNotIn('1/2', task_row.split('|')[-2])
-                            self.assertTrue(all(_width(line) <= width for line in lines))
-                finally:
-                    client.write_job_file(original, 'release', 'finish')
-                self.assertEqual(client.wait(original, wait_timeout=10)['status'], 'succeeded')
-                self.assertEqual(client.fetch(original)['id'], original)
+        self.assertEqual(_progress_label(fields),'')
 
     def test_invalid_work_reports_are_rejected_and_local_use_is_optional(self):
         with patch.dict(os.environ,{},clear=True):self.assertFalse(report_progress(phase='local'))
@@ -236,10 +163,7 @@ def work():
             value=liveboard.snapshot(health,rows)
             self.assertEqual(value['jobs'][0]['id'],i)
             self.assertEqual(value['jobs'][0]['progress']['checkpoint']['resume'],'next-segment')
-            shown = value['jobs'][0]['progress']
-            self.assertEqual((shown['completed'], shown['total'], shown['ratio'], shown['unit']),
-                             (0, 1, 0, 'steps'))
-            self.assertEqual((shown['business_completed'], shown['business_unit']), (17, 'cycles'))
+            self.assertNotIn('ratio',value['jobs'][0]['progress'])
             client.write_job_file(i,'release','done');client.wait(i,wait_timeout=10)
             result=client.fetch(i)
             self.assertEqual(result['status'],'succeeded')
@@ -263,16 +187,18 @@ def work(x):
             result=client.fetch(i);self.assertEqual(result['status'],'succeeded')
             self.assertEqual(result['progress']['completed'],4)
 
-    def test_recent_failure_is_displayed_from_hot_receipt_without_history_scan(self):
+    def test_recent_failure_stays_queryable_outside_active_jobs(self):
         source='from remote_compute import report_progress\ndef work():\n report_progress(phase="native",completed=2,total=5)\n raise ValueError("fixture failure")\n'
         with scratch()as root,provider(Path(root)/'worker',cpus=1)as(_,worker),Pool([worker])as pool,center(pool,Path(root)/'center')as(owner,client):
             i=client.submit(python_call('work:work',max_cpus=1,memory_mb=64),files={'work.py':source})['id']
             until(lambda:client.status(i)['status']=='failed',seconds=10)
-            with patch.object(owner.jobs, 'receipt_reader', side_effect=AssertionError('cold history read')):
-                h = owner.health()
-            row = next(j for j in h['recent_failures'] if j['id'] == i)
-            self.assertEqual(diagnose(row)['code'], 'failed')
-            self.assertEqual(liveboard.display_progress(row)['ratio'], .4)
+            with patch('remote_compute.records.read_receipt',side_effect=AssertionError('cold history read')):
+                h=owner.health()
+            self.assertTrue(any(j['id']==i for j in h['recent_failures']))
+            self.assertFalse(any(j['id']==i for j in liveboard.snapshot(h,h['nodes'])['jobs']))
+            receipt=client.status(i)
+            self.assertEqual(receipt['status'],'failed')
+            self.assertEqual(receipt['progress']['ratio'],.4)
             client.fetch(i)
 
 

@@ -30,6 +30,8 @@ class PhaseClock:
 
 def summarize(root, received, started, ended):
     timing = dict(worker_received_to_process_seconds=None if started is None else max(0., started - received))
+    if started is not None:
+        timing['process_window_seconds'] = max(0., ended - started)
     if root is None or started is None:
         return timing
 
@@ -82,7 +84,6 @@ def summarize(root, received, started, ended):
         live[kind] += delta
         previous = stamp
     timing.update(worker_received_to_native_seconds=None if first_native is None else max(0., first_native - received),
-                  process_window_seconds=max(0., ended - started),
                   native_execution_seconds=totals[0] if events else None,
                   resource_wait_seconds=totals[1] if events else None,
                   other_execution_seconds=max(0., ended - started - sum(totals[:2])) if events else None)

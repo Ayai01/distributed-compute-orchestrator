@@ -56,7 +56,13 @@ def command_step_progress(value):
 
 def progress_fields(value):
     """Return cheap progress fields already present in a task snapshot."""
-    fields = {}
+    fields = {key: value[key] for key in (
+        'dispatch_stage', 'dispatch_stage_started_at', 'asset_preparation_seconds','worker_status',
+        'handoff_seconds', 'handoff_acknowledged_at', 'handoff_transport', 'worker_admission_seconds',
+        'bundle_unpack_seconds', 'preparation_stage', 'worker_sampled_at',
+        'worker_preparation_elapsed_seconds', 'execution_started', 'preparation_seconds',
+        'worker_receive_stage', 'worker_unpack_elapsed_seconds'
+    ) if key in value}
     progress = value.get('progress')
     from .progress import SCHEMA, normalize, diagnose
     business = isinstance(progress,dict) and progress.get('schema')==SCHEMA
@@ -88,6 +94,11 @@ def progress_fields(value):
         steps = command_step_progress(value)
         if steps is not None:
             fields.update(steps)
+            fields['step_progress'] = steps
+    elif 'step_progress' in value and not business:
+        steps = command_step_progress(value)
+        if steps is not None:
+            fields['step_progress'] = steps
     if isinstance(value.get('runtime'),dict):
         fields['runtime'] = {key:value['runtime'][key]for key in
             ('sampled_at','process_alive','returncode','cpu_seconds','last_cpu_advanced')if key in value['runtime']}

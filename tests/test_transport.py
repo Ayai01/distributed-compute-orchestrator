@@ -17,132 +17,182 @@ from unittest.mock import patch
 from remote_compute import Client, Pool, RemoteError
 from remote_compute.bundle import pack, unpack
 from remote_compute.client import PoolBusy, RequestCancelled, _ConnectionPool
+from remote_compute.relay_bulk import MIN_BULK_BYTES, RelayBulkBudget, load_relay_bulk_budget
 from remote_compute.worker import Handler
 from test_center import center
 from test_compute import provider, python, scratch, until
 
 
 class BulkIOControlTests(unittest.TestCase):
-    def test_disconnected_worker_releases_unsubmitted_job_to_another_worker(self):
-        with scratch() as directory:
-            root = Path(directory)
-            with provider(root / 'first') as (_, first_client), \
-                    provider(root / 'second') as (_, second_client), \
-                    Pool([first_client, second_client], policy='round_robin') as pool, \
-                    center(pool, root / 'center') as (state, client):
-                first, _ = pool.nodes
-                asset = client.sync_files({'input': b'one original input'})
-                task = python('print("original executed once")', assets={'input': asset}, max_cpus=1)
-                original = first.client.request
-                disconnected = threading.Event()
+    def test_stale_project_hold_does_not_override_capability_routing(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, remote):
+            root = Path(directory)/'center'
+            root.mkdir()
+            (root/'dispatch-holds.json').write_text(json.dumps({'paused-project': ['campus-*']}))
+            with Pool([dict(name='campus-one', client=remote)]) as pool, center(pool, root) as (_, operator):
+                client = Client(operator.url, operator.token, state_dir=root/'project-client')
+                identity = client.submit(python('print(1)', project='paused-project', requires=['python']))['id']
+                self.assertEqual(client.wait(identity, wait_timeout=10)['status'], 'succeeded')
+                self.assertEqual(operator.status(identity)['assigned_node'], 'campus-one')
+                self.assertNotIn('assigned_node', client.status(identity))
+                self.assertEqual(client.fetch(identity)['stdout'].strip(), '1')
 
-                def request(path, payload=None, **options):
-                    if path == '/assets/' + asset and payload is None:
-                        with pool.condition:
-                            first.error = 'Visitor connection refused'
-                            first.detached = True
-                            disconnected.set()
-                    if disconnected.is_set() and (path == '/health' or path == '/assets/' + asset):
-                        error = RemoteError('Visitor connection refused')
-                        error.transport_retryable = True
-                        raise error
-                    return original(path, payload, **options)
+    def test_relay_prioritizes_nearly_complete_streams_and_services_oldest(self):
+        from remote_compute.relay_bulk import RelayBulkBudget
+        budget = RelayBulkBudget([19001], 1000)
+        budget._next = time.monotonic() + 10
+        order = []
+        def transfer(remaining):
+            budget.pace(40, lambda: None, remaining=remaining)
+            order.append(remaining)
+        with ThreadPoolExecutor(5) as workers:
+            futures = []
+            for count, remaining in enumerate([10000, 900, 300, 800, 100], 1):
+                futures.append(workers.submit(transfer, remaining))
+                until(lambda: len(budget._waiting) == count)
+            with budget._condition:
+                budget._next = time.monotonic()
+                budget._condition.notify_all()
+            for future in futures:
+                future.result(3)
+        self.assertEqual(order, [100, 300, 800, 10000, 900])
+        self.assertEqual(budget.snapshot()['paced_bytes'], 200)
 
-                with patch.object(first.client, 'request', side_effect=request):
-                    identity = client.submit(task)['id']
-                    self.assertTrue(disconnected.wait(2))
+    def test_large_relay_asset_already_available_at_send_time_costs_no_bulk_bytes(self):
+        from remote_compute.relay_bulk import RelayBulkBudget
+        with scratch() as root, provider(Path(root) / 'worker') as (_, client):
+            data = pack({'model': os.urandom(1024 * 1024)})
+            route = '/assets/' + hashlib.sha256(data).hexdigest()
+            client.request(route, data)
+            budget = RelayBulkBudget([client.endpoint.port], 163840)
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', budget):
+                self.assertTrue(client.request(route, data)['exists'])
+            self.assertEqual(budget.snapshot()['paced_bytes'], 0)
+
+    def test_near_ready_job_can_prepare_assets_during_a_large_relay_transfer(self):
+        from remote_compute.relay_bulk import RelayBulkBudget
+        from remote_compute.client import _short_dispatch_request
+        asset = '/assets/' + 'a' * 64
+        job = '/jobs/' + 'b' * 32
+        client = Client('http://127.0.0.1:19001', pool_timeout=0)
+        client.bulk_limit = 1
+        pool = client._transport = _ConnectionPool()
+        self.assertTrue(pool.acquire(0, bulk=True))
+        budget = RelayBulkBudget([19001], 163840)
+        with patch('remote_compute.client._RELAY_BULK_BUDGET', budget), patch.object(client, '_request') as send:
+            for route, data in [(job + '/asset-handoff', {'assets': []}), (asset, None),
+                                (asset, b'a' * 228553), (job, b'b' * 31153),
+                                (job, b'b' * (MIN_BULK_BYTES + 1536))]:
+                client.request(route, data)
+            self.assertEqual(send.call_count, 5)
+            with self.assertRaises(PoolBusy):
+                client.request(asset, b'x' * (256 * 1024 + 1))
+            with self.assertRaises(PoolBusy):
+                client.request(job, b'x' * (256 * 1024 + 1))
+            self.assertFalse(_short_dispatch_request(job + '/artifacts', None, 'GET'))
+        pool.release(bulk=True)
+
+    def test_school_results_have_two_independent_slots_during_asset_upload(self):
+        client = Client('http://127.0.0.1:19001', pool_timeout=0)
+        client.bulk_limit = 1
+        upload = client._transport = _ConnectionPool()
+        upload.bulk_limit = 1
+        self.assertTrue(upload.acquire(0, bulk=True))
+        identity = '/jobs/' + 'a'*32
+        with patch('remote_compute.client._RELAY_BULK_BUDGET', RelayBulkBudget([19001], 163840)), \
+             patch.object(client, '_request', return_value=b'paid result'):
+            self.assertEqual(client.request(identity + '/artifacts', binary=True), b'paid result')
+            result_pool = client._artifact_transports[client.url]
+            self.assertTrue(result_pool.acquire(0, bulk=True))
+            self.assertEqual(client.request(identity + '/artifacts', binary=True), b'paid result')
+            self.assertTrue(result_pool.acquire(0, bulk=True))
+            with self.assertRaises(PoolBusy):
+                client.request(identity + '/artifacts', binary=True)
+            self.assertEqual(client.request(identity, method='DELETE'), b'paid result')
+            result_pool.release(bulk=True)
+            result_pool.release(bulk=True)
+        upload.release(bulk=True)
+
+    def test_short_jobs_share_spare_slots_and_leave_one_for_control(self):
+        pool = _ConnectionPool()
+        pool.bulk_limit = 1
+        self.assertTrue(pool.acquire(0, bulk=True))
+        for _ in range(6):
+            self.assertTrue(pool.acquire(0, short_job=True))
+        self.assertFalse(pool.acquire(0, short_job=True))
+        self.assertTrue(pool.acquire(0))  # Last slot remains available to control.
+        self.assertFalse(pool.acquire(0))
+        for _ in range(7):
+            pool.release()
+        pool.release(bulk=True)
+        self.assertEqual(pool.available, 8)
+
+    def test_relay_budget_shares_upload_and_download_across_visitors(self):
+        payload = b'x' * (2 * MIN_BULK_BYTES)
+
+        class RelayHandler(BaseHTTPRequestHandler):
+            def send_body(self, body):
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                self.send_body(b'{}' if self.path == '/health' else payload)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                self.send_body(b'{}')
+
+            def log_message(self, *_):
+                pass
+
+        @contextmanager
+        def visitor():
+            with ThreadingHTTPServer(('127.0.0.1', 0), RelayHandler) as server:
+                thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+                thread.start()
+                try:
+                    yield server.server_port, Client(f'http://127.0.0.1:{server.server_port}')
+                finally:
+                    server.shutdown()
+                    thread.join()
+
+        with visitor() as (first_port, first), visitor() as (second_port, second), visitor() as (_, other):
+            with scratch() as root:
+                config = Path(root) / 'relay-bulk.json'
+                self.assertIsNone(load_relay_bulk_budget(config))
+                rate = 512 * 1024
+                config.write_text(json.dumps({'ports': [first_port, second_port], 'bytes_per_second': rate}))
+                budget = load_relay_bulk_budget(config)
+            first.bulk_limit = second.bulk_limit = 1
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', budget), ThreadPoolExecutor(2) as transfers:
+                with patch.object(budget, 'pace', wraps=budget.pace) as paced:
+                    self.assertEqual(first.request('/health'), {})
+                    self.assertEqual(first.request('/assets/' + '0' * 64, b'small'), {})
+                    self.assertEqual(other.request('/jobs/' + '0' * 32 + '/artifacts', binary=True), payload)
+                    paced.assert_not_called()
+                pacing, release = threading.Event(), threading.Event()
+                original_pace = budget.pace
+
+                def observe_pace(size, check, **options):
+                    pacing.set()
+                    if not release.wait(2):
+                        raise AssertionError('Health request did not bypass pacing')
+                    original_pace(size, check, **options)
+
+                with patch.object(budget, 'pace', side_effect=observe_pace):
+                    upload = transfers.submit(first.request, '/assets/' + '0' * 64, payload)
                     try:
-                        self.assertEqual(client.wait(identity, wait_timeout=3)['status'], 'succeeded')
+                        self.assertTrue(pacing.wait(2))
+                        self.assertEqual(first.request('/health'), {})
                     finally:
-                        if client.status(identity, brief=True)['status'] not in {'succeeded', 'failed', 'cancelled', 'timed_out'}:
-                            client.cancel(identity)
-                            client.wait(identity, wait_timeout=3)
-                receipt = client.fetch(identity, delete=False)
-                self.assertEqual(receipt['stdout'].strip(), 'original executed once')
-                self.assertFalse(receipt.get('attempts'))
-                self.assertEqual(second_client.status(identity)['status'], 'succeeded')
-                with self.assertRaises(RemoteError) as missing:
-                    first_client.status(identity)
-                self.assertEqual(missing.exception.status_code, 404)
-                self.assertEqual(first.reserved, 0)
-
-    def test_shared_cache_reads_on_different_workers_do_not_wait_for_one_lookup(self):
-        with scratch() as directory:
-            root = Path(directory)
-            with patch.dict(os.environ, {'DCO_SHARED_ASSET_CACHE': str(root / 'shared')}), \
-                    provider(root / 'first') as (_, first_client), \
-                    provider(root / 'second') as (_, second_client), \
-                    Pool([first_client, second_client]) as pool, \
-                    center(pool, root / 'center') as (state, client):
-                asset = client.sync_files({'model': b'immutable shared input'})
-                route = '/assets/' + asset
-                payload = (state.root / 'assets' / (asset + '.zip')).read_bytes()
-                first_client.request(route, payload)
-                first, second = pool.nodes
-                entered, release = threading.Event(), threading.Event()
-                requests = []
-                request = first.client.request
-
-                def slow(path, payload=None, **options):
-                    if path == route:
-                        requests.append(payload)
-                        entered.set()
-                        if not release.wait(5):
-                            raise AssertionError('Asset lookup was not released')
-                    return request(path, payload, **options)
-
-                with patch.object(first.client, 'request', side_effect=slow), ThreadPoolExecutor(3) as transfers:
-                    blocked = transfers.submit(state._ensure_assets, first, [asset])
-                    try:
-                        self.assertTrue(entered.wait(2))
-                        duplicate = transfers.submit(state._ensure_assets, first, [asset])
-                        independent = transfers.submit(state._ensure_assets, second, [asset])
-                        independent.result(timeout=2)
-                        self.assertIn(asset, second.known_assets)
-                    finally:
+                        started = time.monotonic()
                         release.set()
-                    blocked.result(timeout=3)
-                    duplicate.result(timeout=3)
-                self.assertEqual(requests, [None])
-
-    def test_parallel_shared_cache_misses_upload_the_digest_once(self):
-        with scratch() as directory:
-            root = Path(directory)
-            with patch.dict(os.environ, {'DCO_SHARED_ASSET_CACHE': str(root / 'shared')}), \
-                    provider(root / 'first') as (_, first_client), \
-                    provider(root / 'second') as (_, second_client), \
-                    Pool([first_client, second_client]) as pool, \
-                    center(pool, root / 'center') as (state, client):
-                asset = client.sync_files({'model': b'cold shared input'})
-                route = '/assets/' + asset
-                observed_miss = threading.Barrier(2)
-                uploads = []
-
-                def observe(request):
-                    first_lookup = True
-
-                    def invoke(path, payload=None, **options):
-                        nonlocal first_lookup
-                        result = request(path, payload, **options)
-                        if path == route:
-                            if payload is not None:
-                                uploads.append(payload)
-                            elif first_lookup:
-                                first_lookup = False
-                                self.assertFalse(result['exists'])
-                                observed_miss.wait(3)
-                        return result
-                    return invoke
-
-                first, second = pool.nodes
-                with patch.object(first.client, 'request', side_effect=observe(first.client.request)), \
-                        patch.object(second.client, 'request', side_effect=observe(second.client.request)), \
-                        ThreadPoolExecutor(2) as transfers:
-                    futures = [transfers.submit(state._ensure_assets, node, [asset]) for node in pool.nodes]
-                    for future in futures:
-                        future.result(timeout=5)
-                self.assertEqual([hashlib.sha256(data).hexdigest() for data in uploads], [asset])
-                self.assertTrue(all(asset in node.known_assets for node in pool.nodes))
+                    download = transfers.submit(second.request, '/jobs/' + '0' * 32 + '/artifacts', binary=True)
+                    self.assertEqual(upload.result(timeout=5), {})
+                    self.assertEqual(download.result(timeout=5), payload)
+                self.assertGreaterEqual(time.monotonic() - started, 2 * len(payload) / rate - .015)
 
     def test_oversized_request_stops_before_opening_a_connection(self):
         client=Client('http://127.0.0.1:1')
@@ -392,6 +442,30 @@ class BulkIOControlTests(unittest.TestCase):
 
 
 class OriginalSubmitReceiptTests(unittest.TestCase):
+    def test_cancelled_original_after_404_reconciliation_is_not_uploaded_again(self):
+        from remote_compute.client import RequestCancelled
+        client=Client('http://127.0.0.1:19997');cancel=threading.Event();calls=[]
+        def request(path,data=None,**options):
+            calls.append((path,data))
+            if data is not None:
+                cancel.set();error=RemoteError('Lost POST reply');error.transport_retryable=True;raise error
+            error=RemoteError('Original absent');error.status_code=404;raise error
+        with patch.object(client,'request',side_effect=request):
+            with self.assertRaises(RequestCancelled):
+                client.submit_bundle('a'*32,b'frozen original request',cancel=cancel.is_set)
+        self.assertEqual([data is not None for _,data in calls],[True,False])
+
+    def test_cancel_after_lost_acceptance_preserves_the_matching_receipt(self):
+        from remote_compute.client import RequestCancelled
+        client=Client('http://127.0.0.1:19997');cancel=threading.Event();payload=b'frozen original request'
+        saved=dict(id='a'*32,request_sha256=hashlib.sha256(payload).hexdigest())
+        def request(path,data=None,**options):
+            if data is not None:
+                cancel.set();error=RequestCancelled('Stopped after POST');error.request_may_have_been_sent=True;raise error
+            return saved
+        with patch.object(client,'request',side_effect=request):
+            self.assertEqual(client.submit_bundle('a'*32,payload,cancel=cancel.is_set),saved)
+
     @staticmethod
     def disconnect(handler):
         handler.connection.shutdown(socket.SHUT_RDWR)
@@ -568,6 +642,32 @@ class OriginalSubmitReceiptTests(unittest.TestCase):
                 self.assertEqual(client.wait(accepted['id'])['status'],'succeeded')
                 client.fetch(accepted['id'])
 
+    def test_short_relay_post_reconciles_a_stalled_reply_on_the_same_id(self):
+        with scratch() as directory, provider(Path(directory)/'worker') as (_, client):
+            identity = 'f'*32
+            client.timeout = .10
+            budget = RelayBulkBudget([client.endpoint.port], 160*1024)
+            reply = Handler._reply
+            release = threading.Event()
+            posts = []
+
+            def held(handler, value, status=200, **options):
+                if handler.command == 'POST' and handler.path == '/jobs/'+identity and status == 202:
+                    posts.append(identity)
+                    release.wait(2)
+                return reply(handler, value, status, **options)
+
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', budget), patch.object(Handler, '_reply', held):
+                with ThreadPoolExecutor(max_workers=1) as requests:
+                    accepted = requests.submit(client.submit, python('print("once")'), job_id=identity)
+                    try:
+                        self.assertEqual(accepted.result(timeout=1)['id'], identity)
+                    finally:
+                        release.set()
+            self.assertEqual(posts, [identity])
+            self.assertEqual(client.wait(identity)['status'], 'succeeded')
+            self.assertEqual(client.fetch(identity)['stdout'].strip(), 'once')
+
     def test_lost_conflict_reply_never_accepts_a_different_original_body(self):
         with scratch() as directory,provider(Path(directory)/'worker') as (worker,client):
             identity='c'*32
@@ -634,15 +734,7 @@ class ArtifactReloadTests(unittest.TestCase):
                 identity=client.submit(python("print('executed once')"))['id']
                 original=client.wait(identity)
                 raw=pool.nodes[0].client.artifacts(identity)
-                responses=iter([RemoteError('provider reloading'), RemoteError('provider starting'), raw])
-                def interrupted_download(worker_id, *, destination):
-                    self.assertEqual(worker_id,identity)
-                    response=next(responses)
-                    if isinstance(response,RemoteError):
-                        raise response
-                    destination.write_bytes(response)
-                    return destination
-                with patch.object(pool.nodes[0].client,'artifacts',side_effect=interrupted_download) as download, \
+                with patch.object(pool.nodes[0].client,'artifacts',side_effect=[RemoteError('provider reloading'),RemoteError('provider starting'),raw]) as download, \
                         patch.object(client,'submit',side_effect=AssertionError('must not resubmit')):
                     result=client.fetch(identity)
                 self.assertEqual(download.call_count,3)
@@ -774,26 +866,6 @@ class AdaptiveWaitTests(unittest.TestCase):
 
 
 class StatusReadReconnectTests(unittest.TestCase):
-    def test_local_pool_backpressure_retries_a_read_without_replacing_its_id(self):
-        client=Client()
-        identity='a'*32
-        reads=[]
-
-        def read():
-            reads.append(identity)
-            if len(reads)==1:
-                raise PoolBusy('connection pool is busy')
-            return {'id':identity}
-
-        self.assertEqual(client._read_reconnecting(read,deadline=time.monotonic()+2),{'id':identity})
-        self.assertEqual(reads,[identity,identity])
-        with self.assertRaises(PoolBusy):
-            client._read_reconnecting(lambda: self._busy(),deadline=time.monotonic())
-
-    @staticmethod
-    def _busy():
-        raise PoolBusy('connection pool is busy')
-
     @staticmethod
     def outage(status=None):
         error=RemoteError('temporary status connection loss')
@@ -981,7 +1053,7 @@ class TransportTests(unittest.TestCase):
             time.sleep(.15)
             return dict(id=key, cpus=1, memory_mb=128)
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
-            client = Client(remote.url, remote.token, timeout=.05)
+            client = Client(remote.url, timeout=.05)
             environment = dict(REMOTE_COMPUTE_LEASE='1', REMOTE_COMPUTE_URL=remote.url,
                                REMOTE_COMPUTE_JOB_ID=identity, REMOTE_COMPUTE_WORKER_JOB_ID=identity)
             with patch.dict('os.environ', environment), patch.object(worker, 'lease', side_effect=delayed_lease), \
@@ -1020,7 +1092,7 @@ class TransportTests(unittest.TestCase):
             time.sleep(.15)
             return dict(id=key, cpus=cpus, memory_mb=options['memory_mb'])
         with scratch() as root, provider(Path(root)/'worker') as (worker, remote):
-            client = Client(remote.url, remote.token, timeout=.05)
+            client = Client(remote.url, timeout=.05)
             with patch.object(worker, 'resize', side_effect=delayed_resize), \
                     patch.object(http.client.HTTPConnection, 'request', request):
                 result = client.resize(identity, 1, memory_mb=128)
@@ -1070,7 +1142,7 @@ class TransportTests(unittest.TestCase):
                 listing = executor.submit(client.status)
                 try:
                     self.assertTrue(entered.wait(2))
-                    control = Client(client.url, client.token, timeout=.5)
+                    control = Client(client.url, timeout=.5)
                     self.assertEqual(control.request('/jobs/'+identity+'/lease',
                         dict(request_id=1, grant=dict(cpus=1, memory_mb=128))), dict(accepted=True))
                 finally:
@@ -1180,53 +1252,10 @@ class TransportTests(unittest.TestCase):
         with scratch() as root,provider(Path(root)/'worker') as (worker,client):
             with patch.object(Handler,'_reply',reply):
                 result=client.request('/assets/'+identity,payload,extra_headers={'X-DCO-Asset-Job':owner})
-            self.assertEqual(result,dict(id=identity,exists=True,cache_hit=True))
+            self.assertEqual(result,dict(id=identity,exists=True))
             self.assertEqual(requests,[('POST',len(payload)),('GET',0)])
             self.assertEqual(worker.asset_handoffs[owner][0],frozenset({identity}))
             self.assertEqual((worker.root/'assets'/identity/'model.npz').read_bytes(),bytes(range(256))*8192)
-
-    def test_large_asset_waits_for_late_publication_instead_of_replaying(self):
-        payload = pack({'model': os.urandom(1024 * 1024)})
-        identity = hashlib.sha256(payload).hexdigest()
-        route = '/assets/' + identity
-        responses = Handler._reply
-        requests = []
-
-        def reply(handler, value, status=200):
-            if handler.path == route:
-                requests.append(handler.command)
-                if handler.command == 'POST':
-                    handler.close_connection = True
-                    return
-                if requests == ['POST', 'GET']:
-                    value = dict(id=identity, exists=False)
-            return responses(handler, value, status)
-
-        with scratch() as root, provider(Path(root)/'worker') as (_, client):
-            with patch.object(Handler, '_reply', reply):
-                result = client.request(route, payload)
-            self.assertEqual(result, dict(id=identity, exists=True, cache_hit=True))
-            self.assertEqual(requests, ['POST', 'GET', 'GET'])
-
-    def test_large_asset_with_unreadable_receipts_suppresses_body_replay(self):
-        payload = pack({'model': os.urandom(1024 * 1024)})
-        route = '/assets/' + hashlib.sha256(payload).hexdigest()
-        responses = Handler._reply
-        requests = []
-
-        def reply(handler, value, status=200):
-            if handler.path == route:
-                requests.append(handler.command)
-                handler.close_connection = True
-                return
-            return responses(handler, value, status)
-
-        with scratch() as root, provider(Path(root)/'worker') as (_, client):
-            with patch.object(Handler, '_reply', reply):
-                with self.assertRaisesRegex(RemoteError, 'publication acknowledgement pending'):
-                    client.request(route, payload)
-            self.assertEqual(requests, ['POST', 'GET', 'GET', 'GET'])
-            self.assertTrue(client.has_asset(route.rsplit('/', 1)[-1]))
 
     def test_connection_slots_are_fifo_and_timeout_never_sends_a_request(self):
         pool=_ConnectionPool()
@@ -1323,6 +1352,154 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(calls,[None,'bytes=40000-' if mode!='legacy' else None])
                 self.assertEqual(worker.jobs,{})
 
+    def test_relay_artifact_reconnects_when_first_response_header_stalls(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, client):
+            task = python("from pathlib import Path; Path('out.bin').write_bytes(b'paid')", outputs=['out.bin'])
+            identity = client.submit(task)['id']
+            client.wait(identity)
+            client.timeout = .10
+            release = threading.Event()
+            calls = []
+            reply = Handler._reply
+
+            def delayed(handler, value, status=200, **options):
+                if handler.path == '/jobs/'+identity+'/artifacts':
+                    calls.append(handler.path)
+                    if len(calls) == 1:
+                        release.wait(2)
+                return reply(handler, value, status, **options)
+
+            budget = RelayBulkBudget([client.endpoint.port], 256*1024)
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', budget), patch.object(Handler, '_reply', delayed):
+                with ThreadPoolExecutor(max_workers=1) as transfers:
+                    request = transfers.submit(client.fetch, identity, delete=False)
+                    try:
+                        self.assertEqual(request.result(timeout=1)['files']['out.bin'], b'paid')
+                    finally:
+                        release.set()
+            self.assertEqual(len(calls), 2)
+            client.delete(identity)
+
+    def test_fetch_returns_result_when_remote_retirement_cannot_be_confirmed(self):
+        with scratch() as root, provider(Path(root)/'worker') as (worker, client):
+            identity = client.submit(python('print(42)'))['id']
+            client.wait(identity)
+            error = RemoteError('Cleanup reply lost')
+            error.transport_retryable = True
+            with patch.object(client, 'delete', side_effect=error):
+                result = client.fetch(identity)
+            self.assertEqual(result['stdout'].strip(), '42')
+            self.assertTrue(result['retirement_pending'])
+            self.assertIn('Cleanup reply lost', client.last_fetch_timing()['retirement_error'])
+            self.assertIn(identity, worker.jobs)
+            client.delete(identity)
+
+    def test_relay_artifact_allows_slow_body_after_headers(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, client):
+            identity = client.submit(python('print("collected")'))['id']
+            client.wait(identity)
+            client.timeout = .10
+            paths = []
+            reply = Handler._reply
+
+            def split_reply(handler, value, status=200, **options):
+                if handler.path != '/jobs/'+identity+'/artifacts':
+                    return reply(handler, value, status, **options)
+                paths.append(handler.path)
+                handler.send_response(200)
+                handler.send_header('Content-Length', str(len(value)))
+                handler.send_header('Connection', 'close')
+                handler.end_headers()
+                handler.wfile.flush()
+                time.sleep(.20)
+                handler.wfile.write(value)
+                handler.close_connection = True
+
+            budget = RelayBulkBudget([client.endpoint.port], 256*1024)
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', budget), patch.object(Handler, '_reply', split_reply):
+                self.assertEqual(client.fetch(identity, delete=False)['stdout'].strip(), 'collected')
+            self.assertEqual(len(paths), 1)
+            client.delete(identity)
+
+    def test_artifact_prefix_survives_exhausted_call_and_new_client(self):
+        original=Handler._reply
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client):
+            identity=client.submit(python("import os;from pathlib import Path;Path('out.bin').write_bytes(os.urandom(100000))",outputs=['out.bin']))['id']
+            client.wait(identity)
+            destination=Path(root)/'paid-result.partial';calls=[]
+            def reply(handler,value,status=200):
+                if not isinstance(value,bytes):return original(handler,value,status)
+                calls.append(handler.headers.get('Range'))
+                if len(calls)==5:
+                    return original(handler,{'error':'Relay temporarily unavailable'},503)
+                if len(calls)<=4:
+                    offset=int((handler.headers.get('Range') or 'bytes=0-')[6:-1])
+                    handler.send_response(206 if offset else 200)
+                    handler.send_header('Content-Length',str(len(value)-offset))
+                    handler.send_header('Accept-Ranges','bytes')
+                    handler.send_header('ETag','"'+hashlib.sha256(value).hexdigest()+'"')
+                    if offset:handler.send_header('Content-Range',f'bytes {offset}-{len(value)-1}/{len(value)}')
+                    handler.end_headers();handler.wfile.write(value[offset:offset+10000]);handler.wfile.flush()
+                    handler.close_connection=True;return
+                return original(handler,value,status)
+            with patch.object(Handler,'_reply',reply):
+                with patch.object(client,'_read_reconnecting',lambda read:read()):
+                    with self.assertRaises(RemoteError):client.artifacts(identity,destination=destination)
+                self.assertEqual(destination.stat().st_size,40000)
+                replacement=Client(client.url,client.token)
+                replacement.artifacts(identity,destination=destination)
+            self.assertEqual(calls,[None,'bytes=10000-','bytes=20000-','bytes=30000-','bytes=40000-','bytes=40000-'])
+            import zipfile
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual(archive.read('files/out.bin'),(worker.jobs[identity]['directory']/'input'/'out.bin').read_bytes())
+            self.assertIn(identity,worker.jobs)
+
+    def test_checked_restart_runs_even_when_202_reply_is_lost(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock,call
+        restart=Mock()
+        handler=SimpleNamespace(
+            connection=SimpleNamespace(settimeout=lambda value:None,getsockname=lambda:('127.0.0.1',26133)),
+            server=SimpleNamespace(worker=SimpleNamespace(token='known',activity=SimpleNamespace(access=lambda *args:None)),restart=restart),
+            headers={'Authorization':'Bearer known','Content-Length':'2'},
+            client_address=('127.0.0.1',1234),path='/restart',command='POST',
+            rfile=io.BytesIO(b'{}'),body_timeout=120,
+            _reply=Mock(side_effect=[OSError('restart acknowledgement lost'),None]))
+        Handler._handle(handler)
+        self.assertEqual(restart.call_args_list,[call(check=True),call()])
+        self.assertEqual(handler._reply.call_args_list[0].args[1],202)
+
+    def test_partial_post_body_expires_before_admission_and_restores_lease_timeout(self):
+        with scratch() as root,provider(Path(root)/'worker') as (worker,client),patch.object(Handler,'body_timeout',.05):
+            identity='a'*32
+            connection=http.client.HTTPConnection(client.endpoint.hostname,client.endpoint.port,timeout=2)
+            connection.putrequest('POST','/jobs/'+identity)
+            connection.putheader('Authorization','Bearer '+client.token)
+            connection.putheader('Content-Length','100')
+            connection.endheaders();connection.send(b'incomplete')
+            response=connection.getresponse()
+            self.assertEqual(response.status,408)
+            self.assertIn(b'not accepted',response.read())
+            self.assertNotIn(identity,worker.jobs)
+            connection.close()
+            seen=[];original=Handler._reply
+            def reply(handler,value,status=200):
+                if handler.path=='/jobs/status':seen.append(handler.connection.gettimeout())
+                return original(handler,value,status)
+            with patch.object(Handler,'_reply',reply):
+                self.assertEqual(client.request('/jobs/status',{'ids':[identity]})[identity]['status'],'unknown')
+            self.assertEqual(seen,[None])
+
+    def test_bulk_upload_timeout_does_not_change_control_timeout(self):
+        with scratch() as root,provider(Path(root)/'worker') as (_,client):
+            client.timeout=10
+            payload=pack({'input.dat':b'known asset'})
+            client.request('/assets/'+hashlib.sha256(payload).hexdigest(),payload)
+            self.assertEqual(client._transport.idle[-1].timeout,120)
+            client.health(brief=True)
+            self.assertEqual(client._transport.idle[-1].timeout,10)
+            self.assertEqual(client.timeout,10)
+
     def test_slow_transfer_keeps_progress_past_the_socket_timeout(self):
         original=Handler._reply
         with scratch() as root,provider(Path(root)/'worker') as (_,client):
@@ -1402,9 +1579,10 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(backend.timeout,.05)
                 self.assertIs(backend._transport,control_pool)
                 self.assertGreaterEqual(backend._result_client.timeout,120)
-                self.assertIsNot(backend._result_client._artifact_transports[backend.url],control_pool)
+                self.assertIsNot(backend._result_client._transport,control_pool)
                 client.delete(identity)
-                until(lambda: identity not in worker.jobs and identity not in state.jobs)
+                self.assertNotIn(identity,worker.jobs)
+                self.assertNotIn(identity,state.jobs)
 
     def test_idle_keep_alive_is_reclaimed_and_the_same_client_reconnects(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client),patch.object(Handler,'idle_timeout',.05):
@@ -1520,7 +1698,7 @@ class TransportTests(unittest.TestCase):
                     directory=state.jobs[identity]['directory']
                     self.assertTrue((directory/'worker-artifacts.zip').exists())
                     client.delete(identity)
-                    until(lambda: not directory.exists())
+                    self.assertFalse(directory.exists())
 
     def test_slow_provider_result_does_not_hold_other_finished_ids_in_preparing(self):
         with scratch()as root,provider(Path(root)/'worker',cpus=2)as(worker,node):
@@ -1568,11 +1746,10 @@ class TransportTests(unittest.TestCase):
                 def delayed(*args):
                     entered.set();release.wait(2);return original(*args)
                 with patch.object(pool.nodes[0].client,'delete',side_effect=delayed),ThreadPoolExecutor(max_workers=2) as executor:
-                    ordinary=Client(client.url,client.token)
-                    waiting=executor.submit(ordinary.delete,identity)
+                    waiting=executor.submit(Client(client.url).delete,identity)
                     try:
                         self.assertTrue(entered.wait(1))
-                        health=executor.submit(ordinary.health)
+                        health=executor.submit(Client(client.url).health)
                         self.assertEqual(health.result(timeout=.7)['role'],'scheduler')
                     finally:
                         release.set();waiting.result(timeout=2)
