@@ -11,7 +11,8 @@ import test_center as center_fixtures
 
 class UncachedCenter(Coordinator):
     def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, fixed_claims=None):
-        return super()._cooperative_cpu_target(identity, desired, resources)
+        return super()._cooperative_cpu_target(identity, desired, resources,
+                                                warm_cache={} if warm_cache is not None else None)
 
 
 class GrowthReuseTests(unittest.TestCase):

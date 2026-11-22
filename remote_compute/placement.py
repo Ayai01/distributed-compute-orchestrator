@@ -395,7 +395,6 @@ class PlacementPlanning:
             # threads. The same group has one unchanged warm plan;
             # wider idle growth is handled separately at the phase boundary.
             warm_cache.setdefault('warm',{})[group]=warm
-        if desired<=4:
             return min(share_room,max(1,warm.get(identity,{}).get(current['node'].name,0)))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
         entrants=weighted_node_threads(spare,{key:priority_weight(members[key]['task'].get('priority')) for key in waiting},waiting,rooms)

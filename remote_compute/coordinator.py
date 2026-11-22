@@ -3,7 +3,7 @@
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
-from copy import deepcopy
+from copy import copy, deepcopy
 import io
 import json
 from pathlib import Path
@@ -1111,6 +1111,16 @@ class Coordinator(PlacementPlanning):
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
                 task = build_refs.bind(self.root, task)
                 task = self._cache_placement(task) if operator else package_task(task, package, accelerator)
+                if not operator and (abi := task.get('_artifact_abi')) is not None:
+                    portable = dict(task)
+                    portable.pop('_artifact_abi')
+                    pool = copy(self.pool)
+                    with self.pool.condition:
+                        pool.nodes = [copy(node) for node in self.pool.nodes]
+                    narrows_pool = any(build_refs.provider_abi(node.health) != abi for node in pool._matching(portable))
+                    if narrows_pool:
+                        raise ValueError('A native artifact or checkpoint must not narrow the capability pool. '
+                                         'Submit the frozen sources and resolve or build the native artifact on the assigned worker.')
             with self.condition:
                 self._validate_project_share(task)
             with self.asset_cache.lock:

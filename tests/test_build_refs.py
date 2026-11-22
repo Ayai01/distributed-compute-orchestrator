@@ -30,6 +30,31 @@ def record(name, result):
 
 
 class BuildReferenceTests(unittest.TestCase):
+    def test_public_native_reference_cannot_narrow_capability_pool(self):
+        with scratch() as folder:
+            root = Path(folder)
+            with execution_provider(root / 'one') as (_, first), execution_provider(root / 'two') as (other, second):
+                health = other.health
+
+                def different_abi(**options):
+                    return dict(health(**options), artifact_abi=['linux', 'aarch64', 'glibc 2.38'])
+
+                with patch.object(other, 'health', side_effect=different_abi), Pool([
+                    dict(name='one', client=first), dict(name='two', client=second)
+                ]) as pool, center(pool, root / 'center') as (_, operator):
+                    project = Client(operator.url, operator.token)
+                    producer = python("from pathlib import Path; Path('built').write_text('ready')", node='one',
+                                      project=PROJECT, outputs=['built'],
+                                      produces_artifact_ref=dict(paths=['built'], recipe_sha256=RECIPE))
+                    ref = operator.run(producer)['artifact_ref']
+                    pinned = python('print(1)', project=PROJECT, artifact_ref=ref)
+                    with self.assertRaisesRegex(RemoteError, 'must not narrow the capability pool'):
+                        project.submit(pinned)
+                    original = operator.submit(pinned)['id']
+                    self.assertEqual(project.submit(pinned, job_id=original)['id'], original)
+                    self.assertEqual(project.wait(original)['status'], 'succeeded')
+                    self.assertEqual(project.run(python('print(2)', project=PROJECT))['stdout'].strip(), '2')
+
     def test_same_build_coalesces_and_eight_consumers_share_one_upload(self):
         with scratch() as folder:
             root = Path(folder)

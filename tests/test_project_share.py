@@ -173,6 +173,14 @@ class ProjectShareTests(unittest.TestCase):
         urgent['desired_cpus']=2
         self.assertEqual(s._cooperative_cpu_target('regular',16,s.project_resources()),14)
 
+    def test_small_phase_uses_the_same_ratio_as_a_wider_peer(self):
+        s=self.state(8)
+        self.job(s,'regular','A',desired=4,priority=1)
+        self.job(s,'urgent','A',desired=8,priority=3)
+        resources=s.project_resources()
+        self.assertEqual(s._cooperative_cpu_target('regular',4,resources),2)
+        self.assertEqual(s._cooperative_cpu_target('urgent',8,resources),6)
+
     def test_terminal_or_recovering_projects_do_not_enter_growth_comparison(self):
         for status in('succeeded','recovering'):
             s=self.state();old=self.job(s,'old','old')
