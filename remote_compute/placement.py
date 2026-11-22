@@ -5,7 +5,7 @@ import json
 import math
 import time
 
-from .allocation import plan_resize, startup_cpus, weighted_node_threads
+from .allocation import plan_resize, queued_uses_node, startup_cpus, weighted_node_threads
 from .bundle import TERMINAL
 from .memory import plan_memory, same_phase
 from .policy import priority_weight
@@ -40,7 +40,7 @@ def _copy_node(node):
     # resource ledger entries that can be changed in place during planning.
     view.health = node.health.copy()
     view.live_jobs = node.live_jobs.copy()
-    view.memory_holds = {key: hold.copy() for key, hold in node.memory_holds.items()}
+    view.memory_holds = {key: hold.copy() for key, hold in node.memory_holds.copy().items()}
     view.ram_holds = node.ram_holds.copy()
     view.accelerator_reservations = node.accelerator_reservations.copy()
     view.external_accelerator_reservations = list(node.external_accelerator_reservations)
@@ -397,14 +397,12 @@ class PlacementPlanning:
             warm_cache.setdefault('warm',{})[group]=warm
             return min(share_room,max(1,warm.get(identity,{}).get(current['node'].name,0)))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
-        entrants=weighted_node_threads(spare,{key:priority_weight(members[key]['task'].get('priority')) for key in waiting},waiting,rooms)
-        # A ready entrant owns this opportunity until the scheduler admits it.
-        # Wider running phases may still use other nodes with no ready entrant.
-        for node_name in spare:
-            if any(row.get(node_name,0) for row in entrants.values()):
-                capacities[node_name]-=spare[node_name]
-        planned=weighted_node_threads(capacities,shares,running,rooms)
         name=current['node'].name
+        # All running members are pinned. Only the entrant reservation on the
+        # caller's node can change its grant; entrants still share the whole pool.
+        if queued_uses_node(name,spare,{key:priority_weight(members[key]['task'].get('priority')) for key in waiting},waiting,rooms):
+            capacities[name]-=spare[name]
+        planned=weighted_node_threads(capacities,shares,running,rooms)
         target=min(share_room,max(1,planned.get(identity,{}).get(name,0)))
         return target
 
@@ -412,17 +410,20 @@ class PlacementPlanning:
 class PlacementSnapshot(PlacementPlanning):
     """Private view of the ledger. Calculations never acquire service locks."""
 
-    def __init__(self, state):
+    def __init__(self, state, *, display=False):
+        self.display = display
         self.pool = copy(state.pool)
-        self.pool.nodes = [_copy_node(node) for node in state.pool.nodes]
+        self.pool.nodes = [_copy_node(node) for node in tuple(state.pool.nodes)]
         self.nodes = {node.name: node for node in self.pool.nodes}
-        self.queue = dict.fromkeys(state.queue)
-        self.jobs = {key: self._copy_job(job) for key, job in active_items(state.jobs)}
+        queue = tuple(state.queue)
+        self.jobs = {key: self._copy_job(job) for key, job in active_items(state.jobs, snapshot=display)}
+        self.queue = {key:None for key in queue if key in self.jobs}
         self.committed = None
 
     def _copy_job(self, job):
         held = job.get('node')
-        return dict(job, task=job.get('task', {}).copy(), result=job['result'].copy(),
+        result=(job.get('read_result') or job['result']) if self.display else job['result']
+        return dict(job, task=job.get('task', {}).copy(), result=result.copy(),
                     node=self.nodes.get(held.name) if held else None)
 
     def record_dispatch(self, identity, job, node):

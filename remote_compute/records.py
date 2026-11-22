@@ -327,9 +327,10 @@ class JobRecords(MutableMapping):
             for job in self.active.values())
 
 
-def active_items(records):
+def active_items(records, *, snapshot=False):
     # Small isolated allocation fixtures also use ordinary dictionaries.
-    return (records.active if isinstance(records, JobRecords) else records).items()
+    active = records.active if isinstance(records, JobRecords) else records
+    return (active.copy() if snapshot else active).items()
 
 
 def load_job(records, condition, identity):

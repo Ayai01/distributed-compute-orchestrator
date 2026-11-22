@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -114,6 +115,24 @@ class GrantPersistenceTests(unittest.TestCase):
                     operator.write_job_file(original, 'release', 'finish')
                 self.assertEqual(operator.wait(original, wait_timeout=6)['status'], 'succeeded')
                 self.assertEqual(operator.wait(queued, wait_timeout=6)['status'], 'succeeded')
+
+    def test_display_refreshes_an_expired_sample_while_both_scheduling_locks_are_held(self):
+        with scratch() as folder:
+            root = Path(folder)
+            with provider(root / 'worker') as (_, worker), Pool([worker]) as pool, \
+                    center(pool, root / 'center') as (state, operator), \
+                    ThreadPoolExecutor(max_workers=1) as callers:
+                first = operator.health(display=True)
+                with state.condition, pool.condition:
+                    _, sample_at, payload = state._display_health_cache
+                    state._display_health_cache = (time.monotonic() - 60, sample_at, payload)
+                    cached = callers.submit(operator.health, display=True).result(timeout=2)
+                    self.assertGreaterEqual(cached['health_sampled_at'], first['health_sampled_at'])
+                    until(lambda: state._display_health_cache[1] > first['health_sampled_at'], seconds=2)
+                    refreshed = callers.submit(operator.health, display=True).result(timeout=2)
+                    self.assertGreater(refreshed['health_sampled_at'], first['health_sampled_at'])
+                    self.assertEqual(len(refreshed['nodes']), 1)
+                    self.assertEqual((refreshed['used_cpus'], refreshed['queued']), (0, 0))
 
     def check_stale_grant(self, *, retire):
         with scratch() as folder:

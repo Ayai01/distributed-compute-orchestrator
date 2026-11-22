@@ -113,20 +113,27 @@ def weighted_node_threads(capacities, shares, demands, rooms, *, current_used=No
                     heapq.heappush(queue,(rank(name),name))
         return placed
     degree={node:sum(node in edges for edges in rooms.values()) for node in capacities}
+    order={name:index for index,name in enumerate(shares)}
+    donors={node:set() for node in capacities}
+    def add(name,node):
+        placed[name][node]+=1
+        if len(placed[name])>1:donors[node].add(name)
     def place(name,seen):
         nodes=[node for node in placed[name] if node in capacities and node not in seen
                and placed[name][node]<rooms[name][node]]
         nodes.sort(key=lambda node:(used[node]>=capacities[node],
                                    degree[node],node))
         for node in nodes:
+            if node in seen:continue
             seen.add(node)
             if used[node]<capacities[node]:
-                placed[name][node]+=1;used[node]+=1
+                add(name,node);used[node]+=1
                 return True
-            for other in shares:
-                if other!=name and len(placed[other])>1 and placed[other].get(node,0) and place(other,seen):
+            for other in sorted(donors[node],key=order.__getitem__):
+                if other!=name and place(other,seen):
                     placed[other][node]-=1
-                    placed[name][node]+=1
+                    if not placed[other][node]:donors[node].discard(other)
+                    add(name,node)
                     return True
         return False
     # Project opportunity uses current occupancy to break integer share ties.
@@ -140,3 +147,17 @@ def weighted_node_threads(capacities, shares, demands, rooms, *, current_used=No
             remaining-=1
             if total[name]<demands[name]:heapq.heappush(queue,(rank(name),name))
     return placed
+
+
+def queued_uses_node(node, capacities, shares, demands, rooms):
+    """Decide just the occupancy of this node in the same weighted allocation."""
+    if capacities[node]<=0:return False
+    other_capacity=sum(capacities.values())-capacities[node]
+    possible=0
+    for name,demand in demands.items():
+        possible+=min(demand,rooms[name].get(node,0))
+        # Even filling every other slot leaves an eligible unit for this node.
+        if possible>other_capacity:return True
+    if not possible:return False
+    plan=weighted_node_threads(capacities,shares,demands,rooms)
+    return any(row.get(node,0)>0 for row in plan.values())

@@ -3,7 +3,7 @@ from hashlib import sha256
 import json
 from random import Random
 import unittest
-from remote_compute.allocation import weighted_node_threads
+from remote_compute.allocation import queued_uses_node, weighted_node_threads
 
 
 def allocation_parity_cases():
@@ -43,6 +43,14 @@ class AllocationTests(unittest.TestCase):
     def test_seeded_placement_matches_frozen_1048_matrices(self):
         expected = '925262442eace00c33e544ce86d5a3736595bd697ebc5931bd09b8fa9618def1'
         self.assertEqual(allocation_matrix_digest(weighted_node_threads), expected)
+
+    def test_queued_reservation_uses_exactly_the_nodes_in_the_full_grant_matrix(self):
+        for index, (mode, capacities, shares, demands, rooms, _) in enumerate(allocation_parity_cases()):
+            grants = weighted_node_threads(capacities, shares, demands, rooms)
+            for node in capacities:
+                with self.subTest(case=index, mode=mode, node=node):
+                    self.assertEqual(queued_uses_node(node, capacities, shares, demands, rooms),
+                                     any(row.get(node, 0) > 0 for row in grants.values()))
 
     def test_saturated_pinned_waiters_do_not_block_other_nodes(self):
         shares={f'p{i:04d}':1 for i in range(500)}

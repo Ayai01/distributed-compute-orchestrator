@@ -568,9 +568,9 @@ class Coordinator(PlacementPlanning):
         value['relay_bulk'] = relay.snapshot() if relay is not None else None
         return value
 
-    def _health_inputs(self):
+    def _health_inputs(self, *, display=False):
         """Capture published state; build tables and aggregate resources after releasing both locks."""
-        projects = PlacementSnapshot(self)
+        projects = PlacementSnapshot(self,display=display)
         view = copy(self)
         view.pool = projects.pool
         view.pool.condition = nullcontext()
@@ -607,18 +607,10 @@ class Coordinator(PlacementPlanning):
                     health_stale=age >= self.display_health_interval)
 
     def _capture_display_health(self, *, wait):
-        if not self.condition.acquire(blocking=wait):
-            return False
-        try:
-            if not self.pool.condition.acquire(blocking=wait):
-                return False
-            try:
-                view, projects = self._health_inputs()
-                sampled = (time.monotonic(), time.time())
-            finally:
-                self.pool.condition.release()
-        finally:
-            self.condition.release()
+        if not wait:
+            return False  # Return the previous sample while one background reader refreshes it.
+        view, projects = self._health_inputs(display=True)
+        sampled = (time.monotonic(), time.time())
         value = view._health()
         value['projects'] = projects._project_resources()
         self._display_health_cache = (*sampled, deepcopy(value))
