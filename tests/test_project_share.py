@@ -135,7 +135,8 @@ class ProjectShareTests(unittest.TestCase):
 
     def test_lower_share_wide_growth_precedes_another_projects_new_job(self):
         s=self.state(24);self.job(s,'a','A',cpus=12,desired=64)
-        self.job(s,'b','B',cpus=4,desired=64)
+        b=self.job(s,'b','B',cpus=4,desired=64)
+        b['result']['resource_request']=dict(request_id=1)
         q=self.job(s,'q','A',queued=True)
         resources=s.project_resources()
         self.assertEqual(s._growth_headroom(resources,candidate=q['task']),{'0':8})

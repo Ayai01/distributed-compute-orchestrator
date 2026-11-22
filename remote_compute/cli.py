@@ -114,7 +114,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
     def detached(node):
         from .commands import save_detached_node
         save_detached_node(args.nodes or ROOT/'.local/nodes.json',node)
-        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，已移出资源，按退避策略自动重连')
+        if coordinator:coordinator.activity.notify(node.name+' 失联60秒，暂停派发，保留原任务并重连')
     def reconnected(node):
         from .commands import save_detached_node
         save_detached_node(args.nodes or ROOT/'.local/nodes.json',node)

@@ -9,7 +9,7 @@ import test_center as center_fixtures
 
 
 class UncachedCenter(module.Coordinator):
-    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None):
+    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, fixed_claims=None):
         return super()._cooperative_cpu_target(identity, desired, resources)
 
 
@@ -65,9 +65,11 @@ class GrowthReuseTests(unittest.TestCase):
                 cancel=threading.Event(),result=dict(status='running'))
         node.reserved=64
         resources=state.project_resources()
-        with patch.object(module,'weighted_node_threads',wraps=module.weighted_node_threads)as allocation:
+        with patch.object(module,'weighted_node_threads',wraps=module.weighted_node_threads)as allocation, \
+             patch.object(state,'_fixed_queue_claims',wraps=state._fixed_queue_claims)as claims:
             actual=state._growth_headroom(resources)
             calls=allocation.call_count
+            self.assertEqual(claims.call_count,1)
         state.__class__=UncachedCenter
         with patch.object(module,'weighted_node_threads',wraps=module.weighted_node_threads)as allocation:
             expected=state._growth_headroom(resources)

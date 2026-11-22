@@ -251,7 +251,7 @@ def _node_state(node):
     if not node.get('enabled', True):
         return '禁用'
     if node.get('error'):
-        return '失联'
+        return '重连'
     if node.get('paused'):
         return '暂停'
     return '运行' if node.get('active_jobs') else '就绪'
@@ -449,7 +449,7 @@ class StatusRows(list):
         records = []
         for node, record in self.devices:
             state = _node_state(node)
-            sampled = state not in ('禁用','失联')
+            sampled = state not in ('禁用','失联','重连')
             records.append([f'#{record[10]} {record[0]}',state,record[1].split('(')[0],
                             record[2] if sampled else '-',record[3] if sampled else '-',
                             record[9],record[14],record[13] if sampled else '-'])
@@ -481,7 +481,7 @@ class StatusRows(list):
         present = [record[1] for record in records]
         title = f'设备资源 {len(present)} 台 {self.device_page+1}/{self.device_page_count}页'
         if width >= 54:
-            title += f" | 失联 {present.count('失联')} | 暂停 {present.count('暂停')} | 禁用 {present.count('禁用')}"
+            title += f" | 失联 {present.count('失联')} | 重连 {present.count('重连')} | 暂停 {present.count('暂停')} | 禁用 {present.count('禁用')}"
         lines = pages[self.device_page] if pages else [_line('没有节点',width)]
         return [_rule(title, width), *lines, _rule('', width)][:limit]
 

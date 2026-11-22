@@ -121,12 +121,13 @@ class OfflineTests(unittest.TestCase):
             with patch('remote_compute.cli.Client',side_effect=AssertionError('probe disabled configuration')):
                 self.assertFalse(load_nodes(path)['nodes'][0]['enabled'])
 
-    def test_detached_retry_every_minute_stops_after_five_attempts(self):
+    def test_detached_retry_slows_down_without_abandoning_the_worker(self):
         with scratch() as root,provider(Path(root)/'worker') as (_,client),Pool([client],refresh=1000) as pool:
             pool.stop_event.set();pool.monitor.join()
             node=pool.nodes[0];node.last_connected_at=100
             with patch('remote_compute.client.time.time',return_value=1000):pool._expire_unreachable(160)
             self.assertEqual(node.reconnect_after,1060)
+            original = client.health()
             with patch.object(client,'health',side_effect=RemoteError('packet loss')) as health:
                 for attempt in range(1,6):
                     now=1000+60*attempt
@@ -136,11 +137,16 @@ class OfflineTests(unittest.TestCase):
                     self.assertEqual(node.reconnect_attempts,attempt)
                     self.assertFalse(node.enabled)
                     self.assertEqual(pool._retry_detached(now),[])
-                self.assertEqual(pool._retry_detached(10000),[])
+                self.assertEqual(pool._retry_detached(1599),[])
                 self.assertEqual(health.call_count,5)
                 pool.refresh(monitor=True)
                 self.assertEqual(health.call_count,5)
-            self.assertEqual(node.reconnect_after,0)
+            self.assertEqual(node.reconnect_after,1600)
+            with patch.object(client,'health',return_value=original):
+                self.assertEqual(pool._retry_detached(1600),[node])
+                pool.probe_futures[node.name].result(timeout=2)
+            self.assertTrue(node.enabled)
+            self.assertFalse(node.detached)
 
     def test_retry_success_restores_budget_and_original_job_references(self):
         with scratch() as root,provider(Path(root)/'worker',cpus=2) as (worker,client):
@@ -230,18 +236,29 @@ class OfflineTests(unittest.TestCase):
                     pool._retry_detached(future)
                     pool.probe_futures[lost.name].result(timeout=2)
                     self.assertEqual(health.call_count,1)
-                    self.assertEqual(pool._retry_detached(future+600),[])
+                    self.assertEqual(pool._retry_detached(future+299),[])
                 self.assertEqual(lost.reconnect_attempts,5)
                 path=Path(root)/'.local/nodes.json'
                 path.parent.mkdir(parents=True,exist_ok=True)
                 path.write_text(json.dumps({'nodes':[dict(name='lost',url=client.url,enabled=False)]}))
                 save_detached_node(path,lost)
                 row=json.loads(path.read_text())['nodes'][0]
-                self.assertEqual(row['reconnect'],dict(attempts=5,after=0))
+                self.assertEqual(row['reconnect'],dict(attempts=5,after=future+300))
                 lost.enabled=True;lost.detached=False
                 save_detached_node(path,lost)
                 row=json.loads(path.read_text())['nodes'][0]
                 self.assertTrue(row['enabled']);self.assertNotIn('reconnect',row)
+
+    def test_legacy_exhausted_route_can_reconnect_after_restart(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_,client):
+            rows=[dict(name='lost',client=client,enabled=False,reconnect=dict(attempts=7,after=0))]
+            with Pool(rows,refresh=1000) as pool:
+                pool.stop_event.set();pool.monitor.join()
+                node=pool.nodes[0]
+                self.assertGreater(node.reconnect_after,time.time())
+                self.assertEqual(pool._retry_detached(node.reconnect_after),[node])
+                pool.probe_futures[node.name].result(timeout=2)
+                self.assertTrue(node.enabled)
 
     def test_manual_api_disable_is_saved_before_restart(self):
         from test_center import center

@@ -904,6 +904,18 @@ class ConsoleTests(unittest.TestCase):
         self.assertRegex(text,r'设备资源 20 台 2/\d+页')
         self.assertIn('节点详情',text)
 
+    def test_probe_timeout_and_detached_worker_have_separate_panel_counts(self):
+        from remote_compute.view import StatusRows
+        nodes=[dict(name='temporary',error='probe timed out'),
+               dict(name='offline',error='connection timed out',enabled=False,detached=True),
+               dict(name='ready')]
+        status=StatusRows(dict(role='scheduler',nodes=nodes),width=160,viewport=True)
+        text='\n'.join(status.fit(30))
+        self.assertIn('失联 1',text)
+        self.assertIn('重连 1',text)
+        self.assertIn('temporary',text)
+        self.assertIn('offline',text)
+
     def test_live_overview_shows_twenty_registered_nodes_and_health_with_output(self):
         from remote_compute import __version__
         from remote_compute.view import StatusRows
@@ -911,8 +923,10 @@ class ConsoleTests(unittest.TestCase):
                       memory_total_mb=65536, host_memory_available_mb=61440, tags=['ng47','chisel','rtl'])
                  for index in range(20)]
         nodes[15]['error'] = 'Remote worker disconnected'
+        nodes[15]['detached'] = True
         nodes[16]['paused'] = True
         nodes[17]['enabled'] = False
+        nodes[18]['error'] = 'Transient health timeout'
         nodes[19]['active_jobs'] = [dict(id='68fc'+'a'*28, status='running', label='RTL', cpus=4)]
         nodes[0]['tags'] += ['ml','cuda','layout','onnx']
         nodes[0].update(cpu_percent=12.6,url='http://192.0.2.11:26133')
@@ -928,7 +942,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(all(not row or _width(row) == 204 for row in displayed))
         for index in range(20):
             self.assertIn(f'node-{index:02}', text)
-        for text_fragment in ('失联 1', '暂停 1', '禁用 1', '68fc', 'ping succeeded'):
+        for text_fragment in ('失联 1', '重连 1', '暂停 1', '禁用 1', '68fc', 'ping succeeded'):
             self.assertIn(text_fragment, text)
         self.assertIn('能力',displayed[3])
         device_row=next(row for row in displayed if 'node-00' in row)

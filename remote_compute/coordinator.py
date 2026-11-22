@@ -1246,7 +1246,7 @@ class Coordinator:
             if not groups[group]:del groups[group]
             yield key
 
-    def _growth_headroom(self, resources, *, candidate=None):
+    def _growth_headroom(self, resources, *, candidate=None, fixed_claims=None):
         """Give existing elastic work its first four useful threads.
 
         This holds no worker lease and never changes an active pool. Its owner
@@ -1254,7 +1254,7 @@ class Coordinator:
         finishing makes them available to queued work immediately.
         """
         protected={}
-        warm_cache={'projects':self._project_cpu_plan(resources)}
+        warm_cache={} if fixed_claims is None else {'claims':fixed_claims}
         remaining={}
         occupied={}
         for _key,peer in active_items(self.jobs):
@@ -1262,6 +1262,7 @@ class Coordinator:
             if node is not None and peer['result']['status']not in TERMINAL:
                 key=(peer['task'].get('project')or'default',node.name)
                 occupied[key]=occupied.get(key,0)+peer['task']['cpus']
+        warm_cache['occupied']=occupied
         for identity,job in sorted(active_items(self.jobs),key=lambda row:(row[1]['result'].get('submitted',0),row[0])):
             held=job.get('node');current=job.get('task',{})
             group=current.get('project')or'default'
@@ -1273,10 +1274,11 @@ class Coordinator:
             desired=job.get('desired_cpus',startup)
             request=job['result'].get('resource_request')or {}
             pending=request and request.get('request_id')!=job.get('lease_answered')
+            wide_request=lower and pending and desired>4
             # Beyond warmup, protect growth only while its owner is actually
             # requesting it. A standing ceiling during a long native step
             # must not strand idle slots or prevent overcommit from opening.
-            if not lower or not pending:desired=min(4,desired)
+            if not wide_request:desired=min(4,desired)
             old=current.get('cpus',0)
             if (held is None or desired<=old
                     or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
@@ -1284,7 +1286,12 @@ class Coordinator:
                 continue
             free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
             if not free:continue
-            target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=None if lower else warm_cache)
+            if 'projects' not in warm_cache:warm_cache['projects']=self._project_cpu_plan(resources)
+            if wide_request:
+                if 'claims' not in warm_cache:warm_cache['claims']=self._fixed_queue_claims(resources)
+                target=self._cooperative_cpu_target(identity,desired,resources,fixed_claims=warm_cache['claims'])
+            else:
+                target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=warm_cache)
             key=(group,held.name)
             if key not in remaining:
                 remaining[key]=(max(0,warm_cache['projects'].get(group,{}).get(held.name,0)-occupied.get(key,0))
@@ -1311,8 +1318,10 @@ class Coordinator:
             minimum=job['result'].get('min_cpus')or 0
             waiting=(job.get('node')is not None and minimum>1
                 and not job['result'].get('active_cpus',0)and job['task']['cpus']<minimum)
-            if identity in queued or waiting:
-                candidates.append((identity,dict(job['task'],cpus=minimum)if waiting else job['task']))
+            if waiting:
+                candidates.append((identity,dict(job['task'],cpus=minimum)))
+            elif identity in queued and startup_cpus(job['task'])>1:
+                candidates.append((identity,job['task']))
         def order(identity):
             task = self.jobs[identity]['task']
             group = task.get('project') or 'default'
@@ -1382,10 +1391,10 @@ class Coordinator:
                         group = job['task'].get('project') or 'default'
                         budget = budgets[group]
                         try:
-                            if group not in growth:
-                                growth[group]=self._growth_headroom(budgets,candidate=job['task'])
                             if fixed is None:
                                 fixed = self._fixed_queue_claims(budgets)
+                            if group not in growth:
+                                growth[group]=self._growth_headroom(budgets,candidate=job['task'],fixed_claims=fixed)
                             headroom = dict(growth[group])
                             for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
                                 headroom[name] = max(headroom.get(name, 0), count)
@@ -2207,7 +2216,7 @@ class Coordinator:
             return {group:{name:min(capacities[name],room)for name,room in rooms[group].items()}for group in shares}
         return weighted_node_threads(capacities,shares,demands,rooms,current_used={group:resources[group]['used']for group in shares},fixed_used=fixed)
 
-    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, phase_model=None):
+    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, phase_model=None, fixed_claims=None):
         """Apply the project share, then its task order at a drained boundary.
 
         Running peers keep their grants until their own boundary. Within the
@@ -2217,7 +2226,13 @@ class Coordinator:
         """
         current=self.jobs[identity];group=current['task'].get('project') or 'default'
         if desired==0:return 0
-        claims=self._fixed_queue_claims(resources)
+        if fixed_claims is not None:
+            claims=fixed_claims
+        elif warm_cache is None:
+            claims=self._fixed_queue_claims(resources)
+        else:
+            if 'claims' not in warm_cache:warm_cache['claims']=self._fixed_queue_claims(resources)
+            claims=warm_cache['claims']
         claim=claims.get(current['node'].name)
         minimum=current['result'].get('min_cpus')or 0
         if minimum>1 and not current['result'].get('active_cpus',0):
@@ -2245,9 +2260,12 @@ class Coordinator:
         # Other jobs retain their real grants until their own boundaries.
         # An ideal lower share must never be treated as if those peers had
         # already returned CPUs, or hundreds of one-core jobs can warm again.
-        held_here=sum(peer['task']['cpus']for _key,peer in active_items(self.jobs)
-                      if peer.get('node')is current['node']and peer['result']['status']not in TERMINAL
-                      and(peer['task'].get('project')or'default')==group)
+        if warm_cache is not None and 'occupied' in warm_cache:
+            held_here=warm_cache['occupied'].get((group,current['node'].name),0)
+        else:
+            held_here=sum(peer['task']['cpus']for _key,peer in active_items(self.jobs)
+                          if peer.get('node')is current['node']and peer['result']['status']not in TERMINAL
+                          and(peer['task'].get('project')or'default')==group)
         share_room=(max(1,projects.get(group,{}).get(current['node'].name,0)-max(0,held_here-current['task']['cpus']))
                     if len(projects)>1 else desired)
         if claimed_room is not None:share_room=min(share_room,claimed_room)
@@ -2388,7 +2406,9 @@ class Coordinator:
                 # Elastic jobs may report a finite useful phase width.
                 # Repeating that width is still a drained boundary; returning
                 # to one CPU stays cheap for synchronous microkernels.
-                if not draining and (desired>old or cpus==0 or (cooperative and desired>1)):
+                fully_active = (desired == old == active_floor and node.enabled
+                                and not node.error and not node.health.get('paused'))
+                if not draining and not fully_active and (desired>old or cpus==0 or (cooperative and desired>1)):
                     resources=self.project_resources();group=job['task'].get('project') or 'default'
                     resource=resources.get(group)
                     if resource is None:

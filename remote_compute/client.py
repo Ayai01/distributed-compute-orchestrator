@@ -63,6 +63,7 @@ SHORT_DISPATCH_BYTES = 256 * 1024
 # minute has two opportunities before falling back to minute spacing.
 RELAY_RECONNECT_INTERVALS = (10, 25, 60, 60, 60, 60)
 DIRECT_RECONNECT_INTERVALS = (60, 60, 60, 60)
+RECONNECT_BACKOFF_MAX = 300
 
 
 def _reconnect_intervals(client):
@@ -1576,7 +1577,10 @@ class Pool:
                             or not 0 <= after < float('inf')):
                         raise ValueError('Invalid persisted reconnect attempts or timestamp')
                     node.detached = True
-                    node.reconnect_attempts, node.reconnect_after = attempts, after
+                    # Releases before 1.0.42 persisted zero once retries were
+                    # exhausted. A configured worker remains eligible to recover.
+                    node.reconnect_attempts = attempts
+                    node.reconnect_after = after or time.time() + RECONNECT_BACKOFF_MAX
             if isinstance(node.client,Client):node.client.operator=True
             self._validate_node(node)
             node.error = 'Checking worker'
@@ -1774,12 +1778,12 @@ class Pool:
                     pending = self.probe_futures.get(node.name)
                     intervals = _reconnect_intervals(node.client)
                     if (not node.detached or node.enabled or not node.reconnect_after
-                            or now < node.reconnect_after or node.reconnect_attempts > len(intervals)
+                            or now < node.reconnect_after
                             or pending is not None and not pending.done()):
                         continue
                     index = node.reconnect_attempts
-                    node.reconnect_after = now + intervals[index] if index < len(intervals) else 0.0
-                    node.reconnect_attempts += 1
+                    node.reconnect_after = now + (intervals[index] if index < len(intervals) else RECONNECT_BACKOFF_MAX)
+                    node.reconnect_attempts = min(index + 1, len(intervals) + 1)
                     retry.append((node, node.connection_generation))
             # Persist the consumed attempt before starting its network request.
             retry = [(node, generation) for node, generation in retry if self._save_reconnect(node)]
@@ -1879,7 +1883,8 @@ class Pool:
     def snapshot(self):
         with self.condition:
             return {"policy": self.policy,
-                "reconnect_policy": {"offline_seconds":60,"interval_seconds":60,"attempts":5}, "nodes": [
+                "reconnect_policy": {"offline_seconds":60,"interval_seconds":60,
+                                     "max_interval_seconds":RECONNECT_BACKOFF_MAX}, "nodes": [
                 {"name": n.name, "url": n.client.url, "enabled": n.enabled,
                  "display_name":getattr(n,'display_name','')or n.name,
                  "bulk_limit":getattr(n.client,'bulk_limit',7),
