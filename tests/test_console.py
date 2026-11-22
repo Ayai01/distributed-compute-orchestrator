@@ -869,7 +869,7 @@ class ConsoleTests(unittest.TestCase):
 
     def test_node_pages_keep_all_twenty_nodes_and_task_pages_independent(self):
         nodes=[dict(name=f'school-{i}',display_name=f'校方{i:02d}',reserved=1,base_capacity=64,
-                    logical_cpus=64,tags=['rtl'],host_ip=f'10.0.0.{i+1}') for i in range(15)]
+                    logical_cpus=64,packages=['rtl'],host_ip=f'10.0.0.{i+1}') for i in range(15)]
         nodes.extend(dict(name=f'host-{i}',capacity=16) for i in range(5))
         nodes[0]['active_jobs']=[dict(id=f'{i:04x}'+'b'*28,label=f'task-{i}',cpus=1,
                                      status='running') for i in range(32)]
@@ -898,7 +898,7 @@ class ConsoleTests(unittest.TestCase):
                 text='\n'.join(details)
                 self.assertIn('school-0',text)
                 self.assertIn('10.0.0.15',text)
-                self.assertIn('能力 RTL',text)
+                self.assertIn('能力 Chisel',text)
 
     def test_node_keys_change_page_and_open_full_width_detail(self):
         keyboard=Keyboard(['\x00','A','\x00','B',*'quit\r'])
@@ -932,7 +932,7 @@ class ConsoleTests(unittest.TestCase):
         from remote_compute import __version__
         from remote_compute.view import StatusRows
         nodes = [dict(name=f'worker-{index}', display_name=f'node-{index:02}', capacity=32,
-                      memory_total_mb=65536, host_memory_available_mb=61440, tags=['ng47','chisel','rtl'])
+                      memory_total_mb=65536, host_memory_available_mb=61440, packages=['ng47','rtl'])
                  for index in range(20)]
         nodes[15]['error'] = 'Remote worker disconnected'
         nodes[15]['detached'] = True
@@ -940,7 +940,7 @@ class ConsoleTests(unittest.TestCase):
         nodes[17]['enabled'] = False
         nodes[18]['error'] = 'Transient health timeout'
         nodes[19]['active_jobs'] = [dict(id='68fc'+'a'*28, status='running', label='RTL', cpus=4)]
-        nodes[0]['tags'] += ['ml','cuda','layout','onnx']
+        nodes[0]['packages'] += ['python','cuda','layout','onnx']
         nodes[0].update(cpu_percent=12.6,url='http://192.0.2.11:26133')
         nodes[1].update(cpu_percent=0,node='school-worker',node_ip='10.96.4.15',url='http://127.0.0.1:27141')
         status = StatusRows(dict(role='scheduler',node='center',version=__version__,nodes=nodes),width=204,viewport=True)
@@ -958,7 +958,7 @@ class ConsoleTests(unittest.TestCase):
             self.assertIn(text_fragment, text)
         self.assertIn('能力',displayed[3])
         device_row=next(row for row in displayed if 'node-00' in row)
-        self.assertIn('ng47 Chisel ML CUDA Layout RTL ONNX',device_row)
+        self.assertIn('ng47 Chisel ONNX layout cuda',device_row)
         self.assertIn('可调度能力',text)
         status.resize(159)
         rows=_layout(status,['task accepted'],['ping succeeded'],50,reserved=5)
@@ -967,7 +967,7 @@ class ConsoleTests(unittest.TestCase):
             self.assertIn(header,rows[3])
         direct=next(row for row in rows if 'node-00' in row)
         relay=next(row for row in rows if 'node-01' in row)
-        for value in ('12.6%','4.0/64.0','192.0.2.11','ng47 Chisel ML CUDA Layout RTL ONNX'):
+        for value in ('12.6%','4.0/64.0','192.0.2.11','ng47 Chisel ONNX layout cuda'):
             self.assertIn(value,direct)
         self.assertEqual([cell.strip() for cell in relay.split('|')[6:8]],['10.96.4.15','127.0.0.1:27141'])
         self.assertIn('0.0%',relay)
@@ -975,12 +975,12 @@ class ConsoleTests(unittest.TestCase):
     def test_narrow_overview_keeps_cpu_memory_address_and_capabilities(self):
         from remote_compute.view import StatusRows
         value=dict(role='scheduler',node='center',nodes=[
-            dict(name='school',node='school-worker',node_ip='10.96.4.15',cpu_percent=9.5,tags=['chisel','rtl'],
+            dict(name='school',node='school-worker',node_ip='10.96.4.15',cpu_percent=9.5,packages=['rtl'],
                  memory_total_mb=65536,host_memory_available_mb=32768,url='http://127.0.0.1:27141')
         ])
         view=StatusRows(value,width=64,viewport=True)
         text='\n'.join(view.fit(25))
-        for value in ('CPU% 9.5%','内存用/总 GiB 32.0/64.0','节点 IP 10.96.4.15','中转入口 127.0.0.1:27141','Chisel RTL'):
+        for value in ('CPU% 9.5%','内存用/总 GiB 32.0/64.0','节点 IP 10.96.4.15','中转入口 127.0.0.1:27141','能力 Chisel'):
             self.assertIn(value,text)
 
     def test_overview_keeps_unknown_worker_ip_separate_from_relay(self):
@@ -1060,24 +1060,30 @@ class ConsoleTests(unittest.TestCase):
         ]
         value = dict(role='scheduler', node='local',
                      nodes=[dict(name='fixture', capacity=32, active_jobs=jobs)])
-        for width in (38, 83, 160):
+        for width in (38, 80, 83, 100, 140, 160):
             with self.subTest(width=width):
                 screen = _layout(StatusRows(value, width=width, viewport=True), [], [], 33)
                 header = next(row.split('|') for row in screen if 'CPU/限' in row)
                 task_rows = [next(row.split('|') for row in screen if job['id'][:4] in row)
                              for job in jobs]
-                index = [cell.strip() for cell in header].index('CPU/限')
+                columns = [cell.strip() for cell in header]
+                index = columns.index('CPU/限')
                 self.assertEqual(_width(header[index]) - 2, 7)
                 self.assertEqual([row[index].strip() for row in task_rows], ['24/1024', '24/1024'])
-                tag_index = [cell.strip() for cell in header].index('任务标签')
-                self.assertTrue(task_rows[0][tag_index].strip().startswith('检错继续 YOLOv8n'))
-                self.assertTrue(task_rows[1][tag_index].strip().startswith('停机对照 YOLOv8n'))
-                if width == 160:
-                    progress_index = [cell.strip() for cell in header].index('进度')
+                tag_index = columns.index('任务标签')
+                tags = [row[tag_index].strip() for row in task_rows]
+                self.assertTrue(tags[0].startswith('检'))
+                self.assertTrue(tags[1].startswith('停'))
+                self.assertTrue(all('%' not in tag and 'stage' not in tag for tag in tags))
+                if width >= 140:
+                    self.assertTrue(tags[0].startswith('检错继续 YOLOv8n'))
+                    self.assertTrue(tags[1].startswith('停机对照 YOLOv8n'))
+                if width >= 80:
+                    progress_index = columns.index('进度')
                     self.assertEqual([row[progress_index].strip() for row in task_rows], ['56%', ''])
                 else:
-                    self.assertNotIn('%', task_rows[0][tag_index])
-                self.assertFalse(any('stage' in part for row in task_rows for part in row))
+                    self.assertNotIn('进度', columns)
+                self.assertTrue(all(_width(line) <= width for line in screen))
 
     def test_page_keys_change_task_pages_while_preserving_input_and_output_history(self):
         keyboard=Keyboard(['\x00','Q','\x00','Q',*'ping\rquit\r'])
@@ -1114,7 +1120,8 @@ class ConsoleTests(unittest.TestCase):
                     status.task_page=page
                     rows=status.fit(22)
                     self.assertTrue(all(_width(row)==width for row in rows))
-                    self.assertIn('秒','\n'.join(rows))
+                    header = next(row for row in rows if 'CPU/限' in row)
+                    self.assertEqual('秒' in header, width >= 64)
                     for row in rows:
                         seen.extend(record[0] for record in status.records
                                     if any(prefix+record[0]+' |' in row for prefix in ('| ','+ ')))

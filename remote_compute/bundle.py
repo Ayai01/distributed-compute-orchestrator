@@ -28,6 +28,32 @@ def native_path(value,*,force=False):
     return path
 
 
+def command_step_progress(value):
+    """The command runner owns this denominator independently of business progress."""
+    saved = value.get('step_progress')
+    if isinstance(saved, dict):
+        done, total = saved.get('completed'), saved.get('total')
+        if type(total) is int and type(done) is int and 0 <= done <= total and total > 0:
+            return {'completed': done, 'total': total}
+    total, steps = value.get('total_steps'), value.get('steps')
+    if type(total) is not int or total <= 0 or not isinstance(steps, (list, tuple)) or not 0 < len(steps) <= total:
+        return None
+    done = 0
+    for step in steps:
+        if not isinstance(step, dict):
+            return None
+        started, finished, code = step.get('started'), step.get('finished'), step.get('returncode')
+        for stamp in (started, finished):
+            if stamp is not None and (type(stamp) not in (int,float) or not math.isfinite(stamp) or stamp < 0):
+                return None
+        if code is not None and type(code) is not int:
+            return None
+        if started is None and finished is None and code is None:
+            return None
+        done += finished is not None or code is not None
+    return {'completed': done, 'total': total}
+
+
 def progress_fields(value):
     """Return cheap progress fields already present in a task snapshot."""
     fields = {}
@@ -37,6 +63,10 @@ def progress_fields(value):
     if business:
         fields['progress'] = normalize(progress)
         fields.update({key:progress[key]for key in ('phase','completed','total','unit')if key in progress})
+        if 'ratio' not in fields['progress']:
+            steps = command_step_progress(value)
+            if steps is not None:
+                fields['step_progress'] = steps
     elif isinstance(progress, (int, float)) and math.isfinite(float(progress)):
         fields['progress'] = progress
     elif isinstance(progress, dict):
@@ -55,14 +85,9 @@ def progress_fields(value):
         if isinstance(candidate, (int, float)) and math.isfinite(float(candidate)):
             fields[key] = candidate
     if not any(key in fields for key in ('progress', 'completed', 'current', 'nfe')):
-        total = value.get('total_steps')
-        if isinstance(total, int) and total > 0:
-            steps = value.get('steps') or ()
-            completed = sum(1 for step in steps
-                            if isinstance(step, dict)
-                            and (step.get('finished') is not None
-                                 or step.get('returncode') is not None))
-            fields.update(completed=min(completed, total), total=total)
+        steps = command_step_progress(value)
+        if steps is not None:
+            fields.update(steps)
     if isinstance(value.get('runtime'),dict):
         fields['runtime'] = {key:value['runtime'][key]for key in
             ('sampled_at','process_alive','returncode','cpu_seconds','last_cpu_advanced')if key in value['runtime']}

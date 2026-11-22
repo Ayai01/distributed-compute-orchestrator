@@ -14,7 +14,7 @@ from unittest.mock import patch
 from remote_compute.bundle import atomic_json,native_path,pack,unpack
 from remote_compute import cli
 from remote_compute.commands import SchedulerShell
-from test_compute import scratch
+from test_compute import scratch, until
 
 
 class PrivateJsonTests(unittest.TestCase):
@@ -28,17 +28,15 @@ class PrivateJsonTests(unittest.TestCase):
             identity=client.submit(command(['${tool:python}','-c',source],max_cpus=1,outputs=['deep/**/*'],env={'PYTHONPATH':'${dco}'}))['id']
             client.wait(identity)
             job_root=worker.jobs[identity]['directory']
-            try:
-                receipt=client.fetch(identity,delete=False)
-                self.assertEqual(receipt['status'],'succeeded',receipt.get('stderr'))
-                self.assertEqual(receipt['files'][name],b'paid-original')
-                self.assertNotIn('input_cleanup_error',receipt)
-                self.assertFalse((job_root/'input/consumed-input').exists())
-                client.delete(identity)
-                self.assertFalse(native_path(job_root,force=True).exists())
-                self.assertEqual(client.statuses([identity])[identity]['status'],'unknown')
-            finally:
-                if native_path(job_root,force=True).exists():shutil.rmtree(native_path(job_root,force=True))
+            receipt=client.fetch(identity,delete=False)
+            self.assertEqual(receipt['status'],'succeeded',receipt.get('stderr'))
+            self.assertEqual(receipt['id'],identity)
+            self.assertEqual(receipt['files'][name],b'paid-original')
+            self.assertNotIn('input_cleanup_error',receipt)
+            self.assertFalse((job_root/'input/consumed-input').exists())
+            self.assertEqual(client.delete(identity), {'deleted': identity})
+            self.assertEqual(client.statuses([identity])[identity]['status'],'unknown')
+            until(lambda: not native_path(job_root,force=True).exists())
 
     @unittest.skipUnless(os.name=='nt','Windows extended path namespace')
     def test_long_artifact_and_atomic_state_paths_roundtrip(self):
@@ -161,10 +159,12 @@ class PrivateJsonTests(unittest.TestCase):
     def test_save_nodes_keeps_token_and_uses_private_publication(self):
         with scratch() as directory:
             root = Path(directory)
-            target = root / 'nodes.local.json'
+            target = root / '.local/nodes.json'
+            target.parent.mkdir()
             remote = dict(name='remote', url='https://example.test:26133', weight=1.0,
                           limit=0, memory_limit_mb=0, enabled=True)
-            target.write_text(json.dumps({'nodes': [dict(remote, token='test-secret')]}), encoding='utf8')
+            target.write_text(json.dumps({'nodes': [dict(remote, url='https://old.example.test:26133',
+                                                        token='test-secret')]}), encoding='utf8')
             shell = SimpleNamespace(pool=SimpleNamespace(nodes=[]),
                                     center=SimpleNamespace(nodes=lambda: dict(policy='adaptive', nodes=[remote]),
                                                            token=''))
@@ -173,5 +173,7 @@ class PrivateJsonTests(unittest.TestCase):
                  redirect_stdout(io.StringIO()):
                 SchedulerShell.do_save(shell, '')
             self.assertTrue(write.call_args.kwargs['private'])
-            self.assertEqual(json.loads(target.read_text())['nodes'][0]['token'], 'test-secret')
-            self.assertEqual(list(root.iterdir()), [target])
+            self.assertEqual(write.call_args.args[0], target)
+            saved = json.loads(target.read_text())['nodes']
+            self.assertEqual(saved, [dict(remote, token='test-secret')])
+            self.assertEqual(list(target.parent.iterdir()), [target])

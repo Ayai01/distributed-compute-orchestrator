@@ -227,8 +227,17 @@ def snapshot(health, nodes, *, now=None):
 def display_progress(job):
     p=job.get('progress')
     if isinstance(p,dict)and p.get('schema')==SCHEMA:
-        try:return normalize_progress(p)
+        try:
+            progress = normalize_progress(p)
         except ValueError:return None
+        if 'ratio' not in progress:
+            from .bundle import command_step_progress
+            steps = command_step_progress(job)
+            if steps is not None:
+                return {**progress, **steps, 'ratio':steps['completed']/steps['total'], 'unit':'steps',
+                        'source':'execution', 'business_completed':progress.get('completed'),
+                        'business_unit':progress.get('unit')}
+        return progress
     done,count=number(job.get('completed')),number(job.get('total'))
     return (dict(completed=done,total=count,ratio=done/count)
             if done is not None and count is not None and 0<=done<=count and count>0 else None)

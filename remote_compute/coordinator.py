@@ -1969,7 +1969,7 @@ class Coordinator(PlacementPlanning):
         clean_tool_snapshot(remote)
         # A polling snapshot owns these fields, including their absence before
         # the replacement attempt has created its first process.
-        for key in ('runtime','progress','progress_error','diagnostic','phase','stage','unit',
+        for key in ('runtime','progress','step_progress','progress_error','diagnostic','phase','stage','unit',
                     'completed','total','current','target','nfe','budget'):
             if key not in remote:job['result'].pop(key,None)
         if remote.get('status') in TERMINAL and remote['status']!='interrupted':

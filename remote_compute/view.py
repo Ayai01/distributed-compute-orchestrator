@@ -14,6 +14,7 @@ from .policy import canonical_capabilities, priority_weight
 from .packages import DEFAULT_PACKAGE, PACKAGES, package_names
 from .task_tags import compact_tag
 from .telemetry import sampling_notice
+from .bundle import command_step_progress
 
 
 _ambiguous_width = None
@@ -68,7 +69,8 @@ def _progress_label(job):
     """Render only a numeric progress measure with a known denominator."""
     progress = job.get('progress')
     numeric = (int, float)
-    values = {**job, **progress} if isinstance(progress, dict) else job
+    business = isinstance(progress, dict) and progress.get('schema') == 'dco.progress.v1'
+    values = progress if business else ({**job, **progress} if isinstance(progress, dict) else job)
     for done_key, total_key in (('completed', 'total'), ('current', 'target'), ('nfe', 'budget')):
         done, total = values.get(done_key), values.get(total_key)
         if type(done) in numeric and type(total) in numeric and 0 <= done <= total and total > 0:
@@ -83,19 +85,15 @@ def _progress_label(job):
         done = progress.get('completed')
         if percent_unit and type(done) in numeric and 0 <= done <= 100 and progress.get('total') is None:
             return f'{done:.0f}%'
-        if progress.get('schema') == 'dco.progress.v1':
-            return ''
+        if business:
+            steps = command_step_progress(job)
+            return (f"{steps['completed']/steps['total']*100:.0f}%" if steps else '')
     if type(progress) in numeric and 0 <= progress <= 100:
         scale = 100 if percent_unit or progress > 1 else 1
         return f'{progress/scale*100:.0f}%'
-    total = job.get('total_steps')
-    steps = job.get('steps')
-    if type(total) is int and total > 0 and isinstance(steps, (list, tuple)):
-        done = sum(1 for step in steps
-                   if isinstance(step, dict)
-                   and (step.get('finished') is not None
-                        or step.get('returncode') is not None))
-        return f'{min(done, total)/total*100:.0f}%'
+    steps = command_step_progress(job)
+    if steps:
+        return f"{steps['completed']/steps['total']*100:.0f}%"
     return ''
 
 
@@ -628,9 +626,9 @@ class StatusRows(list):
         if width >= 140:
             columns = [identity, node, project, priority, cpu, ram, seconds, status, progress, task]
         elif width >= 100:
-            columns = [identity, node, project, priority, cpu, ram, seconds, status, task]
+            columns = [identity, node, project, priority, cpu, ram, seconds, status, progress, task]
         elif width >= 80:
-            columns = [identity, node, priority, cpu, ram, seconds, status, task]
+            columns = [identity, node, priority, cpu, seconds, status, progress, task]
         elif width >= 64:
             columns = [identity, node, priority, cpu, seconds, task]
         elif width >= 54:
