@@ -1329,7 +1329,7 @@ class CenterTests(unittest.TestCase):
                     until(lambda:pool.nodes[0].reserved==0)
                     self.assertEqual(pool.nodes[0].reserved_memory_mb,0)
 
-    def test_serial_hint_is_center_metadata_and_not_forwarded_to_older_worker(self):
+    def test_retired_serial_hint_is_not_forwarded_to_older_worker(self):
         import zipfile
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
             original=worker.submit_bundle
@@ -1338,10 +1338,11 @@ class CenterTests(unittest.TestCase):
                     self.assertNotIn('single_thread_weight',json.loads(archive.read('task.json')))
                 return original(identity,payload,**options)
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (_,client),patch.object(worker,'submit_bundle',side_effect=submit):
-                result=client.run(python('print(42)',single_thread_weight=2))
+                result=client.run(dict(python('print(42)',priority=7),single_thread_weight=2))
                 self.assertEqual(result['status'],'succeeded',result)
-                self.assertEqual(result['single_thread_weight'],2)
-                self.assertIn('single_thread_weight',client.health()['capabilities'])
+                self.assertEqual(result['priority'],7)
+                self.assertNotIn('single_thread_weight',result)
+                self.assertNotIn('single_thread_weight',client.health()['capabilities'])
 
 
 

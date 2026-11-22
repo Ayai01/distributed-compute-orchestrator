@@ -12,11 +12,12 @@
 
 ## 能力与资源准入
 
-普通 SDK 用 `requires=["<包名>"]` 选一个固定能力包，省略时为 `python`。CPU 线程按资源数量申请。节点由中心分配，固定宽度整组获配，弹性任务按就绪宽度借用或归还资源。
+Python 是所有 worker 的基础环境。普通 SDK 省略 `requires` 即使用基础环境。需要专项能力时，用 `requires=["<包名>"]` 选择一个固定能力包。CPU 线程按资源数量申请。节点由中心分配，固定宽度整组获配，弹性任务按就绪宽度借用或归还资源。
+
+任务只用 `priority` 设置派发优先级，默认 0，数值越高越优先。任务列表显示当前生效值。
 
 | 能力包 | 固定环境 |
 | --- | --- |
-| `python` | 固定的 Python、PyTorch 基础环境 |
 | `ng47`、`hsp` | 基础环境及对应的 ngspice 47 或 HSPICE |
 | `onnx` | 基础环境及 ONNX Runtime，含 INT8 整数卷积 |
 | `rtl` | Chisel、Verilator、C++ 构建和 ONNX。面板显示 Chisel。 |

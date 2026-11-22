@@ -30,11 +30,12 @@ def python_task(function, *, kwargs=None, **options):
 
 def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
-            project='', resource_share=1.0, single_thread_weight=1.0,retries=2,
+            project='', resource_share=1.0, single_thread_weight=None, retries=2,
             accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True,
             artifact_ref=None, produces_artifact_ref=None, checkpoint_ref=None, checkpoint_output=None,
             affinity_keys=None, timeout_grace_s=None, step_phases=None, short_job=False,
             executable_ram_mb=None):
+    # Older SDK callers can still pass the retired keyword.
     if type(resource_recovery) is not bool:raise ValueError("resource_recovery must be a boolean")
     platform = validate_platform(platform)
     if min_start_cpus is not None:
@@ -72,8 +73,6 @@ def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=()
     if native_cache is not None:
         from .runtimes import validate_native_cache
         task['native_cache'] = validate_native_cache(native_cache)
-    if single_thread_weight != 1.0 or isinstance(single_thread_weight, bool):
-        task['single_thread_weight'] = single_thread_weight
     if cwd is not None:
         task["cwd"] = str(cwd)
     if stdin is not None:

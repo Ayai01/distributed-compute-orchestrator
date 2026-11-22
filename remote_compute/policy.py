@@ -14,7 +14,6 @@ MAX_QUEUE_RATIO = 4.0
 MAX_READY_TASKS = 4096
 READY_QUEUE_FLOOR = 129
 MAX_STATUS_BATCH = 128
-MAX_SINGLE_THREAD_WEIGHT = 8.0
 MIN_PRIORITY = -1000
 MAX_PRIORITY = 1000
 MAX_REQUIREMENTS = 32
@@ -283,7 +282,6 @@ def public_capabilities():
         "resize_active_cpus",
         "resize_min_cpus",
 
-        "single_thread_weight",
         "asset_cache",
         "accelerators",
         "accelerator_fallback",

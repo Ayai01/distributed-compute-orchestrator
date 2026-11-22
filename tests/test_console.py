@@ -828,6 +828,18 @@ class ConsoleTests(unittest.TestCase):
             for width in range(38,201):
                 with self.subTest(width=width):format_status(value,width=width).fit(50)
 
+    def test_task_list_displays_running_and_queued_priorities_at_each_width(self):
+        running=dict(id='aaaa'+'f'*28,cpus=1,status='running',label='running',priority=-7)
+        queued=dict(id='bbbb'+'f'*28,cpus=1,status='queued',label='queued',priority=22)
+        value=dict(role='scheduler',node='Aya1-PC',queued_jobs=[queued],
+                   nodes=[dict(name='Aya1-PC',capacity=14,active_jobs=[running])])
+        for width in (34,38,54,64,80,100,140,200):
+            with self.subTest(width=width):
+                rows=format_status(value,width=width).fit(50)
+                self.assertTrue(any('优先' in row for row in rows))
+                self.assertTrue(any('aaaa' in row and '-7' in row for row in rows))
+                self.assertTrue(any('bbbb' in row and '22' in row for row in rows))
+
     def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):
         jobs=[dict(id=f'{i:04x}'+'a'*28,project='Bench',label='very-long-circuit-name/'*6+f'seed-{i}',
                    cpus=2,memory_mb=512,status='running') for i in range(43)]

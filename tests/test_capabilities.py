@@ -132,7 +132,8 @@ class CapabilityTests(unittest.TestCase):
                     public = project.capabilities()
                     self.assertNotIn('tags', public)
                     self.assertNotIn('tools', public)
-                    self.assertEqual(public['capability_cpus']['python']['capacity'], 3)
+                    self.assertNotIn('python', public['capability_cpus'])
+                    self.assertEqual(project.admission('runtime', activity=True)['capability_cpus']['python']['capacity'], 3)
                     task = command(['${tool:aop_python}', '-c',
                                     'import os,pathlib,time;assert pathlib.Path(os.environ["PY"]).is_file();'
                                     'time.sleep(.35);print("ready")'],

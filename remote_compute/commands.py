@@ -135,7 +135,6 @@ def submission_parser(kind):
     parser.add_argument("--max-cpus", type=int, help="任务可用并行上限，由DCO自动分配")
     parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
     parser.add_argument("--priority", type=int)
-    parser.add_argument("--single-thread-weight", type=float, help="单线程偏好，默认1；较高偏单线程、较低偏总吞吐")
     parser.add_argument("--requires", help="节点标签，以逗号分隔")
     parser.add_argument("--accelerator", help='加速器需求 JSON，例如 {"kind":"cuda","memory_mb":8192,"requires":["gpu:training"]}')
     parser.add_argument("--keep", action="store_true", help="回收后保留节点任务目录")
@@ -157,7 +156,7 @@ def prepare(kind, args):
     else:
         task = verilator(args.sources, args.top, flags=words(args.flags))
         inputs = inputs or source
-    for key in ("max_cpus", "priority", "single_thread_weight"):
+    for key in ("max_cpus", "priority"):
         value = getattr(args,key)
         if value is not None:
             task[key] = value

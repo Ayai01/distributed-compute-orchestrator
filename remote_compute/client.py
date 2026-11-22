@@ -1918,7 +1918,7 @@ class Pool:
                      'private_mb','memory_unallocated_mb','commit_unallocated_mb','memory_budget_mb')},
                  "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
-                 "packages": package_names(n.health),
+                 "packages": package_names(n.health, include_base=False),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),
                  "accelerators": n.health.get("accelerators", []),
                  "accelerator_reserved": len({unit[:2] for items in n.accelerator_reservations.values() for unit in items}),
@@ -2053,7 +2053,7 @@ class Pool:
                         # difference, retain speed learning and operator weights.
                         close = [n for n in ready if pressures[n.name] - pressures[least.name]
                                  < max(1 / logical(n), 1 / logical(least))]
-                        priors = self._speed_priors(close,task.get('single_thread_weight',1.0))
+                        priors = self._speed_priors(close)
                         observations = [n.durations[label]/priors[n.name] for n in close if label in n.durations]
                         typical = sum(observations) / len(observations) if observations else 1.0
                         def score(n):
@@ -2087,8 +2087,8 @@ class Pool:
                     return None
                 self.condition.wait(0.2)
 
-    def _speed_priors(self, nodes, single_thread_weight):
-        """A neutral hint balances serial latency and aggregate throughput."""
+    def _speed_priors(self, nodes):
+        """Balance measured serial latency and throughput per CPU."""
         benchmarks = [n.health.get('benchmark') or {} for n in nodes]
         valid = lambda b: (b.get('name') == 'native-mixed-v4' and b.get('unit')=='Miter/s'
                            and b.get('score',0)>0 and b.get('threads',0)>0)
@@ -2099,8 +2099,7 @@ class Pool:
         singles = [b.get('single') or {} for b in benchmarks]
         serial = [b['score'] for b in singles] if all(valid(b) for b in singles) and len({b.get('name') for b in singles})==1 else [1.0]*len(nodes)
         bulk_mean,serial_mean = sum(bulk)/len(nodes),sum(serial)/len(nodes)
-        serial_fraction = single_thread_weight/(1.0+single_thread_weight)
-        return {n.name:1/((total/bulk_mean)**(1-serial_fraction)*(single/serial_mean)**serial_fraction)
+        return {n.name: 1 / ((total / bulk_mean)**0.5 * (single / serial_mean)**0.5)
                 for n,total,single in zip(nodes,bulk,serial)}
 
     def _cpu_pressure(self, node, cpus):

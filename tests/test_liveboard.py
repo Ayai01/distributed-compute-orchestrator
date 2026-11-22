@@ -60,7 +60,7 @@ class LiveboardTests(unittest.TestCase):
         self.assertEqual(live.snapshot(dict(self.health(),cpus=170),nodes)['summary']['cpu_capacity'],170)
         self.assertIsNone(value['summary']['completed'])
         self.assertIsNone(value['source']['uptime_seconds'])
-        self.assertEqual(value['nodes'][0]['capabilities'],['ng47','ml'])
+        self.assertEqual(value['nodes'][0]['capabilities'],['ng47'])
 
     def test_total_threads_are_physical_deduplicated_and_independent_of_grants(self):
         nodes=[self.node(capacity=10,base_capacity=6,logical_cpus=8),
@@ -78,13 +78,15 @@ class LiveboardTests(unittest.TestCase):
 
     def test_task_progress_is_explicit_and_job_width_elapsed_are_real(self):
         jobs=[dict(id='a'*32,label='Task',status='running',cpus=2,max_cpus=64,
-                   project='project',started=90,completed=2,total=8,argv=['SECRET']),
+                   project='project',started=90,completed=2,total=8,priority=-5,argv=['SECRET']),
               dict(id='b'*32,status='running',cpus=1,max_cpus=54,started=95)]
-        value=live.snapshot(self.health(),[self.node(active_jobs=jobs)],now=100)
+        health=dict(self.health(),queued_jobs=[dict(id='c'*32,priority=12)])
+        value=live.snapshot(health,[self.node(active_jobs=jobs)],now=100)
         self.assertEqual(value['jobs'][0]['progress'],dict(completed=2,total=8,ratio=.25))
         self.assertEqual(value['jobs'][0]['elapsed_seconds'],10)
         self.assertEqual(value['jobs'][0]['max_cpus'],64)
         self.assertIsNone(value['jobs'][1]['progress'])
+        self.assertEqual([row['priority'] for row in value['jobs']],[-5,0,12])
         self.assertNotIn('SECRET',live.encode(value).decode())
 
     def test_bounds_hold_for_large_cached_active_sets_without_loading_history(self):

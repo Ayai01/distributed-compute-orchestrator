@@ -11,7 +11,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 from . import ABBREVIATION, __version__
 from .policy import canonical_capabilities
-from .packages import PACKAGES, package_names
+from .packages import DEFAULT_PACKAGE, PACKAGES, package_names
 from .task_tags import compact_tag
 from .telemetry import sampling_notice
 
@@ -156,8 +156,8 @@ def _task_memory(job):
 
 
 def _capabilities(names):
-    labels = {'python': 'Python', 'rtl': 'Chisel', 'onnx': 'ONNX'}
-    return ' '.join(labels.get(name, name) for name in PACKAGES if name in names) or '-'
+    labels = {'rtl': 'Chisel', 'onnx': 'ONNX'}
+    return ' '.join(labels.get(name, name) for name in PACKAGES if name in names and name != DEFAULT_PACKAGE) or '-'
 
 
 def _device_packages(node):
@@ -364,7 +364,7 @@ class StatusRows(list):
             self.records.append([job.get('id','-')[:4],name,job.get('project') or '-',f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
                                  _task_memory(job),state_label,label,
                                  str(max(0,int(now-started))) if started is not None else '-',
-                                 f"{float(job.get('resource_share',value.get('projects',{}).get(job.get('project'),{}).get('resource_share',1.0)))}/{job.get('priority',0)}",
+                                 str(job.get('priority', 0)),
                                  _progress_label(job)])
 
     @property
@@ -612,40 +612,42 @@ class StatusRows(list):
         self.page_count=max(1,math.ceil(len(self.records)/size))
         self.task_page%=self.page_count
         records=self.records[self.task_page*size:(self.task_page+1)*size]
-        records=[r if len(r)>7 else [*r,'-'] for r in records]
         ram_width=max([9]+[_width(r[4])for r in records])
         state_width=max([4]+[_width(r[5])for r in records])
         cpu_header, cpu_width = 'CPU/限', 7
-        # The full progress column appears only when the task panel has room
-        # for it.  Narrow panes retain every existing identity/resource field;
-        # the same ratio remains available in the status/API payload.
-        show_progress = width >= 140
-        if show_progress:
-            table=_table(['ID','节点','工程',cpu_header,'内存实/报','秒','状态','进度','任务标签'],
-                         [[r[i] for i in (0,1,2,3,4,7,5,9,6)] for r in records],
-                         [4,self.node_width,6,cpu_width,ram_width,6,state_width,4,None],width,right=(3,4,5,6))
-        elif width>=100:
-            table=_table(['ID','节点','工程',cpu_header,'内存实/报','秒','状态','任务标签'],
-                         [[r[i] for i in (0,1,2,3,4,7,5,6)] for r in records],
-                         [4,self.node_width,6,cpu_width,ram_width,6,state_width,None],width,right=(3,4,5))
-        elif width>=80:
-            table=_table(['ID','节点',cpu_header,'内存实/报','秒','状态','任务标签'],
-                         [[r[i] for i in (0,1,3,4,7,5,6)] for r in records],
-                         [4,self.node_width,cpu_width,ram_width,5,state_width,None],width,right=(2,3,4))
-        elif width>=64:
-            table=_table(['ID','节点',cpu_header,'秒','任务标签'],[[r[i] for i in (0,1,3,7,6)] for r in records],
-                         [4,self.node_width,cpu_width,5,None],width,right=(2,3))
-        elif width>=54:
-            table=_table(['ID','节点',cpu_header,'任务标签'],
-                         [[r[i] for i in (0,1,3,6)] for r in records],
-                         [4,self.node_width,cpu_width,None],width,right=(2,))
-        elif width>=38:
-            table=_table(['ID',cpu_header,'任务标签'],[[r[i] for i in (0,3,6)] for r in records],
-                         [4,cpu_width,None],width,right=(1,))
+        priority = (8, '优先级', 6)
+        task = (6, '任务标签', None)
+        identity = (0, 'ID', 4)
+        node = (1, '节点', self.node_width)
+        cpu = (3, cpu_header, cpu_width)
+        ram = (4, '内存实/报', ram_width)
+        seconds = (7, '秒', 6)
+        status = (5, '状态', state_width)
+        project = (2, '工程', 6)
+        progress = (9, '进度', 4)
+        if width >= 140:
+            columns = [identity, node, project, priority, cpu, ram, seconds, status, progress, task]
+        elif width >= 100:
+            columns = [identity, node, project, priority, cpu, ram, seconds, status, task]
+        elif width >= 80:
+            columns = [identity, node, priority, cpu, ram, seconds, status, task]
+        elif width >= 64:
+            columns = [identity, node, priority, cpu, seconds, task]
+        elif width >= 54:
+            columns = [identity, node, priority, cpu, task]
+        elif width >= 38:
+            columns = [identity, priority, cpu, task]
         else:
-            table=[_line('ID CPU 任务',width)]
+            columns = None
+        if columns is not None:
+            table = _table([label for _, label, _ in columns],
+                           [[record[index] for index, _, _ in columns] for record in records],
+                           [size for _, _, size in columns], width,
+                           right=tuple(pos for pos, (index, _, _) in enumerate(columns) if index in (3, 4, 7, 8)))
+        else:
+            table=[_line('ID 优先 CPU 任务',width)]
             for r in records:
-                prefix=f'{r[0]} {r[3]} '
+                prefix=f'{r[0]} {r[8]} {r[3]} '
                 fitted=compact_tag({'label':r[6],'id':r[0]},max(1,width-4-_width(prefix)),measure=_width)
                 table.append(_line(prefix+fitted,width))
         title=f'当前任务 {len(self.records)} 个 | {self.task_page+1}/{self.page_count}页'

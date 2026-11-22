@@ -21,7 +21,7 @@ from .worker import (Conflict, _ASSET, _ID, lock_root, validate_task, asset_hand
                      handoff_references, retire_asset, missing_task_assets)
 from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
-                     MAX_RESOURCE_SHARE, MAX_SINGLE_THREAD_WEIGHT,
+                     MAX_RESOURCE_SHARE,
                      public_capabilities, normalize_accelerator_requirement,
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
@@ -555,7 +555,7 @@ class Coordinator(PlacementPlanning):
     def health(self, *, brief=False, sample=False, display=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []))
         if display:
             value = self._display_health()
         else:
@@ -630,6 +630,7 @@ class Coordinator(PlacementPlanning):
         detail = {'default_package': DEFAULT_PACKAGE}
         if operator:
             tags = {tag for node in online for tag in execution_capabilities(node.health.get('tags', ()))}
+            tags.difference_update({'python', 'ml'})
             detail = {
                 'platforms': sorted({node.health.get('platform') for node in online} - {None, ''}),
                 'tags': [name for name in EXECUTION_CAPABILITIES if name in tags],
@@ -637,13 +638,16 @@ class Coordinator(PlacementPlanning):
                 'accelerators': aggregate_accelerators(profile for node in online
                                                        for profile in node.health.get('accelerators', ())),
             }
+        capacity = self._cpu_availability(online, operator=operator)
+        for base in (DEFAULT_PACKAGE, 'ml'):
+            capacity['capability_cpus'].pop(base, None)
         return {
             'protocol': PROTOCOL,
             'role': 'scheduler',
             'version': __version__,
             **detail,
             'capabilities': public_capabilities(),
-            **self._cpu_availability(online, operator=operator),
+            **capacity,
             'memory': {'capacity_mb': memory_capacity, 'available_mb': memory_available, 'unit': 'MiB'},
         }
 
@@ -737,7 +741,6 @@ class Coordinator(PlacementPlanning):
                     item['memory_phase']=(result.get('memory_phase')or job['task'].get('memory_model')
                                           or dict(memory_mb=job['task'].get('memory_mb')))
                     item.update(progress_fields(result))
-                    item['single_thread_weight']=job.get('task',{}).get('single_thread_weight',1.0)
                     item['project'] = job.get('task',{}).get('project','')
                     item.update({key:job['task'].get(key,default) for key,default in
                                  (('priority',0),('resource_share',1.0))})
@@ -778,7 +781,7 @@ class Coordinator(PlacementPlanning):
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
                                      + sum(row['status'] in TERMINAL for row in observation_rows.values()),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','single_thread_weight','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -845,7 +848,7 @@ class Coordinator(PlacementPlanning):
                     raise Conflict('Only queued jobs accept a dispatch priority override')
                 result=job['result']
                 updated=dict(result,submitted_priority=result.get('submitted_priority',job['task']['priority']),
-                             dispatch_priority=priority)
+                             dispatch_priority=priority, priority=priority)
                 # No acceptance/index transition occurs. Publish the one
                 # durable metadata change before it can affect dispatch.
                 atomic_json(job['directory']/'result.json',updated)
@@ -1125,7 +1128,7 @@ class Coordinator(PlacementPlanning):
                 job = Job({"directory": directory, "task": task, "auto_cpus": task['cpus'] == 0,
                            "elastic_cpus": elastic_cpus(task), "cancel": threading.Event(), "node": None,
                        "result": {"id": identity, "status": "queued", "label": task["label"], "project": task['project'], "cpus": task["cpus"], 'max_cpus':task['max_cpus'],
-                                  "single_thread_weight": task.get('single_thread_weight',1.0),
+                                  "priority": task["priority"],
                                   "accelerator": task.get('accelerator'),
                                   "max_retries": task.get('retries',2), "attempts": [],
                                   "resource_recovery_limit":len(RESOURCE_RECOVERY_DELAYS)if reentrant_computation(task)else 0,
@@ -1345,7 +1348,7 @@ class Coordinator(PlacementPlanning):
                     return
                 variants = job['result'].get('_asset_variants', ())
                 dispatch_task = bind_asset_variants(task, variants, node.health) if variants else task
-                if (dispatch_task is not task or job['auto_cpus'] or 'max_cpus' in task or 'single_thread_weight' in task
+                if (dispatch_task is not task or job['auto_cpus'] or 'max_cpus' in task
                         or 'retries' in task or task.get('node') is not None
                         or 'requested_accelerator' in job['result']):
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
@@ -1357,7 +1360,6 @@ class Coordinator(PlacementPlanning):
                     worker_task.pop('cache_ref',None)
                     worker_task.pop('native_cache',None)
                     worker_task.pop('_capability_package', None)
-                    worker_task.pop('single_thread_weight',None)
                     if STARTUP_CPU_FLOOR not in node.health.get('capabilities', ()):
                         worker_task.pop('min_start_cpus', None)
                     worker_task.pop('retries',None)
@@ -1976,6 +1978,7 @@ class Coordinator(PlacementPlanning):
             assigned['min_cpus']=job['result']['min_cpus']
         if job.get('task'):
             assigned['cpus']=job['task']['cpus']
+            assigned['priority']=job['task'].get('priority',0)
             assigned['memory_mb']=job['task']['memory_mb']
             assigned['accelerator']=job['task'].get('accelerator')
         job["result"].update(remote, **assigned, center_submitted=submitted)

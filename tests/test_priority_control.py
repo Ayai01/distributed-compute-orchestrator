@@ -39,6 +39,8 @@ class PriorityControlTests(unittest.TestCase):
                 archive=state.root/'jobs'/first/'request.zip';before=archive.read_bytes()
                 reply=client.control(job=first,priority=2)
                 self.assertEqual((reply['submitted_priority'],reply['dispatch_priority']),(0,2))
+                queued={row['id']: row['priority'] for row in client.health()['queued_jobs']}
+                self.assertEqual(queued,{first:2,second:1})
                 self.assertEqual(reply['request_sha256'],hashlib.sha256(before).hexdigest())
                 self.assertEqual(client.submit(original,job_id=first)['id'],first)
                 self.assertEqual(archive.read_bytes(),before)
@@ -47,6 +49,7 @@ class PriorityControlTests(unittest.TestCase):
                 a=client.fetch(first,delete=False);b=client.fetch(second,delete=False)
                 self.assertLess(a['started'],b['started'])
                 self.assertEqual((a['id'],a['submitted_priority'],a['dispatch_priority']),(first,0,2))
+                self.assertEqual(a['priority'],2)
                 self.assertEqual(a['request_sha256'],hashlib.sha256(before).hexdigest())
                 self.assertEqual(a['stdout'].strip(),'original')
                 client.delete(first);client.delete(second)
@@ -77,7 +80,7 @@ class PriorityControlTests(unittest.TestCase):
     def test_project_client_cannot_change_dispatch_priority(self):
         with scratch()as root,provider(Path(root)/'worker')as(_,node),Pool([node])as pool:
             with center(pool,Path(root)/'center',paused=True)as(state,client):
-                identity=client.submit(python('print(1)'))['id'];ordinary=Client(client.url,operator=False)
+                identity=client.submit(python('print(1)'))['id'];ordinary=Client(client.url,state.token,operator=False)
                 with self.assertRaises(RemoteError)as raised:ordinary.control(job=identity,priority=2)
                 self.assertEqual(raised.exception.status_code,403)
                 self.assertNotIn('dispatch_priority',client.status(identity))

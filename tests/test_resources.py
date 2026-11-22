@@ -265,13 +265,14 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_capability_column_uses_only_public_packages(self):
         packages=['python','rtl','onnx','long-custom-tag'*8]
-        self.assertEqual(_capabilities(packages),'Python RTL/Chisel ONNX')
-        self.assertEqual(_capabilities([*packages,'ng47','hsp']),'Python ng47 hsp RTL/Chisel ONNX')
+        self.assertEqual(_capabilities(packages),'Chisel ONNX')
+        self.assertEqual(_capabilities([*packages,'ng47','hsp']),'ng47 hsp Chisel ONNX')
         value=dict(role='worker',node='Aya1-TX',cpus=30,packages=packages)
         for width in (56,80,110,160):
             lines=format_status(value,width=width)
             self.assertTrue(all(_width(line)<=width for line in lines))
-            self.assertIn('RTL/Chisel','\n'.join(lines))
+            self.assertIn('Chisel','\n'.join(lines))
+            self.assertNotIn('Python','\n'.join(lines))
 
     def test_invalid_thread_budget_fails_without_starting_kernel(self):
         with patch('remote_compute.benchmark.measure') as kernel:
@@ -378,47 +379,46 @@ class CalibrationTests(unittest.TestCase):
         pool=self.pool()
         pool.nodes[0].health['benchmark'].update(name='numpy-mixed-v2',score=1000)
         pool.nodes[1].health['benchmark'].update(name='numpy-mixed-v3',score=1)
-        self.assertEqual(pool._speed_priors(pool.nodes,1),{'one':1.0,'two':1.0})
+        self.assertEqual(pool._speed_priors(pool.nodes),{'one':1.0,'two':1.0})
 
     def test_balanced_policy_uses_speed_only_within_close_cpu_load(self):
         pool=self.pool('balanced')
         pool.nodes[1].health['benchmark'].update(score=40)
         self.assertEqual(self.choose(pool),'two')
 
-    def test_serial_hint_changes_placement_without_changing_cpu_or_project_share(self):
+    def test_legacy_serial_hint_has_no_effect_on_placement(self):
         for policy in ('adaptive','balanced'):
-            for weight,expected in ((.5,'two'),(1.0,'two'),(2.0,'one')):
+            for weight in (.5, 1.0, 2.0):
                 with self.subTest(policy=policy,weight=weight):
                     pool=self.pool(policy)
                     one,two=pool.nodes
                     two.health.update(cpus=16,logical_cpus=16)
                     one.health['benchmark'].update(score=4,single=dict(name=NAME,score=8,unit='Miter/s',threads=1))
                     two.health['benchmark'].update(score=16,threads=16,single=dict(name=NAME,score=2,unit='Miter/s',threads=1))
-                    if weight==1:
-                        priors=pool._speed_priors(pool.nodes,weight)
-                        self.assertAlmostEqual(priors['one'],priors['two'])
-                    self.assertEqual(self.choose(pool,weight),expected)
+                    priors=pool._speed_priors(pool.nodes)
+                    self.assertAlmostEqual(priors['one'],priors['two'])
+                    self.assertEqual(self.choose(pool,weight),'two')
                     self.assertEqual(sum(n.reserved for n in pool.nodes),1)
 
-    def test_lower_cpu_load_overrides_extreme_serial_hint(self):
+    def test_lower_cpu_load_precedes_serial_speed(self):
         pool=self.pool()
         pool.nodes[0].health.update(cpu_percent=75)
         for n,rate in zip(pool.nodes,(100,1)):
             n.health['benchmark']['single']=dict(name=NAME,score=rate,unit='Miter/s',threads=1)
-        self.assertEqual(self.choose(pool,1000),'two')
+        self.assertEqual(self.choose(pool),'two')
 
     def test_missing_single_measurement_is_neutral_and_hash_bulk_is_ignored(self):
         pool=self.pool()
         pool.nodes[0].health['benchmark'].update(name='pbkdf2-sha256-v1',score=1e12)
         pool.nodes[1].health['benchmark']['single']=dict(name=NAME,score=100,unit='Miter/s',threads=1)
-        priors=pool._speed_priors(pool.nodes,2.0)
+        priors=pool._speed_priors(pool.nodes)
         self.assertEqual(priors,{'one':1.0,'two':1.0})
 
-    def test_serial_weight_validation_and_default_packet_compatibility(self):
+    def test_retired_serial_weight_is_ignored_in_legacy_requests(self):
         from remote_compute import command
         from remote_compute.worker import validate_task
-        self.assertNotIn('single_thread_weight',command(['echo']))
-        self.assertEqual(validate_task(command(['echo'],single_thread_weight=2),4)['single_thread_weight'],2)
-        for value in (0,-1,True,False,None,'2',float('inf'),float('nan')):
-            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'single_thread_weight'):
-                validate_task(command(['echo'],single_thread_weight=value),4)
+        task=command(['echo'],priority=-7,single_thread_weight=2)
+        self.assertNotIn('single_thread_weight',task)
+        normalized=validate_task(dict(task,single_thread_weight=2),4)
+        self.assertNotIn('single_thread_weight',normalized)
+        self.assertEqual(normalized['priority'],-7)

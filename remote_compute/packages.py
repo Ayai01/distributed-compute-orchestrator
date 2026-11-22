@@ -160,9 +160,10 @@ def provider_environment(task, health):
     return dict(env, CHISEL_FIRTOOL_PATH=str(path_type(argv[0]).parent))
 
 
-def package_names(health):
+def package_names(health, *, include_base=True):
     """Project package names justified by a single provider's probe report."""
     tags = health.get('tags', ())
-    return [name for name, package in PACKAGES.items() if provider_has_package(health, name)
+    return [name for name, package in PACKAGES.items() if (include_base or name != DEFAULT_PACKAGE)
+            and provider_has_package(health, name)
             and (package.accelerator is None or package.accelerator in tags
                  and package.accelerator in health.get('python_backends', ()))]

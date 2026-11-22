@@ -53,7 +53,7 @@ from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, plan_resize, 
 from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
 from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
-                     MAX_SINGLE_THREAD_WEIGHT, normalize_accelerator_requirement, select_accelerator_units,
+                     normalize_accelerator_requirement, select_accelerator_units,
                      normalize_accelerators, aggregate_accelerators, canonical_capabilities,
                      canonical_capability, clean_tool_snapshot, validate_platform, RESOURCE_CONTROL_FIELDS,validate_resource_controls)
 
@@ -219,10 +219,8 @@ def validate_task(task, capacity, *, allow_auto=False):
     if (isinstance(share, bool) or not isinstance(share, (int, float))
             or not math.isfinite(share) or not 0 < share <= MAX_RESOURCE_SHARE):
         raise ValueError(f'resource_share must be in (0, {MAX_RESOURCE_SHARE:g}]')
-    serial = task.get('single_thread_weight', 1.0)
-    if (isinstance(serial, bool) or not isinstance(serial, (int, float))
-            or not math.isfinite(serial) or not 0 < serial <= MAX_SINGLE_THREAD_WEIGHT):
-        raise ValueError(f'single_thread_weight must be in (0, {MAX_SINGLE_THREAD_WEIGHT:g}]')
+    # Older request bundles may still carry this retired placement hint.
+    task.pop('single_thread_weight', None)
     task['accelerator'] = normalize_accelerator_requirement(task.get('accelerator'))
     task['requires'] = canonical_capabilities(task.get('requires', ()))
     validate_platform(task.get('platform'))
@@ -523,6 +521,7 @@ class Worker:
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'active_cpus', 'min_cpus', 'max_cpus', 'memory_mb', 'memory_phase', 'started', 'accelerator')},
+                                     'priority': j['task'].get('priority', 0),
                                      'rss_mb':round(j.get('rss_mb',0),2),'private_mb':j.get('private_mb'),
                                      'memory_modeled':bool(j.get('memory_phase_model',j['task'].get('memory_model'))),
                                      'memory_phase_model':j.get('memory_phase_model',j['task'].get('memory_model')),
@@ -1096,6 +1095,7 @@ class Worker:
                 if 'onnx-int8' in task['requires']:
                     tools = {**tools, 'onnx': tools['onnx-int8']}
                 result = {"id": identity, "status": "queued", "label": task["label"], 'project': task['project'], "cpus": task["cpus"], 'max_cpus':task['max_cpus'],
+                          'priority': task['priority'],
                           "memory_mb": task["memory_mb"], "peak_rss_mb": 0, "cpu_seconds": 0,
                           'initial_cpus':task['cpus'],'peak_cpus':task['cpus'],'resize_count':0,
                           "submitted": time.time(), "started": None, "finished": None,

@@ -52,15 +52,16 @@ def _paint_row(row, device_names=()):
         'blocked':'\x1b[31;1m', 'error':'\x1b[31;1m', 'failed':'\x1b[31;1m'}
     # The task label can contain pipes, hashes and status words. Count
     # separators only through the known table fields before styling the row.
-    task = re.search(r'[|+] (?P<id>[0-9a-f]{4})(?: \| | +\d+/(?:\d+|\?))', row, re.I)
+    task = re.search(r'[|+] (?P<id>[0-9a-f]{4})(?: \| | +-?\d+ +\d+/(?:\d+|\?))', row, re.I)
     paint_end = len(row)
     if task:
         panel_width = _width(row[task.start():])
         if panel_width < 38:
             paint_end = task.end()
         else:
-            separators = (8 if panel_width >= 140 else 7 if panel_width >= 100 else
-                          6 if panel_width >= 80 else 4 if panel_width >= 64 else 3)
+            separators = (9 if panel_width >= 140 else 8 if panel_width >= 100 else
+                          7 if panel_width >= 80 else 5 if panel_width >= 64 else
+                          4 if panel_width >= 54 else 3)
             fields = row[task.start()+1:].split('|', separators)
             if len(fields) == separators+1:
                 paint_end = len(row)-len(fields[-1])
