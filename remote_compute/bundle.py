@@ -207,7 +207,7 @@ def task_bundle(task, inputs=None, files=None):
     return pack(contents)
 
 
-def atomic_json(path, value, *, private=False):
+def atomic_json(path, value, *, private=False, publish=None):
     """Publish flushed JSON through a unique, owner-only sibling file.
 
     Concurrent progress/final receipt writers must never share a temporary
@@ -225,7 +225,10 @@ def atomic_json(path, value, *, private=False):
             os.fsync(output.fileno())
         for attempt in range(7):
             try:
-                pending.replace(path)
+                if publish is None:
+                    pending.replace(path)
+                else:
+                    publish(pending,path)
                 break
             except PermissionError:
                 # Windows readers/antivirus may briefly hold the old file.

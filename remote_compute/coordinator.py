@@ -2,7 +2,7 @@
 
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 import io
 import json
@@ -561,12 +561,29 @@ class Coordinator(PlacementPlanning):
             value = self._display_health()
         else:
             with self.condition, self.pool.condition:
-                value = self._health()
-                projects = PlacementSnapshot(self)
+                view, projects = self._health_inputs()
+            value = view._health()
             value['projects'] = projects._project_resources()
         relay = transport._RELAY_BULK_BUDGET
         value['relay_bulk'] = relay.snapshot() if relay is not None else None
         return value
+
+    def _health_inputs(self):
+        """Capture published state; build tables and aggregate resources after releasing both locks."""
+        projects = PlacementSnapshot(self)
+        view = copy(self)
+        view.pool = projects.pool
+        view.pool.condition = nullcontext()
+        view.condition = nullcontext()
+        view.queue = projects.queue
+        view.observations = copy(self.observations)
+        if isinstance(self.jobs, JobRecords):
+            view.jobs = copy(self.jobs)
+            view.jobs.active = projects.jobs
+            view.jobs.recent = self.jobs.recent.copy()
+        else:
+            view.jobs = projects.jobs
+        return view, projects
 
     def _display_health(self):
         """Keep the display responsive and queue a fresh sample when busy."""
@@ -596,13 +613,13 @@ class Coordinator(PlacementPlanning):
             if not self.pool.condition.acquire(blocking=wait):
                 return False
             try:
-                value = self._health()
-                projects = PlacementSnapshot(self)
+                view, projects = self._health_inputs()
                 sampled = (time.monotonic(), time.time())
             finally:
                 self.pool.condition.release()
         finally:
             self.condition.release()
+        value = view._health()
         value['projects'] = projects._project_resources()
         self._display_health_cache = (*sampled, deepcopy(value))
         return True
@@ -956,6 +973,7 @@ class Coordinator(PlacementPlanning):
 
     def _save(self, job):
         if job.get('retired'):return
+        job.pop('grant_receipt_revision',None)
         terminal = job['result']['status'] in TERMINAL
         if not terminal:
             self._publish(job)
@@ -964,6 +982,19 @@ class Coordinator(PlacementPlanning):
         # its final outcome after that decision; never expose it mid-retry.
         if terminal and job['result']['status'] != 'interrupted':
             self._publish(job)
+
+    def _persist_grant(self, job, revision, receipt):
+        """Write outside the scheduling locks; publish only the latest durable grant."""
+        def publish(pending, path):
+            with self.condition:
+                if job.get('grant_receipt_revision') is revision and not job.get('retired'):
+                    pending.replace(path)
+        try:
+            atomic_json(job['directory']/'result.json',receipt,publish=publish)
+        except FileNotFoundError:
+            with self.condition:
+                if job.get('grant_receipt_revision') is revision and not job.get('retired'):
+                    raise
 
     @staticmethod
     def _restore_accelerator(task, result):
@@ -2083,6 +2114,8 @@ class Coordinator(PlacementPlanning):
                 job=self.jobs[identity];node=job.get('node')
                 if self.stopping or job['cancel'].is_set() or node is None or job['result']['status'] in TERMINAL:
                     raise Conflict('Only a running task can change its CPU grant')
+                grant_fields=('cpus','memory_mb','memory_phase','requested_cpus','min_cpus','active_cpus')
+                prior_grant=tuple(job['result'].get(field) for field in grant_fields)
                 old=job['task']['cpus']
                 old_memory=job['task']['memory_mb']
                 request = self._resize_memory_request(job, node, request)
@@ -2174,15 +2207,21 @@ class Coordinator(PlacementPlanning):
                 self._publish(job)
 
             def commit(actual,actual_memory,memory_phase=None):
+                revision=None
                 with self.condition,self.pool.condition:
                     # Completion may have released this task while the RPC waited.
+                    if job.get('retired') or job['result']['status'] in TERMINAL or self.jobs.get(identity) is not job:
+                        return
                     if job.get('worker_id',identity) in node.live_jobs:
                         node.reserved+=actual-job['task']['cpus']
                         node.reserved_memory_mb+=actual_memory-job['task']['memory_mb']
                     job['task']['cpus']=job['result']['cpus']=actual
                     job['task']['memory_mb']=job['result']['memory_mb']=actual_memory
                     if memory_phase is not None:job['result']['memory_phase']=memory_phase
-                    if self.jobs.get(identity) is job:self._save(job)
+                    self._publish(job)
+                    if prior_grant!=tuple(job['result'].get(field) for field in grant_fields):
+                        revision=job['grant_receipt_revision']=object()
+                        receipt=job['read_result']
                     hold=node.memory_holds.get(job.get('worker_id',identity))
                     if job.get('worker_id',identity)in node.live_jobs:
                         if hold is None:
@@ -2190,6 +2229,8 @@ class Coordinator(PlacementPlanning):
                         hold.update(after=time.monotonic(),credit=actual_memory)
                     self.pool.condition.notify_all()
                     self.condition.notify_all()
+                if revision is not None:
+                    self._persist_grant(job,revision,receipt)
 
             try:
                 worker_id=job.get('worker_id',identity)

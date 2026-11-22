@@ -1,5 +1,6 @@
 """Integer weighted shares, redistributing demand that a project cannot use."""
 import math
+import heapq
 
 STARTUP_CPU_FLOOR = 'startup_cpu_floor'
 ACTIVE_GRANT_CONFLICT = 'active_cpus must count threads within the existing grant and requested width'
@@ -89,7 +90,28 @@ def weighted_node_threads(capacities, shares, demands, rooms, *, current_used=No
     placed={name:{node:0 for node in rooms.get(name,{})} for name in shares}
     used={node:0 for node in capacities}
     total={name:0 for name in shares}
-    blocked=set()
+    rank=(lambda name:((total[name]+(fixed_used or {}).get(name,0))/shares[name],current_used.get(name,0)/shares[name],name))if current_used is not None else lambda name:((total[name]+1)/shares[name],name)
+    # Running jobs with a fixed provider cannot exchange cores between hosts.
+    # Interleaving their independent heaps gives exactly the same integer grants.
+    pinned = {}
+    for name in shares:
+        edges = [node for node,limit in rooms.get(name,{}).items() if node in capacities and limit > 0]
+        if len(edges) > 1:
+            break
+        if edges and demands[name] > 0:
+            pinned.setdefault(edges[0], []).append((rank(name),name))
+    else:
+        for node, queue in pinned.items():
+            heapq.heapify(queue)
+            remaining = capacities[node]
+            while queue and remaining > 0:
+                _,name = heapq.heappop(queue)
+                total[name] += 1
+                placed[name][node] += 1
+                remaining -= 1
+                if total[name] < min(demands[name],rooms[name][node]):
+                    heapq.heappush(queue,(rank(name),name))
+        return placed
     degree={node:sum(node in edges for edges in rooms.values()) for node in capacities}
     def place(name,seen):
         nodes=[node for node in placed[name] if node in capacities and node not in seen
@@ -102,22 +124,19 @@ def weighted_node_threads(capacities, shares, demands, rooms, *, current_used=No
                 placed[name][node]+=1;used[node]+=1
                 return True
             for other in shares:
-                if other!=name and placed[other].get(node,0) and place(other,seen):
+                if other!=name and len(placed[other])>1 and placed[other].get(node,0) and place(other,seen):
                     placed[other][node]-=1
                     placed[name][node]+=1
                     return True
         return False
     # Project opportunity uses current occupancy to break integer share ties.
-    rank=(lambda name:((total[name]+(fixed_used or {}).get(name,0))/shares[name],current_used.get(name,0)/shares[name],name))if current_used is not None else lambda name:((total[name]+1)/shares[name],name)
-    for _ in range(sum(capacities.values())):
-        candidates=sorted((name for name in shares if name not in blocked and total[name]<demands[name]),key=rank)
-        for name in candidates:
-            if place(name,set()):
-                total[name]+=1
-                break
-            # Capacities and usable edges stay fixed during this flow. Adding
-            # another claim cannot make an already infeasible claim feasible.
-            blocked.add(name)
-        else:
-            break
+    queue=[(rank(name),name) for name in shares if demands[name]>0]
+    heapq.heapify(queue)
+    remaining=sum(capacities.values())
+    while remaining>0 and queue:
+        _,name=heapq.heappop(queue)
+        if place(name,set()):
+            total[name]+=1
+            remaining-=1
+            if total[name]<demands[name]:heapq.heappush(queue,(rank(name),name))
     return placed

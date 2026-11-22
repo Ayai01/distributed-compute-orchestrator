@@ -1,9 +1,49 @@
 """Feasible weighted shares across pinned and overlapping node sets."""
+from hashlib import sha256
+import json
+from random import Random
 import unittest
 from remote_compute.allocation import weighted_node_threads
 
 
+def allocation_parity_cases():
+    rng = Random(1049)
+    for mode in ('single', 'pinned', 'mixed'):
+        for trial in range(160):
+            nodes = [f'n{i}' for i in range(1 if mode == 'single' else rng.randint(2, 6))]
+            rng.shuffle(nodes)
+            capacities = {node: rng.randint(0, 11) for node in nodes}
+            projects = [f'p{i}' for i in range(rng.randint(1, 22))]
+            rng.shuffle(projects)
+            shares = {name: rng.choice((.125, .7, 1, 1, 2.5, 6)) for name in projects}
+            demands = {name: rng.randint(0, 29) for name in projects}
+            rooms = {}
+            for name in projects:
+                edges = rng.sample(nodes, rng.randint(0, len(nodes)) if mode == 'mixed' else rng.randint(0, 1))
+                rooms[name] = {node: rng.randint(0, 10) for node in edges}
+                if rng.random() < .2:
+                    rooms[name]['offline'] = rng.randint(0, 3)
+            options = {}
+            if trial % 4 in (1, 3):
+                options['current_used'] = {name: rng.randint(0, 50) for name in projects[::2]}
+            if trial % 4 in (2, 3):
+                options['fixed_used'] = {name: rng.randint(0, 50) for name in projects[1::2]}
+            yield mode, capacities, shares, demands, rooms, options
+
+
+def allocation_matrix_digest(allocate):
+    matrices = []
+    for mode, capacities, shares, demands, rooms, options in allocation_parity_cases():
+        grants = allocate(capacities, shares, demands, rooms, **options)
+        matrices.append((mode, grants))
+    return sha256(json.dumps(matrices, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 class AllocationTests(unittest.TestCase):
+    def test_seeded_placement_matches_frozen_1048_matrices(self):
+        expected = '925262442eace00c33e544ce86d5a3736595bd697ebc5931bd09b8fa9618def1'
+        self.assertEqual(allocation_matrix_digest(weighted_node_threads), expected)
+
     def test_saturated_pinned_waiters_do_not_block_other_nodes(self):
         shares={f'p{i:04d}':1 for i in range(500)}
         shares['spare']=1
