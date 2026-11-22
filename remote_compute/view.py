@@ -10,7 +10,7 @@ import unicodedata
 from functools import lru_cache
 from urllib.parse import urlsplit
 from . import ABBREVIATION, __version__
-from .policy import canonical_capabilities
+from .policy import canonical_capabilities, priority_weight
 from .packages import DEFAULT_PACKAGE, PACKAGES, package_names
 from .task_tags import compact_tag
 from .telemetry import sampling_notice
@@ -364,7 +364,7 @@ class StatusRows(list):
             self.records.append([job.get('id','-')[:4],name,job.get('project') or '-',f"{job.get('cpus',0)}/{job.get('max_cpus')or '?'}",
                                  _task_memory(job),state_label,label,
                                  str(max(0,int(now-started))) if started is not None else '-',
-                                 str(job.get('priority', 0)),
+                                 str(priority_weight(job.get('priority'))),
                                  _progress_label(job)])
 
     @property

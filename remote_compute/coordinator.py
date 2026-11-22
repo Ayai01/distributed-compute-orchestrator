@@ -21,7 +21,7 @@ from .worker import (Conflict, _ASSET, _ID, lock_root, validate_task, asset_hand
                      handoff_references, retire_asset, missing_task_assets)
 from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
-                     MAX_RESOURCE_SHARE,
+                     MAX_RESOURCE_SHARE, priority_weight,
                      public_capabilities, normalize_accelerator_requirement,
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
@@ -149,8 +149,8 @@ class Coordinator(PlacementPlanning):
             with zipfile.ZipFile(path.parent/'request.zip') as archive:
                 task=json.loads(archive.read('task.json'))
             task=self._restored_task(task, value)
-            if 'dispatch_priority'in value:
-                task['priority']=value['dispatch_priority']
+            value['priority'] = task['priority']
+            job['read_result']['priority'] = task['priority']
             self._restore_accelerator(task, value)
             job.update(task=task,auto_cpus=task['cpus']==0,elastic_cpus=elastic_cpus(task))
             _restore_phase_demand(job)
@@ -743,7 +743,7 @@ class Coordinator(PlacementPlanning):
                     item.update(progress_fields(result))
                     item['project'] = job.get('task',{}).get('project','')
                     item.update({key:job['task'].get(key,default) for key,default in
-                                 (('priority',0),('resource_share',1.0))})
+                                 (('priority',MIN_PRIORITY),('resource_share',1.0))})
                     active.setdefault(result['assigned_node'],[]).append(item)
             observation_rows = self.observations.rows
             observed_active = {}
@@ -796,7 +796,7 @@ class Coordinator(PlacementPlanning):
                     'queued_jobs':[{**{key:self.jobs[identity]['result'].get(key) for key in
                         ('id','label','status','cpus','max_cpus','memory_mb','started')},
                         **{key:self.jobs[identity]['task'].get(key,default) for key,default in
-                           (('project','default'),('priority',0),('resource_share',1.0))}}
+                           (('project','default'),('priority',MIN_PRIORITY),('resource_share',1.0))}}
                         for identity in self.queue],
                     'recent_failures':[{**{key:job['result'].get(key)for key in
                         ('id','label','status','cpus','max_cpus','started','finished','elapsed','assigned_node')},
@@ -1002,6 +1002,7 @@ class Coordinator(PlacementPlanning):
 
     def _restored_task(self, raw_task, result):
         task = validate_task(raw_task, max(1, raw_task.get('cpus', 1)), allow_auto=True)
+        task['priority'] = priority_weight(result.get('dispatch_priority', task['priority']))
         task = build_refs.bind(self.root, task)
         package = result.get('capability_package')
         if package is None:
@@ -1137,6 +1138,8 @@ class Coordinator(PlacementPlanning):
                                   "stdout": "", "stderr": "", "steps": [],
                                   "total_steps": len(task["steps"]), "assets": task["assets"]}})
                 _restore_phase_demand(job)
+                if 'priority' in raw_task and raw_task['priority'] != task['priority']:
+                    job['result']['submitted_priority'] = raw_task['priority']
                 if 'min_start_cpus' in task:
                     job['result']['min_start_cpus'] = task['min_start_cpus']
                 if package is not None:
@@ -1281,8 +1284,6 @@ class Coordinator(PlacementPlanning):
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
                 task=self._restored_task(task, job['result'])
-                if 'dispatch_priority'in job['result']:
-                    task['priority']=job['result']['dispatch_priority']
                 self._restore_accelerator(task, job['result'])
                 automatic=task['cpus']==0;elastic=elastic_cpus(task)
                 grant=remote or job['result']
@@ -1662,14 +1663,12 @@ class Coordinator(PlacementPlanning):
         result = job['result']
         with zipfile.ZipFile(job['directory'] / 'request.zip') as archive:
             task = self._restored_task(json.loads(archive.read('task.json')), result)
-        if 'dispatch_priority' in result:
-            task['priority'] = result['dispatch_priority']
         self._restore_accelerator(task, result)
         job.update(task=task, node=None, auto_cpus=task['cpus'] == 0, elastic_cpus=elastic_cpus(task))
         _restore_phase_demand(job)
         for field in ('assigned_node', 'worker_url', 'dispatched', 'connection_error', 'asset_transport', 'cache_hit', '_artifact_abi'):
             result.pop(field, None)
-        result.update(status='queued', cpus=task['cpus'], memory_mb=task['memory_mb'],
+        result.update(status='queued', priority=task['priority'], cpus=task['cpus'], memory_mb=task['memory_mb'],
                       resource_wait_reason='transport: waiting for a reachable worker')
         identity = result['id']
         self.queue.append(identity)
@@ -1978,7 +1977,7 @@ class Coordinator(PlacementPlanning):
             assigned['min_cpus']=job['result']['min_cpus']
         if job.get('task'):
             assigned['cpus']=job['task']['cpus']
-            assigned['priority']=job['task'].get('priority',0)
+            assigned['priority']=job['task'].get('priority',MIN_PRIORITY)
             assigned['memory_mb']=job['task']['memory_mb']
             assigned['accelerator']=job['task'].get('accelerator')
         job["result"].update(remote, **assigned, center_submitted=submitted)

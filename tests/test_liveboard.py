@@ -86,7 +86,7 @@ class LiveboardTests(unittest.TestCase):
         self.assertEqual(value['jobs'][0]['elapsed_seconds'],10)
         self.assertEqual(value['jobs'][0]['max_cpus'],64)
         self.assertIsNone(value['jobs'][1]['progress'])
-        self.assertEqual([row['priority'] for row in value['jobs']],[-5,0,12])
+        self.assertEqual([row['priority'] for row in value['jobs']],[1,1,12])
         self.assertNotIn('SECRET',live.encode(value).decode())
 
     def test_bounds_hold_for_large_cached_active_sets_without_loading_history(self):

@@ -160,8 +160,18 @@ class ProjectShareTests(unittest.TestCase):
             self.assertEqual(s._cooperative_cpu_target('a',64,s.project_resources()),16)
 
     def test_priority_orders_work_inside_the_same_project(self):
-        s=self.state();self.job(s,'slow','A',queued=True,priority=-1);self.job(s,'urgent','A',queued=True,priority=1)
+        s=self.state();self.job(s,'slow','A',queued=True,priority=0);self.job(s,'urgent','A',queued=True,priority=3)
         self.assertEqual(list(s._queued_candidates(s.project_resources())),['urgent','slow'])
+
+    def test_task_priority_weights_planned_cores_and_lends_unused_threads(self):
+        s=self.state()
+        self.job(s,'regular','A',desired=16,priority=0)
+        urgent=self.job(s,'urgent','A',desired=16,priority=3)
+        resources=s.project_resources()
+        self.assertEqual(s._cooperative_cpu_target('regular',16,resources),4)
+        self.assertEqual(s._cooperative_cpu_target('urgent',16,resources),12)
+        urgent['desired_cpus']=2
+        self.assertEqual(s._cooperative_cpu_target('regular',16,s.project_resources()),14)
 
     def test_terminal_or_recovering_projects_do_not_enter_growth_comparison(self):
         for status in('succeeded','recovering'):

@@ -112,7 +112,7 @@ class PriorityControlTests(unittest.TestCase):
                 before=(state.root/'jobs'/identity/'result.json').read_bytes()
                 with patch('remote_compute.coordinator.atomic_json',side_effect=OSError('injected metadata failure')):
                     with self.assertRaises(RemoteError):client.control(job=identity,priority=2)
-                self.assertEqual(state.jobs[identity]['task']['priority'],0)
+                self.assertEqual(state.jobs[identity]['task']['priority'],1)
                 self.assertEqual((state.root/'jobs'/identity/'result.json').read_bytes(),before)
                 self.assertNotIn('dispatch_priority',client.status(identity))
 

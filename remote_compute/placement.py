@@ -8,6 +8,7 @@ import time
 from .allocation import plan_resize, startup_cpus, weighted_node_threads
 from .bundle import TERMINAL
 from .memory import plan_memory, same_phase
+from .policy import priority_weight
 from .records import active_items, active_values
 from .runtimes import capability_set, execution_bindings
 
@@ -96,12 +97,13 @@ class PlacementPlanning:
                         for node in matching(self.jobs[key]['task'])) for key in ready}
         modes={key:startup_cpus(self.jobs[key]['task']) for key in ready}
         groups={}
-        for key in sorted(ready,key=lambda key:(-self.jobs[key]['task']['priority'],modes[key],counts[key])):
+        weights={key:priority_weight(self.jobs[key]['task'].get('priority')) for key in ready}
+        for key in sorted(ready,key=lambda key:(-weights[key],modes[key],counts[key])):
             task=self.jobs[key]['task']
             groups.setdefault(task.get('project')or'default',deque()).append(key)
         while groups:
             group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'] if group in budgets else math.inf,
-                modes[groups[group][0]],counts[groups[group][0]],group))
+                modes[groups[group][0]],counts[groups[group][0]],-weights[groups[group][0]],group))
             key=groups[group].popleft()
             if not groups[group]:del groups[group]
             yield key
@@ -185,7 +187,7 @@ class PlacementPlanning:
         def order(identity):
             task = self.jobs[identity]['task']
             group = task.get('project') or 'default'
-            return (resources[group]['used']/resources[group]['resource_share'], group, -task['priority'])
+            return (resources[group]['used']/resources[group]['resource_share'], group, -priority_weight(task.get('priority')))
         for identity,task in sorted(candidates,key=lambda row:order(row[0])):
             job = self.jobs[identity]
             if job['result'].get('resource_retry_after',0)>time.time():continue
@@ -215,7 +217,7 @@ class PlacementPlanning:
         for name, (node, waiting) in claims.items():
             owner = waiting.get('project') or 'default'; resource = resources[owner]
             startup_claim = (waiting.get('cpus') == 0 and waiting is not task
-                             and waiting.get('priority', 0) >= task.get('priority', 0))
+                             and priority_weight(waiting.get('priority')) >= priority_weight(task.get('priority')))
             if (owner != group or startup_claim) and resource['used']/resource['resource_share'] <= current['used']/current['resource_share']:
                 protected[name] = max(0, min(startup_cpus(waiting), node.capacity-node.reserved-node.external))
         return protected
@@ -276,7 +278,7 @@ class PlacementPlanning:
         return weighted_node_threads(capacities,shares,demands,rooms,current_used={group:resources[group]['used']for group in shares},fixed_used=fixed)
 
     def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, phase_model=None, fixed_claims=None):
-        """Apply the project share, then its task order at a drained boundary.
+        """Apply the project share, then proportional task weights at a drained boundary.
 
         Running peers keep their grants until their own boundary. Within the
         project's usable compatible capacity, existing work gets up to four useful threads, ready work
@@ -369,13 +371,13 @@ class PlacementPlanning:
             demands[key]=min(demand,task.get('max_cpus',demand))
             rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
             if held is None:waiting[key]=startup_cpus(task)
-        for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-row[1].get('priority',0),len(row[2]),row[3])):
+        for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-priority_weight(row[1].get('priority')),len(row[2]),row[3])):
             choices=[name for name in eligible if capacities[name]>=task['cpus']]
             if choices:
                 selected=max(choices,key=lambda name:capacities[name])
                 capacities[selected]-=task['cpus']
         running={key:value for key,value in demands.items() if key not in waiting}
-        shares={key:1. for key in running}
+        shares={key:priority_weight(members[key]['task'].get('priority')) for key in running}
         warm=weighted_node_threads(capacities,shares,{key:min(4,value) for key,value in running.items()},rooms)
         # A one-slot tail can admit a new one-thread job. Its later four-slot
         # warmup must not dilute older jobs back to two or three threads.
@@ -383,7 +385,7 @@ class PlacementPlanning:
         # admission order on nodes whose combined warm demand does not fit.
         for name,capacity in capacities.items():
             pinned=[key for key in running if name in rooms[key]]
-            if sum(min(4,running[key])for key in pinned)<=capacity:continue
+            if sum(min(4,running[key])for key in pinned)<=capacity or len({shares[key] for key in pinned})>1:continue
             remaining=capacity
             for key in sorted(pinned,key=lambda key:(members[key]['result'].get('submitted',0),key)):
                 count=min(remaining,4,running[key],rooms[key][name])
@@ -393,17 +395,18 @@ class PlacementPlanning:
             # threads. The same group has one unchanged warm plan;
             # wider idle growth is handled separately at the phase boundary.
             warm_cache.setdefault('warm',{})[group]=warm
+        if desired<=4:
             return min(share_room,max(1,warm.get(identity,{}).get(current['node'].name,0)))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
-        entrants=weighted_node_threads(spare,{key:1. for key in waiting},waiting,rooms)
+        entrants=weighted_node_threads(spare,{key:priority_weight(members[key]['task'].get('priority')) for key in waiting},waiting,rooms)
         # A ready entrant owns this opportunity until the scheduler admits it.
         # Wider running phases may still use other nodes with no ready entrant.
-        for name in spare:
-            if any(row.get(name,0) for row in entrants.values()):spare[name]=0
-        extra={key:max(0,value-sum(warm[key].values())) for key,value in running.items()}
-        wide=weighted_node_threads(spare,shares,extra,rooms)
+        for node_name in spare:
+            if any(row.get(node_name,0) for row in entrants.values()):
+                capacities[node_name]-=spare[node_name]
+        planned=weighted_node_threads(capacities,shares,running,rooms)
         name=current['node'].name
-        target=min(share_room,max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0)))
+        target=min(share_room,max(1,planned.get(identity,{}).get(name,0)))
         return target
 
 

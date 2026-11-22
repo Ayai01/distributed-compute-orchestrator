@@ -421,4 +421,5 @@ class CalibrationTests(unittest.TestCase):
         self.assertNotIn('single_thread_weight',task)
         normalized=validate_task(dict(task,single_thread_weight=2),4)
         self.assertNotIn('single_thread_weight',normalized)
-        self.assertEqual(normalized['priority'],-7)
+        self.assertEqual(command(['echo'])['priority'],1)
+        self.assertEqual(normalized['priority'],1)

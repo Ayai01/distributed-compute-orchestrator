@@ -25,11 +25,12 @@ class AutomaticQueueFairnessTests(unittest.TestCase):
         with scratch()as root,provider(Path(root)/'worker',cpus=4)as(_,worker):
             with Pool([worker])as pool,center(pool,Path(root)/'center')as(_,client):
                 busy=[client.submit(python(HOLD,project='serial'))['id']for _ in range(4)]
-                until(lambda:all('ready'in client.logs(i)['stdout']for i in busy),seconds=15)
-                wide=client.submit(python(HOLD,project='parallel',max_cpus=16))['id']
+                until(lambda:all(client.status(i)['status']=='running' for i in busy),seconds=15)
+                wide=client.submit(python(HOLD,project='parallel',max_cpus=16,priority=0))['id']
                 self.assertEqual(client.status(wide)['status'],'queued')
+                self.assertEqual(client.status(wide)['priority'],1)
                 client.write_job_file(busy[0],'release','done');client.wait(busy[0])
-                until(lambda:'ready'in client.logs(wide)['stdout'])
+                until(lambda:client.status(wide)['status']=='running')
                 self.assertEqual(worker.status(wide)['initial_cpus'],1)
                 self.assertEqual(client.status(wide)['cpus'],1)
                 self.assertEqual(client.health()['used_cpus'],4)

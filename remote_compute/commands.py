@@ -23,6 +23,7 @@ from .tasks import ngspice, verilator
 from .records import active_items
 from .auth import node_url
 from .startup import single_instance, Cancelled
+from .policy import MIN_PRIORITY, priority_weight
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -197,7 +198,7 @@ def machine_parser(action):
         parser.add_argument("--max-cpus", type=int, default=1024)
         parser.add_argument("--memory-mb", type=int, default=256)
         parser.add_argument("--timeout", type=float, default=3600)
-        parser.add_argument("--priority", type=int, default=0)
+        parser.add_argument("--priority", type=int, default=MIN_PRIORITY)
         parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
         parser.add_argument("--stdin", help="将本地文件发送为标准输入")
         parser.add_argument("--output", help="保存完整日志和结果")
@@ -254,7 +255,7 @@ def batch(pool, source, output, *, on_submit=None, stop_event=None):
             raise RemoteError("Console is closing")
         task, inputs = prepared[index]
         results[index] = pool.run(task, inputs=inputs, output_dir=Path(output) / str(index), on_submit=on_submit)
-    order = sorted(range(len(entries)), key=lambda i: -prepared[i][0].get("priority", 0))
+    order = sorted(range(len(entries)), key=lambda i: -priority_weight(prepared[i][0].get("priority")))
     capacity = sum(n.capacity for n in pool.nodes) if isinstance(pool, Pool) else pool.health()["cpus"]
     with ThreadPoolExecutor(max_workers=max(1, min(len(entries), capacity or 1))) as executor:
         list(executor.map(run, order))

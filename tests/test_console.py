@@ -829,7 +829,7 @@ class ConsoleTests(unittest.TestCase):
                 with self.subTest(width=width):format_status(value,width=width).fit(50)
 
     def test_task_list_displays_running_and_queued_priorities_at_each_width(self):
-        running=dict(id='aaaa'+'f'*28,cpus=1,status='running',label='running',priority=-7)
+        running=dict(id='aaaa'+'f'*28,cpus=1,status='running',label='running',priority=17)
         queued=dict(id='bbbb'+'f'*28,cpus=1,status='queued',label='queued',priority=22)
         value=dict(role='scheduler',node='Aya1-PC',queued_jobs=[queued],
                    nodes=[dict(name='Aya1-PC',capacity=14,active_jobs=[running])])
@@ -837,7 +837,7 @@ class ConsoleTests(unittest.TestCase):
             with self.subTest(width=width):
                 rows=format_status(value,width=width).fit(50)
                 self.assertTrue(any('优先' in row for row in rows))
-                self.assertTrue(any('aaaa' in row and '-7' in row for row in rows))
+                self.assertTrue(any('aaaa' in row and '17' in row for row in rows))
                 self.assertTrue(any('bbbb' in row and '22' in row for row in rows))
 
     def test_individual_tasks_keep_four_character_ids_across_pages_and_two_columns(self):

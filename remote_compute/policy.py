@@ -14,7 +14,7 @@ MAX_QUEUE_RATIO = 4.0
 MAX_READY_TASKS = 4096
 READY_QUEUE_FLOOR = 129
 MAX_STATUS_BATCH = 128
-MIN_PRIORITY = -1000
+MIN_PRIORITY = 1
 MAX_PRIORITY = 1000
 MAX_REQUIREMENTS = 32
 MAX_REQUIREMENT_LENGTH = 64
@@ -24,6 +24,11 @@ MAX_ACCELERATOR_MEMORY_MB = 2 * 1024 * 1024
 RESOURCE_CONTROL_FIELDS = frozenset((
     'cpus','cpu_limit','cpu_overcommit_factor','cpu_overcommit_utilization',
     'memory_mb','memory_reserve_mb','memory_headroom_mb','memory_commit_headroom_mb'))
+
+
+def priority_weight(value):
+    """Translate a legacy signed priority or a missing value to a positive weight."""
+    return max(MIN_PRIORITY, value) if type(value) is int else MIN_PRIORITY
 
 
 def validate_resource_controls(value, *, logical_cpus, cpu_limit):

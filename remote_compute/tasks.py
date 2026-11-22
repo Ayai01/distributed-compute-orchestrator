@@ -1,5 +1,5 @@
 """Task constructors; callers keep their measurement and scientific semantics."""
-from .policy import canonical_capabilities, validate_platform
+from .policy import MIN_PRIORITY, canonical_capabilities, validate_platform
 
 
 def python_map(function, items, *, kwargs=None, backend='process', item_max_cpus=1, **options):
@@ -29,7 +29,7 @@ def python_task(function, *, kwargs=None, **options):
 
 
 def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
-            priority=0, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
+            priority=MIN_PRIORITY, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=None, retries=2,
             accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True,
             artifact_ref=None, produces_artifact_ref=None, checkpoint_ref=None, checkpoint_output=None,

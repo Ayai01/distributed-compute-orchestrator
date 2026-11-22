@@ -28,7 +28,7 @@ import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack, native_path
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
-                     MAX_STATUS_BATCH, validate_ready_tasks, validate_status_ids, validate_platform)
+                     MAX_STATUS_BATCH, priority_weight, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
 from .allocation import STARTUP_CPU_FLOOR, elastic_cpus, cpu_capacity, startup_cpus
 from .build_refs import provider_abi
@@ -2197,7 +2197,7 @@ class Pool:
         def execute(index):
             results[index] = self.run(tasks[index], inputs=inputs,
                                       output_dir=Path(output_root) / str(index) if output_root else None, keep=keep)
-        ordered = sorted(range(len(tasks)), key=lambda i: -tasks[i].get("priority", 0))
+        ordered = sorted(range(len(tasks)), key=lambda i: -priority_weight(tasks[i].get("priority")))
         threads = min(len(tasks), max(1, sum(n.capacity for n in self.nodes)))
         with ThreadPoolExecutor(max_workers=threads) as executor:
             list(executor.map(execute, ordered))

@@ -77,7 +77,8 @@ class GrowthReuseTests(unittest.TestCase):
             old_calls=allocation.call_count
         self.assertEqual(actual,expected)
         self.assertEqual(calls,1)
-        self.assertGreater(old_calls,calls*32)
+        # The uncached path visits 22 peers to claim 64 slots, three at a time.
+        self.assertEqual(old_calls,22)
 
 
 if __name__=='__main__':unittest.main()

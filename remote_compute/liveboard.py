@@ -23,6 +23,7 @@ from .runtimes import EXECUTION_CAPABILITIES
 from .startup import Cancelled, single_instance
 from .liveboard_wire import encode as encode_cbor
 from .progress import SCHEMA, normalize as normalize_progress, diagnose
+from .policy import priority_weight
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
@@ -142,7 +143,7 @@ def snapshot(health, nodes, *, now=None):
             jobs.append(dict(id=text(j.get('id'), 64), identity_scope=j.get('identity_scope','worker_attempt'),
                              tag=text(j.get('label'), 96), project=project, node=name,
                              status=text(j.get('status'), 16), cpus=number(j.get('cpus')),
-                             priority=j['priority'] if type(j.get('priority')) is int else 0,
+                             priority=priority_weight(j.get('priority')),
                              max_cpus=number(j.get('max_cpus')), rss_mb=number(j.get('rss_mb')),
                              memory_reported_mb=reported_memory(j),
                              memory_reserved_mb=number(j.get('memory_reservation_mb')),
@@ -160,7 +161,7 @@ def snapshot(health, nodes, *, now=None):
         projects.setdefault(project,dict(name=project,running=0,queued=None,cpu_used=0,completed=None,failed=None))
         jobs.append(dict(id=text(j.get('id'),64),identity_scope='task',tag=text(j.get('label'),96),
             project=project,node=None,status='queued',cpus=0,max_cpus=number(j.get('max_cpus')),
-            priority=j['priority'] if type(j.get('priority')) is int else 0,
+            priority=priority_weight(j.get('priority')),
             progress=None,diagnostic=diagnose(dict(j,status='queued'),now=now)))
     for name,p in projects.items():
         resource=(health.get('projects')or{}).get(name,{})

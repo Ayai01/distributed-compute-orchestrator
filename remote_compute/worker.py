@@ -51,7 +51,7 @@ from .ramdisk import EXECUTABLE_RAM_UNAVAILABLE, probe_executable_scratch, valid
 from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, plan_resize, cpu_capacity, validate_cpu_overcommit, validate_cpu_utilization,
                          validate_min_start_cpus)
 from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
-from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, validate_status_ids,
+from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, priority_weight, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      normalize_accelerator_requirement, select_accelerator_units,
                      normalize_accelerators, aggregate_accelerators, canonical_capabilities,
@@ -177,7 +177,7 @@ def validate_task(task, capacity, *, allow_auto=False):
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
     maximum=task.get('max_cpus',task.get('cpus') or 1024)
     task = {"cpus": 0 if allow_auto else 1, "max_cpus": maximum, "timeout": 300, "outputs": [], "env": {}, "assets": {},
-            "render": [], "label": "", "priority": 0, "requires": [], "node": None, "memory_mb": 256,
+            "render": [], "label": "", "priority": MIN_PRIORITY, "requires": [], "node": None, "memory_mb": 256,
             "accelerator": None, **task}
     cpus, timeout = task["cpus"], task["timeout"]
     if type(cpus) is not int or not (0 if allow_auto else 1) <= cpus <= capacity:
@@ -265,9 +265,9 @@ def validate_task(task, capacity, *, allow_auto=False):
         task['outputs'] = [*task['outputs'], CHECKPOINT_MANIFEST]
     if not isinstance(task["label"], str):
         raise ValueError("label must be a string")
-    if (type(task["priority"]) is not int
-            or not MIN_PRIORITY <= task["priority"] <= MAX_PRIORITY):
+    if type(task["priority"]) is not int or abs(task["priority"]) > MAX_PRIORITY:
         raise ValueError(f"priority must be an integer in {MIN_PRIORITY}..{MAX_PRIORITY}")
+    task["priority"] = priority_weight(task["priority"])
     if (not isinstance(task["requires"], list)
             or len(task["requires"]) > MAX_REQUIREMENTS
             or any(not isinstance(x, str) or not x or len(x) > MAX_REQUIREMENT_LENGTH
@@ -521,7 +521,7 @@ class Worker:
                     "cache_root": self.cache_root.as_posix(),
                     "temp_root": self.temp_root.as_posix() if self.temp_root else None,
                     "active_jobs": [{**{k: j['result'].get(k) for k in ('id', 'label', 'project', 'status', 'cpus', 'active_cpus', 'min_cpus', 'max_cpus', 'memory_mb', 'memory_phase', 'started', 'accelerator')},
-                                     'priority': j['task'].get('priority', 0),
+                                     'priority': priority_weight(j['task'].get('priority')),
                                      'rss_mb':round(j.get('rss_mb',0),2),'private_mb':j.get('private_mb'),
                                      'memory_modeled':bool(j.get('memory_phase_model',j['task'].get('memory_model'))),
                                      'memory_phase_model':j.get('memory_phase_model',j['task'].get('memory_model')),
