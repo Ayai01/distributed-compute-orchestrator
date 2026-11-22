@@ -1973,6 +1973,22 @@ class Pool:
             result.append(node)
         return result
 
+    def _ready_nodes(self, matching, task, *, needed_cpus, node_headroom, memory_floor, resource_recovery):
+        executable_ram_mb = task.get('executable_ram_mb', 0)
+        def available(node):
+            return node.capacity-node.reserved-node.external-(node_headroom or {}).get(node.name,0)
+        def memory_ready(node):
+            floor=max(memory_floor,node.startup_memory(task))
+            return (node.memory_free>=floor and self._host_memory_free(node)>=floor
+                and not(resource_recovery and node.health.get('memory_pressure_state',{}).get('limited')))
+        return [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
+                 and available(n) >= needed_cpus(n)
+                 and memory_ready(n)
+                 and (not executable_ram_mb or n.executable_ram_available >= executable_ram_mb)
+                 and n.health.get("queued", 0) == 0
+                 and (task.get('accelerator')is None or
+                      n.can_match_accelerator(n.execution_accelerator(task,available=True)))]
+
     def _acquire(self, task, *, block=True, cancel_event=None, cpu_limit=None, partial_cpus=True, job_id=None, node_headroom=None,
                  memory_floor=0,resource_recovery=False):
         if not isinstance(task, dict) or not isinstance(task.get("steps"), list) or any(
@@ -2000,22 +2016,12 @@ class Pool:
                                           + ' capability package for these resource requirements')
                     raise RemoteError("No matching online node for task platform, CPU count, tools, shared paths, node name and tags")
                 def needed(node):
-                    # Automatic jobs can start with a partial grant. Waiting for
-                    # an entire target reserved idle CPUs behind long-running jobs.
+                    # Automatic jobs can start with a partial grant.
                     return min(cpu_limit,node.capacity,task.get('max_cpus',node.capacity)) if automatic and cpu_limit and not partial_cpus else cpus
                 def available(node):
                     return node.capacity-node.reserved-node.external-(node_headroom or {}).get(node.name,0)
-                def memory_ready(node):
-                    floor=max(memory_floor,node.startup_memory(task))
-                    return (node.memory_free>=floor and self._host_memory_free(node)>=floor
-                        and not(resource_recovery and node.health.get('memory_pressure_state',{}).get('limited')))
-                ready = [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
-                         and available(n) >= needed(n)
-                         and memory_ready(n)
-                         and (not executable_ram_mb or n.executable_ram_available >= executable_ram_mb)
-                         and n.health.get("queued", 0) == 0
-                         and (task.get('accelerator')is None or
-                              n.can_match_accelerator(n.execution_accelerator(task,available=True)))]
+                ready = self._ready_nodes(matching, task, needed_cpus=needed, node_headroom=node_headroom,
+                                          memory_floor=memory_floor, resource_recovery=resource_recovery)
                 affinity = set(task.get('_affinity_assets', ()))
                 if ready and affinity:
                     def preference(node):

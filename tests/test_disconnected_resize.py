@@ -47,6 +47,7 @@ class DisconnectedResizeTests(unittest.TestCase):
         client.request.return_value = {'accepted': True}
         node = Node('worker',client)
         node.health=dict(capabilities=['resize'],cpus=8,memory_capacity_mb=1024)
+        node.error = 'Temporary TLS EOF'
         task = dict(cpus=1, max_cpus=8, memory_mb=64, project='Analog-Opt-Bench')
         job = dict(node=node, task=task, cancel=threading.Event(), reattach=True,
                    result=dict(id=identity, status='running', submitted=time.time() - 10,
@@ -57,7 +58,6 @@ class DisconnectedResizeTests(unittest.TestCase):
         state.pool = SimpleNamespace(condition=threading.Condition(), _release=Mock())
         state.jobs = {identity: job}
         state.threads = {threading.current_thread()}
-        state.project_resources = Mock(return_value={})
         state._save = Mock()
         state._retry = Mock()
         state._execute(job)

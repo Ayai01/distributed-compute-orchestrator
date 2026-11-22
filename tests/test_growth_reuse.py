@@ -4,11 +4,12 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from remote_compute import coordinator as module
+from remote_compute import placement as module
+from remote_compute.coordinator import Coordinator
 import test_center as center_fixtures
 
 
-class UncachedCenter(module.Coordinator):
+class UncachedCenter(Coordinator):
     def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, fixed_claims=None):
         return super()._cooperative_cpu_target(identity, desired, resources)
 

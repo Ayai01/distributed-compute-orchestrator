@@ -26,9 +26,10 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
 from .telemetry import Activity
-from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, weighted_node_threads,
+from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR,
                          plan_resize, elastic_cpus, startup_cpus)
 from .memory import plan_memory, startup_memory, same_phase
+from .placement import PlacementPlanning, PlacementSnapshot, _elastic_job, _matching_pass
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
 from .compat import unlink
 from .cleanup import AssetCache, AssetMaintenance, TransportRetirement, prune_asset_caches, remove_owned, retire_job
@@ -45,7 +46,7 @@ import re
 import secrets
 
 from urllib.parse import urlsplit
-from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python, execution_bindings, capability_set
+from .runtimes import EXECUTION_CAPABILITIES, execution_capabilities, supports_python
 from . import __version__
 from .policy import validate_operator_fields
 from .ramdisk import validate_executable_ram_mb
@@ -64,26 +65,6 @@ ATTEMPT_OBSERVATIONS = ('runtime','progress','progress_error','diagnostic','phas
     'completed','total','current','target','nfe','budget','active_cpus','requested_cpus',
     'min_cpus','memory_phase','memory_reservation_mb','memory_commit_reservation_mb','deadline','resource_request','execution_timing',
     'task_process_started')
-
-
-def _matching_pass(pool):
-    """Reuse provider matches within one unchanged allocation pass."""
-    cache={}
-    def matching(task):
-        accelerator=task.get('accelerator')
-        key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
-             task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
-             tuple(key for key in ('step_phases', 'short_job', 'timeout_grace_s', 'checkpoint_output') if key in task),
-             startup_cpus(task),task.get('min_start_cpus',1)>1,task.get('memory_mb',256),task.get('executable_ram_mb',0),
-             execution_bindings(task),capability_set(task.get('requires',())),
-             json.dumps(accelerator,sort_keys=True)if accelerator is not None else None)
-        if key not in cache:cache[key]=tuple(pool._matching(task))
-        return cache[key]
-    return matching
-
-
-def _elastic_job(job):
-    return job.get('elastic_cpus',job.get('auto_cpus',False))
 
 
 def _restore_phase_demand(job):
@@ -110,7 +91,7 @@ def _infrastructure_interruption(job, outcome):
             and outcome.get('cpu_seconds') == 0))
 
 
-class Coordinator:
+class Coordinator(PlacementPlanning):
     shared_asset_visibility_seconds = 150
     observation_poll_seconds = 5
     observation_grace_seconds = 10
@@ -130,8 +111,8 @@ class Coordinator:
         self.submission_lock = SubmissionLocks()
         self.accepting_assets = SubmissionAssets()
         self.asset_writes = weakref.WeakValueDictionary()
-        self.shared_asset_upload_lock = threading.Lock()
-        self.shared_asset_uploads = weakref.WeakValueDictionary()
+        self.asset_flight_lock = threading.Lock()
+        self.asset_flights = {}
         self.shared_asset_publications = {}
         self.jobs, self.queue, self.threads = JobRecords(
             self.root / 'jobs', index_path=self.root / 'history.index.jsonl',receipt_reader=read_receipt), [], set()
@@ -390,11 +371,18 @@ class Coordinator:
                 or (node_name is not None and not isinstance(node_name,str))
                 or (maximum_cpus is not None and (type(maximum_cpus) is not int or maximum_cpus<max(1,cpus)))):
             raise ValueError(f'project, resource_share <= {MAX_RESOURCE_SHARE:g}, queue_ratio <= {MAX_QUEUE_RATIO:g} and cpus required')
-        paused={node.name for node in self.pool.nodes if node.health.get('paused')}
-        resources = self.project_resources() if paused or job_id is not None else {}
+        providers = tuple(self.pool.nodes)
+        paused={node.name for node in providers if node.health.get('paused')}
+        placement = None
+        if paused or job_id is not None:
+            with self.condition, self.pool.condition:
+                placement = PlacementSnapshot(self)
+            providers = placement.pool.nodes
+            paused = {node.name for node in providers if node.health.get('paused')}
+        resources = placement._project_resources() if placement is not None else {}
         held = ({name: cpus for name, cpus in resources.get(project, {}).get('node_demands', {}).items()
                  if name in paused} if not executable_ram_mb else {})
-        eligible=[n for n in self.pool.nodes if not n.error and n.enabled and not n.health.get('paused')
+        eligible=[n for n in providers if not n.error and n.enabled and not n.health.get('paused')
                   and n.capacity>=max(1,cpus)
                   and (not node_name or n.name==node_name)
                   and (platform is None or n.health.get('platform') == platform)
@@ -412,22 +400,19 @@ class Coordinator:
         capable=sum(n.capacity for n in eligible)
         target=capable+sum(held.values())
         if job_id is not None:
-            with self.condition,self.pool.condition:
-                job=self.jobs.get(job_id)
-                if job is None or job.get('node') is None or job['result']['status'] in TERMINAL:
-                    raise Conflict('admission job_id must identify a running task')
-                if (job['task'].get('project') or 'default')!=project:
-                    raise ValueError('admission project differs from the running task')
-                node=job['node'];old=job['task']['cpus'];old_memory=job['task']['memory_mb']
-                # Advice must describe the new phase's opportunity. Using the
-                # previous one-CPU demand here prevents an idle pool reborrowing.
-                advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
-                                  node.capacity-node.reserved-node.external+old))
-                if _elastic_job(job):
-                    advised=min(advised,self._cooperative_cpu_target(job_id,node.capacity,resources))
-                advice=dict(recommended_cpus=advised if node.enabled and not node.health.get('paused') else old,
-                            current_cpus=old,current_memory_mb=old_memory,
-                            available_memory_mb=old_memory+max(0,min(node.memory_free,self.pool._host_memory_free(node))))
+            job=placement.jobs.get(job_id)
+            if job is None or job.get('node') is None or job['result']['status'] in TERMINAL:
+                raise Conflict('admission job_id must identify a running task')
+            if (job['task'].get('project') or 'default')!=project:
+                raise ValueError('admission project differs from the running task')
+            node=job['node'];old=job['task']['cpus'];old_memory=job['task']['memory_mb']
+            advised=max(1,min(job['task'].get('max_cpus',node.capacity),node.capacity,
+                              node.capacity-node.reserved-node.external+old))
+            if _elastic_job(job) and not node.error and project in resources:
+                advised=min(advised,placement._cooperative_cpu_target(job_id,node.capacity,resources))
+            advice=dict(recommended_cpus=advised if node.enabled and not node.error and not node.health.get('paused') else old,
+                        current_cpus=old,current_memory_mb=old_memory,
+                        available_memory_mb=old_memory+max(0,min(node.memory_free,placement.pool._host_memory_free(node))))
         ceilings=[min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible]+list(held.values())
         maximum=sum(ceilings)
         unit = cpus or maximum_cpus
@@ -463,6 +448,7 @@ class Coordinator:
                     ready=max(1,running+extra)
             ceiling=max(1,maximum)  # Every admitted task may later shrink to one CPU.
         value = dict(project=project,resource_share=share,queue_ratio=ratio,capable_cpus=capable,accepting=getattr(self,'accepting',True),
+                    dispatch_paused=getattr(self, 'paused', False),
                     accelerator=accelerator,fallback_capable_cpus=fallback_capable,
                     **advice,
                     running_tasks=ready,queued_tasks=math.ceil(wave*ratio),
@@ -575,6 +561,8 @@ class Coordinator:
         else:
             with self.condition, self.pool.condition:
                 value = self._health()
+                projects = PlacementSnapshot(self)
+            value['projects'] = projects._project_resources()
         relay = transport._RELAY_BULK_BUDGET
         value['relay_bulk'] = relay.snapshot() if relay is not None else None
         return value
@@ -607,13 +595,16 @@ class Coordinator:
             if not self.pool.condition.acquire(blocking=wait):
                 return False
             try:
-                value = deepcopy(self._health())
-                self._display_health_cache = (time.monotonic(), time.time(), value)
-                return True
+                value = self._health()
+                projects = PlacementSnapshot(self)
+                sampled = (time.monotonic(), time.time())
             finally:
                 self.pool.condition.release()
         finally:
             self.condition.release()
+        value['projects'] = projects._project_resources()
+        self._display_health_cache = (*sampled, deepcopy(value))
+        return True
 
     def _finish_display_refresh(self, refresh):
         try:
@@ -810,49 +801,12 @@ class Coordinator:
                         'identity_scope':'task',**progress_fields(job['result'])}
                         for job in list(getattr(self.jobs,'recent',{}).values())
                         if job['result']['status'] in ('failed','timed_out','interrupted')][-8:],
-                    'projects': self.project_resources(), **self.activity.snapshot()}
+                    **self.activity.snapshot()}
 
     def project_resources(self):
-        shares, demands, used, queued, rooms = {}, {}, {}, {}, {}
-        online={n.name:n for n in self.pool.nodes if not n.error and n.enabled
-                and (not n.health.get('paused') or n.reserved)}
-        capacities={name:node.reserved if node.health.get('paused') else node.capacity for name,node in online.items()}
-        largest = max((n.capacity for n in online.values() if not n.health.get('paused')), default=1)
-        with self.condition,self.pool.condition:
-            matching=_matching_pass(self.pool)
-            for job in active_values(self.jobs):
-                if job['result']['status'] in TERMINAL:
-                    continue
-                held=job.get('node')
-                # Online quotas exclude disconnected grants. Their original
-                # records retain ownership until actual worker reattachment.
-                if job.get('recover') or (held is not None and held.name not in online):
-                    continue
-                task = job.get('task', {})
-                name = task.get('project') or 'default'
-                shares[name] = task.get('resource_share', 1.0)
-                startup=startup_cpus(task)
-                if held is not None and _elastic_job(job):startup=max(4,startup)
-                demand = job.get('desired_cpus',largest if job.get('auto_cpus') else startup)
-                demand=min(demand,task.get('max_cpus',demand))
-                paused=held is not None and held.health.get('paused')
-                if paused:demand=task.get('cpus',0)
-                demands[name] = demands.get(name, 0) + demand
-                available=rooms.setdefault(name,{})
-                wanted={**task,'cpus':0} if _elastic_job(job) else task
-                if paused and held.name in online:
-                    # Pausing stops new work; existing grants still occupy
-                    # their project's share until their tasks release them.
-                    available[held.name]=available.get(held.name,0)+demand
-                else:
-                    for node in matching(wanted):
-                        if node.name in online and not node.health.get('paused') and (not held or node is held):
-                            available[node.name]=available.get(node.name,0)+min(demand,node.capacity)
-                used[name] = used.get(name, 0) + (task.get('cpus', 0) if job.get('node') else 0)
-                queued[name] = queued.get(name, 0) + int(job['result']['status'] == 'queued')
-        ceilings={name:sum(min(capacities[node],demand) for node,demand in rooms[name].items()) for name in shares}
-        return {name:dict(resource_share=shares[name],demand=demands[name],used=used[name],queued=queued[name],
-                          capacity=ceilings[name],eligible_nodes=sorted(rooms[name]),node_demands=rooms[name]) for name in shares}
+        with self.condition, self.pool.condition:
+            snapshot = PlacementSnapshot(self)
+        return snapshot._project_resources()
 
     def control(self, changes):
         if isinstance(changes, dict) and set(changes) == {'observations'}:
@@ -1227,222 +1181,85 @@ class Coordinator:
                 # acceptance reference must not wait behind cache I/O.
                 self.accepting_assets.clear()
 
-    def _queued_candidates(self,budgets):
-        """Least occupied weighted project first; priority orders its own work."""
-        from collections import deque
-        matching=_matching_pass(self.pool)
-        ready=[key for key in self.queue if self.jobs[key]['result'].get('resource_retry_after',0)<=time.time()]
-        counts={key:sum(not node.error and node.enabled and not node.health.get('paused')
-                        for node in matching(self.jobs[key]['task'])) for key in ready}
-        modes={key:startup_cpus(self.jobs[key]['task']) for key in ready}
-        groups={}
-        for key in sorted(ready,key=lambda key:(-self.jobs[key]['task']['priority'],modes[key],counts[key])):
-            task=self.jobs[key]['task']
-            groups.setdefault(task.get('project')or'default',deque()).append(key)
-        while groups:
-            group=min(groups,key=lambda group:(budgets[group]['used']/budgets[group]['resource_share'] if group in budgets else math.inf,
-                modes[groups[group][0]],counts[groups[group][0]],group))
-            key=groups[group].popleft()
-            if not groups[group]:del groups[group]
-            yield key
-
-    def _growth_headroom(self, resources, *, candidate=None, fixed_claims=None):
-        """Give existing elastic work its first four useful threads.
-
-        This holds no worker lease and never changes an active pool. Its owner
-        claims the slots with the next drained resize; lowering demand or
-        finishing makes them available to queued work immediately.
-        """
-        protected={}
-        warm_cache={} if fixed_claims is None else {'claims':fixed_claims}
-        remaining={}
-        occupied={}
-        for _key,peer in active_items(self.jobs):
-            node=peer.get('node')
-            if node is not None and peer['result']['status']not in TERMINAL:
-                key=(peer['task'].get('project')or'default',node.name)
-                occupied[key]=occupied.get(key,0)+peer['task']['cpus']
-        warm_cache['occupied']=occupied
-        for identity,job in sorted(active_items(self.jobs),key=lambda row:(row[1]['result'].get('submitted',0),row[0])):
-            held=job.get('node');current=job.get('task',{})
-            group=current.get('project')or'default'
-            if group not in resources:continue
-            other=(candidate.get('project')or'default')if candidate is not None else group
-            lower=(candidate is not None and other in resources and group!=other and
-                   resources[group]['used']/resources[group]['resource_share']<resources[other]['used']/resources[other]['resource_share'])
-            startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
-            desired=job.get('desired_cpus',startup)
-            request=job['result'].get('resource_request')or {}
-            pending=request and request.get('request_id')!=job.get('lease_answered')
-            wide_request=lower and pending and desired>4
-            # Beyond warmup, protect growth only while its owner is actually
-            # requesting it. A standing ceiling during a long native step
-            # must not strand idle slots or prevent overcommit from opening.
-            if not wide_request:desired=min(4,desired)
-            old=current.get('cpus',0)
-            if (held is None or desired<=old
-                    or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
-                    or held.error or not held.enabled or held.health.get('paused')):
-                continue
-            free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
-            if not free:continue
-            if 'projects' not in warm_cache:warm_cache['projects']=self._project_cpu_plan(resources)
-            if wide_request:
-                if 'claims' not in warm_cache:warm_cache['claims']=self._fixed_queue_claims(resources)
-                target=self._cooperative_cpu_target(identity,desired,resources,fixed_claims=warm_cache['claims'])
-            else:
-                target=self._cooperative_cpu_target(identity,desired,resources,warm_cache=warm_cache)
-            key=(group,held.name)
-            if key not in remaining:
-                remaining[key]=(max(0,warm_cache['projects'].get(group,{}).get(held.name,0)-occupied.get(key,0))
-                                if len(warm_cache['projects'])>1 else math.inf)
-            available_memory=held.memory_credit(job.get('worker_id',identity),current['memory_mb'])+max(0,min(held.memory_free,self.pool._host_memory_free(held)))
-            model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
-            model.update(job.get('phase_memory',dict(memory_mb=current['memory_mb'])))
-            calibrated=held.resize_memory_model(job.get('worker_id',identity),model)
-            model={key:calibrated.get(key)for key in model}
-            target,memory=plan_memory(target,available_memory,**model)if 'adaptive_memory'in held.health.get('capabilities',())else plan_resize(target,available_mb=available_memory,**model)
-            if memory is not None and memory>available_memory:continue
-            count=max(0,min(target-old,free,remaining[key]))
-            if count:
-                remaining[key]-=count
-                protected[held.name]=protected.get(held.name,0)+count
-        return protected
-
-    def _fixed_queue_claims(self, resources):
-        """Let a ready fixed-width job accumulate its share on one worker."""
-        claims, groups = {}, set()
-        candidates=[];queued=set(self.queue)
-        for identity,job in active_items(self.jobs):
-            if (job['task'].get('project')or'default')not in resources:continue
-            minimum=job['result'].get('min_cpus')or 0
-            waiting=(job.get('node')is not None and minimum>1
-                and not job['result'].get('active_cpus',0)and job['task']['cpus']<minimum)
-            if waiting:
-                candidates.append((identity,dict(job['task'],cpus=minimum)))
-            elif identity in queued and startup_cpus(job['task'])>1:
-                candidates.append((identity,job['task']))
-        def order(identity):
-            task = self.jobs[identity]['task']
-            group = task.get('project') or 'default'
-            return (resources[group]['used']/resources[group]['resource_share'], group, -task['priority'])
-        with self.pool.condition:
-            for identity,task in sorted(candidates,key=lambda row:order(row[0])):
-                job = self.jobs[identity]
-                if job['result'].get('resource_retry_after',0)>time.time():continue
-                group = task.get('project') or 'default'; resource = resources[group]
-                width = startup_cpus(task)
-                if width <= 1 or group in groups or job['cancel'].is_set():
-                    continue
-                held=job.get('node')
-                ready = [node for node in self.pool._matching(task)
-                         if node.name not in claims and not node.error and node.enabled
-                         and (held is None or node is held)
-                         and not node.health.get('paused') and not node.health.get('queued', 0)
-                         and node.capacity-node.external >= width
-                         and min(node.memory_free, self.pool._host_memory_free(node))
-                             +(node.memory_credit(job.get('worker_id',identity),job['task']['memory_mb'])if held is node else 0) >= node.startup_memory(task)
-                         and node.can_match_accelerator(node.execution_accelerator(task,available=True))]
-                if ready:
-                    node = max(ready, key=lambda node: (node.capacity-node.reserved-node.external, node.name))
-                    claims[node.name] = (node, task)
-                    groups.add(group)
-        return claims
-
-    @staticmethod
-    def _fixed_queue_headroom(task, resources, claims):
-        group = task.get('project') or 'default'; current = resources[group]
-        protected = {}
-        for name, (node, waiting) in claims.items():
-            owner = waiting.get('project') or 'default'; resource = resources[owner]
-            startup_claim = (waiting.get('cpus') == 0 and waiting is not task
-                             and waiting.get('priority', 0) >= task.get('priority', 0))
-            if (owner != group or startup_claim) and resource['used']/resource['resource_share'] <= current['used']/current['resource_share']:
-                protected[name] = max(0, min(startup_cpus(waiting), node.capacity-node.reserved-node.external))
-        return protected
-
     def _schedule(self):
-        with self.condition:
-            while not self.stopping:
+        while True:
+            with self.condition:
+                if self.stopping:
+                    return
                 self._recover_running()
                 self._poll_observations()
-                if not self.paused:
+                if not self.paused and self.queue:
                     for identity in self.queue:
-                        self._fallback_accelerator(self.jobs[identity])
-                    budgets = self.project_resources()
-                    growth = {}
-                    fixed = None
-                    slice_started=time.monotonic()
-                    # Within the same priority and CPU mode, place constrained
-                    # work first so flexible jobs retain the other devices.
-                    # Free compatible slots are not fenced by project quotas.
-                    for identity in self._queued_candidates(budgets):
-                        # A full campaign can have thousands of ready originals.
-                        # Let asset handoffs, status and grants acquire the same
-                        # condition between bounded stretches of placement work.
-                        if time.monotonic()-slice_started>=.02:
-                            self.condition.wait(.001)
-                            if self.stopping or self.paused:break
-                            budgets.clear();budgets.update(self.project_resources())
-                            growth={};fixed=None;slice_started=time.monotonic()
-                        if identity not in self.queue:
-                            continue
                         job = self.jobs[identity]
-                        group = job['task'].get('project') or 'default'
-                        budget = budgets[group]
-                        try:
-                            if fixed is None:
-                                fixed = self._fixed_queue_claims(budgets)
-                            if group not in growth:
-                                growth[group]=self._growth_headroom(budgets,candidate=job['task'],fixed_claims=fixed)
-                            headroom = dict(growth[group])
-                            for name, count in self._fixed_queue_headroom(job['task'], budgets, fixed).items():
-                                headroom[name] = max(headroom.get(name, 0), count)
-                            node = self.pool._acquire(job["task"], block=False,
-                                cpu_limit=startup_cpus(job['task']) if job.get('auto_cpus') else None,
-                                partial_cpus=True,job_id=job.get('worker_id',identity),
-                                node_headroom=headroom,memory_floor=job['result'].get('resource_recovery_memory_mb',0),
-                                resource_recovery=bool(job['result'].get('resource_recovery_count')))
-                        except (RuntimeError, ValueError) as error:
-                            message=('Cache-reference provider is unavailable or incompatible'if job['task'].get('cache_ref')else str(error))
-                            job["result"].update(status="failed", error=message, finished=time.time())
-                            self._save(job)
-                            self.queue.remove(identity)
-                            archive_job(self.jobs, job)
+                        if job['task'].get('accelerator'):
+                            self._fallback_accelerator(job)
+                    with self.pool.condition:
+                        snapshot = PlacementSnapshot(self)
+                else:
+                    snapshot = None
+                    self._wait_for_placement()
+            if snapshot is not None:
+                for identity, planned, headroom in snapshot.candidates():
+                    with self.condition:
+                        if self.stopping or self.paused:
+                            break
+                        job = self.jobs.get(identity)
+                        if (job is None or job['result']['status'] != 'queued' or job['cancel'].is_set()
+                                or job['task'] != planned['task']
+                                or job['result'].get('resource_retry_after', 0) > time.time()):
                             continue
-                        if node is None:
-                            continue
-                        self.queue.remove(identity)
-                        job["node"] = node
-                        job['cpu_overcommit']=node.reserved+node.external>node.base_capacity
-                        budget['used'] += job['task']['cpus']
-                        growth = {}
-                        fixed = None
-                        job["result"].update(status="dispatching", assigned_node=node.name, worker_url=node.client.url,
-                                             cpus=job['task']['cpus'])
-                        abi = build_refs.provider_abi(node.health)
-                        if abi is not None:
-                            job['result']['_artifact_abi'] = list(abi)
-                        job['result'].pop('resource_retry_after',None)
-                        job['result'].pop('resource_wait_reason',None)
-                        if job['result'].get('accelerator')!=job['task'].get('accelerator'):
-                            job['result'].setdefault('requested_accelerator',job['result'].get('accelerator'))
-                            job['result']['accelerator']=job['task'].get('accelerator')
-                        # Admission turns a one-thread waiter into warmup demand.
-                        # Recompute the same budget mapping before admitting its
-                        # next peer, so the four-thread headroom has a real share.
-                        if _elastic_job(job):
-                            budgets.clear()
-                            budgets.update(self.project_resources())
-                        self._save(job)
-                        thread = threading.Thread(target=self._execute, args=(job,), name="central-job", daemon=True)
-                        self.threads.add(thread)
-                        thread.start()
-                delayed=self.queue and all(self.jobs[key]['result'].get('resource_retry_after',0)>time.time()for key in self.queue)
-                wait = .5 if self.paused or delayed else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None
-                if wait is None and self.observations.active:
-                    wait = self.observation_poll_seconds
-                self.condition.wait(wait)
+                        node = self._dispatch_queued(identity, job, headroom)
+                        if node is not None:
+                            with self.pool.condition:
+                                snapshot.record_dispatch(identity, job, node)
+                with self.condition:
+                    if not self.stopping and self.queue:
+                        self._wait_for_placement()
+
+    def _wait_for_placement(self):
+        delayed = self.queue and all(self.jobs[key]['result'].get('resource_retry_after',0)>time.time()
+                                     for key in self.queue)
+        wait = .5 if self.paused or delayed else .05 if self.queue else .5 if self.__dict__.get('_pending_recovery') else None
+        if wait is None and self.observations.active:
+            wait = self.observation_poll_seconds
+        self.condition.wait(wait)
+
+    def _dispatch_queued(self, identity, job, headroom):
+        """Commit one still-valid placement and its durable assignment."""
+        try:
+            node = self.pool._acquire(job['task'], block=False,
+                cpu_limit=startup_cpus(job['task']) if job.get('auto_cpus') else None,
+                partial_cpus=True,job_id=job.get('worker_id',identity),
+                node_headroom=headroom,memory_floor=job['result'].get('resource_recovery_memory_mb',0),
+                resource_recovery=bool(job['result'].get('resource_recovery_count')))
+        except (RuntimeError, ValueError) as error:
+            message = ('Cache-reference provider is unavailable or incompatible'
+                       if job['task'].get('cache_ref') else str(error))
+            job['result'].update(status='failed', error=message, finished=time.time())
+            self._save(job)
+            self.queue.remove(identity)
+            archive_job(self.jobs, job)
+            return None
+        if node is None:
+            return None
+        self.queue.remove(identity)
+        job['node'] = node
+        job['cpu_overcommit'] = node.reserved + node.external > node.base_capacity
+        job['result'].update(status='dispatching', assigned_node=node.name, worker_url=node.client.url,
+                             cpus=job['task']['cpus'])
+        abi = build_refs.provider_abi(node.health)
+        if abi is not None:
+            job['result']['_artifact_abi'] = list(abi)
+        job['result'].pop('resource_retry_after', None)
+        job['result'].pop('resource_wait_reason', None)
+        if job['result'].get('accelerator') != job['task'].get('accelerator'):
+            job['result'].setdefault('requested_accelerator', job['result'].get('accelerator'))
+            job['result']['accelerator'] = job['task'].get('accelerator')
+        self._save(job)
+        thread = threading.Thread(target=self._execute, args=(job,), name='central-job', daemon=True)
+        self.threads.add(thread)
+        thread.start()
+        return node
 
     def _recover_running(self):
         """Reattach accepted work from fresh worker snapshots; never resubmit it."""
@@ -1573,6 +1390,7 @@ class Coordinator:
             # the frozen request on disk; polling needs no transport buffers.
             payload = files = None
             cancel_sent=False
+            last_worker_status = None
             while True:
                 try:
                     if job['cancel'].is_set() and node.detached:
@@ -1626,11 +1444,13 @@ class Coordinator:
                                                                                   'checkpoint', checkpoint)
                     except (OSError, ValueError, KeyError, RemoteError, zipfile.BadZipFile) as error:
                         remote['artifact_publication_error'] = str(error)
-                with self.condition:
-                    job['result'].pop('connection_error',None)
-                    # Retry is one atomic state transition. A client must not
-                    # collect/delete a transient interrupted outcome mid-retry.
-                    if not (remote['status']=='interrupted' or _infrastructure_interruption(job,remote)) or job['cancel'].is_set():self._update(job, remote)
+                if remote['status'] in TERMINAL or remote != last_worker_status or 'connection_error' in job['result']:
+                    last_worker_status = remote.copy()
+                    with self.condition:
+                        job['result'].pop('connection_error',None)
+                        # Retry is one atomic state transition. A client must not
+                        # collect a transient interrupted outcome mid-retry.
+                        if not (remote['status']=='interrupted' or _infrastructure_interruption(job,remote)) or job['cancel'].is_set():self._update(job, remote)
                 if remote["status"] in TERMINAL:
                     result = remote
                     retry=remote['status']=='interrupted' or _infrastructure_interruption(job,remote)
@@ -1728,18 +1548,24 @@ class Coordinator:
         # POST after asset preparation, without serializing network transfers.
         node = job['node']
         interval = 1. if job.get('cpu_overcommit') else .1 if job.get('task', {}).get('short_job') else .5
-        with node.dispatch_lock:
-            deadline=node.next_dispatch+max(0,interval-node.dispatch_interval)
-            if self.stopping or job['cancel'].wait(max(0,deadline-time.monotonic())):
-                return False
-            if self.stopping or job['cancel'].is_set():
-                return False
+        while not self.stopping and not job['cancel'].is_set():
+            with node.dispatch_lock:
+                now = time.monotonic()
+                delay = node.next_dispatch + max(0, interval - node.dispatch_interval) - now
+                if delay <= 0:
+                    dispatched = time.time()
+                    node.next_dispatch = time.monotonic() + interval
+                    node.dispatch_interval = interval
+            if delay > 0:
+                job['cancel'].wait(delay)
+                continue
             with self.condition:
-                job['result']['dispatched'] = time.time()
+                if self.stopping or job['cancel'].is_set():
+                    return False
+                job['result']['dispatched'] = dispatched
                 self._save(job)
-            node.next_dispatch = time.monotonic() + interval
-            node.dispatch_interval=interval
             return True
+        return False
 
     def _submit(self, job, identity, payload, callback, *, assets=None):
         node, force, uncertain = job['node'], False, False
@@ -1987,128 +1813,138 @@ class Coordinator:
             else:
                 return receiver
 
+    @contextmanager
+    def _asset_flight(self, key, cancel):
+        """Elect one operation; waiters never hold a scheduler or transport lock."""
+        with self.asset_flight_lock:
+            done = self.asset_flights.get(key)
+            owner = done is None
+            if owner:
+                done = self.asset_flights[key] = threading.Event()
+        if not owner:
+            while not done.wait(.1):
+                _check_cancelled(cancel)
+            _check_cancelled(cancel)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with self.asset_flight_lock:
+                del self.asset_flights[key]
+            done.set()
+
+    def _send_asset(self, node, shared_cache, asset, route, archive, *, cancel, report):
+        archive_bytes = archive.stat().st_size
+        receivers = self._resumable_asset_receivers(node, shared_cache) if archive_bytes >= ASSET_RESUME_MIN_BYTES else []
+        started = time.monotonic()
+        receiver = None
+        if receivers:
+            receiver = self._upload_shared_asset(receivers, asset, archive, cancel=cancel, report=report)
+        elif report.get('protocol') == 'resumable':
+            raise RemoteError('Waiting for the shared asset upload receiver to reconnect')
+        else:
+            report.update(protocol='legacy', archive_bytes=archive_bytes)
+            node.client.request(route, archive.read_bytes(), cancel=cancel)
+        if shared_cache:
+            key = (shared_cache, asset)
+            completed = time.monotonic()
+            with self.asset_flight_lock:
+                publications = self.shared_asset_publications
+                publications.pop(key, None)
+                publications[key] = ((receiver or node).name, completed, completed - started)
+                if len(publications) > 1024:
+                    del publications[next(iter(publications))]
+        if receiver is not None and not node.client.request(route, cancel=cancel)['exists']:
+            raise RemoteError('Waiting for the committed archive on the shared asset volume')
+
+    def _ensure_shared_asset(self, node, cache, asset, route, archive, *, cancel, abandoned, report):
+        key = (cache, asset)
+        while True:
+            with self.asset_flight_lock:
+                published = self.shared_asset_publications.get(key)
+            if published and published[0] != node.name:
+                now = time.monotonic()
+                deadline = min(now + self.shared_asset_visibility_seconds, published[1] + 1 + 2 * published[2])
+                delay = 1
+                while now < deadline:
+                    until = min(deadline, now + delay)
+                    while (left := until - time.monotonic()) > 0:
+                        _check_cancelled(cancel)
+                        time.sleep(min(.25, left))
+                    if node.client.request(route, cancel=abandoned)['exists']:
+                        return
+                    now = time.monotonic()
+                    delay = min(30, delay * 2)
+            # Visibility waits never own the election. Independent targets can
+            # use a mounted copy while this one waits for its own mount.
+            with self._asset_flight(('shared', *key), cancel) as owner:
+                _check_cancelled(cancel)
+                if node.client.request(route, cancel=abandoned)['exists']:
+                    return
+                if owner:
+                    with self.asset_flight_lock:
+                        newer = self.shared_asset_publications.get(key)
+                    if newer == published:
+                        self._send_asset(node, cache, asset, route, archive, cancel=abandoned, report=report)
+                        return
+
     def _ensure_assets(self, node, assets, *, force=False, cancel=None, report=None):
-        # Cache changes invalidate presence, but keep same-hash uploads serialized.
-        assets=set(assets)
-        if not assets:return
-        shared_cache = node.health.get('shared_asset_cache')
+        assets = set(assets)
+        if not assets:
+            return
+        cache = node.health.get('shared_asset_cache')
         with node.asset_lock:
             session = (node.health.get('pid'), node.health.get('root'), node.health.get('asset_revision'))
             if node.asset_session != session:
                 node.known_assets.clear()
                 node.asset_session = session
-            if force:node.known_assets.difference_update(assets)
-            pending_assets = assets - node.known_assets
-            if report is not None:
-                for asset in assets - pending_assets:
-                    report.setdefault(asset, {}).setdefault('cache_hit', True)
-            locks = node.__dict__.setdefault('_asset_upload_locks', weakref.WeakValueDictionary())
-            pending = [(asset, locks.setdefault(asset, threading.Lock())) for asset in pending_assets]
-        for asset, lookup in pending:
-            _check_cancelled(cancel)
-            while not lookup.acquire(timeout=.1):
-                _check_cancelled(cancel)
-            upload_locked = False
-            try:
+            if force:
+                node.known_assets.difference_update(assets)
+        for asset in assets:
+            metrics = report.setdefault(asset, {}) if report is not None else {}
+            route = '/assets/' + asset
+            archive = self.root / 'assets' / (asset + '.zip')
+
+            def abandoned():
+                if cancel is None or not cancel():
+                    return False
+                # Another original can still need an upload owned by a
+                # cancelled original. Read active references without the
+                # dispatch lock; a later arrival can resume the same digest.
+                return not any((job.get('node') is node or
+                                (cache and job.get('node') is not None and
+                                 job['node'].health.get('shared_asset_cache') == cache))
+                               and not job['cancel'].is_set() and asset in job.get('task', {}).get('assets', {}).values()
+                               for job in active_values(self.jobs, snapshot=True))
+
+            while True:
                 _check_cancelled(cancel)
                 with node.asset_lock:
-                    if node.asset_session==session and asset in node.known_assets:
-                        if report is not None:
-                            report.setdefault(asset, {}).setdefault('cache_hit', True)
+                    if node.asset_session == session and asset in node.known_assets:
+                        metrics.setdefault('cache_hit', True)
+                        break
+                with self._asset_flight(('node', id(node), asset), cancel) as owner:
+                    if not owner:
                         continue
-                def abandoned():
-                    if cancel is None or not cancel():return False
-                    # Other accepted jobs can still need this same upload.
-                    # Finish their shared transfer while cancelling its owner
-                    # before job submission; cancelled waiters leave the lock.
-                    with self.condition:
-                        return not any((job.get('node') is node or
-                                        (shared_cache and job.get('node') is not None and
-                                         job['node'].health.get('shared_asset_cache') == shared_cache))
-                                       and not job['cancel'].is_set()
-                                       and asset in job.get('task',{}).get('assets',{}).values()
-                                       for job in active_values(self.jobs))
-                route = '/assets/' + asset
-                archive = self.root / 'assets' / (asset + '.zip')
-                presence = node.client.request(route, cancel=abandoned)
-                exists = presence['exists']
-                if report is not None:
-                    report.setdefault(asset, {}).setdefault('cache_hit', presence.get('cache_hit', exists and not shared_cache))
-                if shared_cache and not exists:
-                    # Wait across workers only when a write may be needed.
-                    # Recheck on the target after another writer could have completed.
-                    key = (shared_cache, asset)
-                    with self.shared_asset_upload_lock:
-                        upload = self.shared_asset_uploads.setdefault(key, threading.Lock())
-                    while not upload.acquire(timeout=.1):
-                        _check_cancelled(cancel)
-                    upload_locked = True
-                    _check_cancelled(cancel)
-                    exists = node.client.request(route, cancel=abandoned)['exists']
-                wait_until = time.monotonic() + self.shared_asset_visibility_seconds
-                while shared_cache and not exists:
-                    with self.shared_asset_upload_lock:
-                        published = self.shared_asset_publications.get(key)
-                    if not published or published[0] == node.name:
-                        break
-                    # Bound the visibility wait by the cost of retransmitting this archive.
-                    deadline = min(wait_until, published[1] + 1 + 2 * published[2])
-                    if time.monotonic() >= deadline:
-                        break
-                    # Other nodes may already see the archive. Serialize sends, not waiting.
-                    upload.release()
-                    upload_locked = False
-                    delay = 1
-                    while not exists:
-                        retry = min(deadline, time.monotonic() + delay)
-                        while (remaining := retry - time.monotonic()) > 0:
-                            _check_cancelled(cancel)
-                            time.sleep(min(.25, remaining))
-                        _check_cancelled(cancel)
-                        exists = node.client.request(route, cancel=abandoned)['exists']
-                        if time.monotonic() >= deadline:
+                    with node.asset_lock:
+                        if node.asset_session == session and asset in node.known_assets:
+                            metrics.setdefault('cache_hit', True)
                             break
-                        delay = min(30, delay * 2)
+                    presence = node.client.request(route, cancel=abandoned)
+                    exists = presence['exists']
+                    metrics.setdefault('cache_hit', presence.get('cache_hit', exists and not cache))
                     if not exists:
-                        while not upload.acquire(timeout=.1):
-                            _check_cancelled(cancel)
-                        upload_locked = True
-                        _check_cancelled(cancel)
-                        with self.shared_asset_upload_lock:
-                            current_publication = self.shared_asset_publications.get(key)
-                        if current_publication != published:
-                            exists = node.client.request(route, cancel=abandoned)['exists']
-                if not exists:
-                    archive_bytes = archive.stat().st_size
-                    metrics = report.setdefault(asset, {}) if report is not None else {}
-                    receivers = self._resumable_asset_receivers(node, shared_cache) if archive_bytes >= ASSET_RESUME_MIN_BYTES else []
-                    receiver = None
-                    upload_started = time.monotonic()
-                    if receivers:
-                        receiver = self._upload_shared_asset(receivers, asset, archive, cancel=abandoned, report=metrics)
-                    elif metrics.get('protocol') == 'resumable':
-                        raise RemoteError('Waiting for the shared asset upload receiver to reconnect')
-                    else:
-                        metrics.update(protocol='legacy', archive_bytes=archive_bytes)
-                        node.client.request(route, archive.read_bytes(), cancel=abandoned)
-                    if shared_cache:
-                        key = (shared_cache, asset)
-                        with self.shared_asset_upload_lock:
-                            publications = self.shared_asset_publications
-                            publications.pop(key, None)
-                            completed = time.monotonic()
-                            publications[key] = ((receiver or node).name, completed, completed - upload_started)
-                            if len(publications) > 1024:
-                                del publications[next(iter(publications))]
-                    if receiver is not None and not node.client.request(route, cancel=abandoned)['exists']:
-                        raise RemoteError('Waiting for the committed archive on the shared asset volume')
-                with node.asset_lock:
-                    if node.asset_session==session:node.known_assets.add(asset)
-                _check_cancelled(cancel)
-            finally:
-                if upload_locked:
-                    upload.release()
-                lookup.release()
+                        if cache:
+                            self._ensure_shared_asset(node, cache, asset, route, archive, cancel=cancel,
+                                                      abandoned=abandoned, report=metrics)
+                        else:
+                            self._send_asset(node, None, asset, route, archive, cancel=abandoned, report=metrics)
+                    with node.asset_lock:
+                        if node.asset_session == session:
+                            node.known_assets.add(asset)
+                    _check_cancelled(cancel)
+                    break
 
     def _update(self, job, remote):
         if job.get('retired'):return
@@ -2161,191 +1997,49 @@ class Coordinator:
         host='127.0.0.1' if host=='0.0.0.0' else host
         return dict(url=f'http://{host}:{port}',token=self.token,timeout=node.client.timeout)
 
-    def _project_cpu_plan(self, resources, *, demand_override=None, memory_exempt=()):
-        """Lend compatible capacity by current, usable weighted demand.
+    @staticmethod
+    def _resize_intent(job, node, cpus, active_cpus, min_cpus):
+        explicit = min_cpus is not None and 'resize_min_cpus' in node.health.get('capabilities', ())
+        maximum = job['task'].get('max_cpus', node.capacity)
+        desired = min(cpus if min_cpus is not None else cpus or node.capacity, maximum)
+        if not explicit:
+            desired = max(1, desired)
+        floor = (active_cpus or 0) if explicit else max(1, active_cpus or 0)
+        cooperative = min_cpus is not None or cpus == 0 or _elastic_job(job)
+        available = node.enabled and not node.error and not node.health.get('paused')
+        fully_active = desired == job['task']['cpus'] == floor and available
+        return desired, floor, explicit, cooperative, available and cooperative and not fully_active and (cpus == 0 or desired > 1)
 
-        These are opportunities at safe boundaries, not revocable live grants.
-        A project unable to use RAM, an accelerator or a node contributes no
-        hypothetical claim there; the other projects can borrow that capacity.
-        """
-        nodes={n.name:n for n in self.pool.nodes if n.enabled and not n.error and not n.health.get('paused')}
-        capacities={name:max(0,n.capacity-n.external)for name,n in nodes.items()}
-        matching=_matching_pass(self.pool);demands={};rooms={};memory={};fixed={}
-        now=time.time()
-        for key,job in active_items(self.jobs):
-            if (job['result']['status']in TERMINAL or job['cancel'].is_set()or job.get('recover')
-                    or job['result'].get('resource_retry_after',0)>now):continue
-            task=job['task'];group=task.get('project')or'default';held=job.get('node')
-            if group not in resources:continue
-            if held is not None and held.name not in nodes:
-                if held.enabled and not held.error and held.health.get('paused'):
-                    fixed[group]=fixed.get(group,0)+task['cpus']
-                continue
-            elastic=_elastic_job(job)
-            demand=job.get('desired_cpus',max(4,task.get('cpus',1))if held is not None and elastic else startup_cpus(task))
-            if demand_override is not None:demand=demand_override.get(key,demand)
-            demand=min(demand,task.get('max_cpus',demand))
-            eligible=[]
-            for node in matching({**task,'cpus':0}if elastic else task):
-                if node.name not in nodes or held is not None and held is not node:continue
-                if node.name not in memory:memory[node.name]=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
-                if held is None:
-                    if node.startup_memory(task)>memory[node.name]:continue
-                    if task.get('accelerator')and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
-                eligible.append(node.name)
-            if not eligible:continue
-            if held is not None and elastic:
-                model=dict(memory_mb=None,base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None)
-                model.update(job.get('phase_memory')or task.get('memory_model')or dict(memory_mb=task['memory_mb']))
-                sample=next((j for j in held.health.get('active_jobs',())if j['id']==job.get('worker_id',key)),{})
-                # Unknown estimates must not erase CPU opportunity before the
-                # caller can wait for cold calibration. Its new phase is fitted
-                # separately by resize, after the fair CPU target is known.
-                if (key not in memory_exempt and sample.get('memory_calibrated')and
-                        same_phase(model,sample.get('memory_phase')or sample.get('memory_phase_model'))):
-                    calibrated=held.resize_memory_model(job.get('worker_id',key),model)
-                    model={field:calibrated.get(field)for field in model}
-                    available=min(held.memory_capacity,held.memory_credit(job.get('worker_id',key),task['memory_mb'])+memory[held.name])
-                    width,_=plan_memory(demand,available,**model)if 'adaptive_memory'in held.health.get('capabilities',())else plan_resize(demand,available_mb=available,**model)
-                    demand=max(1,min(demand,width))
-            demands[group]=demands.get(group,0)+demand
-            edges=rooms.setdefault(group,{})
-            for name in eligible:edges[name]=edges.get(name,0)+min(demand,capacities[name])
-        shares={group:resources[group]['resource_share']for group in demands}
-        if len(shares)<=1:
-            return {group:{name:min(capacities[name],room)for name,room in rooms[group].items()}for group in shares}
-        return weighted_node_threads(capacities,shares,demands,rooms,current_used={group:resources[group]['used']for group in shares},fixed_used=fixed)
+    @staticmethod
+    def _resize_memory_request(job, node, model):
+        if any(value is not None for value in model.values()):
+            return model
+        current = job.get('phase_memory') or job['result'].get('memory_phase') or job['task'].get('memory_model') or {}
+        if 'base_memory_mb' in current:
+            return {key: current.get(key) for key in model}
+        if 'adaptive_memory' in node.health.get('capabilities', ()):
+            return dict(model, memory_mb=current.get('memory_mb', job['task']['memory_mb']))
+        return model
 
-    def _cooperative_cpu_target(self, identity, desired, resources, *, warm_cache=None, phase_model=None, fixed_claims=None):
-        """Apply the project share, then its task order at a drained boundary.
-
-        Running peers keep their grants until their own boundary. Within the
-        project's usable compatible capacity, existing work gets up to four useful threads, ready work
-        enters at its startup width, then idle slots widen running work. Explicit
-        fixed-width requests retain their indivisible admission contract.
-        """
-        current=self.jobs[identity];group=current['task'].get('project') or 'default'
-        if desired==0:return 0
-        if fixed_claims is not None:
-            claims=fixed_claims
-        elif warm_cache is None:
-            claims=self._fixed_queue_claims(resources)
-        else:
-            if 'claims' not in warm_cache:warm_cache['claims']=self._fixed_queue_claims(resources)
-            claims=warm_cache['claims']
-        claim=claims.get(current['node'].name)
-        minimum=current['result'].get('min_cpus')or 0
-        if minimum>1 and not current['result'].get('active_cpus',0):
-            # Weighted shares choose the next indivisible opportunity. Rounding
-            # every waiting four-core stage down to two would strand both.
-            return desired if claim is None or (claim[1].get('project')or'default')==group else 0
-        claimed_room=None
-        if claim is not None:
-            owner=claim[1].get('project')or'default'
-            if owner==group or resources[owner]['used']/resources[owner]['resource_share']<=resources[group]['used']/resources[group]['resource_share']:
-                claimed_room=max(0,current['node'].capacity-current['node'].external-current['node'].reserved
-                                 +current['task']['cpus']-startup_cpus(claim[1]))
-                if claimed_room==0:return 0
-        if desired==1:
-            # The plan grants at most the requested width and at least one.
-            # A one-thread phase therefore has the exact target without a plan.
-            return 1
-        if warm_cache is not None:
-            if 'projects'not in warm_cache:warm_cache['projects']=self._project_cpu_plan(resources)
-            projects=warm_cache['projects']
-        else:
-            previous=current.get('phase_memory')or current['task'].get('memory_model')or dict(memory_mb=current['task']['memory_mb'])
-            exempt=(identity,)if phase_model is not None and not same_phase(phase_model,previous)else()
-            projects=self._project_cpu_plan(resources,demand_override={identity:max(desired,current.get('desired_cpus',desired))},memory_exempt=exempt)
-        # Other jobs retain their real grants until their own boundaries.
-        # An ideal lower share must never be treated as if those peers had
-        # already returned CPUs, or hundreds of one-core jobs can warm again.
-        if warm_cache is not None and 'occupied' in warm_cache:
-            held_here=warm_cache['occupied'].get((group,current['node'].name),0)
-        else:
-            held_here=sum(peer['task']['cpus']for _key,peer in active_items(self.jobs)
-                          if peer.get('node')is current['node']and peer['result']['status']not in TERMINAL
-                          and(peer['task'].get('project')or'default')==group)
-        share_room=(max(1,projects.get(group,{}).get(current['node'].name,0)-max(0,held_here-current['task']['cpus']))
-                    if len(projects)>1 else desired)
-        if claimed_room is not None:share_room=min(share_room,claimed_room)
-        if warm_cache is not None and group in warm_cache.get('warm',{}):
-            return min(share_room,max(1,warm_cache['warm'][group].get(identity,{}).get(current['node'].name,0)))
-        members={key:job for key,job in active_items(self.jobs)
-                 if job['result']['status'] not in TERMINAL and not job['cancel'].is_set()
-                 and job['result'].get('resource_retry_after',0)<=time.time()
-                 and (job['task'].get('project') or 'default')==group}
-        nodes={node.name:node for node in self.pool.nodes
-               if node.enabled and not node.error and not node.health.get('paused')}
-        capacities={}
-        for name,node in nodes.items():
-            held=sum(job['task']['cpus'] for job in members.values() if job.get('node') is node)
-            capacities[name]=max(0,min(node.capacity-node.external-node.reserved+held,projects.get(group,{}).get(name,0)))
-        matching=_matching_pass(self.pool)
-        fixed=[];demands={};rooms={};waiting={};memory_available={}
-        for key,job in members.items():
-            task=job['task'];held=job.get('node')
-            automatic=key==identity or _elastic_job(job)
-            if held is not None and not automatic:
-                if held.name in capacities:capacities[held.name]=max(0,capacities[held.name]-task['cpus'])
-                continue
-            wanted={**task,'cpus':0} if automatic else task
-            eligible=[]
-            for node in matching(wanted):
-                if node.name not in capacities or (held is not None and held is not node):continue
-                if held is None:
-                    if node.name not in memory_available:
-                        memory_available[node.name]=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
-                    if node.startup_memory(task)>memory_available[node.name]:continue
-                    if task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
-                eligible.append(node.name)
-            if not eligible:continue
-            if not automatic:
-                fixed.append((key,task,eligible,job['result'].get('submitted',0)))
-                continue
-            # Before its first phase request, an elastic peer gets four-thread
-            # warmup demand, bounded by its useful ceiling.
-            demand=desired if key==identity else job.get('desired_cpus',
-                max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(4,task.get('cpus',1)))
-            demands[key]=min(demand,task.get('max_cpus',demand))
-            rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
-            if held is None:waiting[key]=startup_cpus(task)
-        for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-row[1].get('priority',0),len(row[2]),row[3])):
-            choices=[name for name in eligible if capacities[name]>=task['cpus']]
-            if choices:
-                selected=max(choices,key=lambda name:capacities[name])
-                capacities[selected]-=task['cpus']
-        running={key:value for key,value in demands.items() if key not in waiting}
-        shares={key:1. for key in running}
-        warm=weighted_node_threads(capacities,shares,{key:min(4,value) for key,value in running.items()},rooms)
-        # A one-slot tail can admit a new one-thread job. Its later four-slot
-        # warmup must not dilute older jobs back to two or three threads.
-        # Running work is pinned to its current node, so preserve warmup in
-        # admission order on nodes whose combined warm demand does not fit.
-        for name,capacity in capacities.items():
-            pinned=[key for key in running if name in rooms[key]]
-            if sum(min(4,running[key])for key in pinned)<=capacity:continue
-            remaining=capacity
-            for key in sorted(pinned,key=lambda key:(members[key]['result'].get('submitted',0),key)):
-                count=min(remaining,4,running[key],rooms[key][name])
-                warm[key]={name:count};remaining-=count
-        if warm_cache is not None:
-            # One growth pass asks each elastic peer for its first four useful
-            # threads. The same group has one unchanged warm plan;
-            # wider idle growth is handled separately at the phase boundary.
-            warm_cache.setdefault('warm',{})[group]=warm
-            return min(share_room,max(1,warm.get(identity,{}).get(current['node'].name,0)))
-        spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
-        entrants=weighted_node_threads(spare,{key:1. for key in waiting},waiting,rooms)
-        # A ready entrant owns this opportunity until the scheduler admits it.
-        # Wider running phases may still use other nodes with no ready entrant.
-        for name in spare:
-            if any(row.get(name,0) for row in entrants.values()):spare[name]=0
-        extra={key:max(0,value-sum(warm[key].values())) for key,value in running.items()}
-        wide=weighted_node_threads(spare,shares,extra,rooms)
-        name=current['node'].name
-        target=min(share_room,max(1,warm.get(identity,{}).get(name,0)+wide.get(identity,{}).get(name,0)))
-        return target
+    def _resize_fair_target(self, job, identity, cpus, active_cpus, min_cpus, model):
+        node = job.get('node')
+        if node is None or not self._resize_intent(job, node, cpus, active_cpus, min_cpus)[-1]:
+            return None
+        with self.condition, self.pool.condition:
+            if job.get('node') is not node or job['result']['status'] in TERMINAL or job['cancel'].is_set():
+                return None
+            snapshot = PlacementSnapshot(self)
+        view = snapshot.jobs[identity]
+        desired, _, _, _, needs_plan = self._resize_intent(view, view['node'], cpus, active_cpus, min_cpus)
+        if not needs_plan:
+            return None
+        view['desired_cpus'] = desired
+        view['result']['min_cpus'] = min_cpus
+        view['result']['active_cpus'] = active_cpus or 0
+        phase = {key: value for key, value in self._resize_memory_request(view, view['node'], model).items()
+                 if value is not None}
+        target = snapshot._cooperative_cpu_target(identity, desired, snapshot._project_resources(), phase_model=phase)
+        return node, target
 
     def resize(self, identity, cpus, *, active_cpus=None, min_cpus=None, memory_mb=None, base_memory_mb=None, memory_per_cpu_mb=None, memory_limit_mb=None):
         if type(cpus) is not int or cpus<0:
@@ -2357,21 +2051,26 @@ class Coordinator:
         if min_cpus is not None and (type(min_cpus)is not int or not 0<=min_cpus<=cpus):
             raise ValueError('min_cpus must be an integer in 0..cpus')
         with self.condition:
-            resize_lock=self.jobs[identity].setdefault('resize_lock',threading.Lock())
+            job = self.jobs[identity]
+            resize_lock = job.get('resize_lock')
+            if resize_lock is None:
+                resize_lock = job['resize_lock'] = threading.Lock()
         # A slow worker must not hold up health, admission or other tasks.
         with resize_lock:
+            request = dict(memory_mb=memory_mb, base_memory_mb=base_memory_mb,
+                           memory_per_cpu_mb=memory_per_cpu_mb, memory_limit_mb=memory_limit_mb)
+            fair = self._resize_fair_target(job, identity, cpus, active_cpus, min_cpus, request)
             with self.condition,self.pool.condition:
                 job=self.jobs[identity];node=job.get('node')
                 if self.stopping or job['cancel'].is_set() or node is None or job['result']['status'] in TERMINAL:
                     raise Conflict('Only a running task can change its CPU grant')
                 old=job['task']['cpus']
                 old_memory=job['task']['memory_mb']
-                if all(value is None for value in (memory_mb,base_memory_mb,memory_per_cpu_mb,memory_limit_mb)):
-                    current=job.get('phase_memory')or job['result'].get('memory_phase')or job['task'].get('memory_model')or {}
-                    if 'base_memory_mb' in current:
-                        base_memory_mb=current['base_memory_mb'];memory_per_cpu_mb=current['memory_per_cpu_mb']
-                        memory_limit_mb=current.get('memory_limit_mb')
-                    elif 'adaptive_memory'in node.health.get('capabilities',()):memory_mb=current.get('memory_mb',old_memory)
+                request = self._resize_memory_request(job, node, request)
+                memory_mb = request['memory_mb']
+                base_memory_mb = request['base_memory_mb']
+                memory_per_cpu_mb = request['memory_per_cpu_mb']
+                memory_limit_mb = request['memory_limit_mb']
                 modeled=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
                 capabilities=node.health.get('capabilities',[])
                 if ('resize' not in capabilities or ((memory_mb is not None or modeled) and 'resize_memory' not in capabilities)
@@ -2380,17 +2079,14 @@ class Coordinator:
                 maximum=job['task'].get('max_cpus',node.capacity)
                 if min_cpus is not None and min_cpus>maximum:
                     raise ValueError('min_cpus exceeds task max_cpus')
-                explicit=min_cpus is not None and 'resize_min_cpus'in capabilities
-                desired=min(cpus if min_cpus is not None else cpus or node.capacity,maximum)
-                if not explicit:desired=max(1,desired)
-                active_floor=(active_cpus or 0)if explicit else max(1,active_cpus or 0)
+                desired, active_floor, explicit, cooperative, needs_plan = self._resize_intent(
+                    job, node, cpus, active_cpus, min_cpus)
                 if active_cpus is not None and (active_cpus>old or active_cpus>desired):
                     raise ValueError(ACTIVE_GRANT_CONFLICT)
-                model=dict(memory_mb=memory_mb,base_memory_mb=base_memory_mb,memory_per_cpu_mb=memory_per_cpu_mb,memory_limit_mb=memory_limit_mb)
-                requested_model={k:v for k,v in model.items()if v is not None}
+                requested_model={k:v for k,v in request.items()if v is not None}
                 sample=next((j for j in node.health.get('active_jobs',())if j['id']==job.get('worker_id',identity)),{})
                 phase_calibrated=bool(sample.get('memory_calibrated')and same_phase(requested_model,sample.get('memory_phase')or sample.get('memory_phase_model')))
-                model=node.resize_memory_model(job.get('worker_id',identity),model)
+                model=node.resize_memory_model(job.get('worker_id',identity),request)
                 planner=(lambda width,available,**values:plan_memory(width,available,
                     floor=max(active_floor,min(min_cpus or 1,width)),**values))if 'adaptive_memory'in node.health.get('capabilities',())else lambda width,available,**values:plan_resize(width,available_mb=available,**values)
                 previous_desired=job.get('desired_cpus')
@@ -2402,24 +2098,18 @@ class Coordinator:
                 job['result']['active_cpus']=active_cpus or 0
                 draining=not node.enabled and not node.detached
                 granted=min(desired,old)if draining else desired
-                cooperative=min_cpus is not None or cpus==0 or _elastic_job(job)
-                # Elastic jobs may report a finite useful phase width.
-                # Repeating that width is still a drained boundary; returning
-                # to one CPU stays cheap for synchronous microkernels.
                 fully_active = (desired == old == active_floor and node.enabled
                                 and not node.error and not node.health.get('paused'))
-                if not draining and not fully_active and (desired>old or cpus==0 or (cooperative and desired>1)):
-                    resources=self.project_resources();group=job['task'].get('project') or 'default'
-                    resource=resources.get(group)
-                    if resource is None:
-                        # Disconnected grants are absent from the online quota
-                        # projection, but still belong to their original worker.
+                if not draining and not fully_active and (desired > old or cpus == 0 or (cooperative and desired > 1)):
+                    if node.error or job.get('recover'):
                         return dict(id=identity,node=node.name,cpus=old,memory_mb=old_memory,requested_cpus=cpus)
-                    available=node.capacity-node.reserved-node.external+old
-                    floor=active_floor if cooperative else old
-                    granted=max(floor,min(desired,available)) if node.enabled and not node.health.get('paused') else active_floor if explicit else old
-                    if cooperative and node.enabled and not node.health.get('paused'):
-                        granted=min(granted,self._cooperative_cpu_target(identity,desired,resources,phase_model=requested_model))
+                    available = node.capacity - node.reserved - node.external + old
+                    floor = active_floor if cooperative else old
+                    granted = max(floor, min(desired, available)) if node.enabled and not node.health.get('paused') else active_floor if explicit else old
+                    if needs_plan:
+                        # A concurrent health/policy change can invalidate the
+                        # opportunity, never the already held grant.
+                        granted = min(granted, fair[1] if fair is not None and fair[0] is node else old)
                 # The report describes work already in flight. Return only
                 # unoccupied slots, then let the owner refill from the grant.
                 granted=max(active_floor,granted)

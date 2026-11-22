@@ -41,7 +41,9 @@ worker 在启动进程前写好该任务的工具表。`REMOTE_COMPUTE_TOOLS_FIL
 
 `execution_timing` 以 worker 单调时钟记录接收到进程启动和到首次原生派发的时间。托管 Python 阶段另记原生执行、空等资源、其余执行墙钟。并行原生区间合并，与原生执行重叠的等待计入执行区间。`cpu_seconds` 继续计量进程树实际 CPU。首次派发或执行区间缺少观测时对应值为 `null`。
 
-`admission(project, activity=True)` 返回聚合 `cpu`、各可调度能力的 `capability_cpus`、提交窗口和所请求工程的在途任务。容量与当前可分配量分别记录，当前池未提供的能力配额为零。工程用 `statuses(ids)` 短请求批量查询，按原 ID 领取结果。任务目录、ID 前缀搜索、节点名、设备 IP、中转地址和部署分组归运维端。
+`admission(project, activity=True)` 返回聚合 `cpu`、各可调度能力的 `capability_cpus`、提交窗口和所请求工程的在途任务。`dispatch_paused` 报告是否暂停新派发，CPU 的 available 仍表示当前兼容资产池中的物理余量。工程用 `statuses(ids)` 短请求批量查询，按原 ID 领取结果。任务目录、ID 前缀搜索、节点名、设备 IP、中转地址和部署分组归运维端。
+
+调度器在短临界区读取任务和资源快照，在锁外排序并计算扩核配额。落位和扩核前重新核对现有任务、实际资源和暂停状态。资产传输只锁定摘要传输登记，通过完成事件唤醒同摘要等待者。
 
 `activity.active_cpus` 对当前运行原单的最近上报取样。`lower_bound` 是已观测活跃宽度之和，`coverage` 是 `observed_jobs / running_jobs`。零宽度是有效观测，缺报的任务仍返回 `null`。无运行任务时宽度为零且覆盖率为 1。
 

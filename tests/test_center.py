@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import threading
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -1236,7 +1237,8 @@ class CenterTests(unittest.TestCase):
     def test_slow_resize_reserves_growth_without_blocking_admission(self):
         # Test resource acknowledgement separately from initial kernel preparation.
         with patch('remote_compute.worker.Worker._automatic_grant',return_value=None):
-            with scratch() as root,provider(Path(root)/'worker',cpus=4) as (_,worker):
+            with scratch() as root,provider(Path(root)/'worker',cpus=4,tags=['ml'],
+                                             python_runtimes={'ml':[sys.executable]}) as (_,worker):
                 with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
                     identity=client.submit(python('import time;time.sleep(30)',project='A',max_cpus=4))['id']
                     until(lambda:client.status(identity)['status']=='running' and bool(worker.status(identity).get('steps')))
@@ -1946,7 +1948,7 @@ class CenterTests(unittest.TestCase):
                         self.assertEqual(packed.call_count,1)
                     self.assertEqual(result['files']['value'],b'42')
                     self.assertEqual(result['worker_url'],local.url)
-                    self.assertEqual(local.status(),[])
+                    until(lambda: local.status() == [])
             finally:
                 worker.close()
 
@@ -1974,7 +1976,7 @@ class CenterTests(unittest.TestCase):
                         release.set();blocked.result(timeout=3)
                 self.assertTrue({large,small}.issubset(node.known_assets))
 
-    def test_asset_revision_preserves_the_inflight_hash_lock_and_releases_it_afterward(self):
+    def test_asset_revision_preserves_the_inflight_transfer_and_releases_it_afterward(self):
         from concurrent.futures import ThreadPoolExecutor
         with scratch() as root,provider(Path(root)/'worker') as (_,worker):
             with Pool([worker]) as pool,center(pool,Path(root)/'center') as (state,client):
@@ -1992,21 +1994,23 @@ class CenterTests(unittest.TestCase):
                     first=transfers.submit(state._ensure_assets,node,[asset])
                     try:
                         self.assertTrue(entered.wait(2))
+                        key = ('node', id(node), asset)
+                        with state.asset_flight_lock:
+                            transfer = state.asset_flights[key]
                         with node.asset_lock:
-                            transfer=node._asset_upload_locks[asset]
                             revision=node.health.get('asset_revision',0)+1
                             node.health['asset_revision']=revision
                         second=transfers.submit(state._ensure_assets,node,[asset])
                         until(lambda:node.asset_session[-1]==revision)
-                        with node.asset_lock:
-                            self.assertIs(node._asset_upload_locks[asset],transfer)
+                        with state.asset_flight_lock:
+                            self.assertIs(state.asset_flights[key], transfer)
                     finally:
                         release.set()
                     first.result(timeout=3);second.result(timeout=3)
                 self.assertEqual(uploads,[(state.root/'assets'/(asset+'.zip')).stat().st_size])
                 self.assertIn(asset,node.known_assets)
-                del transfer
-                self.assertFalse(node._asset_upload_locks)
+                self.assertTrue(transfer.is_set())
+                self.assertFalse(state.asset_flights)
 
     def test_concurrent_jobs_check_and_upload_an_asset_once(self):
         with scratch() as root, provider(Path(root)/'worker',cpus=4) as (_,node):
@@ -2198,7 +2202,7 @@ class CenterTests(unittest.TestCase):
                 self.assertEqual(set(result['tools']['python']), {'argv', 'available'})
                 self.assertNotIn('sha256', result['tools']['python'])
                 self.assertEqual(client.status(), [])
-                self.assertEqual(node.status(), [])
+                until(lambda: node.status() == [])
                 self.assertEqual(list((state.root/'jobs').iterdir()), [])
 
     def test_memory_blocks_until_inflight_task_finishes(self):
@@ -2286,7 +2290,7 @@ class CenterTests(unittest.TestCase):
                     if not shell.closing.is_set():
                         shell.close()
                 self.assertEqual(client.status(), [])
-                self.assertEqual(node.status(), [])
+                until(lambda: node.status() == [])
 
 
 if __name__ == '__main__':

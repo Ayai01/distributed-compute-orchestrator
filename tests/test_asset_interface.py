@@ -7,10 +7,12 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from remote_compute import Pool
 from remote_compute.bundle import atomic_json
 from remote_compute.coordinator import Coordinator
+from remote_compute.placement import PlacementSnapshot
 from remote_compute.receipts import read_center_receipt
 from remote_compute.worker import asset_handoff
 from test_compute import scratch,provider,python
@@ -24,37 +26,45 @@ class AssetInterfaceTests(unittest.TestCase):
         state.asset_cache=SimpleNamespace(lock=threading.RLock())
         state.asset_handoffs={};state.stopping=False;state.paused=False
         state.jobs={str(i):dict(task=dict(project='P',cpus=1,priority=0),
-            result=dict(status='queued'))for i in range(120)}
-        state.queue=list(state.jobs);entered=threading.Event();errors=[]
-        def acquire(*args,**kwargs):
-            entered.set();time.sleep(.005)
-        state.pool=SimpleNamespace(nodes=[],_matching=lambda task:[],_acquire=acquire)
+            result=dict(status='queued'),cancel=threading.Event())for i in range(120)}
+        state.queue=list(state.jobs);entered=threading.Event();resume=threading.Event();errors=[]
+        acquired = []
+        def planning(*args, **kwargs):
+            entered.set()
+            if not resume.wait(2):
+                raise AssertionError('Other operations waited for the planner')
+            return {}
+        state.pool=SimpleNamespace(nodes=[],condition=threading.Condition(),_matching=lambda task:[],
+                                   _acquire=lambda task, **kw: acquired.append(kw['job_id']))
         state._recover_running=lambda:None
         state._poll_observations=lambda:None
-        state._fallback_accelerator=lambda job:None
-        state.project_resources=lambda:dict(P=dict(used=0,resource_share=1))
-        state._growth_headroom=lambda *a,**k:{}
-        state._fixed_queue_claims=lambda *a:{}
-        state._fixed_queue_headroom=lambda *a:{}
         def schedule():
             try:state._schedule()
             except Exception as error:errors.append(error)
-        thread=threading.Thread(target=schedule);thread.start()
-        try:
-            self.assertTrue(entered.wait(2))
-            with ThreadPoolExecutor(1)as calls:
-                response=calls.submit(asset_handoff,state,'a'*32,['b'*64]).result(timeout=.25)
-                self.assertEqual(response,dict(id='a'*32))
-                with state.condition:
-                    for key in state.queue[30:]:state.jobs.pop(key)
-                    del state.queue[30:]
-                    state.condition.notify_all()
-                # Continue through a yield with the earlier candidate snapshot.
-                time.sleep(.2)
-        finally:
-            with state.condition:state.stopping=True;state.condition.notify_all()
-            thread.join(3)
+        def update():
+            response=asset_handoff(state,'a'*32,['b'*64])
+            with state.condition, state.pool.condition:
+                for key in state.queue[30:]:state.jobs.pop(key)
+                del state.queue[30:]
+                state.condition.notify_all()
+            return response
+        with patch.object(PlacementSnapshot, '_growth_headroom', planning):
+            thread=threading.Thread(target=schedule);thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                with ThreadPoolExecutor(1)as calls:
+                    self.assertEqual(calls.submit(update).result(timeout=.25),dict(id='a'*32))
+                resume.set()
+                deadline=time.monotonic()+2
+                while not acquired and time.monotonic()<deadline:
+                    time.sleep(.01)
+            finally:
+                resume.set()
+                with state.condition:state.stopping=True;state.condition.notify_all()
+                thread.join(3)
         self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+        self.assertTrue(acquired)
+        self.assertLess(max(map(int, acquired)),30)
 
     def test_legacy_center_hash_is_qualified_without_mutating_paid_receipt(self):
         with scratch()as root:
