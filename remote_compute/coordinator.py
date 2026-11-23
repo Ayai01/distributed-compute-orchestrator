@@ -1466,6 +1466,11 @@ class Coordinator(PlacementPlanning):
                     if job["cancel"].is_set() and not cancel_sent:
                         node.client.cancel(identity)
                         cancel_sent=True
+                    if not self.stopping and self.pool.needs_relay_status_sample(node):
+                        # All accepted IDs share one worker sample. A stalled
+                        # probe must not fan out into one new STCP dial per ID.
+                        time.sleep(.25)
+                        continue
                     remote = node.client.status(identity, brief=True)
                     if remote.get('resource_request'):
                         self._answer_resource_request(job, identity, remote)

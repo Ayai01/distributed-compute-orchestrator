@@ -866,6 +866,43 @@ class AdaptiveWaitTests(unittest.TestCase):
 
 
 class StatusReadReconnectTests(unittest.TestCase):
+    def test_stale_relay_sample_does_not_fan_out_original_reads(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, remote):
+            budget = RelayBulkBudget([remote.endpoint.port], None)
+            stalled = threading.Event()
+            original = remote.request
+            requests = []
+
+            def request(path, *args, **kwargs):
+                if stalled.is_set():
+                    if path == '/health':
+                        raise self.outage()
+                    requests.append((time.monotonic(), path))
+                return original(path, *args, **kwargs)
+
+            with patch('remote_compute.client._RELAY_BULK_BUDGET', budget), \
+                    patch.object(remote, 'request', side_effect=request), \
+                    Pool([remote]) as pool, center(pool, Path(root)/'center') as (_, client):
+                gate = Path(root)/'finish'
+                body = ('from pathlib import Path\nimport time\n'
+                        f'while not Path({str(gate)!r}).exists(): time.sleep(.05)\n'
+                        'print("complete")\n')
+                ids = [client.submit(python(body))['id'] for _ in range(4)]
+                try:
+                    until(lambda: all(client.status(i)['status'] == 'running' for i in ids))
+                    stalled.set()
+                    until(lambda: pool.needs_relay_status_sample(pool.nodes[0]))
+                    start = time.monotonic()
+                    time.sleep(.65)
+                    self.assertEqual([p for t,p in requests if t >= start and p.startswith('/jobs/')], [])
+                finally:
+                    gate.touch()
+                    stalled.clear()
+                for identity in ids:
+                    client.wait(identity, wait_timeout=10)
+                    row = client.fetch(identity, delete=False)
+                    self.assertEqual((row['id'], row['status'], row['attempts']), (identity, 'succeeded', []))
+
     @staticmethod
     def outage(status=None):
         error=RemoteError('temporary status connection loss')

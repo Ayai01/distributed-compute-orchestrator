@@ -60,6 +60,7 @@ class RequestCancelled(RemoteError):
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
 _RELAY_BULK_BUDGET = load_relay_bulk_budget()
+WORKER_STATUS_SAMPLE_MAX_AGE = 2.0
 SHORT_DISPATCH_BYTES = 256 * 1024
 _measured_post = ContextVar('dco_measured_post', default=None)
 
@@ -887,7 +888,7 @@ class Client:
     def status(self, identity=None, *, brief=False):
         if brief and identity:
             stamp,active=self.__dict__.get('_status_sample',(0,{}))
-            if time.monotonic()-stamp<=2 and identity in active:
+            if time.monotonic()-stamp<=WORKER_STATUS_SAMPLE_MAX_AGE and identity in active:
                 return dict(active[identity])
         return self.request("/jobs" + ("/" + identity if identity else ""), brief=brief)
 
@@ -1734,6 +1735,15 @@ class Pool:
                     node.reconnect_attempts, node.reconnect_after = 0, 0.0
             self.condition.notify_all()
         if reconnect or (not error and renamed):self._save_reconnect(node)
+
+    def needs_relay_status_sample(self, node):
+        """Only the node sampler should dial an intermittently unreachable relay."""
+        endpoint = getattr(node.client, '_endpoint', None)
+        if not (endpoint and _RELAY_BULK_BUDGET and _RELAY_BULK_BUDGET.matches(endpoint)
+                and 'health_sample' in node.health.get('capabilities', ())):
+            return False
+        stamp, _ = node.client.__dict__.get('_status_sample', (0, {}))
+        return time.monotonic() - stamp > WORKER_STATUS_SAMPLE_MAX_AGE
 
     @staticmethod
     def _network_target(node):
