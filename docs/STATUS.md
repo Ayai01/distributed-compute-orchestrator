@@ -1,5 +1,15 @@
 # DCO 当前状态
 
+**2026-11-23 00:05（太平洋时间）。1.0.57 已上线。** 中心与 22 台设备统一版本，627 个基础调度核，接单和派发已恢复。发布凭据续期后，内置浏览器核实看板重新收到实时采样。22 台设备的整数探针输出摘要一致，校内 AQ 同时运行 32 个独立工作项。ARH-DSE、AOP、RGCN、DCBFS-MO 和 Chiplet3D 的公开入口均通过。 [中心与设备验收](../.local/migration/rollout-1057/fleet-qualification.json) · [32 核验收](../.local/migration/rollout-1057/full-width.json) · [五工程公开入口](../.local/migration/rollout-1057/public-projects.json)
+
+**两种调度权限。** 工程只声明通用能力包和资源需求，内容哈希只校验制品，设备由 DCO 分配。用户明确授权的场次由运维凭据写入 `placement_scope`，将完整许可名单和授权说明绑定到每个原 ID；范围内设备暂时不可用时继续排队。生产验收核实了公开 HTTP 入口拒收节点、平台、范围及设备专属能力，且单个许可节点停用期间始终保留待派发。 [权限与取消验收](../.local/migration/rollout-1057/cancel-and-width-qualification.json)
+
+**拥塞与取消。** Rocket W4 在两分钟内提交 2,029 笔，随后 RV32I 每分钟最高 199 笔。学校中转瞬间复用工作连接不足，17 台受影响，峰值每分钟 1,256 次连接等待超时。102 个 Rocket 原 ID 已补齐终态和费用，其中 32 个成功产物已封存。新版按提交窗口节流，为中转心跳保留独立连接，并按 worker 合并取消。隔离验证排队 10,000 笔时健康请求 P99 为 117 毫秒，取消确认 67 毫秒。生产验证 17 笔运行和 120 笔排队全部取消，确认约 21 毫秒，约 2.5 秒归零。 [故障证据](../.local/network/frps-school-burst-buffer/portal-takeover-ay-aq.json) · [原单核对](../.local/migration/rollout-1056/reconciled-rocket-originals.json)
+
+**核心缓存。** 学校共享卷已命中 1,024 份 Rocket W4、61 份历史 YOLO 资产，以及 RV32I、AOP、RGCN 的登记核心资产。19 个原 ZIP 通过执行端已有片段复原，88.29 MB 归档只通过链路补 7.08 MB；新拆出的 YOLO 固定模型与 9 个分片共 86.11 MB，差量约 178 KB。DCBFS 当前代码与数据、Chiplet 求解器和通用代码已准备并由两个校内路由交叉核实。后续复用登记项可走运维 `sync_cache 工程ID --kind assets`。首次出现的实验输入按冻结生成器、参数与校验摘要准备。 [缓存复核](../.local/migration/rollout-1057/cache-final-school.json) · [YOLO 分片](../.local/migration/rollout-1057/yolo-split-caches.json) · [通用资产](../.local/migration/rollout-1057/common-project-caches.json)
+
+## 近期历史
+
 **1.0.52 已完成隔离验收，生产仍运行 1.0.51。** 同一任务解包延迟 1.25 秒时，另一个任务接单由 1.269 秒降至 0.015 秒。72 项定向回归通过，公开轮询可读取解包和开算前的连续采样。人工切换后用自然原单核对学校链路的交接尾延迟。[隔离回执](../.local/migration/qualification-1052/handoff.json)
 
 **2026-11-22 运维审计。** 3D chiplet 批次已完成 73,728/73,728 槽验证，2,432 次请求全部确认、结算并释放，DCO 无未结算任务或退休队列。重复恢复的根因是工程侧并行分析壳和恢复入口缺少进程 owner 保护，已在工程侧修复；DCO 的原 ID 幂等提交、回执恢复、缓存复用和异步退休路径保持有效。ARH、AOP、RGCN 普通入口审计通过能力包路由，不暴露节点、平台或拓扑选择器；历史校内 operator 路径仍受显式拒绝保护。当前无需 DCO 生产版本变更。
