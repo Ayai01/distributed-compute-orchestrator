@@ -19,6 +19,7 @@ def _matching_pass(pool):
     def matching(task):
         accelerator=task.get('accelerator')
         key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
+             tuple(task.get('placement_scope', {}).get('nodes', ())),
              task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
              json.dumps(task.get('native_cache'), sort_keys=True) if task.get('native_cache') else None,
              tuple(key for key in ('step_phases', 'short_job', 'timeout_grace_s', 'checkpoint_output') if key in task),

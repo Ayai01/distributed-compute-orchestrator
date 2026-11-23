@@ -703,7 +703,7 @@ class Coordinator(PlacementPlanning):
 
     def public_result(self, result):
         """Return a project result without placement or worker-local paths."""
-        hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd', '_artifact_abi',
+        hidden = {'assigned_node', 'worker_url', 'worker_id', 'node', 'cwd', '_artifact_abi', 'placement_scope',
                   'tool_root', 'root', 'home', 'worker_root',
                   'shared_paths', 'unavailable_shared', 'resource_request',
                   'observe_only', 'source', 'revision', '_asset_variants'}
@@ -1191,6 +1191,11 @@ class Coordinator(PlacementPlanning):
                     package, accelerator = project_package(raw_task.get('requires', []), raw_task.get('accelerator'))
                 task = validate_task(raw_task,
                                      max((n.capacity for n in self.pool.nodes), default=1), allow_auto=True)
+                if scope := task.get('placement_scope'):
+                    if not set(scope['nodes']) <= {node.name for node in self.pool.nodes}:
+                        raise ValueError('placement_scope includes an unregistered node')
+                    if task.get('node') and task['node'] not in scope['nodes']:
+                        raise ValueError('Explicit node falls outside the authorized scope')
                 task = build_refs.bind(self.root, task)
                 task = self._cache_placement(task) if operator else package_task(task, package, accelerator)
                 if not operator and (abi := task.get('_artifact_abi')) is not None:
@@ -1237,6 +1242,8 @@ class Coordinator(PlacementPlanning):
                     job['result']['min_start_cpus'] = task['min_start_cpus']
                 if package is not None:
                     job['result']['capability_package'] = package
+                if scope := task.get('placement_scope'):
+                    job['result']['placement_scope'] = scope
                 if task['accelerator'] is not None and 'fallback_after_seconds' in task['accelerator']:
                     job['result']['requested_accelerator'] = task['accelerator']
                 if task.get('cache_ref'):job['result']['cache_ref']=task['cache_ref']
@@ -1448,13 +1455,14 @@ class Coordinator(PlacementPlanning):
                 dispatch_task = bind_asset_variants(task, variants, node.health) if variants else task
                 if (dispatch_task is not task or job['auto_cpus'] or 'max_cpus' in task
                         or 'retries' in task or task.get('node') is not None
-                        or 'requested_accelerator' in job['result']):
+                        or 'requested_accelerator' in job['result'] or 'placement_scope' in task):
                     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                         files = {name: archive.read(name) for name in archive.namelist()}
                     worker_task = dict(dispatch_task)
                     worker_task['env'] = provider_environment(dispatch_task, node.health)
                     # Placement hints belong to the dispatcher, not the executable.
                     worker_task.pop('node',None)
+                    worker_task.pop('placement_scope', None)
                     worker_task.pop('cache_ref',None)
                     worker_task.pop('native_cache',None)
                     worker_task.pop('_capability_package', None)

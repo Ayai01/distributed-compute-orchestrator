@@ -131,7 +131,11 @@ def package_task(task, name, accelerator):
     bindings = ['ml']
     if 'onnx-int8' in tools or 'onnx-int8' in task.get('requires', ()):
         bindings.append('onnx-int8')
-    return dict(task, requires=bindings, accelerator=accelerator, _capability_package=name)
+    public = dict(task, requires=bindings, accelerator=accelerator, _capability_package=name)
+    # Older clients still carry the affinity field in frozen requests. Data
+    # references are mounted, while their hashes never rank public providers.
+    public.pop('_affinity_assets', None)
+    return public
 
 
 def provider_has_package(health, name):

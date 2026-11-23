@@ -2058,6 +2058,7 @@ class Pool:
 
     def _matching(self, task):
         cpus=startup_cpus(task)
+        scoped = frozenset(task.get('placement_scope', {}).get('nodes', ()))
         executable_ram_mb = task.get('executable_ram_mb', 0)
         required_tools,required_shared,python,backend=execution_bindings(task)
         required=capability_set(task.get('requires',()))
@@ -2065,7 +2066,7 @@ class Pool:
         result=[]
         for node in self.nodes:
             health=node.health
-            if ((task.get('node')and node.name!=task['node'])or node.capacity<cpus
+            if ((scoped and node.name not in scoped) or (task.get('node')and node.name!=task['node'])or node.capacity<cpus
                     or task.get('min_start_cpus', 1) > 1 and STARTUP_CPU_FLOOR not in health.get('capabilities', ())
                     or task.get('platform') is not None and health.get('platform') != task['platform']
                     or executable_ram_mb and node.executable_ram_capacity < executable_ram_mb

@@ -297,6 +297,19 @@ def public_capabilities():
 def validate_operator_fields(value, operator=False):
     """Placement and external host paths belong to explicit debugging."""
     if not operator:
-        for field in ('node', 'platform', 'cwd', 'cache_ref', 'native_cache'):
+        for field in ('node', 'platform', 'cwd', 'cache_ref', 'native_cache', 'placement_scope'):
             if value.get(field) is not None:
                 raise ValueError(field+' selection is operator/debug-only; ordinary tasks must omit '+field)
+
+
+def validate_placement_scope(value):
+    if not isinstance(value, dict) or set(value) != {'nodes', 'reason'}:
+        raise ValueError('placement_scope requires an explicit node list and authorization reason')
+    nodes, reason = value['nodes'], value['reason']
+    if (not isinstance(nodes, list) or not 1 <= len(nodes) <= 128
+            or any(not isinstance(name, str) or not 1 <= len(name) <= 128 for name in nodes)
+            or len(set(nodes)) != len(nodes)):
+        raise ValueError('placement_scope requires 1..128 distinct configured node names')
+    if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 240:
+        raise ValueError('placement_scope requires a brief authorization reason')
+    return dict(nodes=sorted(nodes), reason=reason.strip())

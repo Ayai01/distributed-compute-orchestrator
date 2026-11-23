@@ -177,9 +177,12 @@ def validate_task(task, capacity, *, allow_auto=False):
     unknown = set(task) - {"steps", "cpus", "max_cpus", "execution", "memory_model", "timeout", "outputs", "env", "assets", "render", "label", "priority", "requires", "node", "memory_mb", "cwd", "stdin", "project", "resource_share", "single_thread_weight", "retries", "resource_recovery", "accelerator", "platform", "cache_ref", "native_cache"}
     unknown -= {'step_phases', 'timeout_grace_s', 'checkpoint_output', 'short_job', 'min_start_cpus', 'executable_ram_mb'}
     if allow_auto:
-        unknown -= REFERENCE_FIELDS
+        unknown -= REFERENCE_FIELDS | {'placement_scope'}
     if unknown:
         raise ValueError("Unknown task fields: " + ", ".join(sorted(unknown)))
+    if 'placement_scope' in task:
+        from .policy import validate_placement_scope
+        task = dict(task, placement_scope=validate_placement_scope(task['placement_scope']))
     maximum=task.get('max_cpus',task.get('cpus') or 1024)
     task = {"cpus": 0 if allow_auto else 1, "max_cpus": maximum, "timeout": 300, "outputs": [], "env": {}, "assets": {},
             "render": [], "label": "", "priority": MIN_PRIORITY, "requires": [], "node": None, "memory_mb": 256,
