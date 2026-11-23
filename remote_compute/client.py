@@ -1288,12 +1288,15 @@ class Client:
         metrics.setdefault('resumed_from_bytes', 0)
         metrics['protocol'] = 'resumable'
         metrics['archive_bytes'] = total
+        minimum_chunk = 256 * 1024
+        chunk_bytes = metrics.setdefault('chunk_bytes', min(2 * minimum_chunk, ASSET_CHUNK_BYTES))
         current, failures = None, 0
         use_xz = False
         with archive.open('rb') as stream:
             while True:
                 _check_cancelled(cancel)
                 offset = current['offset'] if current is not None else None
+                sent_at = None
                 try:
                     if offset is None:
                         headers = {'X-DCO-Accept-Chunk-Encoding': 'xz'} if lzma is not None else {}
@@ -1303,7 +1306,7 @@ class Client:
                         receipt = self.request(path, {'total': total}, cancel=cancel)
                     else:
                         stream.seek(offset)
-                        chunk = stream.read(min(ASSET_CHUNK_BYTES, total - offset))
+                        chunk = stream.read(min(chunk_bytes, total - offset))
                         if not chunk:
                             raise ValueError('Asset archive changed during upload')
                         metrics['attempted_bytes'] += len(chunk)
@@ -1315,6 +1318,7 @@ class Client:
                                 chunk = encoded
                                 headers['X-DCO-Chunk-Encoding'] = 'xz'
                         metrics['wire_body_bytes'] += len(chunk)
+                        sent_at = time.monotonic()
                         receipt = self.request(path, chunk, extra_headers=headers, cancel=cancel)
                     confirmed = receipt.get('offset')
                     if (receipt.get('id') != identity or type(confirmed) is not int or not 0 <= confirmed <= total
@@ -1337,6 +1341,13 @@ class Client:
                         stalled = RemoteError('Asset receiver has not advanced its checkpoint')
                         stalled.transport_retryable = True
                         raise stalled
+                    if sent_at is not None:
+                        elapsed = time.monotonic() - sent_at
+                        if elapsed <= 2:
+                            chunk_bytes = min(ASSET_CHUNK_BYTES, chunk_bytes * 2)
+                        elif elapsed > 12:
+                            chunk_bytes = max(minimum_chunk, chunk_bytes // 2)
+                        metrics['chunk_bytes'] = chunk_bytes
                     if confirmed > (offset if offset is not None else previous):
                         failures = 0
                     current = receipt
@@ -1346,6 +1357,9 @@ class Client:
                         raise
                     failures += 1
                     metrics['reconciliations'] += 1
+                    if sent_at is not None:
+                        chunk_bytes = max(minimum_chunk, chunk_bytes // 2)
+                        metrics['chunk_bytes'] = chunk_bytes
                     if fail_fast or failures >= 6:
                         pending = RemoteError(f'Asset upload {identity} awaits receiver checkpoint: {error}')
                         pending.transport_retryable = True

@@ -1335,6 +1335,11 @@ class CenterTests(unittest.TestCase):
                     self.assertEqual(result['id'], identity)
                     self.assertEqual(result['assigned_node'], 'retired')
                     self.assertEqual(result['files']['answer'], b'42')
+                    public = Client(client.url, client.token)
+                    self.assertEqual(public.read_job_file(identity, 'answer'), b'42')
+                    current = public.read_job_file_changed(identity, 'answer')
+                    self.assertEqual(current['data'], b'42')
+                    self.assertFalse(public.read_job_file_changed(identity, 'answer', current['version'])['changed'])
 
     def test_interrupted_result_recovers_worker_outcome_and_upstream_failure_is_typed(self):
         for private in (False,True):

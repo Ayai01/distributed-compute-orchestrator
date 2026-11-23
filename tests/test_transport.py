@@ -866,6 +866,35 @@ class AdaptiveWaitTests(unittest.TestCase):
 
 
 class StatusReadReconnectTests(unittest.TestCase):
+    def test_resumable_upload_shrinks_chunk_after_timeout_without_rewinding(self):
+        unit = 256 * 1024
+        confirmed = unit
+        sent = []
+        with scratch() as root:
+            archive = Path(root) / 'archive.zip'
+            archive.write_bytes(b'a' * (4 * unit))
+            identity = hashlib.sha256(archive.read_bytes()).hexdigest()
+            total = archive.stat().st_size
+
+            def receiver(_path, data=None, *, extra_headers=None, **_kwargs):
+                nonlocal confirmed
+                if isinstance(data, bytes):
+                    offset, end = map(int, extra_headers['Content-Range'].split()[1].split('/')[0].split('-'))
+                    sent.append((offset, end - offset + 1))
+                    if len(sent) == 1:
+                        raise self.outage()
+                    self.assertEqual(offset, confirmed)
+                    confirmed = end + 1
+                return dict(id=identity, complete=isinstance(data, dict), total=total, offset=confirmed)
+
+            client = Client()
+            report = {}
+            with patch.object(client, 'request', side_effect=receiver), patch('remote_compute.client.time.sleep'):
+                receipt = client.upload_resumable(identity, archive, report=report)
+            self.assertEqual(sent[:2], [(unit, 2 * unit), (unit, unit)])
+            self.assertEqual((receipt['offset'], report['resumed_from_bytes'], report['reconciliations']),
+                             (total, unit, 1))
+
     def test_stale_relay_sample_does_not_fan_out_original_reads(self):
         with scratch() as root, provider(Path(root)/'worker', cpus=4) as (_, remote):
             budget = RelayBulkBudget([remote.endpoint.port], None)

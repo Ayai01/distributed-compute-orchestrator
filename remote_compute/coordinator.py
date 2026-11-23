@@ -6,7 +6,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import threading
 import time
@@ -2415,8 +2415,29 @@ class Coordinator(PlacementPlanning):
                     raise Conflict(str(error)) from None
         return {"stdout": "", "stderr": ""}
 
+    @staticmethod
+    def _cached_job_output(job, identity, name):
+        result = job['result']
+        if result['status'] not in TERMINAL:
+            return None
+        name = str(name).replace('\\', '/')
+        path = PurePosixPath(name)
+        if path.is_absolute() or '..' in path.parts or ':' in name or not path.parts:
+            raise ValueError('Expected a relative file path: ' + name)
+        try:
+            with zipfile.ZipFile(job['directory'] / 'worker-artifacts.zip') as archive:
+                if json.loads(archive.read('result.json'))['id'] != job.get('worker_id', result.get('worker_id', identity)):
+                    return None
+                return archive.read('files/' + path.as_posix())
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            return None
+
     def job_file(self, identity, name, data=None):
         job = load_job(self.jobs, self.condition, identity)
+        if data is None:
+            cached = self._cached_job_output(job, identity, name)
+            if cached is not None:
+                return cached
         with self.condition:
             client = self._client(job)
         if not client:
@@ -2430,6 +2451,10 @@ class Coordinator(PlacementPlanning):
 
     def job_file_version(self, identity, name, version=None):
         job = load_job(self.jobs, self.condition, identity)
+        cached = self._cached_job_output(job, identity, name)
+        if cached is not None:
+            etag = '"' + hashlib.sha256(cached).hexdigest() + '"'
+            return dict(version=etag, changed=etag != version, data=cached if etag != version else None)
         with self.condition:
             client=self._client(job);worker_id=job.get('worker_id',identity)
         if not client:raise Conflict('Job has not been assigned yet')
