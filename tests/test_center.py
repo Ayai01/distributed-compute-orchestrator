@@ -1324,11 +1324,17 @@ class CenterTests(unittest.TestCase):
         with scratch() as directory:
             root = Path(directory)
             with provider(root / 'worker') as (_, worker), Pool([dict(name='retired', client=worker)]) as pool:
-                with center(pool, root / 'center') as (_, client):
+                with center(pool, root / 'center') as (scheduler, client):
                     task = python("from pathlib import Path; Path('answer').write_bytes(b'42')", outputs=['answer'])
                     identity = client.submit(task)['id']
                     client.wait(identity)
                     self.assertEqual(client.fetch(identity, delete=False)['files']['answer'], b'42')
+                    original = scheduler.jobs.load(identity, scheduler.condition)
+                    public = Client(client.url, client.token, timeout=1)
+                    with original['artifact_lock']:
+                        from zipfile import ZipFile
+                        with ZipFile(io.BytesIO(public.artifacts(identity))) as archive:
+                            self.assertEqual(archive.read('files/answer'), b'42')
             with provider(root / 'other') as (_, worker), Pool([dict(name='other', client=worker)]) as pool:
                 with center(pool, root / 'center') as (_, client):
                     result = client.fetch(identity, delete=False)

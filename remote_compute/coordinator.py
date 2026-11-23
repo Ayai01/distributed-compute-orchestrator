@@ -2604,24 +2604,32 @@ class Coordinator(PlacementPlanning):
                 client=None
             worker_id=job.get('worker_id',result.get('worker_id',identity))
             result_lock=job.setdefault('artifact_lock',threading.RLock())
-        with result_lock:
+        sealed = None
+        if not cache_only and result['status'] == 'succeeded' and not result.get('attempts'):
+            try:
+                sealed = cached.read_bytes()
+            except FileNotFoundError:
+                pass
+        # A complete archive is published atomically. A reader holding its
+        # bytes need not queue behind a previous download from the worker.
+        with (nullcontext() if sealed is not None else result_lock):
             with self.condition:
                 if self.jobs.get(identity) is not job:
                     raise KeyError(identity)
             files = {}
-            if (client is None and not cached.is_file() and result['status'] != 'interrupted'
+            if (client is None and sealed is None and not cached.is_file() and result['status'] != 'interrupted'
                     and not (result.get('cancelled_before_submit') or result.get('rejected_before_submit'))
                     and (result['status'] == 'succeeded' or result.get('execution_started') or result.get('worker_id'))
                     and (result.get('assigned_node') or result.get('worker_url'))):
                 raise Conflict('Original result archive is waiting for its worker to reconnect')
-            if client or cached.is_file():
+            if client or sealed is not None or cached.is_file():
                 from .local import LocalClient
-                if isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts') and not cached.is_file():
+                if sealed is None and isinstance(client, LocalClient) and result['status'] != 'interrupted' and not result.get('attempts') and not cached.is_file():
                     return client.worker.artifacts(worker_id, result=self.public_result(result) if public else result)
                 try:
                     if is_connected and not is_connected():
                         raise ConnectionAbortedError('Result download caller disconnected while queued')
-                    raw = self._worker_artifact_archive(client, worker_id, cached)
+                    raw = sealed if sealed is not None else self._worker_artifact_archive(client, worker_id, cached)
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) != 404 or result['status'] != 'interrupted':
                         raise
