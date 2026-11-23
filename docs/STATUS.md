@@ -1,6 +1,6 @@
 # DCO 当前状态
 
-**2026-11-23 00:05（太平洋时间）。1.0.57 已上线。** 中心与 22 台设备统一版本，627 个基础调度核，接单和派发已恢复。发布凭据续期后，内置浏览器核实看板重新收到实时采样。22 台设备的整数探针输出摘要一致，校内 AQ 同时运行 32 个独立工作项。ARH-DSE、AOP、RGCN、DCBFS-MO 和 Chiplet3D 的公开入口均通过。 [中心与设备验收](../.local/migration/rollout-1057/fleet-qualification.json) · [32 核验收](../.local/migration/rollout-1057/full-width.json) · [五工程公开入口](../.local/migration/rollout-1057/public-projects.json)
+**2026-11-23 00:12（太平洋时间）。1.0.57 已上线。** 中心与 22 台设备统一版本，627 个基础调度核，接单和派发已恢复。发布凭据续期后，内置浏览器核实看板重新收到实时采样。22 台设备的整数探针摘要一致，ngspice、ONNX 和 Verilator 共 66 笔参考算例均返回预期值，校内 AQ 同时运行 32 个独立工作项。五个工程的公开入口均通过。 [中心与设备验收](../.local/migration/rollout-1057/fleet-qualification.json) · [求解器验收](../.local/migration/rollout-1057/common-engine-qualification.json) · [32 核验收](../.local/migration/rollout-1057/full-width.json) · [五工程公开入口](../.local/migration/rollout-1057/public-projects.json)
 
 **两种调度权限。** 工程只声明通用能力包和资源需求，内容哈希只校验制品，设备由 DCO 分配。用户明确授权的场次由运维凭据写入 `placement_scope`，将完整许可名单和授权说明绑定到每个原 ID；范围内设备暂时不可用时继续排队。生产验收核实了公开 HTTP 入口拒收节点、平台、范围及设备专属能力，且单个许可节点停用期间始终保留待派发。 [权限与取消验收](../.local/migration/rollout-1057/cancel-and-width-qualification.json)
 
