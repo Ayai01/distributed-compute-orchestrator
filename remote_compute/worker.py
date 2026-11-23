@@ -68,6 +68,10 @@ class Conflict(ValueError):
     pass
 
 
+class QueueFull(ValueError):
+    """A new original exceeded the center's persistent queue budget."""
+
+
 class ExecutableScratchUnavailable(RuntimeError):
     def __init__(self):
         super().__init__(EXECUTABLE_RAM_UNAVAILABLE)
@@ -484,6 +488,7 @@ class Worker:
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
                         capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress','execution_profiles_v1',STARTUP_CPU_FLOOR]
+                        + ['batch_cancel', 'kill_snapshot']
                         + ([ASSET_RESUME_CAPABILITY] if self.shared_assets else [])
                         + (['restart'] if self.restart_available else []))
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:
@@ -1804,6 +1809,17 @@ class Worker:
                 self.condition.notify_all()
         return self.get(identity)
 
+    def cancel_all(self):
+        from .operations import cancel_worker_batch
+        with self.condition:
+            identities = [job['result']['id'] for job in active_values(self.jobs)
+                          if job['result']['status'] not in TERMINAL]
+        results = cancel_worker_batch(self, identities)
+        pending = [identity for identity, row in results.items() if row['status'] not in TERMINAL]
+        return dict(status='accepted' if pending else 'completed', matched=len(identities),
+                    finished=len(identities) - len(pending), pending=pending, errors={},
+                    jobs=list(results.values()))
+
     def artifacts(self, identity, *, result=None):
         job = load_job(self.jobs, self.condition, identity)
         with self.condition:
@@ -2031,6 +2047,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/zip" if binary else "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-DCO-Node", socket.gethostname())
+            if status == 429:
+                self.send_header("Retry-After", "2")
             if etag:
                 self.send_header('Accept-Ranges', 'bytes')
                 self.send_header('ETag', etag)
@@ -2132,6 +2150,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not operator:
                     return self._reply({'error':'Queue cleanup is operator-only'},403)
                 value=worker.clean()
+            elif parts == ['kill-all'] and self.command == 'POST':
+                if scheduler and not operator:
+                    return self._reply({'error': 'Fleet cancellation is operator-only'}, 403)
+                value = worker.cancel_all()
+            elif parts == ['jobs', 'cancel'] and self.command == 'POST' and not scheduler:
+                from .operations import cancel_worker_batch
+                request = json.loads(body)
+                value = cancel_worker_batch(worker, dict.fromkeys(validate_status_ids(
+                    request.get('ids') if isinstance(request, dict) else None)))
             elif parts == ["restart"] and self.command == "POST":
                 if scheduler and not operator:
                     return self._reply({"error": "Scheduler restart is operator-only"}, 403)
@@ -2314,6 +2341,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply({"error": "Unknown job, tool or path variable: " + str(exc)}, 404)
         except Conflict as exc:
             self._reply({"error": worker.public_error(exc) if scheduler and not operator else str(exc)}, 409)
+        except QueueFull as exc:
+            self._reply({"error": str(exc), "retry_after_s": 2}, 429)
         except RemoteError as exc:
             self._reply({"error": worker.public_error(exc) if scheduler and not operator else str(exc)}, 502)
         except FileNotFoundError as exc:

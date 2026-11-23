@@ -148,10 +148,10 @@ def _short_dispatch_request(path, data, method):
 
 
 class _ConnectionPool:
-    def __init__(self):
+    def __init__(self, slots=8):
         self.idle = []
         self.condition = threading.Condition()
-        self.available = 8
+        self.available = slots
         self.bulk_limit = 7
         self.bulk_active = 0
         self.waiting = deque()
@@ -263,7 +263,7 @@ class Client:
         verb=method or ('POST' if data is not None else 'GET')
         job_upload=verb=='POST' and isinstance(data,bytes) and bool(re.fullmatch(r'/jobs/[0-9a-f]{32}',path))
         replayable=(verb=='GET' or verb=='DELETE' or job_upload or verb=='POST' and (
-            path in ('/admission','/jobs/status') or bool(re.fullmatch(r'/assets/[0-9a-f]{64}|/jobs/[0-9a-f]{32}/cancel',path))))
+            path in ('/admission','/jobs/status','/jobs/cancel') or bool(re.fullmatch(r'/assets/[0-9a-f]{64}|/jobs/[0-9a-f]{32}/cancel',path))))
         previous=getattr(self.connections,'route',None)
         errors=[]
         try:
@@ -312,13 +312,15 @@ class Client:
             pools, key = self.__dict__.setdefault('_artifact_transports', {}), authority
         elif retirement:
             pools, key = self.__dict__.setdefault('_retirement_transports', {}), authority
+        elif relayed and path == '/health':
+            pools, key = self.__dict__.setdefault('_heartbeat_transports', {}), authority
         elif authority == self.url:
             pools, key = self.__dict__, '_transport'
         else:
             pools, key = self.__dict__.setdefault('_transports', {}), authority
         pool = pools.get(key)
         if pool is None:
-            pool = pools.setdefault(key, _ConnectionPool())
+            pool = pools.setdefault(key, _ConnectionPool(slots=2 if relayed and path == '/health' else 8))
         pool.set_bulk_limit(getattr(self, 'bulk_limit', 7))
         # Local FIFO backpressure is independent of a socket's network timeout.
         # A busy client waits for its bounded slot without failing accepted work.
@@ -441,7 +443,7 @@ class Client:
             partial.seek(0);partial.truncate()
         asset_checkpoint = bool(re.fullmatch(r'/assets/[0-9a-f]{64}/upload', path))
         attempts = 1 if _asset_probe or asset_checkpoint else 4 if binary and method == 'GET' else 2
-        retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status') or bool(re.fullmatch(
+        retryable=(method=='GET' or method=='POST' and (path in ('/admission','/jobs/status','/jobs/cancel') or bool(re.fullmatch(
             r'/(jobs/[0-9a-f]{32}(/cancel)?|assets/[0-9a-f]{64})',path))))
         asset_upload=method=='POST' and stream_body and bool(re.fullmatch(r'/assets/[0-9a-f]{64}',path))
         large_asset = asset_upload and len(data) >= 1024 * 1024
@@ -985,13 +987,37 @@ class Client:
                 delay = min(delay, deadline-now)
             _pause(delay, check)
 
-    def cancel(self, identity):
+    def _cancel_transport(self, timeout=3):
         # A force control must not queue behind this client's long resource
         # handshakes or artifact transfers. Keep the same auth/TLS identity.
-        control = Client(self.url, self.token, timeout=min(self.timeout, 3), ca_file=self.ca_file,
-                         operator=self.operator, operator_token=self.operator_token, pool_timeout=.5,
-                         relay_url=self.relay_url,peer_id=self.peer_id)
-        return control.request("/jobs/" + identity + "/cancel", {})
+        return Client(self.url, self.token, timeout=min(self.timeout, timeout), ca_file=self.ca_file,
+                      operator=self.operator, operator_token=self.operator_token, pool_timeout=.5,
+                      relay_url=self.relay_url, peer_id=self.peer_id)
+
+    def cancel(self, identity):
+        return self._cancel_transport().request("/jobs/" + identity + "/cancel", {})
+
+    def cancel_many(self, identities):
+        """Send each worker one bounded batch at a time, including during rolling upgrades."""
+        from .operations import cancel_receipt
+        control = self._cancel_transport(timeout=8)
+        values = {}
+        for offset in range(0, len(identities), MAX_STATUS_BATCH):
+            batch = identities[offset:offset + MAX_STATUS_BATCH]
+            if 'batch_cancel' in (self._capabilities or ()):
+                values.update(control.request('/jobs/cancel', {'ids': batch}))
+            else:
+                for identity in batch:
+                    try:
+                        values[identity] = cancel_receipt(control.request('/jobs/' + identity + '/cancel', {}))
+                    except RemoteError as error:
+                        if error.status_code != 404:
+                            raise
+                        values[identity] = {'id': identity, 'status': 'unknown'}
+        return values
+
+    def cancel_all(self):
+        return self._cancel_transport(timeout=8).request('/kill-all', {})
 
     def clean(self):
         """Operator cleanup of queued tasks; active and finished receipts remain."""
@@ -1448,6 +1474,7 @@ class Node:
     artifact_claims: dict = field(default_factory=dict)
     known_jobs: set = field(default_factory=set)
     live_jobs: set = field(default_factory=set)
+    pending_dispatches: set = field(default_factory=set)
     memory_holds: dict = field(default_factory=dict)
     ram_holds: dict = field(default_factory=dict)
     host_ip: str = ""
@@ -1463,6 +1490,12 @@ class Node:
     next_dispatch: float = 0.0
     dispatch_interval: float = .5
     display_name: str = ""
+
+    @property
+    def dispatch_room(self):
+        endpoint = getattr(self.client, '_endpoint', None)
+        return not (endpoint is not None and _RELAY_BULK_BUDGET is not None
+                    and _RELAY_BULK_BUDGET.matches(endpoint)) or len(self.pending_dispatches) < 4
 
     @property
     def executable_ram_capacity(self):
@@ -2072,6 +2105,7 @@ class Pool:
             return (node.memory_free>=floor and self._host_memory_free(node)>=floor
                 and not(resource_recovery and node.health.get('memory_pressure_state',{}).get('limited')))
         return [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
+                 and n.dispatch_room
                  and available(n) >= needed_cpus(n)
                  and memory_ready(n)
                  and (not executable_ram_mb or n.executable_ram_available >= executable_ram_mb)

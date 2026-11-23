@@ -294,6 +294,10 @@ def active_job_identity(client, prefix):
 
 def kill_all(client):
     """Cancel only the original IDs in this endpoint's invocation snapshot."""
+    if isinstance(client, Client):
+        health = client.health(brief=True)
+        if 'kill_snapshot' in health.get('capabilities', ()):
+            return client.cancel_all()
     identities=list(active_job_rows(client))
     if not identities:
         return dict(status='completed',matched=0,finished=0,pending=[],errors={},jobs=[])

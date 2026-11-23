@@ -40,6 +40,7 @@ def _copy_node(node):
     # resource ledger entries that can be changed in place during planning.
     view.health = node.health.copy()
     view.live_jobs = node.live_jobs.copy()
+    view.pending_dispatches = node.pending_dispatches.copy()
     view.memory_holds = {key: hold.copy() for key, hold in node.memory_holds.copy().items()}
     view.ram_holds = node.ram_holds.copy()
     view.accelerator_reservations = node.accelerator_reservations.copy()
@@ -477,6 +478,9 @@ class PlacementSnapshot(PlacementPlanning):
                 placed = self.committed
                 self.committed = None
                 budgets[group]['used'] += placed['task']['cpus']
+                if not any(n.enabled and not n.error and not n.health.get('paused')
+                        and n.capacity > n.reserved + n.external and n.dispatch_room for n in self.pool.nodes):
+                    return
                 growth, claims, matching = {}, None, _matching_pass(self.pool)
                 if _elastic_job(placed):
                     budgets.clear()

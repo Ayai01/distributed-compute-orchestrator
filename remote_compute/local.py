@@ -18,6 +18,13 @@ class LocalClient(Client):
     def cancel(self, identity):
         return self.worker.cancel(identity)
 
+    def cancel_many(self, identities):
+        from .operations import cancel_worker_batch
+        return cancel_worker_batch(self.worker, identities)
+
+    def cancel_all(self):
+        return self.worker.cancel_all()
+
     def request(self, path, data=None, *, method=None, binary=False, brief=False, extra_headers=None, cancel=None):
         _check_cancelled(cancel)
         worker = self.worker

@@ -17,7 +17,10 @@ class AdmissionWindow:
                 self.value=self.client.admission(self.project,**self.options)
                 self.maximum=self.value.get('max_in_flight',self.value['in_flight'])
                 self.updated=time.monotonic()
-            return max(1,min(self.maximum,self.value['in_flight']))
+            limit = min(self.maximum, self.value['in_flight'])
+            if 'submission_window' in self.value:
+                return max(0, min(limit, self.value['submission_window']))
+            return max(1, limit)
 
     def available(self, pending):
         """Credits after the caller counts all submitted but unconsumed IDs."""
