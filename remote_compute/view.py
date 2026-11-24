@@ -227,6 +227,8 @@ def _node_state(node):
         return '重连'
     if node.get('paused'):
         return '暂停'
+    if node.get('cpu_suspended') and not node.get('active_jobs'):
+        return '零核'
     return '运行' if node.get('active_jobs') else '就绪'
 
 

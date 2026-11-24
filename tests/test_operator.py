@@ -13,6 +13,38 @@ from test_compute import provider, python, scratch, until
 
 
 class OperatorTests(unittest.TestCase):
+    def test_zero_cpu_budget_drains_and_survives_restart(self):
+        source = "from pathlib import Path\nimport time\nwhile not Path('release').exists():time.sleep(.02)"
+        with scratch() as directory:
+            root = Path(directory)
+            with provider(root/'one', cpus=2) as (worker, remote), provider(root/'two', cpus=2) as (_, second):
+                with Pool([remote, second]) as pool:
+                    scope = {'nodes':['node1'], 'reason':'Validate zero CPU scheduling'}
+                    with center(pool, root/'center') as (_, client):
+                        identity = client.submit(dict(python(source,max_cpus=2),placement_scope=scope))['id']
+                        until(lambda:client.status(identity)['status']=='running' and client.health()['nodes'][0]['used_cpus']==2)
+                        try:
+                            view = client.request('/control/resources',dict(node='node1',changes={'cpus':0}))
+                            row = view['nodes'][0]
+                            self.assertEqual((row['configured']['cpus'],row['effective']['cpus'],row['actual']['cpus']),(0,0,2))
+                            self.assertTrue(row['enabled'])
+                            self.assertTrue(row['cpu_suspended'])
+                            self.assertEqual(client.status(identity)['status'],'running')
+                        finally:
+                            client.write_job_file(identity,'release','yes')
+                        self.assertEqual(client.wait(identity)['status'],'succeeded')
+                        free = client.submit(python('print(2)'))['id']
+                        self.assertEqual(client.wait(free)['assigned_node'],'node2')
+                    with center(pool, root/'center') as (_, client):
+                        row = client.health()['nodes'][0]
+                        self.assertTrue(row['cpu_suspended'])
+                        self.assertEqual(row['base_capacity'],0)
+                        queued = client.submit(dict(python('print(1)'),placement_scope=scope))['id']
+                        self.assertEqual(client.status(queued)['status'],'queued')
+                        snapshot = client.control(node='node1',worker={'cpus':None})
+                        self.assertFalse(snapshot['nodes'][0]['cpu_suspended'])
+                        self.assertEqual(client.wait(queued)['assigned_node'],'node1')
+
     def test_resource_control_surface_persists_policy_and_keeps_active_grants(self):
         source="from pathlib import Path\nimport time\nprint('ready',flush=True)\nwhile not Path('release').exists():time.sleep(.02)"
         with scratch()as root,provider(Path(root)/'worker',cpus=4,memory_mb=4096)as(worker,remote),Pool([remote])as pool,center(pool,Path(root)/'center')as(_,client):

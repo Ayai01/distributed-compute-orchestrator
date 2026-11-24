@@ -1459,6 +1459,7 @@ class Node:
     detached: bool = False
     reconnect_attempts: int = 0
     reconnect_after: float = 0.0
+    cpu_suspended: bool = False
     connection_generation: int = 0
     reserved: int = 0
     external: int = 0
@@ -1507,9 +1508,13 @@ class Node:
         return max(0, available - sum(self.ram_holds.values()))
 
     @property
-    def base_capacity(self):
+    def configured_capacity(self):
         available = self.health.get('base_cpus',self.health.get('cpus',0))
         return min(available, self.limit) if self.limit else available
+
+    @property
+    def base_capacity(self):
+        return 0 if self.cpu_suspended else self.configured_capacity
 
     @property
     def capacity(self):
@@ -1987,10 +1992,11 @@ class Pool:
                     pool.set_bulk_limit(client.bulk_limit)
             if connection_change:self._save_reconnect(node)
 
-    def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None, relay_url=None, peer_id=None, bulk_limit=7, display_name=""):
+    def add(self, name, url, *, token="", weight=1.0, limit=0, timeout=10, host_ip="", ca_file=None, aliases=None, relay_url=None, peer_id=None, bulk_limit=7, display_name="", cpu_suspended=False):
         if type(bulk_limit)is not int or not 1<=bulk_limit<=7:
             raise ValueError('Node bulk_limit must be an integer in 1..7')
         node = Node(name, Client(url, token,timeout=timeout,ca_file=ca_file,operator=True,relay_url=relay_url,peer_id=peer_id), weight=weight, limit=limit)
+        node.cpu_suspended = cpu_suspended
         node.client.bulk_limit=bulk_limit
         node.host_ip = host_ip
         node.aliases=[] if aliases is None else aliases
@@ -2019,6 +2025,7 @@ class Pool:
                  "ca_file":getattr(n.client,'ca_file',None),"aliases":getattr(n,'aliases',[]),
                  "relay_url":getattr(n.client,'relay_url',None),"peer_id":getattr(n.client,'peer_id',None),
                  "capacity": n.capacity, "base_capacity":n.base_capacity,
+                 "cpu_suspended": n.cpu_suspended,
                  "cpu_overcommit_factor":n.health.get('cpu_overcommit_factor',1.0),
                  "cpu_overcommit_utilization":n.health.get('cpu_overcommit_utilization',90),
                  "memory_commit_headroom_mb":n.health.get('memory_commit_headroom_mb'),
@@ -2066,7 +2073,8 @@ class Pool:
         result=[]
         for node in self.nodes:
             health=node.health
-            if ((scoped and node.name not in scoped) or (task.get('node')and node.name!=task['node'])or node.capacity<cpus
+            width = node.configured_capacity if node.cpu_suspended else node.capacity
+            if ((scoped and node.name not in scoped) or (task.get('node')and node.name!=task['node'])or width<cpus
                     or task.get('min_start_cpus', 1) > 1 and STARTUP_CPU_FLOOR not in health.get('capabilities', ())
                     or task.get('platform') is not None and health.get('platform') != task['platform']
                     or executable_ram_mb and node.executable_ram_capacity < executable_ram_mb
@@ -2105,7 +2113,7 @@ class Pool:
             floor=max(memory_floor,node.startup_memory(task))
             return (node.memory_free>=floor and self._host_memory_free(node)>=floor
                 and not(resource_recovery and node.health.get('memory_pressure_state',{}).get('limited')))
-        return [n for n in matching if not n.error and n.enabled and not n.health.get("paused")
+        return [n for n in matching if not n.error and n.enabled and not n.cpu_suspended and not n.health.get("paused")
                  and n.dispatch_room
                  and available(n) >= needed_cpus(n)
                  and memory_ready(n)

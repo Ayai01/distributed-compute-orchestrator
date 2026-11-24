@@ -899,7 +899,7 @@ class SchedulerShell(Shell):
         self.pool.refresh()
 
     def do_cpus(self, line):
-        """cpus [节点] N：设置基础CPU预算；省略节点即本机，0为自动，现有任务自然收尾。
+        """cpus [节点] N|auto：中心 CPU 预算，0 暂停分配，auto 自动预算；现有任务自然收尾。
         超发按配置倍率临时增加准入，基础预算保持。
         例：cpus 16；cpus Aya1-TX 30。设置自动保存，下次启动继续使用。
         """
@@ -909,16 +909,19 @@ class SchedulerShell(Shell):
         if len(args) not in (1,2):
             raise ValueError('需要线程数，可在前面指定设备')
         name, count = (socket.gethostname(),args[0]) if len(args)==1 else (self._node(args[0]).name,args[1])
+        count = None if count.lower() == 'auto' else int(count)
         if self.center:
-            snapshot = self.center.control(node=name, worker={"cpus": int(count)})
+            snapshot = self.center.control(node=name, worker={"cpus": count})
         else:
-            self._node(name).client.control(cpus=int(count))
+            if count == 0:
+                raise ValueError('0 核调度预算由 DCO 中心管理，请连接中心后设置')
+            self._node(name).client.control(cpus=count or 0)
             self.pool.refresh()
             snapshot = self.pool.snapshot()
         row = next(row for row in snapshot['nodes'] if row['name'] == name)
         budget = row.get('base_capacity',row['capacity'])
         limit = row['limit']
-        print(name+' CPU配置已保存：设备 '+str(count if int(count) else '自动')+
+        print(name+' CPU配置已保存：设备 '+str('自动' if count is None else count)+
               '；中心上限 '+str(limit or '自动')+'；基础预算 '+str(budget)+
               '；当前准入 '+str(row['capacity'])+'。')
 

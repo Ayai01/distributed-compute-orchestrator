@@ -115,6 +115,11 @@ class Coordinator(PlacementPlanning):
         (self.root / "assets").mkdir(exist_ok=True)
         self.operator_token = self._load_operator_token(operator_token)
         self.condition = threading.Condition(threading.RLock())
+        self.cpu_suspension_path = self.root / 'cpu-suspended-nodes.json'
+        self.cpu_suspended = set(json.loads(self.cpu_suspension_path.read_bytes())) if self.cpu_suspension_path.is_file() else set()
+        with self.pool.condition:
+            for node in self.pool.nodes:
+                node.cpu_suspended = node.name in self.cpu_suspended
         self.submission_lock = SubmissionLocks()
         self.accepting_assets = SubmissionAssets()
         self.asset_writes = weakref.WeakValueDictionary()
@@ -426,7 +431,7 @@ class Coordinator(PlacementPlanning):
                               node.capacity-node.reserved-node.external+old))
             if _elastic_job(job) and not node.error and project in resources:
                 advised=min(advised,placement._cooperative_cpu_target(job_id,node.capacity,resources))
-            advice=dict(recommended_cpus=advised if node.enabled and not node.error and not node.health.get('paused') else old,
+            advice=dict(recommended_cpus=advised if node.enabled and not node.error and not node.cpu_suspended and not node.health.get('paused') else old,
                         current_cpus=old,current_memory_mb=old_memory,
                         available_memory_mb=old_memory+max(0,min(node.memory_free,placement.pool._host_memory_free(node))))
         ceilings=[min(n.limit or n.health.get('cpu_limit',n.capacity),n.health.get('cpu_limit',n.capacity)) for n in eligible]+list(held.values())
@@ -917,12 +922,11 @@ class Coordinator(PlacementPlanning):
                     self.retirement.routes_changed()
             if "worker" in changes:
                 try:
-                    result=node.client.control(**changes["worker"])
+                    result=self._node_worker_control(node, changes["worker"])
                 except RemoteError as error:
                     if getattr(error, 'status_code', None) == 400:
                         raise ValueError(str(error)) from None
                     raise Conflict(str(error)) from None
-                self.pool.refresh(nodes=[node])
                 if set(changes)=={'node','worker'}and set(changes['worker'])=={'retire_asset'}:
                     return dict(result,node=name)
             return self.health()
@@ -930,7 +934,7 @@ class Coordinator(PlacementPlanning):
             self.pool.configure(policy=changes["policy"])
             return self.health()
         if isinstance(changes, dict) and set(changes) == {"add"}:
-            self.pool.add(**changes["add"])
+            self.pool.add(**{**changes['add'], 'cpu_suspended': changes['add'].get('name') in self.cpu_suspended})
             self.retirement.routes_changed()
             return self.health()
         if (not isinstance(changes,dict)or not changes or set(changes)-{'paused','accepting'}
@@ -944,6 +948,32 @@ class Coordinator(PlacementPlanning):
             self.condition.notify_all()
         return self.health()
 
+    def _node_worker_control(self, node, changes):
+        requested = dict(changes)
+        has_cpus = 'cpus' in requested
+        cpus = requested.get('cpus')
+        if has_cpus and cpus is not None and (type(cpus) is not int or cpus < 0):
+            raise ValueError('cpus requires a nonnegative integer or null for automatic')
+        held = has_cpus and cpus == 0
+        if held:
+            requested.pop('cpus')
+        elif has_cpus and cpus is None:
+            requested['cpus'] = 0  # the worker wire protocol still uses 0 for automatic
+        with self.submission_lock.hold('cpu-budget:' + node.name):
+            result = node.client.control(**requested) if requested else {}
+            if requested:
+                self.pool.refresh(nodes=[node])
+            if has_cpus:
+                with self.condition, self.pool.condition:
+                    names = (self.cpu_suspended | {node.name}) if held else (self.cpu_suspended - {node.name})
+                    if names != self.cpu_suspended:
+                        atomic_json(self.cpu_suspension_path, sorted(names), private=True)
+                        self.cpu_suspended = names
+                    node.cpu_suspended = held
+                    self.condition.notify_all()
+                    self.pool.condition.notify_all()
+        return result
+
     def resource_controls(self, changes=None):
         """The website changes numeric device policy through the same owner."""
         if changes is not None:
@@ -953,18 +983,19 @@ class Coordinator(PlacementPlanning):
             if node is None:raise ValueError('Unknown node: '+str(changes['node']))
             logical=node.health.get('logical_cpus')
             if type(logical)is not int or logical<1:raise Conflict('Device CPU limits are awaiting a health sample')
-            requested=validate_resource_controls(changes['changes'],logical_cpus=logical,
+            values = changes['changes']
+            numeric = {**values, 'cpus': 0} if isinstance(values, dict) and 'cpus' in values and values['cpus'] is None else values
+            validate_resource_controls(numeric,logical_cpus=logical,
                 cpu_limit=node.health.get('cpu_limit',logical))
-            try:node.client.control(**requested)
+            try:self._node_worker_control(node, values)
             except RemoteError as error:
                 if error.status_code==400:raise ValueError(str(error))from None
                 raise Conflict(str(error))from None
-            self.pool.refresh(nodes=[node])
         snapshots={row['name']:row for row in self.pool.snapshot()['nodes']}
         nodes=[]
         for node in self.pool.nodes:
             source=snapshots[node.name];health=node.health
-            fields=('name','display_name','enabled','capacity','base_capacity','logical_cpus','cpu_limit','cpu_overcommit_factor',
+            fields=('name','display_name','enabled','capacity','base_capacity','cpu_suspended','logical_cpus','cpu_limit','cpu_overcommit_factor',
                 'reserved','external_cpus','used_cpus','queued','cpu_percent','memory_capacity_mb','memory_available_mb',
                 'memory_reserved_mb','memory_total_mb','host_memory_available_mb','host_commit_limit_mb','host_commit_available_mb',
                 'memory_headroom_mb','memory_reserve_mb','memory_budget_mb','rss_mb','private_mb','paused','error')
@@ -977,6 +1008,7 @@ class Coordinator(PlacementPlanning):
                 memory_headroom_mb=health.get('memory_headroom_mb',0),
                 memory_commit_headroom_mb=health.get('memory_commit_headroom_mb',1024))
             row['configured']={key:configured.get(key,defaults[key])for key in sorted(RESOURCE_CONTROL_FIELDS)}
+            row['configured']['cpus'] = 0 if node.cpu_suspended else (row['configured']['cpus'] or None)
             row['effective']=dict(cpus=row['capacity'],base_cpus=row['base_capacity'],
                 max_cpus=int(row['base_capacity']*defaults['cpu_overcommit_factor']),memory_mb=row['memory_capacity_mb'],
                 memory_available_mb=row['memory_available_mb'])
@@ -985,8 +1017,9 @@ class Coordinator(PlacementPlanning):
             reasons=[]
             if node.error:reasons.append('offline')
             if health.get('paused')or not node.enabled:reasons.append('paused')
+            if node.cpu_suspended:reasons.append('cpu_budget')
             if health.get('memory_pressure_state',{}).get('limited'):reasons.append('memory_pressure')
-            if health.get('queued',0)and health.get('used_cpus',0)>=row['capacity']:reasons.append('cpu_budget')
+            if not node.cpu_suspended and health.get('queued',0)and health.get('used_cpus',0)>=row['capacity']:reasons.append('cpu_budget')
             if row['memory_available_mb']<=0:reasons.append('memory_budget')
             row.update(wait_reasons=reasons,restart_required=[])
             nodes.append(row)
