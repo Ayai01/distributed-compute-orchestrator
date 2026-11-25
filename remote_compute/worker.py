@@ -1789,10 +1789,22 @@ class Worker:
             return result
 
     def cancel(self, identity):
-        job = load_job(self.jobs, self.condition, identity)
-        queued = False
+        self.cancel_many((identity,))
+        return self.get(identity)
+
+    def cancel_many(self, identities):
+        from .operations import cancel_receipt
+
+        identities = tuple(dict.fromkeys(identities))
+        affected = {}
         with self.condition:
-            if job["result"]["status"] not in TERMINAL:
+            # Signal every local process before writing any individual receipt.
+            # Running jobs own their final write and retain the flag if they exit here.
+            for identity in identities:
+                job = self.jobs.active.get(identity)
+                if job is None or job['result']['status'] in TERMINAL:
+                    continue
+                affected[identity] = job
                 job["cancel"].set()
                 job['result']['cancel_requested'] = True
                 process = job.get('process')
@@ -1801,23 +1813,30 @@ class Worker:
                     job['result']['kill_signal_sent'] = True
                 if job["result"]["status"] == "queued" and identity in self.queue:
                     self.queue.remove(identity)
-                    queued = True
-                self._save(job)
-                self.condition.notify_all()
-        if queued:
+                    job["result"].update(status="cancelled", finished=time.time())
+            self.condition.notify_all()
+        results = {}
+        for identity in identities:
+            if identity not in affected:
+                try:
+                    results[identity] = cancel_receipt(self.get(identity))
+                except (KeyError, FileNotFoundError):
+                    results[identity] = {'id': identity, 'status': 'unknown'}
+                continue
+            job = affected[identity]
             with self.condition:
-                job["result"].update(status="cancelled", finished=time.time())
-                self._save(job)
-                archive_job(self.jobs, job)
-                self.condition.notify_all()
-        return self.get(identity)
+                if self.jobs.active.get(identity) is job:
+                    self._save(job)
+                    if job['result']['status'] in TERMINAL:
+                        archive_job(self.jobs, job)
+                results[identity] = cancel_receipt(job['result'])
+        return results
 
     def cancel_all(self):
-        from .operations import cancel_worker_batch
         with self.condition:
             identities = [job['result']['id'] for job in active_values(self.jobs)
                           if job['result']['status'] not in TERMINAL]
-        results = cancel_worker_batch(self, identities)
+        results = self.cancel_many(identities)
         pending = [identity for identity, row in results.items() if row['status'] not in TERMINAL]
         return dict(status='accepted' if pending else 'completed', matched=len(identities),
                     finished=len(identities) - len(pending), pending=pending, errors={},
@@ -2158,10 +2177,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply({'error': 'Fleet cancellation is operator-only'}, 403)
                 value = worker.cancel_all()
             elif parts == ['jobs', 'cancel'] and self.command == 'POST' and not scheduler:
-                from .operations import cancel_worker_batch
                 request = json.loads(body)
-                value = cancel_worker_batch(worker, dict.fromkeys(validate_status_ids(
-                    request.get('ids') if isinstance(request, dict) else None)))
+                value = worker.cancel_many(validate_status_ids(
+                    request.get('ids') if isinstance(request, dict) else None))
             elif parts == ["restart"] and self.command == "POST":
                 if scheduler and not operator:
                     return self._reply({"error": "Scheduler restart is operator-only"}, 403)

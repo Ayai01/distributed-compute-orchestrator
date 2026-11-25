@@ -15,6 +15,29 @@ from test_compute import provider, python, scratch, until
 
 
 class DeepQueueStabilityTests(unittest.TestCase):
+    def test_worker_signals_whole_batch_before_saving_a_receipt(self):
+        with scratch() as directory, provider(Path(directory) / 'worker', cpus=3) as (worker, api):
+            identities = [api.submit(python('import time; time.sleep(60)'))['id'] for _ in range(3)]
+            until(lambda: all(worker.jobs.active[i].get('process') for i in identities))
+            jobs = [worker.jobs.active[i] for i in identities]
+            save = worker._save
+            caller = threading.current_thread()
+            verified = []
+
+            def check(job):
+                if threading.current_thread() is caller:
+                    self.assertTrue(all(item['cancel'].is_set() and item['result']['kill_signal_sent']
+                                        for item in jobs))
+                    verified.append(job['result']['id'])
+                return save(job)
+
+            with worker.condition, patch.object(worker, '_save', side_effect=check):
+                receipts = worker.cancel_many(identities)
+            self.assertEqual(set(receipts), set(identities))
+            self.assertEqual(verified, identities)
+            self.assertTrue(all(row.get('kill_signal_sent') for row in receipts.values()))
+            until(lambda: all(api.status(i)['status'] == 'cancelled' for i in identities))
+
     def test_deep_queue_health_and_batched_cancel(self):
         count = int(os.environ.get('DCO_STRESS_QUEUE', '128'))
         with scratch() as directory:

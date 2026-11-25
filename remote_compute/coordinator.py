@@ -58,6 +58,7 @@ from .packages import (DEFAULT_PACKAGE, PACKAGES, RETAINED_NAMES, package_names,
 
 
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
+TRANSIENT_WORKER_HTTP = (429, 502, 503, 504)
 
 
 class _PreparationWorkerLost(Exception):
@@ -1564,11 +1565,6 @@ class Coordinator(PlacementPlanning):
                                 self._save(job)
                         time.sleep(.5)
                         continue
-                    if not self.stopping and self.pool.needs_relay_status_sample(node):
-                        # All accepted IDs share one worker sample. A stalled
-                        # probe must not fan out into one new STCP dial per ID.
-                        time.sleep(.25)
-                        continue
                     if job["cancel"].is_set() and not cancel_sent:
                         with self.condition:
                             cancellation_in_progress = job.get('cancel_sending')
@@ -1579,8 +1575,13 @@ class Coordinator(PlacementPlanning):
                         if not cancel_sent:
                             node.client.cancel(identity)
                             cancel_sent = True
+                    if not self.stopping and self.pool.needs_relay_status_sample(node):
+                        # Status reads await the common sample. The stop signal
+                        # uses its own control connection and takes priority.
+                        time.sleep(.25)
+                        continue
                     remote = node.client.status(identity, brief=True)
-                    if remote.get('resource_request'):
+                    if remote.get('resource_request') and not job['cancel'].is_set():
                         self._answer_resource_request(job, identity, remote)
                     if remote['status'] in TERMINAL:
                         remote = node.client.status(identity)
@@ -1590,7 +1591,7 @@ class Coordinator(PlacementPlanning):
                         result=dict(status='interrupted',error='Worker unavailable: '+str(error),finished=time.time())
                         with self.pool.condition:node.error=str(error)
                         break
-                    if self.stopping or getattr(error,'status_code',None) is not None:
+                    if self.stopping or error.status_code not in (None, *TRANSIENT_WORKER_HTTP):
                         raise
                     with self.condition:
                         job['result']['connection_error']=str(error)
@@ -1812,9 +1813,9 @@ class Coordinator(PlacementPlanning):
                     force=True
                     continue
                 if (not submitting and lost_before_submit()
-                        and (error.transport_retryable or error.status_code in (502,503,504))):
+                        and (error.transport_retryable or error.status_code in TRANSIENT_WORKER_HTTP)):
                     raise _PreparationWorkerLost() from error
-                if self.stopping or getattr(error,'status_code',None) is not None:
+                if self.stopping or error.status_code not in (None, *TRANSIENT_WORKER_HTTP):
                     raise
                 uncertain=uncertain or submitting
                 if not uncertain:
@@ -1837,7 +1838,7 @@ class Coordinator(PlacementPlanning):
                             # The first POST may still arrive later. Repeating
                             # its exact ID and payload remains worker-idempotent.
                             break
-                        if self.stopping or getattr(observed,'status_code',None) is not None:
+                        if self.stopping or observed.status_code not in (None, *TRANSIENT_WORKER_HTTP):
                             raise
                         error=observed
                         time.sleep(.5)

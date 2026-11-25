@@ -866,6 +866,27 @@ class AdaptiveWaitTests(unittest.TestCase):
 
 
 class StatusReadReconnectTests(unittest.TestCase):
+    def test_center_retains_original_after_gateway_status_errors(self):
+        with scratch() as folder, provider(Path(folder) / 'worker') as (worker, remote):
+            original = remote.status
+            failed = []
+
+            def status(identity, **options):
+                if len(failed) < 4:
+                    failed.append(identity)
+                    raise self.outage((502, 503, 504, 429)[len(failed) - 1])
+                return original(identity, **options)
+
+            with Pool([remote]) as pool, center(pool, Path(folder) / 'center') as (_, api), \
+                    patch.object(remote, 'status', side_effect=status):
+                identity = api.submit(python('print("ran once")', retries=0))['id']
+                api.wait(identity, wait_timeout=15)
+                result = api.fetch(identity, delete=False)
+                self.assertEqual(result['status'], 'succeeded')
+                self.assertEqual(result['attempts'], [])
+                self.assertEqual(failed, [identity] * 4)
+                self.assertEqual(list(worker.jobs), [identity])
+
     def test_resumable_upload_shrinks_chunk_after_timeout_without_rewinding(self):
         unit = 256 * 1024
         confirmed = unit

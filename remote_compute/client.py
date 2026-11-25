@@ -1743,7 +1743,6 @@ class Pool:
             error=''
         except RemoteError as exc:
             value,error={},str(exc)
-        self._sample_network(node)
         with self.condition:
             if client is not node.client or generation != node.connection_generation:return
             node.sampled_at=time.monotonic()
@@ -1789,6 +1788,7 @@ class Pool:
                     node.reconnect_attempts, node.reconnect_after = 0, 0.0
             self.condition.notify_all()
         if reconnect or (not error and renamed):self._save_reconnect(node)
+        self._sample_network(node)
 
     def needs_relay_status_sample(self, node):
         """Only the node sampler should dial an intermittently unreachable relay."""

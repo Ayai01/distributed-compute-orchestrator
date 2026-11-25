@@ -19,8 +19,7 @@ class LocalClient(Client):
         return self.worker.cancel(identity)
 
     def cancel_many(self, identities):
-        from .operations import cancel_worker_batch
-        return cancel_worker_batch(self.worker, identities)
+        return self.worker.cancel_many(identities)
 
     def cancel_all(self):
         return self.worker.cancel_all()

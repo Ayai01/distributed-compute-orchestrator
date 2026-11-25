@@ -10,17 +10,6 @@ def cancel_receipt(result):
                                         'remote_cancel_pending', 'cost_incomplete') if key in result}
 
 
-def cancel_worker_batch(worker, identities):
-    """Run local cancellation with no network round trip between jobs."""
-    results = {}
-    for identity in identities:
-        try:
-            results[identity] = cancel_receipt(worker.cancel(identity))
-        except (KeyError, FileNotFoundError):
-            results[identity] = {'id': identity, 'status': 'unknown'}
-    return results
-
-
 def clean_pending(service, *, discard=None):
     # Queue removal and cancellation share the scheduler's admission lock.
     # Already dispatched/running work never enters this deletion set.
