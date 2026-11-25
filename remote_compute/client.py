@@ -29,7 +29,7 @@ import uuid
 import weakref
 import zipfile
 
-from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle, tree, unpack, native_path
+from .bundle import MAX_BODY, PROTOCOL, TERMINAL, cancellation_needs_reconnect, json_bytes, pack, task_bundle, tree, unpack, native_path
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
                      MAX_STATUS_BATCH, priority_weight, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
@@ -1267,7 +1267,8 @@ class Client:
             archive_bytes=archive_bytes,expanded_bytes=expanded,**(metrics.value or {}))
         result["url"] = self.url
         retired=time.monotonic()
-        if delete:
+        retire = delete and not cancellation_needs_reconnect(result)
+        if retire:
             try:
                 self.delete(identity)
             except RemoteError as error:
@@ -1277,7 +1278,7 @@ class Client:
                 # acknowledgement must not discard the caller's only copy.
                 result['retirement_pending']=True
                 fetched.value['retirement_error']=str(error)
-        fetched.value['delete_seconds']=time.monotonic()-retired if delete else 0.0
+        fetched.value['delete_seconds']=time.monotonic()-retired if retire else 0.0
         fetched.value['total_seconds']=time.monotonic()-started
         return result
 

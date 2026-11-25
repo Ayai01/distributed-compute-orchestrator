@@ -19,6 +19,12 @@ MAX_BODY = 512 * 1024 * 1024
 _PACK_BLOCK = 4 * 1024 * 1024
 
 
+def cancellation_needs_reconnect(result):
+    """A locally interrupted original still owns its remote cancellation."""
+    return (result.get('status') == 'interrupted' and result.get('finished') is None
+            and result.get('remote_cancel_pending'))
+
+
 def native_path(value,*,force=False):
     """Use the Windows extended namespace for owned filesystem I/O."""
     # Keep a link's own identity; containment checks resolve links in inside().

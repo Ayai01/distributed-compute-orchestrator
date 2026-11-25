@@ -405,36 +405,42 @@ class OfflineTests(unittest.TestCase):
         from test_center import center
         from test_compute import python,until
         with scratch() as root,provider(Path(root)/'worker') as (worker,remote):
-            with Pool([remote],refresh=1000) as pool,center(pool,Path(root)/'center') as (state,client):
+            state_root = Path(root)/'center'
+            with Pool([remote],refresh=1000) as pool:
                 pool.stop_event.set();pool.monitor.join()
-                identity=client.submit(python('import time;time.sleep(30)'))['id']
-                until(lambda:client.status(identity,brief=True)['status']=='running')
                 node=pool.nodes[0]
-                with patch.object(node.client,'status',side_effect=RemoteError('offline')), \
-                     patch.object(node.client,'cancel',side_effect=RemoteError('offline')):
+                with center(pool,state_root) as (_,client):
+                    identity=client.submit(python('import time;time.sleep(30)'))['id']
+                    until(lambda:client.status(identity,brief=True)['status']=='running')
                     node.last_connected_at=time.monotonic()-61
                     pool._expire_unreachable()
-                    client.cancel(identity)
-                    result=client.wait(identity,wait_timeout=3)
-                    self.assertEqual(result['status'],'interrupted')
-                    self.assertTrue(result['cost_incomplete'])
-                    self.assertTrue(result['remote_cancel_pending'])
-                    until(lambda:node.reserved==0)
-                    # An evicted/reloaded terminal record has only its stored
-                    # worker URL, not a live Node object.
-                    state.jobs[identity].pop('node',None)
-                    with patch.object(node.client,'artifacts',side_effect=AssertionError('offline artifacts RPC')):
-                        receipt=client.fetch(identity,delete=False)
-                    self.assertEqual(receipt['id'],identity)
-                    self.assertTrue((Path(root)/'center/jobs'/identity/'request.zip').exists())
-                self.assertEqual(len(worker.jobs),1)
-                pool.configure(node.name,enabled=True);pool.refresh(nodes=[node])
-                # Cleanup retries only the original cancellation, never submit.
-                for _ in range(20):
-                    try:client.delete(identity);break
-                    except RemoteError:time.sleep(.02)
-                else:self.fail('original cancellation did not finish after reconnect')
-                until(lambda: not worker.jobs, seconds=12)
+                    with patch.object(node.client,'cancel_many',side_effect=AssertionError('offline batch RPC')), \
+                         patch.object(node.client,'cancel',side_effect=AssertionError('offline single RPC')):
+                        self.assertEqual(client.cancel_all()['pending'],[identity])
+                        result=client.wait(identity,wait_timeout=3)
+                        self.assertEqual(result['status'],'interrupted')
+                        self.assertTrue(result['cost_incomplete'])
+                        self.assertTrue(result['remote_cancel_pending'])
+                        with patch.object(node.client,'artifacts',side_effect=AssertionError('offline artifacts RPC')):
+                            receipt=client.fetch(identity)
+                        self.assertEqual(receipt['id'],identity)
+                        with self.assertRaisesRegex(RemoteError, 'waiting for the worker to reconnect'):
+                            client.delete(identity)
+                    self.assertEqual(node.reserved,0)
+                self.assertTrue((state_root/'jobs'/identity/'request.zip').exists())
+                with center(pool,state_root) as (_,client):
+                    self.assertEqual(client.cancel_all()['pending'],[identity])
+                    with patch.object(remote,'submit_bundle',side_effect=AssertionError('original resubmitted')):
+                        pool.configure(node.name,enabled=True);pool.refresh(nodes=[node])
+                        until(lambda:client.status(identity)['status']=='cancelled')
+                    result=client.status(identity)
+                    self.assertEqual(result['id'],identity)
+                    self.assertNotIn('remote_cancel_pending',result)
+                    self.assertNotIn('cost_incomplete',result)
+                    self.assertEqual(result['cpu_seconds'],remote.status(identity)['cpu_seconds'])
+                    self.assertEqual(list(worker.jobs),[identity])
+                    client.delete(identity)
+                    until(lambda: not worker.jobs, seconds=12)
 
     def test_restored_offline_original_keeps_health_and_cancels_before_reattachment(self):
         from test_center import center

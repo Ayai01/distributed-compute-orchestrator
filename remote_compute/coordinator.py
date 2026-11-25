@@ -15,7 +15,7 @@ import time
 import weakref
 import zipfile
 
-from .bundle import PROTOCOL, TERMINAL, atomic_json, batch_status, json_bytes, pack, progress_fields
+from .bundle import PROTOCOL, TERMINAL, atomic_json, batch_status, cancellation_needs_reconnect, json_bytes, pack, progress_fields
 from . import client as transport
 from . import build_refs
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
@@ -186,9 +186,11 @@ class Coordinator(PlacementPlanning):
                 self._enqueue(value['id'])
             else:
                 job['recover_submission']=value['status']=='dispatching' and value.get('started')is None
-                value.update(status='dispatching')
                 job['recover']=True
-            value.pop('error',None)
+                if not cancellation_needs_reconnect(value):
+                    value.update(status='dispatching')
+            if not cancellation_needs_reconnect(value):
+                value.pop('error',None)
             self._save(job)
 
         if indexed:
@@ -1041,7 +1043,7 @@ class Coordinator(PlacementPlanning):
         atomic_json(job["directory"] / "result.json", job["result"])
         # Interrupted may be an internal retry transition. Archive publishes
         # its final outcome after that decision; never expose it mid-retry.
-        if terminal and job['result']['status'] != 'interrupted':
+        if terminal and (job['result']['status'] != 'interrupted' or cancellation_needs_reconnect(job['result'])):
             self._publish(job)
 
     def _persist_grant(self, job, revision, receipt):
@@ -1414,11 +1416,14 @@ class Coordinator(PlacementPlanning):
                 pending=self._pending_recovery={identity for identity,job in active_items(self.jobs) if job.get('recover')}
             for identity in list(pending):
                 job=self.jobs.get(identity)
-                if job is None or job['result']['status'] in TERMINAL:
+                if job is None:
+                    pending.discard(identity);continue
+                pending_cancel = cancellation_needs_reconnect(job['result'])
+                if job['result']['status'] in TERMINAL and not pending_cancel:
                     pending.discard(identity);continue
                 node = self._original_node(job['result'].get('assigned_node'), job['result'].get('worker_url'))
                 worker_id=job['result'].get('worker_id',identity)
-                if node is None or node.error or worker_id in node.live_jobs:continue
+                if node is None or node.error or node.detached or worker_id in node.live_jobs:continue
                 remote=next((r for r in node.health.get('active_jobs') or [] if r['id']==worker_id),None)
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
@@ -1446,9 +1451,10 @@ class Coordinator(PlacementPlanning):
                     node.external_accelerator_reservations.extend(node.accelerator_units())
                 node.reserved+=task['cpus'];node.reserved_memory_mb+=task['memory_mb']
                 node.live_jobs.add(worker_id)
-                job['result'].pop('error',None)
+                if not pending_cancel:
+                    job['result'].pop('error',None)
+                    if remote:self._update(job,remote)
                 job['result'].setdefault('dispatched',job['result']['submitted'])
-                if remote:self._update(job,remote)
                 self._save(job)
                 job.pop('recover',None)
                 pending.discard(identity)
@@ -1460,6 +1466,7 @@ class Coordinator(PlacementPlanning):
         node, identity, task = job["node"], job.get('worker_id',job['result']['id']), job["task"]
         result = None;retry=False
         preparation_worker_lost = False
+        deferred_cancel = False
         released = False
         try:
             reattach=job.pop('reattach',False)
@@ -1546,23 +1553,12 @@ class Coordinator(PlacementPlanning):
             last_worker_status = None
             while True:
                 try:
-                    if job['cancel'].is_set() and node.detached and self.stopping:
-                        # Cancellation has no remote acknowledgement. Finish
-                        # the caller's drain, keeping the original receipt for
-                        # recovery rather than retrying uncertain computation.
-                        with self.condition:
-                            job['result'].update(status='interrupted',finished=time.time(),
-                                error='Cancellation pending on a worker detached after 60 seconds offline',
-                                remote_cancel_pending=True,cost_incomplete=True)
-                            self._save(job)
-                        break
                     if node.detached:
+                        if job['cancel'].is_set():
+                            deferred_cancel = True
+                            break
                         # The pool owns bounded reconnection probes. Keep this
                         # accepted ID without a separate offline polling loop.
-                        if job['cancel'].is_set() and not job['result'].get('remote_cancel_pending'):
-                            with self.condition:
-                                job['result']['remote_cancel_pending'] = True
-                                self._save(job)
                         time.sleep(.5)
                         continue
                     if job["cancel"].is_set() and not cancel_sent:
@@ -1587,6 +1583,12 @@ class Coordinator(PlacementPlanning):
                         remote = node.client.status(identity)
                 except RemoteError as error:
                     if getattr(error,'status_code',None)==404:
+                        if cancellation_needs_reconnect(job['result']):
+                            with self.condition:
+                                job['result'].update(error='Cancellation unresolved: original worker receipt is missing',
+                                                     finished=time.time())
+                                self._save(job)
+                            break
                         retry=True
                         result=dict(status='interrupted',error='Worker does not have the original receipt: '+str(error),
                                     finished=time.time())
@@ -1613,7 +1615,9 @@ class Coordinator(PlacementPlanning):
                                                                                   'checkpoint', checkpoint)
                     except (OSError, ValueError, KeyError, RemoteError, zipfile.BadZipFile) as error:
                         remote['artifact_publication_error'] = str(error)
-                if remote['status'] in TERMINAL or remote != last_worker_status or 'connection_error' in job['result']:
+                pending_cancel = cancellation_needs_reconnect(job['result'])
+                if remote['status'] in TERMINAL or (not pending_cancel and
+                        (remote != last_worker_status or 'connection_error' in job['result'])):
                     last_worker_status = remote.copy()
                     with self.condition:
                         job['result'].pop('connection_error',None)
@@ -1632,10 +1636,14 @@ class Coordinator(PlacementPlanning):
         except _PreparationWorkerLost:
             preparation_worker_lost = True
         except Exception as error:
-            with self.condition:
-                if not retry:
-                    job["result"].update(status="interrupted", error=str(error), finished=time.time())
-                    self._save(job)
+            deferred_cancel = (job['cancel'].is_set() and job['result'].get('dispatched') is not None
+                               and isinstance(error, RemoteError)
+                               and error.status_code in (None, *TRANSIENT_WORKER_HTTP))
+            if not deferred_cancel:
+                with self.condition:
+                    if not retry:
+                        job["result"].update(status="interrupted", error=str(error), finished=time.time())
+                        self._save(job)
         finally:
             with self.pool.condition:
                 node.pending_dispatches.discard(identity)
@@ -1648,7 +1656,9 @@ class Coordinator(PlacementPlanning):
                     job['resource_recovery_business_failure']=isinstance(error,BusinessItemFailure)
             with self.condition:
                 self.threads.discard(threading.current_thread())
-                if preparation_worker_lost:
+                if deferred_cancel:
+                    self._defer_cancellation(job)
+                elif preparation_worker_lost:
                     if job['cancel'].is_set():
                         self._update(job, dict(status='cancelled', finished=time.time(),
                                                cancelled_before_submit=True, cpu_seconds=0))
@@ -1657,7 +1667,8 @@ class Coordinator(PlacementPlanning):
                 elif retry and not self.stopping and not job['cancel'].is_set():self._retry(job,result)
                 elif retry and job['cancel'].is_set():
                     self._update(job,{**result,'status':'cancelled','finished':time.time()})
-                archive_job(self.jobs, job)
+                if not deferred_cancel:
+                    archive_job(self.jobs, job)
                 self.condition.notify_all()
 
     def _answer_resource_request(self, job, worker_id, remote):
@@ -2589,6 +2600,17 @@ class Coordinator(PlacementPlanning):
             if remote.get('kill_signal_sent'):
                 result['kill_signal_sent'] = True
 
+    def _defer_cancellation(self, job):
+        """Keep a cancelled intent live internally until its original node settles it."""
+        job.update(recover=True, node=None)
+        result = job['result']
+        result.update(status='interrupted', finished=None,
+                      error='Cancellation pending until the original worker reconnects',
+                      cancel_requested=True, remote_cancel_pending=True, cost_incomplete=True)
+        if (pending := self.__dict__.get('_pending_recovery')) is not None:
+            pending.add(result['id'])
+        self._save(job)
+
     def cancel_all(self):
         """Persist one snapshot, stop dispatch, and deliver worker controls asynchronously."""
         with self.condition:
@@ -2596,23 +2618,30 @@ class Coordinator(PlacementPlanning):
                 return self.cancel_snapshot
             if self.stopping:
                 raise Conflict('Scheduler is stopping')
-            jobs = {identity: job for identity, job in active_items(self.jobs)
-                    if job['result']['status'] not in TERMINAL}
+            jobs, deferred = {}, []
+            for identity, job in active_items(self.jobs):
+                if job['result']['status'] not in TERMINAL:
+                    jobs[identity] = job
+                elif cancellation_needs_reconnect(job['result']):
+                    deferred.append(identity)
             if not jobs:
-                return dict(status='completed', matched=0, finished=0, pending=[], errors={}, jobs=[])
+                return dict(status='incomplete' if deferred else 'completed', matched=len(deferred),
+                            finished=0, pending=deferred, errors={}, jobs=[])
             atomic_json(self.cancel_snapshot_path, list(jobs))
             self.queue[:] = [identity for identity in self.queue if identity not in jobs]
             routes = defaultdict(list)
             for identity, job in jobs.items():
-                client = self._client(job) if job['result']['status'] != 'queued' else None
+                node = job.get('node')
+                client = (node.client if node is not None and not node.detached
+                          and job['result']['status'] != 'queued' else None)
                 if client is not None and not job.get('cancel_sending') and not job['result'].get('cancel_acknowledged'):
                     job['cancel_sending'] = True
                     routes[client].append((job.get('worker_id', identity), job))
                 job['result']['cancel_requested'] = True
                 self._publish(job)
                 job['cancel'].set()
-            self.cancel_snapshot = dict(status='accepted', matched=len(jobs), finished=0,
-                                        pending=list(jobs), errors={}, jobs=[])
+            self.cancel_snapshot = dict(status='accepted', matched=len(jobs) + len(deferred), finished=0,
+                                        pending=list(jobs) + deferred, errors={}, jobs=[])
             self.cancel_snapshot_thread = threading.Thread(target=self._deliver_cancel_snapshot,
                 args=(jobs, routes), name='center-cancel-snapshot', daemon=True)
             self.cancel_snapshot_thread.start()
@@ -2644,7 +2673,10 @@ class Coordinator(PlacementPlanning):
                             self._save(job)
                             archive_job(self.jobs, job)
                         elif job['result']['status'] not in TERMINAL:
-                            self._save(job)
+                            if job.get('recover') and job.get('node') is None:
+                                self._defer_cancellation(job)
+                            else:
+                                self._save(job)
                 for sent in sends:
                     sent.result()
         except (OSError, RemoteError) as error:
@@ -2665,15 +2697,11 @@ class Coordinator(PlacementPlanning):
                     self._save(job)
                     archive_job(self.jobs, job)
                 elif job.get('recover') and job.get('node') is None:
-                    # No worker acknowledgement has been recovered. Keep its
-                    # original ID and cancellation intent for later cleanup.
-                    job['result'].update(status='interrupted',finished=time.time(),
-                        error='Cancellation pending before original worker reattachment',
-                        remote_cancel_pending=True,cost_incomplete=True)
-                    self._save(job)
-                    archive_job(self.jobs,job)
+                    self._defer_cancellation(job)
                 else:
-                    if not job.get('cancel_sending') and not job['result'].get('cancel_acknowledged'):
+                    node = job.get('node')
+                    if ((node is None or not node.detached) and not job.get('cancel_sending')
+                            and not job['result'].get('cancel_acknowledged')):
                         client = self._client(job)
                         if client is not None:
                             job['cancel_sending'] = True
@@ -2906,6 +2934,8 @@ class Coordinator(PlacementPlanning):
 
     def _retirement_record(self, job):
         result = job['result']
+        if cancellation_needs_reconnect(result):
+            raise Conflict('The original cancellation and CPU accounting are waiting for the worker to reconnect')
         targets = []
         if not (result.get('rejected_before_submit') or result.get('cancelled_before_submit')):
             client = self._client(job)
