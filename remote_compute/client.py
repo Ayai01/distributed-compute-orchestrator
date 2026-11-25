@@ -1,6 +1,6 @@
 """HTTP client and weighted, adaptive dispatch across independent workers."""
 
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -10,6 +10,7 @@ import gzip
 import http.client
 import io
 import ipaddress
+from itertools import count
 import json
 import os
 from pathlib import Path
@@ -148,63 +149,92 @@ def _short_dispatch_request(path, data, method):
 
 
 class _ConnectionPool:
+    _CONTROL, _SHORT_JOB, _BULK = range(3)
+
     def __init__(self, slots=8):
         self.idle = []
-        self.condition = threading.Condition()
+        self.lock = threading.Lock()
         self.available = slots
         self.bulk_limit = 7
         self.bulk_active = 0
-        self.waiting = deque()
+        self._order = count()
+        self._queues = ({}, {}, {})
+
+    @property
+    def waiting_count(self):
+        with self.lock:
+            return sum(map(len, self._queues))
+
+    def _eligible(self, lane):
+        # Leave one slot for health, status and resource grants.
+        return (self.available > (lane != self._CONTROL)
+                and (lane != self._BULK or self.bulk_active < self.bulk_limit))
+
+    def _first_waiter(self):
+        # Each lane is already in arrival order. Compare only eligible heads.
+        return min((next(iter(queue.items())) for lane, queue in enumerate(self._queues)
+                    if queue and self._eligible(lane)), default=None)
+
+    def _wake_next(self):
+        first = self._first_waiter()
+        if first is not None:
+            first[1].set()
+
+    def _claim(self, bulk):
+        self.available -= 1
+        self.bulk_active += int(bulk)
 
     def set_bulk_limit(self, limit):
         if self.bulk_limit != limit:
-            with self.condition:
+            with self.lock:
                 self.bulk_limit = limit
-                self.condition.notify_all()
+                self._wake_next()
 
     def acquire(self, timeout, *, bulk=False, short_job=False, cancel=None):
-        ticket = (object(), 'short_job' if short_job else bulk)
-
-        def eligible(kind):
-            if kind == 'short_job':
-                return self.available > 1
-            return not kind or self.available > 1 and self.bulk_active < self.bulk_limit
+        lane = self._SHORT_JOB if short_job else self._BULK if bulk else self._CONTROL
+        queue = self._queues[lane]
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self.condition:
-            self.waiting.append(ticket)
+        _check_cancelled(cancel)
+        with self.lock:
+            if self._eligible(lane) and self._first_waiter() is None:
+                self._claim(bulk)
+                return True
+            ready = threading.Event()
+            ticket = next(self._order)
+            queue[ticket] = ready
         try:
             while True:
                 # Cancellation may inspect the coordinator. Check after
-                # dropping the transport condition.
+                # dropping the transport lock.
                 _check_cancelled(cancel)
-                with self.condition:
-                    # Leave one slot for health, status and resource grants.
-                    if self.available and next((entry for entry in self.waiting if eligible(entry[1])), None) is ticket:
-                        self.available -= 1
-                        self.bulk_active += int(bulk)
+                with self.lock:
+                    if self._first_waiter() == (ticket, ready):
+                        self._claim(bulk)
                         return True
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         return False
-                    wait_for=remaining
-                    if cancel is not None:wait_for=.1 if remaining is None else min(.1,remaining)
-                    self.condition.wait(wait_for)
+                    ready.clear()
+                wait_for = remaining
+                if cancel is not None:
+                    wait_for = .1 if remaining is None else min(.1, remaining)
+                ready.wait(wait_for)
         finally:
-            with self.condition:
-                self.waiting.remove(ticket)
-                self.condition.notify_all()
+            with self.lock:
+                del queue[ticket]
+                self._wake_next()
 
     def take_idle(self):
-        with self.condition:
+        with self.lock:
             return self.idle.pop() if self.idle else None
 
     def release(self, *, bulk=False, connection=None):
-        with self.condition:
+        with self.lock:
             if connection is not None:
                 self.idle.append(connection)
             self.available += 1
             self.bulk_active -= int(bulk)
-            self.condition.notify_all()
+            self._wake_next()
 
     def __del__(self):
         for connection in self.idle:

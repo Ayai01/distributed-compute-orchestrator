@@ -24,6 +24,77 @@ from test_compute import provider, python, scratch, until
 
 
 class BulkIOControlTests(unittest.TestCase):
+    def test_relay_control_and_results_progress_during_deep_dispatch_queue(self):
+        release = threading.Event()
+        guard = threading.Lock()
+        accepted, result_reads = {}, []
+        job_ids = [format(number, '032x') for number in range(32)]
+        result_ids = ['e' * 32, 'f' * 32]
+        body = b'x' * (2 * MIN_BULK_BYTES)
+
+        class RelayHandler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def respond(self, data):
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                identity = self.path.split('/')[-1]
+                data = self.rfile.read(int(self.headers['Content-Length']))
+                digest = hashlib.sha256(data).hexdigest()
+                with guard:
+                    accepted.setdefault(identity, []).append(digest)
+                release.wait(5)
+                self.respond(json.dumps({'id': identity, 'request_sha256': digest}).encode())
+
+            def do_GET(self):
+                if self.path == '/health':
+                    self.respond(b'{"protocol":1,"role":"worker"}')
+                elif self.path.endswith('/artifacts'):
+                    identity = self.path.split('/')[-2]
+                    with guard:
+                        result_reads.append(identity)
+                    release.wait(5)
+                    self.respond(body)
+                else:
+                    self.respond(json.dumps({'id': self.path.split('/')[-1], 'status': 'running'}).encode())
+
+            def log_message(self, *_):
+                pass
+
+        class RelayServer(ThreadingHTTPServer):
+            request_queue_size = 64
+
+        with RelayServer(('127.0.0.1', 0), RelayHandler) as server, ThreadPoolExecutor(48) as callers:
+            listener = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+            listener.start()
+            client = Client(f'http://127.0.0.1:{server.server_port}', pool_timeout=5)
+            relay = RelayBulkBudget([server.server_port], None)
+            try:
+                with patch('remote_compute.client._RELAY_BULK_BUDGET', relay):
+                    jobs = [callers.submit(client.request, '/jobs/' + identity, body) for identity in job_ids]
+                    until(lambda: len(accepted) == 7 and client._transport.waiting_count == len(job_ids) - 7)
+                    results = [callers.submit(client.request, '/jobs/' + identity + '/artifacts', binary=True)
+                               for identity in result_ids]
+                    until(lambda: len(result_reads) == len(result_ids))
+                    heartbeats = [callers.submit(client.health, brief=True) for _ in range(4)]
+                    statuses = [callers.submit(client.status, identity) for identity in job_ids[:4]]
+                    self.assertTrue(all(row.result(2)['role'] == 'worker' for row in heartbeats))
+                    self.assertEqual([row.result(2)['id'] for row in statuses], job_ids[:4])
+                    self.assertFalse(any(row.done() for row in jobs + results))
+                    release.set()
+                    self.assertEqual([row.result(5)['id'] for row in jobs], job_ids)
+                    self.assertTrue(all(row.result(5) == body for row in results))
+                self.assertEqual(accepted, {identity: [hashlib.sha256(body).hexdigest()] for identity in job_ids})
+                self.assertCountEqual(result_reads, result_ids)
+            finally:
+                release.set()
+                server.shutdown()
+                listener.join()
+
     def test_stale_project_hold_does_not_override_capability_routing(self):
         with scratch() as directory, provider(Path(directory)/'worker') as (_, remote):
             root = Path(directory)/'center'
@@ -1314,10 +1385,10 @@ class TransportTests(unittest.TestCase):
         client=Client();client._transport=pool;cancel=threading.Event()
         with patch.object(client,'_request') as request,ThreadPoolExecutor(max_workers=1) as callers:
             waiting=callers.submit(client.request,'/assets/'+'a'*64,b'data',cancel=cancel.is_set)
-            until(lambda:bool(pool.waiting));cancel.set()
+            until(lambda: bool(pool.waiting_count));cancel.set()
             with self.assertRaises(RequestCancelled):waiting.result(timeout=1)
             request.assert_not_called()
-        self.assertFalse(pool.waiting)
+        self.assertEqual(pool.waiting_count, 0)
         self.assertEqual(pool.available,0)
         for _ in range(8):pool.release()
 
@@ -1356,7 +1427,7 @@ class TransportTests(unittest.TestCase):
             futures=[]
             for index in range(3):
                 futures.append(executor.submit(waiter,index))
-                until(lambda:len(pool.waiting)==index+1)
+                until(lambda: pool.waiting_count == index + 1)
             client=Client(timeout=.01,pool_timeout=.01);client._transport=pool
             with patch.object(client,'_request') as request:
                 with self.assertRaises(PoolBusy):client.health()
@@ -1365,7 +1436,7 @@ class TransportTests(unittest.TestCase):
             for future in futures:future.result()
         self.assertEqual(order,[0,1,2])
         self.assertEqual(pool.available,1)
-        self.assertFalse(pool.waiting)
+        self.assertEqual(pool.waiting_count, 0)
         for _ in range(7):pool.release()
         self.assertEqual(pool.available,8)
 
@@ -1392,7 +1463,7 @@ class TransportTests(unittest.TestCase):
             with patch.object(Handler,'_reply',delayed),ThreadPoolExecutor(max_workers=9) as callers:
                 uploads=[callers.submit(client.request,'/assets/'+hashlib.sha256(data).hexdigest(),data) for data in payloads]
                 try:
-                    until(lambda:counts['active']==8 or counts['active']==7 and bool(client._transport.waiting))
+                    until(lambda: counts['active'] == 8 or counts['active'] == 7 and client._transport.waiting_count)
                     health=callers.submit(client.health,brief=True).result(timeout=1)
                     self.assertEqual(health['role'],'worker')
                     grant=callers.submit(client.resize,identity,1,memory_mb=128).result(timeout=1)
@@ -1403,7 +1474,7 @@ class TransportTests(unittest.TestCase):
                 self.assertTrue(all(f.result(timeout=5)['exists'] for f in uploads))
             self.assertEqual(counts['requests'],8)
             self.assertEqual(client._transport.available,8)
-            self.assertFalse(client._transport.waiting)
+            self.assertEqual(client._transport.waiting_count, 0)
             self.assertEqual(client.timeout,5)
             self.assertEqual(list(worker.jobs),[identity])
             client.write_job_file(identity,'release','done');client.wait(identity)
@@ -1718,7 +1789,7 @@ class TransportTests(unittest.TestCase):
             self.assertLessEqual(counts['peak'],8)
             self.assertEqual(client.timeout,.5)
             self.assertEqual(client._transport.available,8)
-            self.assertFalse(client._transport.waiting)
+            self.assertEqual(client._transport.waiting_count, 0)
             self.assertEqual(list(worker.jobs),[identity])
             self.assertEqual(client.fetch(identity)['stdout'].strip(),'original retained work')
 
