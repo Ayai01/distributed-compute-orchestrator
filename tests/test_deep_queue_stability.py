@@ -9,12 +9,42 @@ import unittest
 from unittest.mock import ANY, patch
 
 from remote_compute import Client, Pool, RemoteError
+from remote_compute.bundle import task_bundle, unpack
 from remote_compute.relay_bulk import RelayBulkBudget
 from test_center import center
 from test_compute import provider, python, scratch, until
 
 
 class DeepQueueStabilityTests(unittest.TestCase):
+    def test_cancel_during_worker_unpack_cannot_launch_after_the_cancel(self):
+        with scratch() as directory, provider(Path(directory) / 'worker', cpus=2) as (worker, api):
+            sending = threading.Event()
+            resume = threading.Event()
+            identity = 'f' * 32
+            payload = task_bundle(python('raise AssertionError("cancelled input ran")'))
+            api.health()
+
+            def unpack_after_cancel(*args, **options):
+                sending.set()
+                self.assertTrue(resume.wait(8))
+                return unpack(*args, **options)
+
+            with patch('remote_compute.worker.unpack', side_effect=unpack_after_cancel), \
+                    ThreadPoolExecutor(max_workers=1) as executor:
+                upload = executor.submit(api.submit_bundle, identity, payload)
+                try:
+                    self.assertTrue(sending.wait(5))
+                    stop = api.cancel_many([identity])[identity]
+                    self.assertTrue(stop['cancel_requested'])
+                finally:
+                    resume.set()
+                self.assertEqual(upload.result(timeout=8)['status'], 'cancelled')
+            result = api.status(identity)
+            self.assertEqual((result['status'], result['cpu_seconds'], result['started']),
+                             ('cancelled', 0, None))
+            self.assertTrue(result['cancelled_before_process'])
+            until(lambda: not worker.receiving_submissions)
+
     def test_worker_signals_whole_batch_before_saving_a_receipt(self):
         with scratch() as directory, provider(Path(directory) / 'worker', cpus=3) as (worker, api):
             identities = [api.submit(python('import time; time.sleep(60)'))['id'] for _ in range(3)]

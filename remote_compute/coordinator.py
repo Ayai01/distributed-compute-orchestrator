@@ -2582,7 +2582,7 @@ class Coordinator(PlacementPlanning):
         result = job['result']
         if error is not None and result['status'] not in TERMINAL and not result.get('cancel_acknowledged'):
             result.update(remote_cancel_pending=True, cancel_error=str(error))
-        elif remote is not None and remote.get('status') != 'unknown':
+        elif remote is not None and (remote.get('status') != 'unknown' or remote.get('cancel_requested')):
             result.pop('cancel_error', None)
             result.pop('remote_cancel_pending', None)
             result['cancel_acknowledged'] = True

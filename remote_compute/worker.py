@@ -1,7 +1,7 @@
 """One HTTP worker, one CPU budget, and one private directory per job."""
 
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, ExitStack, nullcontext
 import hashlib
 import gzip
 import hmac
@@ -422,6 +422,7 @@ class Worker:
         self.submission_lock = SubmissionLocks()
         self.accepting_assets = SubmissionAssets()
         self.pending_unpacks = {}
+        self.receiving_submissions = {}
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
         phase=time.monotonic();indexed = self.jobs.load_index()
@@ -1030,12 +1031,25 @@ class Worker:
                 job['result'].pop('resource_request',None)
                 self.condition.notify_all()
 
+    @contextmanager
+    def receiving_submission(self, identity):
+        with self.condition:
+            entry = self.receiving_submissions.setdefault(identity, [0, False])
+            entry[0] += 1
+        try:
+            yield entry
+        finally:
+            with self.condition:
+                entry[0] -= 1
+                if not entry[0]:
+                    del self.receiving_submissions[identity]
+
     def submit(self, identity, payload, *, callback=None):
         received = time.monotonic()
         if not _ID.fullmatch(identity):
             raise ValueError("Job id requires 32 lowercase hex characters")
         digest = hashlib.sha256(payload).hexdigest()
-        with self.submission_lock.hold(identity), self.accepting_assets.holding():
+        with self.receiving_submission(identity) as incoming, self.submission_lock.hold(identity), self.accepting_assets.holding():
             with self.condition:
                 if self.stopping:
                     raise Conflict("Worker is stopping")
@@ -1150,10 +1164,20 @@ class Worker:
                     if task['cpus'] > int(self.capacity*self.cpu_overcommit_factor) or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
                     result['worker_admission_seconds'] = time.monotonic() - received
+                    if incoming[1]:
+                        # The independent control request can arrive while
+                        # this request is still receiving or unpacking.
+                        job['cancel'].set()
+                        result.update(status='cancelled', cancel_requested=True,
+                                      cancelled_before_process=True, finished=time.time())
+                        self._save(job)
                     self.jobs[identity] = job
                     self.asset_handoffs.pop(identity, None)
-                    self.queue.append(identity)
-                    self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
+                    if incoming[1]:
+                        archive_job(self.jobs, job)
+                    else:
+                        self.queue.append(identity)
+                        self.queue = deque(sorted(self.queue, key=lambda key: -self.jobs[key]["task"]["priority"]))
                     self.condition.notify_all()
             except BaseException:
                 if directory.exists():
@@ -1789,7 +1813,9 @@ class Worker:
             return result
 
     def cancel(self, identity):
-        self.cancel_many((identity,))
+        marked = self.cancel_many((identity,))[identity]
+        if marked['status'] == 'unknown' and marked.get('cancel_requested'):
+            return marked
         return self.get(identity)
 
     def cancel_many(self, identities):
@@ -1797,11 +1823,16 @@ class Worker:
 
         identities = tuple(dict.fromkeys(identities))
         affected = {}
+        receiving = set()
         with self.condition:
             # Signal every local process before writing any individual receipt.
             # Running jobs own their final write and retain the flag if they exit here.
             for identity in identities:
                 job = self.jobs.active.get(identity)
+                if (job is None and identity not in self.jobs
+                        and (entry := self.receiving_submissions.get(identity)) is not None):
+                    entry[1] = True
+                    receiving.add(identity)
                 if job is None or job['result']['status'] in TERMINAL:
                     continue
                 affected[identity] = job
@@ -1817,6 +1848,9 @@ class Worker:
             self.condition.notify_all()
         results = {}
         for identity in identities:
+            if identity in receiving:
+                results[identity] = dict(id=identity, status='unknown', cancel_requested=True)
+                continue
             if identity not in affected:
                 try:
                     results[identity] = cancel_receipt(self.get(identity))
@@ -2112,6 +2146,7 @@ class Handler(BaseHTTPRequestHandler):
         worker.activity.access(self.client_address[0], self.connection.getsockname()[0])
         parts = urlsplit(self.path).path.strip("/").split("/")
         asset_upload = len(parts) == 3 and parts[0] == 'assets' and parts[2] == 'upload'
+        receiving = None
         try:
             body = None
             if self.command == "POST":
@@ -2121,6 +2156,9 @@ class Handler(BaseHTTPRequestHandler):
                 if asset_upload and length > ASSET_CHUNK_BYTES:
                     self.close_connection = True
                     return self._reply({'error': 'Asset upload chunk exceeds 2 MiB'}, 413)
+                if not scheduler and len(parts) == 2 and parts[0] == 'jobs' and _ID.fullmatch(parts[1]):
+                    receiving = ExitStack()
+                    receiving.enter_context(worker.receiving_submission(parts[1]))
                 # Lost relay senders must not retain a POST handler forever.
                 # Bound only body inactivity; leases keep their long wait.
                 self.connection.settimeout(self.body_timeout)
@@ -2370,5 +2408,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply({"error": str(exc)}, 404)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             self._reply({"error": str(exc)}, 400)
+        finally:
+            if receiving is not None:
+                receiving.close()
 
     do_GET = do_POST = do_DELETE = _handle
