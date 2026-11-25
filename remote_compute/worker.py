@@ -2092,7 +2092,7 @@ class Handler(BaseHTTPRequestHandler):
             if match and self.headers.get('If-Range') == etag:
                 offset = int(match[1])
                 if 0 < offset < total:
-                    body, status = body[offset:], 206
+                    body, status = memoryview(body)[offset:], 206
                 else:
                     offset = 0
         compressed = not binary and len(body) >= 1024 and 'gzip' in self.headers.get('Accept-Encoding', '')
