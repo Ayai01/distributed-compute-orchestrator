@@ -5,7 +5,7 @@ import json
 import math
 import time
 
-from .allocation import plan_resize, queued_uses_node, startup_cpus, weighted_node_threads
+from .allocation import PREFERRED_PHASE_CPUS, plan_resize, queued_uses_node, startup_cpus, weighted_node_threads
 from .bundle import TERMINAL
 from .memory import plan_memory, same_phase
 from .policy import priority_weight
@@ -18,7 +18,8 @@ def _matching_pass(pool):
     cache={}
     def matching(task):
         accelerator=task.get('accelerator')
-        key=(task.get('node'),task.get('platform'),task.get('_capability_package'),
+        key=(task.get('node'),task.get('platform'),frozenset(task.get('placement_scope',{}).get('nodes',())),
+             task.get('_capability_package'),
              tuple(task.get('placement_scope', {}).get('nodes', ())),
              task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
              json.dumps(task.get('native_cache'), sort_keys=True) if task.get('native_cache') else None,
@@ -33,6 +34,29 @@ def _matching_pass(pool):
 
 def _elastic_job(job):
     return job.get('elastic_cpus',job.get('auto_cpus',False))
+
+
+def _pending_resize(job):
+    request = job['result'].get('resource_request') or {}
+    serial = request.get('request_id')
+    acknowledged = job.get('lease_answered')
+    stale = serial == acknowledged or (type(serial) is int and type(acknowledged) is int and serial < acknowledged)
+    if not stale and serial is not None and request.get('_operation','resize') == 'resize':
+        return request
+    return {}
+
+
+def _preparing(job):
+    result = job['result']
+    return (result['status'] == 'dispatching' and result.get('dispatch_stage') in
+            ('bundle','assets','pacing','awaiting_worker','worker_accepted') and not _pending_resize(job))
+
+
+def _phase_demand(job, default):
+    request = _pending_resize(job)
+    if request.get('min_cpus') is not None:
+        return request['cpus']
+    return job.get('desired_cpus',default)
 
 
 def _copy_node(node):
@@ -70,10 +94,10 @@ class PlacementPlanning:
             shares[name] = task.get('resource_share', 1.0)
             startup=startup_cpus(task)
             if held is not None and _elastic_job(job):startup=max(4,startup)
-            demand = job.get('desired_cpus',largest if job.get('auto_cpus') else startup)
+            demand = _phase_demand(job,largest if job.get('auto_cpus') else startup)
             demand=min(demand,task.get('max_cpus',demand))
             paused=held is not None and held.health.get('paused')
-            if paused:demand=task.get('cpus',0)
+            if held is not None and (paused or _preparing(job)):demand=task.get('cpus',0)
             demands[name] = demands.get(name, 0) + demand
             available=rooms.setdefault(name,{})
             wanted={**task,'cpus':0} if _elastic_job(job) else task
@@ -141,21 +165,25 @@ class PlacementPlanning:
             other=(candidate.get('project')or'default')if candidate is not None else group
             lower=(candidate is not None and other in resources and group!=other and
                    resources[group]['used']/resources[group]['resource_share']<resources[other]['used']/resources[other]['resource_share'])
-            startup=min(4,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
-            desired=job.get('desired_cpus',startup)
+            request=_pending_resize(job)
+            pending=bool(request)
+            status=job['result']['status']
+            if _preparing(job):
+                continue
+            startup=min(PREFERRED_PHASE_CPUS,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
+            desired=_phase_demand(job,startup)
+            desired=min(desired,current.get('max_cpus',desired))
             old=current.get('cpus',0)
-            request=job['result'].get('resource_request')or {}
-            pending=request and request.get('request_id')!=job.get('lease_answered')
-            wide_request=lower and pending and desired>4
+            wide_request=lower and pending and desired>PREFERRED_PHASE_CPUS
             # Beyond warmup, protect growth only while its owner is actually
             # requesting it. A standing ceiling during a long native step
             # must not strand idle slots or prevent overcommit from opening.
             if queue_pressure and not pending:
                 desired = old
             elif not wide_request:
-                desired=min(4,desired)
+                desired=min(PREFERRED_PHASE_CPUS,desired)
             if (held is None or desired<=old
-                    or job['result']['status'] not in ('running','dispatching') or job['cancel'].is_set()
+                    or status not in ('running','dispatching') or job['cancel'].is_set()
                     or held.error or not held.enabled or held.health.get('paused')):
                 continue
             free=max(0,held.capacity-held.reserved-held.external-protected.get(held.name,0))
@@ -189,11 +217,12 @@ class PlacementPlanning:
         candidates=[];queued=set(self.queue)
         for identity,job in active_items(self.jobs):
             if (job['task'].get('project')or'default')not in resources:continue
-            minimum=job['result'].get('min_cpus')or 0
+            request=_pending_resize(job)
+            minimum=request.get('min_cpus',job['result'].get('min_cpus'))or 0
             waiting=(job.get('node')is not None and minimum>1
-                and not job['result'].get('active_cpus',0)and job['task']['cpus']<minimum)
+                and not request.get('active_cpus',job['result'].get('active_cpus',0))and job['task']['cpus']<minimum)
             if waiting:
-                candidates.append((identity,dict(job['task'],cpus=minimum)))
+                candidates.append((identity,dict(job['task'],cpus=minimum,_ready_fixed_phase=True)))
             elif identity in queued and startup_cpus(job['task'])>1:
                 candidates.append((identity,job['task']))
         def order(identity):
@@ -230,7 +259,8 @@ class PlacementPlanning:
             owner = waiting.get('project') or 'default'; resource = resources[owner]
             startup_claim = (waiting.get('cpus') == 0 and waiting is not task
                              and priority_weight(waiting.get('priority')) >= priority_weight(task.get('priority')))
-            if (owner != group or startup_claim) and resource['used']/resource['resource_share'] <= current['used']/current['resource_share']:
+            if ((owner != group or startup_claim or waiting.get('_ready_fixed_phase')) and
+                    resource['used']/resource['resource_share'] <= current['used']/current['resource_share']):
                 protected[name] = max(0, min(startup_cpus(waiting), node.capacity-node.reserved-node.external))
         return protected
 
@@ -255,7 +285,8 @@ class PlacementPlanning:
                     fixed[group]=fixed.get(group,0)+task['cpus']
                 continue
             elastic=_elastic_job(job)
-            demand=job.get('desired_cpus',max(4,task.get('cpus',1))if held is not None and elastic else startup_cpus(task))
+            demand=_phase_demand(job,max(PREFERRED_PHASE_CPUS,task.get('cpus',1))if held is not None and elastic else startup_cpus(task))
+            if held is not None and _preparing(job):demand=task['cpus']
             if demand_override is not None:demand=demand_override.get(key,demand)
             demand=min(demand,task.get('max_cpus',demand))
             eligible=[]
@@ -359,7 +390,7 @@ class PlacementPlanning:
         for key,job in members.items():
             task=job['task'];held=job.get('node')
             automatic=key==identity or _elastic_job(job)
-            if held is not None and not automatic:
+            if held is not None and (not automatic or (key != identity and _preparing(job))):
                 if held.name in capacities:capacities[held.name]=max(0,capacities[held.name]-task['cpus'])
                 continue
             wanted={**task,'cpus':0} if automatic else task
@@ -378,8 +409,8 @@ class PlacementPlanning:
                 continue
             # Before its first phase request, an elastic peer gets four-thread
             # warmup demand, bounded by its useful ceiling.
-            demand=desired if key==identity else job.get('desired_cpus',
-                max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(4,task.get('cpus',1)))
+            demand=desired if key==identity else _phase_demand(job,
+                max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(PREFERRED_PHASE_CPUS,task.get('cpus',1)))
             demands[key]=min(demand,task.get('max_cpus',demand))
             rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
             if held is None:waiting[key]=startup_cpus(task)
@@ -390,17 +421,19 @@ class PlacementPlanning:
                 capacities[selected]-=task['cpus']
         running={key:value for key,value in demands.items() if key not in waiting}
         shares={key:priority_weight(members[key]['task'].get('priority')) for key in running}
-        warm=weighted_node_threads(capacities,shares,{key:min(4,value) for key,value in running.items()},rooms)
+        warm=weighted_node_threads(capacities,shares,{key:min(PREFERRED_PHASE_CPUS,value) for key,value in running.items()},rooms)
         # A one-slot tail can admit a new one-thread job. Its later four-slot
         # warmup must not dilute older jobs back to two or three threads.
         # Running work is pinned to its current node, so preserve warmup in
         # admission order on nodes whose combined warm demand does not fit.
+        ordered_warm_nodes=set()
         for name,capacity in capacities.items():
             pinned=[key for key in running if name in rooms[key]]
-            if sum(min(4,running[key])for key in pinned)<=capacity or len({shares[key] for key in pinned})>1:continue
+            if sum(min(PREFERRED_PHASE_CPUS,running[key])for key in pinned)<=capacity or len({shares[key] for key in pinned})>1:continue
+            ordered_warm_nodes.add(name)
             remaining=capacity
             for key in sorted(pinned,key=lambda key:(members[key]['result'].get('submitted',0),key)):
-                count=min(remaining,4,running[key],rooms[key][name])
+                count=min(remaining,PREFERRED_PHASE_CPUS,running[key],rooms[key][name])
                 warm[key]={name:count};remaining-=count
         if warm_cache is not None:
             # One growth pass asks each elastic peer for its first four useful
@@ -408,8 +441,12 @@ class PlacementPlanning:
             # wider idle growth is handled separately at the phase boundary.
             warm_cache.setdefault('warm',{})[group]=warm
             return min(share_room,max(1,warm.get(identity,{}).get(current['node'].name,0)))
-        spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
         name=current['node'].name
+        if name in ordered_warm_nodes:
+            # This saturated node already has a complete plan for equal-priority
+            # peers. Re-solving from raw ceilings would dilute older grants.
+            return min(share_room,max(1,warm.get(identity,{}).get(name,0)))
+        spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
         # All running members are pinned. Only the entrant reservation on the
         # caller's node can change its grant; entrants still share the whole pool.
         if queued_uses_node(name,spare,{key:priority_weight(members[key]['task'].get('priority')) for key in waiting},waiting,rooms):
@@ -464,16 +501,37 @@ class PlacementSnapshot(PlacementPlanning):
                 claims = self._fixed_queue_claims(budgets)
             if group not in growth:
                 growth[group] = self._growth_headroom(budgets, candidate=task, fixed_claims=claims)
+            fixed = self._fixed_queue_headroom(task, budgets, claims)
             headroom = dict(growth[group])
-            for name, count in self._fixed_queue_headroom(task, budgets, claims).items():
+            for name, count in fixed.items():
                 headroom[name] = max(headroom.get(name, 0), count)
             providers = matching(task)
             # No structural match is handled by the live ledger. An ordinary
             # unavailable candidate can wait for a fresh sample without a lock.
-            if providers and not self.pool._ready_nodes(providers, task, needed_cpus=lambda _: startup_cpus(task),
-                    node_headroom=headroom, memory_floor=job['result'].get('resource_recovery_memory_mb', 0),
-                    resource_recovery=bool(job['result'].get('resource_recovery_count'))):
-                continue
+            if providers:
+                def ready(reservation):
+                    return self.pool._ready_nodes(providers, task, needed_cpus=lambda _: startup_cpus(task),
+                        node_headroom=reservation, memory_floor=job['result'].get('resource_recovery_memory_mb', 0),
+                        resource_recovery=bool(job['result'].get('resource_recovery_count')))
+
+                if not ready(headroom):
+                    # A soft, ungranted expansion may yield one start. Keep the
+                    # fixed-phase claim intact and keep cold transfers on the
+                    # normal admission path.
+                    if startup_cpus(task) != 1 or headroom == fixed:
+                        continue
+                    assets = set(task.get('assets',{}).values()) | set(task.get('_affinity_assets',()))
+                    if assets:
+                        for node in providers:
+                            session = tuple(node.health.get(key) for key in ('pid','root','asset_revision'))
+                            if node.asset_session != session or not assets.issubset(node.known_assets):
+                                fixed[node.name] = node.capacity
+                    for name,(node,waiting) in claims.items():
+                        fixed[name] = max(fixed.get(name,0),
+                            min(startup_cpus(waiting),node.capacity-node.reserved-node.external))
+                    if not ready(fixed):
+                        continue
+                    headroom = fixed
             yield identity, job, headroom
             if self.committed is not None:
                 placed = self.committed

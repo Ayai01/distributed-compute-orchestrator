@@ -1680,6 +1680,9 @@ class Coordinator(PlacementPlanning):
         if not reply or serial != reply['request_id']:
             options = {key: value for key, value in request.items() if key != 'request_id'}
             operation = options.pop('_operation', 'resize')
+            if operation == 'resize':
+                with self.condition:
+                    job['result']['resource_request'] = request.copy()
             reply = {'request_id': serial}
             try:
                 reply['grant'] = (self.admission(options) if operation == 'admission'
