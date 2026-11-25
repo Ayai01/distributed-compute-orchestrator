@@ -1588,8 +1588,8 @@ class Coordinator(PlacementPlanning):
                 except RemoteError as error:
                     if getattr(error,'status_code',None)==404:
                         retry=True
-                        result=dict(status='interrupted',error='Worker unavailable: '+str(error),finished=time.time())
-                        with self.pool.condition:node.error=str(error)
+                        result=dict(status='interrupted',error='Worker does not have the original receipt: '+str(error),
+                                    finished=time.time())
                         break
                     if self.stopping or error.status_code not in (None, *TRANSIENT_WORKER_HTTP):
                         raise

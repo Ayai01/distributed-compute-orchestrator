@@ -1726,6 +1726,11 @@ class Pool:
                             or isinstance(after, bool) or not isinstance(after, (int, float))
                             or not 0 <= after < float('inf')):
                         raise ValueError('Invalid persisted reconnect attempts or timestamp')
+                    identity = retry.get('worker_identity')
+                    if identity is not None:
+                        if not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9]{32}', identity):
+                            raise ValueError('Invalid persisted reconnect worker identity')
+                        node.health['worker_identity'] = identity
                     node.detached = True
                     # Releases before 1.0.42 persisted zero once retries were
                     # exhausted. A configured worker remains eligible to recover.
@@ -1780,11 +1785,14 @@ class Pool:
             if not error:
                 previous_name = node.health.get('node')
                 previous_machine, current_machine = node.health.get('machine_id'), value.get('machine_id')
-                # machine_id contains hostname:hardware-address. Renaming a
-                # computer leaves the endpoint, credentials and hardware intact.
-                same_worker = (previous_machine.rsplit(':',1)[-1] == current_machine.rsplit(':',1)[-1]
-                               if previous_machine and current_machine else value.get('node') == previous_name)
-                if reconnect and previous_name and not same_worker:
+                expected_identity = node.health.get('worker_identity')
+                if expected_identity:
+                    same_worker = expected_identity == value.get('worker_identity')
+                else:
+                    # Older workers can still rejoin using their hardware address.
+                    same_worker = (previous_machine.rsplit(':',1)[-1] == current_machine.rsplit(':',1)[-1]
+                                   if previous_machine and current_machine else value.get('node') == previous_name)
+                if reconnect and (expected_identity or previous_name) and not same_worker:
                     node.error = 'Reconnect worker identity differs from the accepted endpoint'
                     return
                 node.last_connected_at=time.monotonic()
@@ -2077,7 +2085,8 @@ class Pool:
                  "host_memory_available_mb": n.health.get("host_memory_available_mb"),
                  **{key:n.health.get(key)for key in ('host_commit_limit_mb','host_commit_available_mb','memory_headroom_mb','memory_reserve_mb',
                      'private_mb','memory_unallocated_mb','commit_unallocated_mb','memory_budget_mb')},
-                 "machine_id": n.health.get("machine_id", n.client.url), "rss_mb": n.health.get("rss_mb", 0),
+                 "machine_id": n.health.get("machine_id", n.client.url),
+                 "worker_identity": n.health.get("worker_identity"), "rss_mb": n.health.get("rss_mb", 0),
                  "paused": n.health.get("paused", False), "tags": n.health.get("tags", []),
                  "packages": package_names(n.health, include_base=False),
                  "capabilities": n.health.get("capabilities", []), "home": n.health.get("home"),

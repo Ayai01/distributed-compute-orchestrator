@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import select
@@ -379,6 +380,14 @@ class Worker:
         self._refresh_tags()
         # The lock is released by the OS on exit; no stale PID files to repair.
         self.root_lock = lock_root(self.root, "worker")
+        worker_identity_path = self.root / 'worker-identity.json'
+        if worker_identity_path.exists():
+            self.worker_identity = json.loads(worker_identity_path.read_bytes())
+            if not isinstance(self.worker_identity, str) or not _ID.fullmatch(self.worker_identity):
+                raise ValueError('Invalid persistent worker identity')
+        else:
+            self.worker_identity = secrets.token_hex(16)
+            atomic_json(worker_identity_path, self.worker_identity, private=True)
         self.temp_reclaimer=Reclaimer(self.temp_root/'.trash')if self.temp_root else None
         self.temp_reclaimers = {self.temp_root: self.temp_reclaimer} if self.temp_reclaimer else {}
         self.ram_scratch = probe_executable_scratch(self.temp_root, namespace)
@@ -505,6 +514,7 @@ class Worker:
             resources = self._memory_state()
             value = {**identity, "platform": sys.platform, "architecture": self.architecture,
                     "artifact_abi": artifact_abi,
+                    "worker_identity": self.worker_identity,
                     "node_ip": self.node_ip,
                     "role": "worker", "benchmark": self.benchmark, "benchmark_state": self.benchmark_state, **resources,
                     "cpus": self._cpu_capacity(resources), "base_cpus":self.capacity,

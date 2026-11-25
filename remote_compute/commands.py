@@ -64,6 +64,8 @@ def save_detached_node(path, node):
                     else:row.pop(key,None)
                 if node.detached:
                     row['reconnect']={'attempts':node.reconnect_attempts,'after':node.reconnect_after}
+                    if identity := node.health.get('worker_identity'):
+                        row['reconnect']['worker_identity'] = identity
                 else:
                     row.pop('reconnect',None)
 

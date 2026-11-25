@@ -206,13 +206,51 @@ class OfflineTests(unittest.TestCase):
     def test_different_machine_cannot_rejoin_under_the_previous_computer_name(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client), Pool([client],refresh=1000) as pool:
             pool.stop_event.set();pool.monitor.join()
-            node=pool.nodes[0];value=dict(node.health,machine_id='another-machine:ffffffffffff')
+            node=pool.nodes[0];value=dict(node.health,worker_identity='f'*32)
             node.last_connected_at=100;pool._expire_unreachable(160)
             with patch.object(client,'health',return_value=value):
                 pool._retry_detached(node.reconnect_after)
                 pool.probe_futures[node.name].result(timeout=2)
             self.assertFalse(node.enabled)
             self.assertIn('identity differs',node.error)
+
+    def test_reconnect_restores_persistent_worker_identity_after_center_restart(self):
+        with scratch() as root, provider(Path(root)/'worker') as (_, client):
+            config_path = Path(root) / 'nodes.json'
+            config_path.write_text(json.dumps({'nodes':[dict(name='original',url=client.url)]}))
+            original = client.health()
+            with Pool([dict(name='original',client=client)],refresh=1000,
+                      on_detach=lambda n:save_detached_node(config_path,n)) as center:
+                center.stop_event.set();center.monitor.join()
+                node=center.nodes[0];node.last_connected_at=100
+                center._expire_unreachable(160)
+            saved = json.loads(config_path.read_text())['nodes'][0]
+            self.assertEqual(saved['reconnect']['worker_identity'], original['worker_identity'])
+            with Pool([dict(saved,client=client)],refresh=1000) as center:
+                center.stop_event.set();center.monitor.join()
+                node=center.nodes[0]
+                other_instance=dict(original,worker_identity='0'*32)
+                with patch.object(client,'health',return_value=other_instance):
+                    center._retry_detached(node.reconnect_after)
+                    center.probe_futures[node.name].result(timeout=2)
+                self.assertTrue(node.detached)
+                self.assertIn('identity differs',node.error)
+                restarted=dict(original,machine_id=original['node']+':1133557799bb')
+                with patch.object(client,'health',return_value=restarted):
+                    center._retry_detached(node.reconnect_after)
+                    center.probe_futures[node.name].result(timeout=2)
+                self.assertTrue(node.enabled)
+                self.assertFalse(node.error)
+
+    def test_worker_identity_is_bound_to_its_state_root(self):
+        with scratch() as root:
+            path=Path(root)/'same'
+            with provider(path) as (_,client):
+                identity=client.health()['worker_identity']
+            with provider(path) as (_,client):
+                self.assertEqual(client.health()['worker_identity'],identity)
+            with provider(Path(root)/'other') as (_,client):
+                self.assertNotEqual(client.health()['worker_identity'],identity)
 
     def test_startup_keeps_configured_name_and_records_live_name_as_alias(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
