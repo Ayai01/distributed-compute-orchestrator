@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import tempfile
 import time
@@ -15,6 +16,7 @@ from .compat import is_relative_to
 PROTOCOL = 1
 TERMINAL = frozenset({"succeeded", "failed", "cancelled", "timed_out", "interrupted"})
 MAX_BODY = 512 * 1024 * 1024
+_PACK_BLOCK = 4 * 1024 * 1024
 
 
 def native_path(value,*,force=False):
@@ -151,10 +153,22 @@ def pack(files):
             info = zipfile.ZipInfo(str(name).replace("\\", "/"), (1980, 1, 1, 0, 0, 0))
             info.compress_type = (zipfile.ZIP_STORED if str(name).lower().endswith(('.gz','.npz','.zip','.7z'))
                                   else zipfile.ZIP_DEFLATED)
-            mode = source.stat().st_mode if isinstance(source, Path) else 0o644
-            info.external_attr = (stat.S_IFREG | stat.S_IMODE(mode)) << 16
-            archive.writestr(info, source.read_bytes() if isinstance(source, Path) else source,
-                            compresslevel=1)
+            metadata = source.stat() if isinstance(source, Path) else None
+            mode = stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o644
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            if (metadata is not None and metadata.st_size > _PACK_BLOCK
+                    and info.compress_type == zipfile.ZIP_DEFLATED):
+                info.file_size = metadata.st_size
+                # Use the same compressor and ZIP headers as writestr().
+                if hasattr(info, 'compress_level'):
+                    info.compress_level = 1
+                else:
+                    info._compresslevel = 1
+                with source.open('rb') as stream, archive.open(info, 'w') as entry:
+                    shutil.copyfileobj(stream, entry, _PACK_BLOCK)
+            else:
+                archive.writestr(info, source.read_bytes() if metadata is not None else source,
+                                compresslevel=1)
     return buffer.getvalue()
 
 

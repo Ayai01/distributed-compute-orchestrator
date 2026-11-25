@@ -10,11 +10,36 @@ import stat
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import zipfile
 
 from remote_compute.bundle import atomic_json,native_path,pack,unpack
 from remote_compute import cli
 from remote_compute.commands import SchedulerShell
 from test_compute import scratch, until
+
+
+class BundleTests(unittest.TestCase):
+    def test_path_members_keep_the_existing_zip_bytes(self):
+        with scratch() as directory:
+            source = Path(directory) / 'source'
+            data = bytes(range(256)) * (9 * 1024**2 // 256 + 1)
+            source.write_bytes(data)
+            source.chmod(0o755)
+            path_mode = stat.S_IMODE(source.stat().st_mode)
+            files = {'nested/数据.dat': source, 'stored.npz': source, 'task.json': b'{}'}
+            for limit in (zipfile.ZIP64_LIMIT, 2 * 1024**2):
+                with self.subTest(zip64_limit=limit), patch.object(zipfile, 'ZIP64_LIMIT', limit):
+                    expected = io.BytesIO()
+                    with zipfile.ZipFile(expected, 'w') as archive:
+                        for name, value in sorted(files.items()):
+                            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+                            info.compress_type = (zipfile.ZIP_STORED if name.endswith('.npz')
+                                                  else zipfile.ZIP_DEFLATED)
+                            from_file = isinstance(value, Path)
+                            mode = path_mode if from_file else 0o644
+                            info.external_attr = (stat.S_IFREG | mode) << 16
+                            archive.writestr(info, data if from_file else value, compresslevel=1)
+                    self.assertEqual(pack(files), expected.getvalue())
 
 
 class PrivateJsonTests(unittest.TestCase):
