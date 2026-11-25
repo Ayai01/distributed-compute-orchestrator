@@ -168,7 +168,7 @@ class PlacementPlanning:
             request=_pending_resize(job)
             pending=bool(request)
             status=job['result']['status']
-            if _preparing(job):
+            if not pending and (_preparing(job) or job['result'].get('execution_started')):
                 continue
             startup=min(PREFERRED_PHASE_CPUS,current.get('max_cpus',held.capacity)) if held is not None and _elastic_job(job) else 0
             desired=_phase_demand(job,startup)

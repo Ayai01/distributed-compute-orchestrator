@@ -1623,7 +1623,9 @@ class Coordinator(PlacementPlanning):
                         job['result'].pop('connection_error',None)
                         # Retry is one atomic state transition. A client must not
                         # collect a transient interrupted outcome mid-retry.
-                        if not (remote['status']=='interrupted' or _infrastructure_interruption(job,remote)) or job['cancel'].is_set():self._update(job, remote)
+                        if not (remote['status']=='interrupted' or _infrastructure_interruption(job,remote)) or job['cancel'].is_set():
+                            self._reconcile_startup_memory(job, identity, remote)
+                            self._update(job, remote)
                 if remote["status"] in TERMINAL:
                     result = remote
                     retry=remote['status']=='interrupted' or _infrastructure_interruption(job,remote)
@@ -2151,6 +2153,34 @@ class Coordinator(PlacementPlanning):
                     break
             if 'protocol' not in metrics:
                 metrics.setdefault('wire_body_bytes', 0)
+
+    def _reconcile_startup_memory(self, job, worker_id, remote):
+        """Release a superseded center estimate once the original actually starts."""
+        node, task = job['node'], job['task']
+        funded = remote.get('memory_mb')
+        if (remote['status'] != 'running' or not remote.get('execution_started') or
+                job['result'].get('execution_started') or remote.get('resource_request') or
+                remote.get('id') != worker_id or 'adaptive_memory' not in node.health.get('capabilities', ()) or
+                type(funded) is not int or not 0 < funded < task['memory_mb'] or
+                task['cpus'] != remote.get('cpus') or job.get('resize_uncertain') or
+                job.get('grant_receipt_revision') is not None):
+            return
+        # The caller holds the center lock. A resize may be waiting for that
+        # lock or for its worker ACK, so never wait on its lock from here.
+        resize_lock = job.get('resize_lock')
+        if resize_lock is not None and not resize_lock.acquire(blocking=False):
+            return
+        try:
+            with self.pool.condition:
+                if worker_id not in node.live_jobs:
+                    return
+                node.reserved_memory_mb -= task['memory_mb'] - funded
+                task['memory_mb'] = funded
+                self.pool.condition.notify_all()
+                self.condition.notify_all()
+        finally:
+            if resize_lock is not None:
+                resize_lock.release()
 
     def _update(self, job, remote):
         if job.get('retired'):return

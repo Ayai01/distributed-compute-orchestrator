@@ -68,6 +68,19 @@ class ObservedMemoryTests(unittest.TestCase):
         job['memory_phase_model']=None
         self.assertEqual(reservation(job),(128,127))
 
+    def test_launched_single_cpu_command_reclaims_its_overestimated_phase_model(self):
+        job=self.job(memory_observation=MemoryObservation(now=0))
+        job['task']['cpus']=1
+        job['memory_phase_model']=dict(base_memory_mb=512,memory_per_cpu_mb=256)
+        job['result']['execution_started']=1
+        self.assertEqual(reservation(job),(768,768))
+        job['memory_observation']=observed()
+        self.assertEqual(reservation(job),(128,127))
+        job['rss_mb']=900
+        self.assertEqual(reservation(job)[0],900)
+        job['task']['cpus']=2
+        self.assertEqual(reservation(job),(900,768))
+
     def test_growth_room_recent_peak_and_phase_reset(self):
         value=MemoryObservation(now=0)
         for now,amount in [(0,100),(1,150),(2,200)]:value.observe(amount,amount,now)

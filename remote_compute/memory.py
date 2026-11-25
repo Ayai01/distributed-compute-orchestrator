@@ -226,6 +226,14 @@ def reservation(job):
     funded = job.get('startup_memory_mb',task['memory_mb'])
     observation = job.get('memory_observation')
     physical, commit = measured_memory(job)
-    if phase or observation is None or observation.envelope is None:
+    if observation is None or observation.envelope is None:
+        return max(funded,physical), max(funded,commit)
+    # A launched raw command at one CPU has no unstarted parallel lanes to
+    # fund. Its current peak envelope can replace the initial estimate, even
+    # when a phase model was supplied for future expansion.
+    measured_single = (task.get('cpus') == 1 and 'execution' not in task and
+                       job['result'].get('execution_started') and
+                       not job['result'].get('active_cpus'))
+    if phase and not measured_single:
         return max(funded,physical), max(funded,commit)
     return physical, commit
