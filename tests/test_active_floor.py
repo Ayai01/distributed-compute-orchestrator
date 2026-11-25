@@ -40,7 +40,7 @@ def entry():
                     return resize(original, cpus, **options)
 
                 state.resize = move_grant
-                task = python_task('fixture:entry', max_cpus=3, min_start_cpus=3, memory_mb=128,
+                task = python_task('fixture:entry', max_cpus=3, memory_mb=128,
                                    outputs=['native.log'], timeout=12, retries=0)
                 result = client.run(task, files={'fixture.py': source}, job_id=identity, keep=True)
                 self.assertEqual(result['status'], 'succeeded', (result.get('error'), result.get('stderr')))

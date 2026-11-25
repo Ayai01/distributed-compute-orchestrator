@@ -11,22 +11,37 @@ from test_capability_packages import packaged_worker
 
 
 class ProjectAdmissionPolicyTests(unittest.TestCase):
-    def test_public_startup_floor_survives_worker_dispatch(self):
+    def test_new_tasks_start_with_one_cpu_and_reject_explicit_startup_floors(self):
         with scratch() as folder, packaged_worker(Path(folder) / 'worker', 'python', cpus=4) as (_, remote), Pool([remote]) as pool:
             with center(pool, Path(folder) / 'center') as (_, operator):
                 client = Client(operator.url, operator.token)
                 source = "import os\ndef run():\n    print(os.environ['REMOTE_COMPUTE_CPUS'], os.environ['OMP_NUM_THREADS'])\n"
-                job = client.run(python_task('entry:run', max_cpus=4, min_start_cpus=3),
-                                 files={'entry.py': source}, keep=True)
-                self.assertEqual(job['status'], 'succeeded', job)
-                self.assertEqual(job['stdout'].strip(), '3 1')
-                self.assertEqual(job['initial_cpus'], 3)
-                self.assertEqual(job['min_start_cpus'], 3)
-                default = client.run(python_task('entry:run', max_cpus=4), files={'entry.py': source}, keep=True)
+                task = python_task('entry:run', max_cpus=4)
+                for submitted in (client, operator):
+                    for width in (1, 3, None):
+                        with self.subTest(operator=submitted.operator, width=width):
+                            legacy = dict(task, min_start_cpus=width)
+                            with self.assertRaisesRegex(RemoteError, 'min_start_cpus'):
+                                submitted.submit(legacy)
+                            identity = uuid.uuid4().hex
+                            with self.assertRaisesRegex(RemoteError, 'min_start_cpus') as rejected:
+                                submitted.submit_bundle(identity, task_bundle(legacy))
+                            self.assertEqual(rejected.exception.status_code, 400)
+                            self.assertEqual(submitted.statuses([identity], compact=True)[identity]['status'], 'unknown')
+                default = client.run(task, files={'entry.py': source}, keep=True)
+                self.assertEqual(default['status'], 'succeeded', default)
                 self.assertEqual(default['initial_cpus'], 1)
                 self.assertEqual(default['stdout'].strip(), '1 1')
-                with self.assertRaisesRegex(ValueError, 'min_start_cpus'):
+                with self.assertRaisesRegex(TypeError, 'min_start_cpus'):
                     python_task('entry:run', max_cpus=2, min_start_cpus=3)
+
+                legacy = task_bundle(dict(task, min_start_cpus=3), files={'entry.py': source})
+                original = uuid.uuid4().hex
+                with patch('remote_compute.coordinator.reject_startup_cpu_floor'):
+                    client.submit_bundle(original, legacy)
+                self.assertEqual(client.submit_bundle(original, legacy)['id'], original)
+                saved = client.wait(original)
+                self.assertEqual((saved['status'], saved['initial_cpus'], saved['min_start_cpus']), ('succeeded', 3, 3))
 
     def test_rtl_and_chisel_remain_available_before_the_handoff_upgrade(self):
         with scratch() as folder, packaged_worker(Path(folder)/'old','rtl',cpus=4) as (old,old_client), \

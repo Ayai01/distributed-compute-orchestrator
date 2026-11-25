@@ -28,7 +28,7 @@ def python_task(function, *, kwargs=None, **options):
     return task
 
 
-def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
+def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=None, render=(), label="",
             priority=MIN_PRIORITY, requires=(), node=None, memory_mb=None, base_memory_mb=None,memory_per_cpu_mb=None,memory_limit_mb=None,cwd=None,stdin=None,
             project='', resource_share=1.0, single_thread_weight=None, retries=2,
             accelerator=None, platform=None, cache_ref=None, native_cache=None, resource_recovery=True,
@@ -38,18 +38,14 @@ def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=()
     # Older SDK callers can still pass the retired keyword.
     if type(resource_recovery) is not bool:raise ValueError("resource_recovery must be a boolean")
     platform = validate_platform(platform)
-    if min_start_cpus is not None:
-        from .allocation import validate_min_start_cpus
-        validate_min_start_cpus(min_start_cpus, max_cpus)
     model=base_memory_mb is not None or memory_per_cpu_mb is not None or memory_limit_mb is not None
     if model:
         if memory_mb is not None:raise ValueError('Declare fixed memory_mb or a base/per-CPU memory model')
         from .allocation import plan_resize
         base=0 if base_memory_mb is None else base_memory_mb
         per=0 if memory_per_cpu_mb is None else memory_per_cpu_mb
-        startup_width = min_start_cpus or 1
-        width,memory_mb=plan_resize(startup_width,None,base,per,memory_limit_mb,base+per*startup_width)
-        if width!=startup_width or memory_mb is None or memory_limit_mb is not None and memory_mb>memory_limit_mb:
+        width,memory_mb=plan_resize(1,None,base,per,memory_limit_mb,base+per)
+        if width!=1 or memory_mb is None or memory_limit_mb is not None and memory_mb>memory_limit_mb:
             raise ValueError('Memory model must fit the startup CPU width')
     else:memory_mb=256 if memory_mb is None else memory_mb
     task = {"steps": [list(argv)], "max_cpus": max_cpus, "timeout": timeout,
@@ -57,8 +53,6 @@ def command(argv, *, max_cpus=1024, min_start_cpus=None, timeout=300, outputs=()
             "render": list(render), "label": label, "priority": priority,
             "requires": canonical_capabilities(requires), "node": node, "memory_mb": memory_mb,
             "project": project, "resource_share": resource_share}
-    if min_start_cpus is not None:
-        task['min_start_cpus'] = min_start_cpus
     if executable_ram_mb is not None:
         from .ramdisk import validate_executable_ram_mb
         task['executable_ram_mb'] = validate_executable_ram_mb(executable_ram_mb)

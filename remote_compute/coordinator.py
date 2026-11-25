@@ -29,7 +29,7 @@ from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMEN
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
 from .telemetry import Activity
 from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR,
-                         plan_resize, elastic_cpus, startup_cpus)
+                         plan_resize, elastic_cpus, reject_startup_cpu_floor, startup_cpus)
 from .memory import plan_memory, startup_memory, same_phase
 from .placement import PlacementPlanning, PlacementSnapshot, _elastic_job, _matching_pass
 from .recovery import RESOURCE_RECOVERY_DELAYS, reentrant_computation, resource_recovery, resume_map, carry_outputs, restore_map_results, BusinessItemFailure
@@ -1217,6 +1217,7 @@ class Coordinator(PlacementPlanning):
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 raw_task = json.loads(archive.read("task.json"))
                 if 'cpus'in raw_task:raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')
+                reject_startup_cpu_floor(raw_task)
                 if not self.accepting and not operator:raise Conflict('DCO maintenance: new task admissions are paused')
                 validate_operator_fields(raw_task,operator)
                 package = None

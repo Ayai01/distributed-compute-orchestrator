@@ -32,7 +32,7 @@ from .bundle import MAX_BODY, PROTOCOL, TERMINAL, json_bytes, pack, task_bundle,
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
                      MAX_STATUS_BATCH, priority_weight, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
-from .allocation import STARTUP_CPU_FLOOR, elastic_cpus, cpu_capacity, startup_cpus
+from .allocation import STARTUP_CPU_FLOOR, elastic_cpus, cpu_capacity, reject_startup_cpu_floor, startup_cpus
 from .build_refs import provider_abi
 from .relay_bulk import MIN_BULK_BYTES, load_relay_bulk_budget
 from .packages import package_names, provider_has_package
@@ -736,7 +736,9 @@ class Client:
 
     def submit(self, task, *, inputs=None, files=None, job_id=None):
         from .policy import validate_operator_fields
-        try:validate_operator_fields(task,self.operator)
+        try:
+            reject_startup_cpu_floor(task)
+            validate_operator_fields(task,self.operator)
         except ValueError as error:raise RemoteError(str(error)) from None
         if 'cpus' in task:
             raise ValueError('Declare max_cpus; DCO assigns the actual CPU count')

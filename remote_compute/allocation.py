@@ -27,8 +27,13 @@ def cpu_capacity(base,used,percent,factor,utilization=90):
 
 
 def startup_cpus(task):
-    """Width required before an unassigned task can start."""
+    """Honor a persisted startup floor only for historical originals."""
     return task.get('cpus', 1) or task.get('min_start_cpus', 1)
+
+
+def reject_startup_cpu_floor(task):
+    if 'min_start_cpus' in task:
+        raise ValueError('min_start_cpus is not accepted for new tasks. DCO starts with one CPU; set max_cpus for elastic growth.')
 
 
 def validate_min_start_cpus(value, maximum):
