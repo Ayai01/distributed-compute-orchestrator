@@ -1,5 +1,13 @@
 # DCO 当前状态
 
+## 1.0.67 · 2026-11-26（太平洋时间）
+
+中心、面板和 15 台 worker 已统一到 1.0.67。03:29 恢复接单，西交 488 核，5 台零核设备在线，超发均为 1.0。切换前的 108 笔 ARH-DSE 原单均自然成功。[上线回执](../.local/migration/rollout-1067/final-acceptance.json)
+
+普通 SDK 原单以优先级 0.2 在 xjtu-ac 成功运行，提交 SHA-256、中心和 worker 回执一致。五个工程公开 SDK 接入通过。03:46 实际占用 488 核，Chiplet3D 在途和排队原单均显示 0.2。[普通 SDK 探针](../.local/migration/rollout-1067/public-priority.json) · [生产采样](../.local/migration/rollout-1067/production-priority.json)
+
+98 项回归通过，5,000 笔隔离队列健康查询 P99 为 54 ms，批量取消确认 34 ms。另两项扩核测试的模拟任务缺少结果目录，1.0.66 中复现同一错误。[隔离验收](../.local/migration/rollout-1067/pre-release.json)
+
 ## 1.0.66 · 2026-11-26（太平洋时间）
 
 中心和 15 台 worker 已统一到 1.0.66。西交提供 488 核，5 台零核设备保持在线，全部超发倍率为 1.0。五个工程公开 SDK 及面板发布状态验收通过。01:30 核预算占用 439/488，排队 26，正在计算的 42 笔 Chiplet3D 原单中 21 笔获配 16 核。[上线回执](../.local/migration/rollout-1066/final-acceptance.json)
