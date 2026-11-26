@@ -29,7 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / '.local/liveboard.local.json'
 MAX_BYTES = 65536
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-PUBLISHER_VERSION = '1.0.10'
+MAX_SAMPLE_AGE_SECONDS = 5
+PUBLISHER_VERSION = '1.0.11'
 ACTIVE_SECONDS, IDLE_SECONDS, HEARTBEAT_SECONDS = 15, 60, 60
 _network_lock = threading.Lock()
 _network_call = None
@@ -300,10 +301,18 @@ def collect(config):
     token = Path(config['operator_token_file']).read_text(encoding='utf8').strip()
     opener = build_opener(ProxyHandler({}), NoRedirect())
     started = time.perf_counter()
-    # This existing endpoint waits behind scheduler planning. Allow the normal
-    # loaded response while keeping the wait isolated in this bounded sidecar.
-    health = read_json(opener, Request(url+'/health',headers={
-        'Authorization':'Bearer '+token,'X-DCO-Role':'operator','X-DCO-Health-Display':'1'}), 5, MAX_SOURCE_BYTES)
+    headers = {'Authorization': 'Bearer '+token, 'X-DCO-Role': 'operator'}
+    health = read_json(opener, Request(url+'/health', headers={
+        **headers, 'X-DCO-Health-Display': '1'}), 5, MAX_SOURCE_BYTES)
+    queries = 1
+    source_bytes = len(encode(health))
+    # A recent upload can still contain an old center snapshot. Ask for a
+    # bounded live read only when the dedicated sampling path falls behind.
+    age = number(health.get('health_age_seconds')) if isinstance(health, dict) else None
+    if age is not None and age > MAX_SAMPLE_AGE_SECONDS:
+        health = read_json(opener, Request(url+'/health', headers=headers), 5, MAX_SOURCE_BYTES)
+        queries += 1
+        source_bytes += len(encode(health))
     if not isinstance(health, dict) or not isinstance(health.get('nodes'), list):
         raise ValueError('Invalid display source response')
     if not all(isinstance(n, dict) for n in health['nodes']):
@@ -312,7 +321,7 @@ def collect(config):
     if number(health.get('health_sampled_at')) is not None:
         value['sampled_at'] = datetime.fromtimestamp(health['health_sampled_at'],timezone.utc).isoformat().replace('+00:00','Z')
     return value, dict(collect_ms=round((time.perf_counter()-started)*1000, 3),
-                       source_bytes=len(encode(health)),source_queries=1)
+                       source_bytes=source_bytes,source_queries=queries)
 
 
 def fingerprint(value):

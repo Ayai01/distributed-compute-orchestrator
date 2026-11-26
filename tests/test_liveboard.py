@@ -181,6 +181,22 @@ class LiveboardTests(unittest.TestCase):
             self.assertGreater(metrics['source_bytes'],0)
             with self.assertRaises(ValueError):live.collect(dict(source_url='http://remote:26133',operator_token_file=str(token)))
 
+    def test_collector_reads_live_health_when_display_sample_is_stale(self):
+        with tempfile.TemporaryDirectory(prefix='dco-liveboard-stale-') as folder:
+            token=Path(folder)/'operator.token'
+            token.write_text('private')
+            old=dict(self.health(), nodes=[self.node()], health_sampled_at=1,
+                     health_age_seconds=287.7)
+            fresh=dict(self.health(), nodes=[self.node()])
+            with patch.object(live, 'read_json', side_effect=(old, fresh)) as read:
+                value, metrics=live.collect(dict(operator_token_file=str(token)))
+            self.assertEqual(metrics['source_queries'], 2)
+            headers=[call.args[1] for call in read.call_args_list]
+            self.assertEqual(headers[0].get_header('X-dco-health-display'), '1')
+            self.assertIsNone(headers[1].get_header('X-dco-health-display'))
+            self.assertEqual(headers[1].get_header('Authorization'), 'Bearer private')
+            self.assertNotEqual(value['sampled_at'], '1970-01-01T00:00:01Z')
+
     def test_upload_sends_data_only_and_never_follows_redirects(self):
         with tempfile.TemporaryDirectory(prefix='dco-liveboard-test-')as folder:
             path=Path(folder)/'upload.local.json'

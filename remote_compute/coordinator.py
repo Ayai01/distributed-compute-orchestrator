@@ -238,6 +238,12 @@ class Coordinator(PlacementPlanning):
         self.asset_maintenance = AssetMaintenance(lambda: self._maintain_assets(wait=False), self._report_asset_cleanup)
         self.scheduler = threading.Thread(target=self._schedule, name="central-dispatch", daemon=True)
         self.scheduler.start()
+        self._display_health_cache = None
+        self._display_health_refresh = threading.Lock()
+        self._display_health_pending = threading.Event()
+        self._display_sampler = threading.Thread(
+            target=self._sample_display, name='dco-display-refresh', daemon=True)
+        self._display_sampler.start()
         self.retirement.start()
         self.asset_maintenance.request()
 
@@ -622,43 +628,48 @@ class Coordinator(PlacementPlanning):
         return view, projects
 
     def _display_health(self):
-        """Keep the display responsive and queue a fresh sample when busy."""
-        cached = getattr(self, '_display_health_cache', None)
-        if cached is None or time.monotonic() - cached[0] >= self.display_health_interval:
-            refresh = vars(self).setdefault('_display_health_refresh', threading.Lock())
-            if refresh.acquire(blocking=cached is None):
-                handoff = False
-                try:
-                    if getattr(self, '_display_health_cache', None) is cached and (
-                            not self._capture_display_health(wait=cached is None)):
-                        threading.Thread(target=self._finish_display_refresh, args=(refresh,),
-                                         name='dco-display-refresh', daemon=True).start()
-                        handoff = True
-                finally:
-                    if not handoff:
-                        refresh.release()
-        sampled, wall, value = self._display_health_cache
+        """Return the latest complete sample and signal the persistent sampler."""
+        cached = self._display_health_cache
+        if cached is None:
+            with self._display_health_refresh:
+                if self._display_health_cache is None:
+                    self._capture_display_health()
+                cached = self._display_health_cache
+        sampled, wall, value = cached
         age = time.monotonic() - sampled
+        stale = age >= self.display_health_interval
+        if stale:
+            self._display_health_pending.set()
         return dict(value, health_sampled_at=wall, health_age_seconds=round(age, 3),
-                    health_stale=age >= self.display_health_interval)
+                    health_stale=stale)
 
-    def _capture_display_health(self, *, wait):
-        if not wait:
-            return False  # Return the previous sample while one background reader refreshes it.
+    def _capture_display_health(self):
         view, projects = self._health_inputs(display=True)
         sampled = (time.monotonic(), time.time())
         value = view._health()
         value['projects'] = projects._project_resources()
         self._display_health_cache = (*sampled, deepcopy(value))
-        return True
 
-    def _finish_display_refresh(self, refresh):
-        try:
-            self._capture_display_health(wait=True)
-        except Exception as error:
-            self.activity.notify('面板采样失败 ' + str(error), 'local')
-        finally:
-            refresh.release()
+    def _sample_display(self):
+        while True:
+            self._display_health_pending.wait()
+            self._display_health_pending.clear()
+            # Wait for a planning boundary without holding scheduler locks while
+            # formatting the snapshot or coupling HTTP readers to this wait.
+            with self.condition, self.pool.condition:
+                if self.stopping:
+                    return
+            with self._display_health_refresh:
+                cached = self._display_health_cache
+                if cached is not None and time.monotonic() - cached[0] < self.display_health_interval:
+                    continue
+                try:
+                    self._capture_display_health()
+                except Exception as error:
+                    try:
+                        self.activity.notify('面板采样失败 ' + str(error), 'local')
+                    except MemoryError:
+                        pass
 
     def capabilities(self, *, platform=None, operator=False):
         """Return the scheduler's aggregate project-facing capability view.
@@ -3166,6 +3177,8 @@ class Coordinator(PlacementPlanning):
                 self.cancel(identity)
             except KeyError:
                 pass
+        self._display_health_pending.set()
+        self._display_sampler.join()
         self.scheduler.join()
         if self.cancel_snapshot_thread is not None:
             self.cancel_snapshot_thread.join()

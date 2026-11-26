@@ -34,6 +34,15 @@ from .commands import (Shell, SchedulerShell, WorkerShell, MACHINE_ACTIONS, read
                        machine_action, batch, cache_parser)
 
 
+def _remote_display_health(client):
+    from .liveboard import MAX_SAMPLE_AGE_SECONDS
+    value = client.health(display=True)
+    age = value.get('health_age_seconds')
+    if isinstance(age, (int, float)) and age > MAX_SAMPLE_AGE_SECONDS:
+        return client.health()
+    return value
+
+
 def load_nodes(path=None, url=None, local_client=None, operator_token=None):
     if url:
         token = os.environ.get('REMOTE_COMPUTE_TOKEN', '')
@@ -172,7 +181,7 @@ def run_scheduler(args, local_client=None, restarting=None, stopping=None):
             try:
                 shell.do_nodes("")
                 read_display = (lambda: coordinator.health(display=True)) if coordinator else (
-                    (lambda: dispatch.health(display=True)) if dispatch else None)
+                    (lambda: _remote_display_health(dispatch)) if dispatch else None)
                 shell.loop(read_display, dispatch.url if dispatch else '',
                            lambda: not stopping.is_set() and (api_thread is None or api_thread.is_alive()))
             finally:

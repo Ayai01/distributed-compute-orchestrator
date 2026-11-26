@@ -1813,6 +1813,35 @@ class CenterTests(unittest.TestCase):
                     # The queued read progresses even when the viewer doesn't poll again.
                     until(lambda: state._display_health_cache[1] > captured['health_sampled_at'])
 
+    def test_display_sampler_recovers_after_memory_error(self):
+        with scratch() as root, provider(Path(root)/'worker', cpus=2) as (_, worker):
+            with Pool([worker], refresh=60) as pool, center(pool, Path(root)/'center') as (state, client):
+                state.display_health_interval = .75
+                original = client.health(display=True)
+                _, wall, data = state._display_health_cache
+                state._display_health_cache = (time.monotonic() - 10, wall, data)
+                sampler = state._display_sampler
+                completed = threading.Event()
+                capture = state._capture_display_health
+
+                def fail_once():
+                    if not completed.is_set():
+                        completed.set()
+                        raise MemoryError('injected display allocation failure')
+                    capture()
+
+                with patch.object(state, '_capture_display_health', side_effect=fail_once):
+                    stale = client.health(display=True)
+                    self.assertTrue(completed.wait(3))
+                    self.assertTrue(stale['health_stale'])
+                    self.assertEqual(stale['health_sampled_at'], original['health_sampled_at'])
+                    client.health(display=True)
+                    until(lambda: state._display_health_cache[1] > wall)
+                    fresh = client.health(display=True)
+                    self.assertFalse(fresh['health_stale'])
+                    self.assertIs(state._display_sampler, sampler)
+                    self.assertTrue(sampler.is_alive())
+
     def test_brief_polling_omits_payload_and_wait_returns_full_provenance(self):
         with scratch() as root, provider(Path(root)/'worker') as (_,client):
             identity=client.submit(python("import time; print('complete'); time.sleep(.2)"))['id']
