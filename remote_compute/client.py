@@ -31,7 +31,7 @@ import zipfile
 
 from .bundle import MAX_BODY, PROTOCOL, TERMINAL, cancellation_needs_reconnect, json_bytes, pack, task_bundle, tree, unpack, native_path
 from .policy import (normalize_accelerator_requirement, select_accelerator_units, canonical_capabilities,
-                     MAX_STATUS_BATCH, priority_weight, validate_ready_tasks, validate_status_ids, validate_platform)
+                     FRACTIONAL_PRIORITY, MAX_STATUS_BATCH, priority_weight, validate_ready_tasks, validate_status_ids, validate_platform)
 from .auth import lan_endpoint
 from .allocation import STARTUP_CPU_FLOOR, elastic_cpus, cpu_capacity, reject_startup_cpu_floor, startup_cpus
 from .build_refs import provider_abi
@@ -2212,11 +2212,13 @@ class Pool:
         required_tools,required_shared,python,backend=execution_bindings(task)
         required=capability_set(task.get('requires',()))
         package = task.get('_capability_package')
+        needs_fractional_priority = type(task.get('priority')) is float
         result=[]
         for node in self.nodes:
             health=node.health
             width = node.configured_capacity if node.cpu_suspended else node.capacity
             if ((scoped and node.name not in scoped) or (task.get('node')and node.name!=task['node'])or width<cpus
+                    or needs_fractional_priority and FRACTIONAL_PRIORITY not in health.get('capabilities', ())
                     or task.get('min_start_cpus', 1) > 1 and STARTUP_CPU_FLOOR not in health.get('capabilities', ())
                     or task.get('platform') is not None and health.get('platform') != task['platform']
                     or executable_ram_mb and node.executable_ram_capacity < executable_ram_mb

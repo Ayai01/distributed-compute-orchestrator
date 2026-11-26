@@ -53,7 +53,7 @@ from .ramdisk import EXECUTABLE_RAM_UNAVAILABLE, probe_executable_scratch, valid
 from .allocation import (ACTIVE_GRANT_CONFLICT, STARTUP_CPU_FLOOR, plan_resize, cpu_capacity, validate_cpu_overcommit, validate_cpu_utilization,
                          validate_min_start_cpus)
 from .memory import MemoryObservation, measured_memory, reservation, startup_memory, calibrated_model, plan_memory, pressure_victim, same_phase, PressureGuard, COMMIT_EMERGENCY_MB
-from .policy import (MAX_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, priority_weight, validate_status_ids,
+from .policy import (FRACTIONAL_PRIORITY, MIN_PRIORITY, MAX_REQUIREMENTS, priority_weight, validate_priority, validate_status_ids,
                      MAX_REQUIREMENT_LENGTH, MAX_RESOURCE_SHARE,
                      normalize_accelerator_requirement, select_accelerator_units,
                      normalize_accelerators, aggregate_accelerators, canonical_capabilities,
@@ -274,9 +274,7 @@ def validate_task(task, capacity, *, allow_auto=False):
         task['outputs'] = [*task['outputs'], CHECKPOINT_MANIFEST]
     if not isinstance(task["label"], str):
         raise ValueError("label must be a string")
-    if type(task["priority"]) is not int or abs(task["priority"]) > MAX_PRIORITY:
-        raise ValueError(f"priority must be an integer in {MIN_PRIORITY}..{MAX_PRIORITY}")
-    task["priority"] = priority_weight(task["priority"])
+    task["priority"] = priority_weight(validate_priority(task["priority"], legacy_signed=True))
     if (not isinstance(task["requires"], list)
             or len(task["requires"]) > MAX_REQUIREMENTS
             or any(not isinstance(x, str) or not x or len(x) > MAX_REQUIREMENT_LENGTH
@@ -504,7 +502,7 @@ class Worker:
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
                         capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress','execution_profiles_v1',STARTUP_CPU_FLOOR]
-                        + ['batch_cancel', 'kill_snapshot', 'cancel_handoff']
+                        + ['batch_cancel', 'kill_snapshot', 'cancel_handoff', FRACTIONAL_PRIORITY]
                         + ([ASSET_RESUME_CAPABILITY] if self.shared_assets else [])
                         + (['restart'] if self.restart_available else []))
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:

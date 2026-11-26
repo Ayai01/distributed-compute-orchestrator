@@ -23,9 +23,17 @@ from .tasks import ngspice, verilator
 from .records import active_items
 from .auth import node_url
 from .startup import single_instance, Cancelled
-from .policy import MIN_PRIORITY, priority_weight
+from .policy import MIN_PRIORITY, priority_weight, validate_priority
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _priority_arg(text):
+    try:
+        value = int(text)
+    except ValueError:
+        value = float(text)
+    return validate_priority(value, legacy_signed=True)
 
 
 def read_json(path):
@@ -137,7 +145,7 @@ def submission_parser(kind):
     parser.add_argument("--output", help="结果保存目录")
     parser.add_argument("--max-cpus", type=int, help="任务可用并行上限，由DCO自动分配")
     parser.add_argument("--memory-mb", type=int, help="任务内存预留，MiB")
-    parser.add_argument("--priority", type=int)
+    parser.add_argument("--priority", type=_priority_arg)
     parser.add_argument("--requires", help="节点标签，以逗号分隔")
     parser.add_argument("--accelerator", help='加速器需求 JSON，例如 {"kind":"cuda","memory_mb":8192,"requires":["gpu:training"]}')
     parser.add_argument("--keep", action="store_true", help="回收后保留节点任务目录")
@@ -200,7 +208,7 @@ def machine_parser(action):
         parser.add_argument("--max-cpus", type=int, default=1024)
         parser.add_argument("--memory-mb", type=int, default=256)
         parser.add_argument("--timeout", type=float, default=3600)
-        parser.add_argument("--priority", type=int, default=MIN_PRIORITY)
+        parser.add_argument("--priority", type=_priority_arg, default=MIN_PRIORITY)
         parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
         parser.add_argument("--stdin", help="将本地文件发送为标准输入")
         parser.add_argument("--output", help="保存完整日志和结果")
@@ -692,7 +700,7 @@ class SchedulerShell(Shell):
         print(f"\n已接单 {client.url}  {identity}")
 
     def do_run(self, line):
-        """run 任务.json [--input 目录] [--output 目录] [--cpus N] [--priority N]"""
+        """run 任务.json [--input 目录] [--output 目录] [--cpus N] [--priority WEIGHT]"""
         self._submit("run", line)
 
     def do_spice(self, line):

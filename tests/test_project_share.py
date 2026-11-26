@@ -173,6 +173,18 @@ class ProjectShareTests(unittest.TestCase):
         urgent['desired_cpus']=2
         self.assertEqual(s._cooperative_cpu_target('regular',16,s.project_resources()),14)
 
+
+    def test_fractional_priorities_weight_jobs_within_their_project_share(self):
+        s = self.state(32)
+        s.pool.nodes[0].health['capabilities'] = ['fractional_priority']
+        self.job(s, 'regular', 'A', desired=16, priority=0.2)
+        self.job(s, 'urgent', 'A', desired=16, priority=0.6)
+        self.job(s, 'peer', 'B', desired=32, priority=1)
+        resources = s.project_resources()
+        self.assertEqual(s._project_cpu_plan(resources), {'A': {'0': 16}, 'B': {'0': 16}})
+        self.assertEqual([s._cooperative_cpu_target(key, 16, resources)
+                          for key in ('regular', 'urgent', 'peer')], [4, 12, 16])
+
     def test_small_phase_uses_the_same_ratio_as_a_wider_peer(self):
         s=self.state(8)
         self.job(s,'regular','A',desired=4,priority=1)

@@ -16,6 +16,7 @@ READY_QUEUE_FLOOR = 129
 MAX_STATUS_BATCH = 128
 MIN_PRIORITY = 1
 MAX_PRIORITY = 1000
+FRACTIONAL_PRIORITY = "fractional_priority"
 MAX_REQUIREMENTS = 32
 MAX_REQUIREMENT_LENGTH = 64
 MAX_TOOL_CONSTRAINTS = 32
@@ -26,9 +27,20 @@ RESOURCE_CONTROL_FIELDS = frozenset((
     'memory_mb','memory_reserve_mb','memory_headroom_mb','memory_commit_headroom_mb'))
 
 
+def validate_priority(value, *, legacy_signed=False):
+    """Check a priority without changing its submitted value or numeric type."""
+    if legacy_signed and type(value) is int and -MAX_PRIORITY <= value <= 0:
+        return value
+    if type(value) not in (int, float) or not 0 < value <= MAX_PRIORITY:
+        raise ValueError(f"priority must be a finite number in (0, {MAX_PRIORITY}]")
+    return value
+
+
 def priority_weight(value):
-    """Translate a legacy signed priority or a missing value to a positive weight."""
-    return max(MIN_PRIORITY, value) if type(value) is int else MIN_PRIORITY
+    """Keep valid weights and give legacy nonpositive integers the default weight."""
+    if type(value) in (int, float) and 0 < value <= MAX_PRIORITY:
+        return value
+    return MIN_PRIORITY
 
 
 def validate_resource_controls(value, *, logical_cpus, cpu_limit):
@@ -279,6 +291,7 @@ def public_capabilities():
         "artifact_cas_v1",
         "warm_affinity_v1",
         "staged_cpu_accounting_v1",
+        FRACTIONAL_PRIORITY,
         "max_cpus",
         "resize",
         "resize_auto",

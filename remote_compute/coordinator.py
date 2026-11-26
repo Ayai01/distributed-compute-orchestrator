@@ -21,9 +21,9 @@ from . import build_refs
 from .client import PoolBusy, RemoteError, RequestCancelled, _check_cancelled
 from .worker import (Conflict, QueueFull, _ASSET, _ID, lock_root, validate_task, asset_handoff,
                      handoff_references, retire_asset, missing_task_assets)
-from .policy import (MIN_PRIORITY, MAX_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
+from .policy import (MIN_PRIORITY, FRACTIONAL_PRIORITY, MAX_QUEUE_RATIO, MAX_REQUIREMENTS, MAX_READY_TASKS, READY_QUEUE_FLOOR,
                      MAX_REQUIREMENT_LENGTH,
-                     MAX_RESOURCE_SHARE, priority_weight,
+                     MAX_RESOURCE_SHARE, priority_weight, validate_priority,
                      public_capabilities, normalize_accelerator_requirement,
                      aggregate_accelerators, canonical_capabilities, clean_tool_snapshot, validate_ready_tasks, validate_platform,
                      RESOURCE_CONTROL_FIELDS, validate_resource_controls)
@@ -592,7 +592,7 @@ class Coordinator(PlacementPlanning):
     def health(self, *, brief=False, sample=False, display=False):
         if brief:
             return dict(protocol=PROTOCOL,role='scheduler',node=socket.gethostname(),version=__version__,
-                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting','kill_snapshot']+(['restart'] if self.restart_available else []))
+                        capabilities=['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting','kill_snapshot',FRACTIONAL_PRIORITY]+(['restart'] if self.restart_available else []))
         if display:
             value = self._display_health()
         else:
@@ -833,7 +833,7 @@ class Coordinator(PlacementPlanning):
                     'retained_jobs': (len(self.jobs.history) if isinstance(self.jobs, JobRecords) else 0)
                                      + sum(j['result']['status'] in TERMINAL for j in active_values(self.jobs))
                                      + sum(row['status'] in TERMINAL for row in observation_rows.values()),
-                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting']+(['restart'] if self.restart_available else []),
+                    'capabilities':['resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','max_cpus','admission_job','admission_ready_tasks','batch_status','job_prefix','job_file_version','retry_jobs','accelerators','accelerator_fallback','asset_handoff','cache_references','cpu_accounting',FRACTIONAL_PRIORITY]+(['restart'] if self.restart_available else []),
                     "cpus": sum(n.capacity for n in online), "used_cpus": sum(n.reserved + n.external for n in online),
                     "logical_cpus": sum(group[0].health.get("logical_cpus", 0) for group in machines.values()),
                     "memory_total_mb": sum(group[0].health.get("memory_total_mb", 0) for group in machines.values()),
@@ -891,8 +891,7 @@ class Coordinator(PlacementPlanning):
             identity,priority=changes['job'],changes['priority']
             if not isinstance(identity,str)or not _ID.fullmatch(identity):
                 raise ValueError('Job id requires 32 lowercase hex characters')
-            if type(priority)is not int or not MIN_PRIORITY<=priority<=MAX_PRIORITY:
-                raise ValueError('priority must be an integer in%d..%d'%(MIN_PRIORITY,MAX_PRIORITY))
+            validate_priority(priority)
             if self.job_observed(identity):
                 raise Conflict('Externally observed jobs are read-only')
             job=load_job(self.jobs,self.condition,identity)

@@ -1,5 +1,5 @@
 """Task constructors; callers keep their measurement and scientific semantics."""
-from .policy import MIN_PRIORITY, canonical_capabilities, validate_platform
+from .policy import MIN_PRIORITY, canonical_capabilities, validate_platform, validate_priority
 
 
 def python_map(function, items, *, kwargs=None, backend='process', item_max_cpus=1, **options):
@@ -50,7 +50,7 @@ def command(argv, *, max_cpus=1024, timeout=300, outputs=(), env=None, assets=No
     else:memory_mb=256 if memory_mb is None else memory_mb
     task = {"steps": [list(argv)], "max_cpus": max_cpus, "timeout": timeout,
             "outputs": list(outputs), "env": dict(env or {}), "assets": dict(assets or {}),
-            "render": list(render), "label": label, "priority": priority,
+            "render": list(render), "label": label, "priority": validate_priority(priority, legacy_signed=True),
             "requires": canonical_capabilities(requires), "node": node, "memory_mb": memory_mb,
             "project": project, "resource_share": resource_share}
     if executable_ram_mb is not None:

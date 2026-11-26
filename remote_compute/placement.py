@@ -20,7 +20,7 @@ def _matching_pass(pool):
     def matching(task):
         accelerator=task.get('accelerator')
         key=(task.get('node'),task.get('platform'),frozenset(task.get('placement_scope',{}).get('nodes',())),
-             task.get('_capability_package'),
+             task.get('_capability_package'),type(task.get('priority')) is float,
              tuple(task.get('placement_scope', {}).get('nodes', ())),
              task.get('_artifact_abi'),bool(task.get('produces_artifact_ref')),
              json.dumps(task.get('native_cache'), sort_keys=True) if task.get('native_cache') else None,

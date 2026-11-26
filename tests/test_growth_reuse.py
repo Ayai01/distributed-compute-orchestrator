@@ -41,7 +41,7 @@ class GrowthReuseTests(unittest.TestCase):
                 cpus=1 if held else rng.choice([0,1])
                 elastic=maximum>1
                 task=dict(steps=[['echo']],cpus=cpus,memory_mb=64,
-                          max_cpus=maximum,priority=rng.choice([-1,0,2]),
+                          max_cpus=maximum,priority=rng.choice([-1,0,0.2,0.4,2]),
                           project=rng.choice(['A','B','C']),
                           requires=['matrix'+str(int(node.name)%2)] if rng.random()<.35 else [])
                 job=dict(task=task,auto_cpus=cpus==0,elastic_cpus=elastic,
@@ -52,7 +52,7 @@ class GrowthReuseTests(unittest.TestCase):
                 if rng.random()<.05:job['cancel'].set()
                 state.jobs[str(index)]=job
             resources=state.project_resources()
-            candidate=dict(priority=rng.choice([-1,0,2]))
+            candidate=dict(priority=rng.choice([-1,0,0.2,0.4,2]))
             actual=state._growth_headroom(resources)
             state.__class__=UncachedCenter
             expected=state._growth_headroom(resources)
