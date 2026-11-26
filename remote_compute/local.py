@@ -18,7 +18,9 @@ class LocalClient(Client):
     def cancel(self, identity):
         return self.worker.cancel(identity)
 
-    def cancel_many(self, identities):
+    def cancel_many(self, identities, *, handoff_ids=()):
+        if handoff_ids:
+            return self.worker.cancel_many(identities, handoff_ids=handoff_ids)
         return self.worker.cancel_many(identities)
 
     def cancel_all(self):

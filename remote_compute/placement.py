@@ -5,7 +5,8 @@ import json
 import math
 import time
 
-from .allocation import PREFERRED_PHASE_CPUS, plan_resize, queued_uses_node, startup_cpus, weighted_node_threads
+from .allocation import (PREFERRED_PHASE_CPUS, plan_resize, queued_threads_on_node, queued_uses_node,
+                         startup_cpus, weighted_node_threads)
 from .bundle import TERMINAL
 from .memory import plan_memory, same_phase
 from .policy import priority_weight
@@ -239,7 +240,7 @@ class PlacementPlanning:
             held=job.get('node')
             ready = [node for node in self.pool._matching(task)
                      if node.name not in claims and not node.error and node.enabled
-                     and (held is None or node is held)
+                     and (node.dispatch_room if held is None else node is held)
                      and not node.health.get('paused') and not node.health.get('queued', 0)
                      and node.capacity-node.external >= width
                      and min(node.memory_free, self.pool._host_memory_free(node))
@@ -386,6 +387,7 @@ class PlacementPlanning:
             held=sum(job['task']['cpus'] for job in members.values() if job.get('node') is node)
             capacities[name]=max(0,min(node.capacity-node.external-node.reserved+held,projects.get(group,{}).get(name,0)))
         matching=_matching_pass(self.pool)
+        dispatch_slots = {name: node.dispatch_slots for name, node in nodes.items()}
         fixed=[];demands={};rooms={};waiting={};memory_available={}
         for key,job in members.items():
             task=job['task'];held=job.get('node')
@@ -398,14 +400,17 @@ class PlacementPlanning:
             for node in matching(wanted):
                 if node.name not in capacities or (held is not None and held is not node):continue
                 if held is None:
+                    if dispatch_slots[node.name] == 0 or node.health.get('queued', 0):
+                        continue
                     if node.name not in memory_available:
                         memory_available[node.name]=max(0,min(node.memory_free,self.pool._host_memory_free(node)))
                     if node.startup_memory(task)>memory_available[node.name]:continue
                     if task.get('accelerator') and not node.can_match_accelerator(node.execution_accelerator(task,available=True)):continue
                 eligible.append(node.name)
             if not eligible:continue
-            if not automatic:
-                fixed.append((key,task,eligible,job['result'].get('submitted',0)))
+            width = startup_cpus(task)
+            if not automatic or held is None and width > 1:
+                fixed.append((key, task, width, eligible, job['result'].get('submitted', 0)))
                 continue
             # Before its first phase request, an elastic peer gets four-thread
             # warmup demand, bounded by its useful ceiling.
@@ -413,12 +418,16 @@ class PlacementPlanning:
                 max(nodes[n].capacity for n in eligible)if job.get('auto_cpus')else max(PREFERRED_PHASE_CPUS,task.get('cpus',1)))
             demands[key]=min(demand,task.get('max_cpus',demand))
             rooms[key]={name:min(demands[key],nodes[name].capacity) for name in eligible}
-            if held is None:waiting[key]=startup_cpus(task)
-        for key,task,eligible,submitted in sorted(fixed,key=lambda row:(-priority_weight(row[1].get('priority')),len(row[2]),row[3])):
-            choices=[name for name in eligible if capacities[name]>=task['cpus']]
+            if held is None:
+                waiting[key] = width
+        for key, task, width, eligible, submitted in sorted(
+                fixed, key=lambda row: (-priority_weight(row[1].get('priority')), len(row[3]), row[4])):
+            choices = [name for name in eligible if capacities[name] >= width and dispatch_slots[name] != 0]
             if choices:
-                selected=max(choices,key=lambda name:capacities[name])
-                capacities[selected]-=task['cpus']
+                selected = max(choices, key=capacities.__getitem__)
+                capacities[selected] -= width
+                if dispatch_slots[selected] is not None:
+                    dispatch_slots[selected] -= 1
         running={key:value for key,value in demands.items() if key not in waiting}
         shares={key:priority_weight(members[key]['task'].get('priority')) for key in running}
         warm=weighted_node_threads(capacities,shares,{key:min(PREFERRED_PHASE_CPUS,value) for key,value in running.items()},rooms)
@@ -447,10 +456,15 @@ class PlacementPlanning:
             # peers. Re-solving from raw ceilings would dilute older grants.
             return min(share_room,max(1,warm.get(identity,{}).get(name,0)))
         spare={name:max(0,value-sum(row.get(name,0) for row in warm.values())) for name,value in capacities.items()}
-        # All running members are pinned. Only the entrant reservation on the
-        # caller's node can change its grant; entrants still share the whole pool.
-        if queued_uses_node(name,spare,{key:priority_weight(members[key]['task'].get('priority')) for key in waiting},waiting,rooms):
-            capacities[name]-=spare[name]
+        # Relay acknowledgements release dispatch slots while running leases
+        # can expand independently. Only reserve starts that have a slot now.
+        entrant_caps = {key: value if dispatch_slots[key] is None else min(value, dispatch_slots[key])
+                        for key, value in spare.items()}
+        entrant_shares = {key: priority_weight(members[key]['task'].get('priority')) for key in waiting}
+        if dispatch_slots[name] is not None:
+            capacities[name] -= queued_threads_on_node(name, entrant_caps, entrant_shares, waiting, rooms)
+        elif queued_uses_node(name, entrant_caps, entrant_shares, waiting, rooms):
+            capacities[name] -= spare[name]
         planned=weighted_node_threads(capacities,shares,running,rooms)
         target=min(share_room,max(1,planned.get(identity,{}).get(name,0)))
         return target

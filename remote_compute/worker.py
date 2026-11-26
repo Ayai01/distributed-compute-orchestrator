@@ -432,6 +432,9 @@ class Worker:
         self.accepting_assets = SubmissionAssets()
         self.pending_unpacks = {}
         self.receiving_submissions = {}
+        self.handoff_cancellations_path = self.root / 'handoff-cancellations.json'
+        self.handoff_cancellations = (set(json.loads(self.handoff_cancellations_path.read_bytes()))
+                                      if self.handoff_cancellations_path.is_file() else set())
         self.asset_writes = weakref.WeakValueDictionary()
         self.startup['environment_seconds']=round(time.monotonic()-started,4)
         phase=time.monotonic();indexed = self.jobs.load_index()
@@ -442,7 +445,7 @@ class Worker:
         paths = ((self.root / 'jobs' / identity / 'result.json') for identity in candidates) if candidates is not None else (self.root / "jobs").glob("*/result.json")
         self.startup_recoveries = []
         for path in paths:
-            if path.parent.name in self.jobs.deleted:
+            if path.parent.name in self.jobs.deleted or path.parent.name in self.handoff_cancellations:
                 continue
             saved = read_receipt(path, assets=self.jobs.pending_assets.get(path.parent.name, ()))
             if clean_tool_snapshot(saved):
@@ -501,7 +504,7 @@ class Worker:
     def health(self, *, brief=False, sample=False):
         identity=dict(protocol=PROTOCOL,node=socket.gethostname(),role='worker',version=__version__,
                         capabilities=['machine','resize','resize_memory','resize_auto','resize_memory_model','resize_active_cpus','resize_min_cpus','max_cpus','lease_polling','job_identity','health_sample','batch_status','job_file_version','accelerators','asset_handoff','cpu_accounting','adaptive_memory','task_progress','execution_profiles_v1',STARTUP_CPU_FLOOR]
-                        + ['batch_cancel', 'kill_snapshot']
+                        + ['batch_cancel', 'kill_snapshot', 'cancel_handoff']
                         + ([ASSET_RESUME_CAPABILITY] if self.shared_assets else [])
                         + (['restart'] if self.restart_available else []))
         if SINGLE_CORE_PHASE_HANDOFF in self.tags:
@@ -1065,6 +1068,8 @@ class Worker:
                     raise Conflict("Worker is stopping")
                 if identity in self.jobs.deleted:
                     raise Conflict('Job transport has already been retired')
+                if identity in self.handoff_cancellations:
+                    raise Conflict('Original handoff was cancelled before worker admission')
                 existing = identity in self.jobs
             if existing:
                 job = load_job(self.jobs, self.condition, identity)
@@ -1174,6 +1179,8 @@ class Worker:
                     if task['cpus'] > int(self.capacity*self.cpu_overcommit_factor) or startup_memory(task) > self.memory_capacity:
                         raise Conflict('Worker budget changed during submission; retry the original id')
                     result['worker_admission_seconds'] = time.monotonic() - received
+                    if identity in self.handoff_cancellations:
+                        raise Conflict('Original handoff was cancelled before worker admission')
                     if incoming[1]:
                         # The independent control request can arrive while
                         # this request is still receiving or unpacking.
@@ -1828,13 +1835,15 @@ class Worker:
             return marked
         return self.get(identity)
 
-    def cancel_many(self, identities):
+    def cancel_many(self, identities, *, handoff_ids=()):
         from .operations import cancel_receipt
 
         identities = tuple(dict.fromkeys(identities))
         affected = {}
         receiving = set()
         with self.condition:
+            fenced = {identity for identity in handoff_ids
+                      if identity not in self.jobs and identity not in self.jobs.deleted}
             # Signal every local process before writing any individual receipt.
             # Running jobs own their final write and retain the flag if they exit here.
             for identity in identities:
@@ -1856,8 +1865,15 @@ class Worker:
                     self.queue.remove(identity)
                     job["result"].update(status="cancelled", finished=time.time())
             self.condition.notify_all()
+            if fenced - self.handoff_cancellations:
+                saved = self.handoff_cancellations | fenced
+                atomic_json(self.handoff_cancellations_path, sorted(saved))
+                self.handoff_cancellations = saved
         results = {}
         for identity in identities:
+            if identity in fenced:
+                results[identity] = dict(id=identity, status='cancelled', cancel_requested=True, handoff_fenced=True)
+                continue
             if identity in receiving:
                 results[identity] = dict(id=identity, status='unknown', cancel_requested=True)
                 continue
@@ -2226,8 +2242,11 @@ class Handler(BaseHTTPRequestHandler):
                 value = worker.cancel_all()
             elif parts == ['jobs', 'cancel'] and self.command == 'POST' and not scheduler:
                 request = json.loads(body)
-                value = worker.cancel_many(validate_status_ids(
-                    request.get('ids') if isinstance(request, dict) else None))
+                ids = validate_status_ids(request.get('ids') if isinstance(request, dict) else None)
+                handoffs = validate_status_ids(request['handoff_ids']) if request.get('handoff_ids') else ()
+                if not set(handoffs).issubset(ids):
+                    raise ValueError('Handoff fences require cancellation of the same original IDs')
+                value = worker.cancel_many(ids, handoff_ids=handoffs) if handoffs else worker.cancel_many(ids)
             elif parts == ["restart"] and self.command == "POST":
                 if scheduler and not operator:
                     return self._reply({"error": "Scheduler restart is operator-only"}, 403)

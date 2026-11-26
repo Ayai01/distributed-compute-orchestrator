@@ -167,3 +167,20 @@ def queued_uses_node(node, capacities, shares, demands, rooms):
     if not possible:return False
     plan=weighted_node_threads(capacities,shares,demands,rooms)
     return any(row.get(node,0)>0 for row in plan.values())
+
+
+def queued_threads_on_node(node, capacities, shares, demands, rooms):
+    """Count planned startup threads on a route with a bounded dispatch window."""
+    limit = capacities[node]
+    if limit <= 0:
+        return 0
+    total = sum(capacities.values())
+    possible = 0
+    for name, demand in demands.items():
+        possible += min(demand, rooms[name].get(node, 0))
+        if possible >= total:
+            return limit
+    if not possible or total == limit:
+        return possible
+    plan = weighted_node_threads(capacities, shares, demands, rooms)
+    return sum(row.get(node, 0) for row in plan.values())

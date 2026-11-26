@@ -4,9 +4,11 @@ from pathlib import Path
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from remote_compute import Pool
 from remote_compute.placement import PlacementSnapshot, _matching_pass
+from remote_compute.relay_bulk import RelayBulkBudget
 import test_center as fixtures
 from remote_compute.worker import Conflict
 from test_compute import provider, python, scratch, until
@@ -78,6 +80,38 @@ class SoftCpuGoalTests(unittest.TestCase):
         state.jobs['0']['result']['resource_request'] = dict(request_id=2,cpus=4,min_cpus=0,active_cpus=0)
         view = PlacementSnapshot(state)
         self.assertGreater(view._growth_headroom(view._project_resources())['0'],0)
+
+    def test_deep_queue_does_not_claim_cores_behind_full_relay_handoffs(self):
+        state = fixtures.AdmissionPlanningTests().center([19])
+        node = state.pool.nodes[0]
+        node.client._endpoint = urlsplit('http://127.0.0.1:27100')
+        active = state.jobs['active'] = job('running', node, execution_started=1)
+        active['task'].update(max_cpus=16, cpus=4)
+        active['desired_cpus'] = 16
+        for index in range(4):
+            name = f'dispatch-{index}'
+            node.pending_dispatches.add(name)
+            state.jobs[name] = job('dispatching', node, dispatch_stage='awaiting_worker')
+        node.reserved = 8
+        for i in range(979):
+            key = f'queued-{i}'
+            state.jobs[key] = job('queued')
+            state.jobs[key]['task']['cpus'] = 0
+            state.queue.append(key)
+
+        with patch('remote_compute.client._RELAY_BULK_BUDGET', RelayBulkBudget([27100], None)):
+            view = PlacementSnapshot(state)
+            self.assertFalse(list(view.candidates()))
+            self.assertEqual(view._cooperative_cpu_target('active', 16, view._project_resources()), 15)
+
+            node.pending_dispatches.remove('dispatch-0')
+            view = PlacementSnapshot(state)
+            self.assertTrue(list(view.candidates()))
+            self.assertEqual(view._cooperative_cpu_target('active', 16, view._project_resources()), 14)
+
+            node.health['cpus'] = node.health['cpu_limit'] = 29
+            view = PlacementSnapshot(state)
+            self.assertEqual(view._cooperative_cpu_target('active', 16, view._project_resources()), 16)
 
     def test_worker_cold_start_funding_releases_the_centers_larger_estimate(self):
         original = 'c' * 32

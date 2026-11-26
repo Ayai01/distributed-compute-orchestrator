@@ -1424,6 +1424,8 @@ class Coordinator(PlacementPlanning):
                 node = self._original_node(job['result'].get('assigned_node'), job['result'].get('worker_url'))
                 worker_id=job['result'].get('worker_id',identity)
                 if node is None or node.error or node.detached or worker_id in node.live_jobs:continue
+                if job.get('handoff_cancel_retry_at', 0) > time.monotonic():
+                    continue
                 remote=next((r for r in node.health.get('active_jobs') or [] if r['id']==worker_id),None)
                 with zipfile.ZipFile(job['directory']/'request.zip') as archive:
                     task=json.loads(archive.read('task.json'))
@@ -1470,6 +1472,14 @@ class Coordinator(PlacementPlanning):
         released = False
         try:
             reattach=job.pop('reattach',False)
+            if reattach and job['cancel'].is_set() and (job.get('recover_submission')
+                    or job['result'].get('handoff_cancel_pending')):
+                result = self._settle_cancelled_handoff(job, node, identity)
+                if result is not None:
+                    with self.condition:
+                        self._update(job, result)
+                    return
+                job.pop('recover_submission', None)
             if reattach and job.pop('recover_submission',False):
                 # A center can stop between reserving a provider and finishing
                 # its POST. Observe the same ID before replaying that pending
@@ -1533,7 +1543,16 @@ class Coordinator(PlacementPlanning):
                 job['result']['dispatch_zip_bytes'] = len(payload)
                 job['result']['worker_request_sha256'] = hashlib.sha256(payload).hexdigest()
                 dispatch_options = {'assets': dispatch_task['assets']} if dispatch_task is not task else {}
-                if not self._submit(job, identity, payload, callback, **dispatch_options):
+                try:
+                    submitted = self._submit(job, identity, payload, callback, **dispatch_options)
+                except RequestCancelled:
+                    result = self._settle_cancelled_handoff(job, node, identity)
+                    if result is not None:
+                        with self.condition:
+                            self._update(job, result)
+                        return
+                    submitted = True
+                if not submitted:
                     result=dict(status='cancelled',finished=time.time(),cancelled_before_submit=True,cpu_seconds=0)
                     with self.condition:self._update(job,result)
                     return
@@ -1658,7 +1677,10 @@ class Coordinator(PlacementPlanning):
                     job['resource_recovery_business_failure']=isinstance(error,BusinessItemFailure)
             with self.condition:
                 self.threads.discard(threading.current_thread())
+                job.pop('handoff_stop', None)
                 if deferred_cancel:
+                    if job['result'].get('handoff_cancel_pending'):
+                        job['handoff_cancel_retry_at'] = time.monotonic() + 2
                     self._defer_cancellation(job)
                 elif preparation_worker_lost:
                     if job['cancel'].is_set():
@@ -1764,12 +1786,18 @@ class Coordinator(PlacementPlanning):
             return (not uncertain and not job['result'].get('submission_recovered')
                     and not self.stopping and (node.error or node.detached))
 
+        stop_post = transport.HandoffCancellation(job['cancel'])
+        with self.condition:
+            job['handoff_stop'] = stop_post
         asset_metrics = None
         if assets:
             asset_metrics = job['result'].setdefault('asset_transport', {'uploads': {}})
             asset_metrics['selected'] = sorted(assets)
         while True:
-            if not uncertain and job['cancel'].is_set():return False
+            if job['cancel'].is_set():
+                if uncertain:
+                    raise RequestCancelled('Worker POST acceptance remains uncertain')
+                return False
             submitting=False
             try:
                 if assets and not uncertain:
@@ -1803,13 +1831,15 @@ class Coordinator(PlacementPlanning):
                     timing = dict(job['result'].get('handoff_transport', {}))
                     try:
                         with transport.measure_job_post(identity, timing):
-                            node.client.submit_bundle(identity,payload,cancel=job['cancel'].is_set,
+                            node.client.submit_bundle(identity,payload,cancel=stop_post,
                                 **({'callback':callback} if callback else {}))
                     finally:
                         if timing:
                             job['result']['handoff_transport'] = timing
                 return True
-            except RequestCancelled:
+            except RequestCancelled as error:
+                if uncertain or getattr(error, 'request_may_have_been_sent', False):
+                    raise
                 return False
             except PoolBusy as error:
                 # Nothing was sent. Keep the same reservation and ID while the
@@ -1825,6 +1855,8 @@ class Coordinator(PlacementPlanning):
                 elif job['cancel'].wait(.1):
                     return False
             except RemoteError as error:
+                if submitting and job['cancel'].is_set():
+                    raise RequestCancelled('Worker POST cancelled before acknowledgement') from error
                 if not force and getattr(error,'status_code',None)==400 and 'Synchronize missing asset first:' in str(error):
                     force=True
                     continue
@@ -1842,6 +1874,8 @@ class Coordinator(PlacementPlanning):
                 # A missing POST reply says nothing about acceptance. Keep the
                 # original worker, ID and grant while querying that same job.
                 while True:
+                    if job['cancel'].is_set():
+                        raise RequestCancelled('Worker POST acceptance remains uncertain') from error
                     with self.condition:
                         job['result']['connection_error']=str(error)
                         self._publish(job)
@@ -1850,7 +1884,6 @@ class Coordinator(PlacementPlanning):
                         return True
                     except RemoteError as observed:
                         if getattr(observed,'status_code',None)==404:
-                            if job['cancel'].is_set():return False
                             # The first POST may still arrive later. Repeating
                             # its exact ID and payload remains worker-idempotent.
                             break
@@ -2622,6 +2655,31 @@ class Coordinator(PlacementPlanning):
             if getattr(error,'status_code',None)==409:raise Conflict(str(error)) from None
             raise
 
+    def _settle_cancelled_handoff(self, job, node, identity):
+        """Fence an unacknowledged upload or hand an admitted original to normal settlement."""
+        with self.condition:
+            job['result']['handoff_cancel_pending'] = True
+            self._save(job)
+            while job.get('cancel_sending'):
+                self.condition.wait(.1)
+            fenced = job['result'].get('handoff_fenced', False)
+        if not fenced:
+            try:
+                remote = node.client.cancel_many([identity], handoff_ids=[identity]).get(identity, {})
+            except OSError as error:
+                raise RemoteError('Cancellation awaits an authoritative worker receipt') from error
+            fenced = remote.get('handoff_fenced', False)
+            if not fenced and remote.get('status', 'unknown') == 'unknown':
+                raise RemoteError('Cancellation awaits an authoritative worker receipt')
+            with self.condition:
+                self._cancel_response(job, remote=remote)
+        with self.condition:
+            job['result'].pop('handoff_cancel_pending', None)
+        if fenced:
+            return dict(status='cancelled', finished=time.time(), cancel_requested=True,
+                        cancelled_before_submit=True, handoff_fenced=True, cpu_seconds=0)
+        return None
+
     def _cancel_response(self, job, remote=None, error=None):
         result = job['result']
         if error is not None and result['status'] not in TERMINAL and not result.get('cancel_acknowledged'):
@@ -2632,6 +2690,8 @@ class Coordinator(PlacementPlanning):
             result['cancel_acknowledged'] = True
             if remote.get('kill_signal_sent'):
                 result['kill_signal_sent'] = True
+            if remote.get('handoff_fenced'):
+                result['handoff_fenced'] = True
 
     def _defer_cancellation(self, job):
         """Keep a cancelled intent live internally until its original node settles it."""
@@ -2673,6 +2733,8 @@ class Coordinator(PlacementPlanning):
                 job['result']['cancel_requested'] = True
                 self._publish(job)
                 job['cancel'].set()
+                if stop_post := job.get('handoff_stop'):
+                    stop_post.interrupt()
             self.cancel_snapshot = dict(status='accepted', matched=len(jobs) + len(deferred), finished=0,
                                         pending=list(jobs) + deferred, errors={}, jobs=[])
             self.cancel_snapshot_thread = threading.Thread(target=self._deliver_cancel_snapshot,
@@ -2685,7 +2747,10 @@ class Coordinator(PlacementPlanning):
         def send(client, pairs):
             failure = None
             try:
-                responses = client.cancel_many([identity for identity, _job in pairs])
+                ids = [identity for identity, _job in pairs]
+                handoffs = [identity for identity, job in pairs
+                            if job['result'].get('dispatch_stage') == 'awaiting_worker']
+                responses = client.cancel_many(ids, handoff_ids=handoffs) if handoffs else client.cancel_many(ids)
             except (RemoteError, OSError) as error:
                 responses = {}
                 failure = error
@@ -2723,6 +2788,8 @@ class Coordinator(PlacementPlanning):
         with self.condition:
             if job["result"]["status"] not in TERMINAL:
                 job["cancel"].set()
+                if stop_post := job.get('handoff_stop'):
+                    stop_post.interrupt()
                 job['result']['cancel_requested'] = True
                 if identity in self.queue:
                     self.queue.remove(identity)
@@ -2750,11 +2817,13 @@ class Coordinator(PlacementPlanning):
                     job.pop('cancel_sending', None)
                     self._cancel_response(job, error=error)
                     self._save(job)
+                    self.condition.notify_all()
             else:
                 with self.condition:
                     job.pop('cancel_sending', None)
                     self._cancel_response(job, remote=remote)
                     self._save(job)
+                    self.condition.notify_all()
         return self.get(identity)
 
     def prepare_artifacts(self, identity):

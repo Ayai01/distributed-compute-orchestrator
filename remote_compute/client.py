@@ -59,6 +59,70 @@ class RequestCancelled(RemoteError):
     """A caller stopped its transfer or local wait, preserving accepted work."""
 
 
+class HandoffCancellation:
+    """Interrupt the worker POST socket when its original is cancelled."""
+
+    def __init__(self, event):
+        self.event = event
+        self.lock = threading.Lock()
+        self.socket = None
+        self.attempted = False
+
+    def __call__(self):
+        return self.event.is_set()
+
+    def bind(self, sock):
+        with self.lock:
+            _check_cancelled(self)
+            self.socket = sock
+            self.attempted = True
+
+    def unbind(self):
+        with self.lock:
+            self.socket = None
+
+    def interrupt(self):
+        with self.lock:
+            if self.socket is not None:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+class _HandoffResponseReader(io.RawIOBase):
+    """Read the ordinary HTTP response with a bounded cancellation check."""
+
+    def __init__(self, sock, lifetime, cancel):
+        self.sock = sock
+        self.lifetime = lifetime
+        self.cancel = cancel
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        timeout = self.sock.gettimeout()
+        expires = time.monotonic() + timeout
+        try:
+            while True:
+                _check_cancelled(self.cancel)
+                remaining = expires - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Worker POST response timed out')
+                self.sock.settimeout(min(.2, remaining))
+                try:
+                    return self.sock.recv_into(buffer)
+                except TimeoutError:
+                    continue
+        finally:
+            self.sock.settimeout(timeout)
+
+    def close(self):
+        self.lifetime.close()
+        super().close()
+
+
 RESOURCE_TRANSPORT_RETAINED='Center resource transport interrupted; existing grant retained'
 _RELAY_BULK_BUDGET = load_relay_bulk_budget()
 WORKER_STATUS_SAMPLE_MAX_AGE = 2.0
@@ -527,6 +591,7 @@ class Client:
                 connection.sock.settimeout(attempt_timeout)
             sent=False
             asset_body_sent = False
+            handoff = cancel if job_upload and isinstance(cancel, HandoffCancellation) else None
             try:
                 if partial.tell() and etag:
                     headers.update(Range='bytes='+str(partial.tell())+'-', **{'If-Range':etag})
@@ -538,6 +603,8 @@ class Client:
                 body=_UploadBody(data,cancel,upload_budget) if stream_body else data
                 with _elapsed(timing, 'connect_send_seconds') if timing is not None else nullcontext():
                     if connection.sock is None:connection.connect()
+                    if handoff is not None:
+                        handoff.bind(connection.sock)
                     sent=True
                     if timing is not None:
                         timing['post_attempts'] = timing.get('post_attempts', 0) + 1
@@ -555,7 +622,18 @@ class Client:
                     # deadline. Lost acceptance is reconciled using the same ID.
                     connection.sock.settimeout(min(attempt_timeout,self.timeout))
                 with _elapsed(timing, 'reply_header_seconds') if timing is not None else nullcontext():
-                    response = connection.getresponse()
+                    if handoff is None:
+                        response = connection.getresponse()
+                    else:
+                        def cancellable_response(sock, *args, **kwargs):
+                            reply = http.client.HTTPResponse(sock, *args, **kwargs)
+                            reply.fp = io.BufferedReader(_HandoffResponseReader(sock, reply.fp, handoff))
+                            return reply
+                        connection.response_class = cancellable_response
+                        try:
+                            response = connection.getresponse()
+                        finally:
+                            del connection.response_class
                 if artifact_socket is not None and not response.isclosed():
                     artifact_socket.settimeout(attempt_timeout)
                 if self.peer_id and response.getheader('X-DCO-Node') != self.peer_id:
@@ -650,6 +728,12 @@ class Client:
                     raise error
                 break
             except (http.client.HTTPException, OSError, RemoteError) as exc:
+                if handoff is not None:
+                    handoff.unbind()
+                    if handoff():
+                        cancelled = RequestCancelled('Worker POST cancelled during handoff')
+                        cancelled.request_may_have_been_sent = sent
+                        raise cancelled from exc
                 if isinstance(exc,RequestCancelled):
                     exc.request_may_have_been_sent=sent
                     raise
@@ -696,6 +780,9 @@ class Client:
                     error.request_may_have_been_sent=sent
                     raise error from None
                 time.sleep(min(1,.1*2**attempt))
+            finally:
+                if handoff is not None:
+                    handoff.unbind()
         return raw if binary else json.loads(raw)
 
     def health(self, *, brief=False, sample=False, display=False):
@@ -785,8 +872,12 @@ class Client:
         try:
             return self.request(path,payload,**options)
         except RemoteError as error:
-            if isinstance(error,RequestCancelled)and not getattr(error,'request_may_have_been_sent',False):
-                raise
+            if isinstance(error, RequestCancelled):
+                if isinstance(cancel, HandoffCancellation):
+                    error.request_may_have_been_sent = cancel.attempted
+                    raise
+                if not getattr(error, 'request_may_have_been_sent', False):
+                    raise
             if not (error.transport_retryable or error.status_code in (502,503)or isinstance(error,RequestCancelled)):
                 raise
         # A busy center can accept a task while both its reply and the first
@@ -1029,15 +1120,19 @@ class Client:
     def cancel(self, identity):
         return self._cancel_transport().request("/jobs/" + identity + "/cancel", {})
 
-    def cancel_many(self, identities):
-        """Send each worker one bounded batch at a time, including during rolling upgrades."""
+    def cancel_many(self, identities, *, handoff_ids=()):
+        """Send bounded controls and optionally fence original POSTs before admission."""
         from .operations import cancel_receipt
         control = self._cancel_transport(timeout=8)
         values = {}
+        handoff_ids = set(handoff_ids)
         for offset in range(0, len(identities), MAX_STATUS_BATCH):
             batch = identities[offset:offset + MAX_STATUS_BATCH]
             if 'batch_cancel' in (self._capabilities or ()):
-                values.update(control.request('/jobs/cancel', {'ids': batch}))
+                request = {'ids': batch}
+                if handoff_ids and 'cancel_handoff' in self._capabilities:
+                    request['handoff_ids'] = [identity for identity in batch if identity in handoff_ids]
+                values.update(control.request('/jobs/cancel', request))
             else:
                 for identity in batch:
                     try:
@@ -1526,10 +1621,15 @@ class Node:
     display_name: str = ""
 
     @property
-    def dispatch_room(self):
+    def dispatch_slots(self):
         endpoint = getattr(self.client, '_endpoint', None)
-        return not (endpoint is not None and _RELAY_BULK_BUDGET is not None
-                    and _RELAY_BULK_BUDGET.matches(endpoint)) or len(self.pending_dispatches) < 4
+        if endpoint is not None and _RELAY_BULK_BUDGET is not None and _RELAY_BULK_BUDGET.matches(endpoint):
+            return max(0, 4 - len(self.pending_dispatches))
+        return None
+
+    @property
+    def dispatch_room(self):
+        return self.dispatch_slots != 0
 
     @property
     def executable_ram_capacity(self):
